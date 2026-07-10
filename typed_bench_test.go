@@ -327,3 +327,14 @@ func BenchmarkEncodeLargeStdlib(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkValidMedium(b *testing.B) {
+	src := benchRecordsJSON(32)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	for range b.N {
+		if !Valid(src) {
+			b.Fatal("invalid")
+		}
+	}
+}

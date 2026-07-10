@@ -1,144 +1,151 @@
 package simdjson
 
-import "unsafe"
+import (
+	"encoding/binary"
+	"math/bits"
+	"unsafe"
+)
 
-// validFast is the bool-only validation path. It keeps common nesting state
-// inline and leaves detailed diagnostics and extreme depth to Validate. Small
-// inputs first try the short-string scanner before the general one.
+// validFast is the bool-only validation path: a recursive descent machine
+// with an inline word-at-a-time fast path for short clean strings. Depth is
+// bounded like Validate.
 func validFast(src []byte) bool {
-	const inlineDepth = 16
-	var containers [inlineDepth]uint8
 	n := len(src)
-	short := n <= 64
 	base := unsafe.Pointer(unsafe.SliceData(src))
-	containerBase := unsafe.Pointer(&containers[0])
-	i := skipSpaceFast(base, n, 0)
-	depth := 0
-	completed := false
-	needObjectKey := false
+	i, c := nextSignificantFast(base, n, 0)
+	if i >= n {
+		return false
+	}
+	i, ok := validValueFast(src, base, n, i, c, 0)
+	if !ok {
+		return false
+	}
+	return skipSpaceFast(base, n, i) == n
+}
 
-	for {
-		if !completed {
-			if needObjectKey {
-				i = skipSpaceFast(base, n, i)
-				if i >= n || fastByteAt(base, i) != '"' {
-					return false
-				}
-				var ok bool
-				i, _, ok = scanJSONStringFast(src, base, i, short)
-				if !ok {
-					return false
-				}
-				i = skipSpaceFast(base, n, i)
-				if i >= n || fastByteAt(base, i) != ':' {
-					return false
-				}
-				i++
-				needObjectKey = false
-			}
-
-			i = skipSpaceFast(base, n, i)
-			if i >= n {
-				return false
-			}
-			kind := uint8(0)
-			switch fastByteAt(base, i) {
-			case 'n':
-				if i+4 > n || fastByteAt(base, i+1) != 'u' || fastByteAt(base, i+2) != 'l' || fastByteAt(base, i+3) != 'l' {
-					return false
-				}
-				i += 4
-			case 't':
-				if i+4 > n || fastByteAt(base, i+1) != 'r' || fastByteAt(base, i+2) != 'u' || fastByteAt(base, i+3) != 'e' {
-					return false
-				}
-				i += 4
-			case 'f':
-				if i+5 > n || fastByteAt(base, i+1) != 'a' || fastByteAt(base, i+2) != 'l' || fastByteAt(base, i+3) != 's' || fastByteAt(base, i+4) != 'e' {
-					return false
-				}
-				i += 5
-			case '"':
-				var ok bool
-				i, _, ok = scanJSONStringFast(src, base, i, short)
-				if !ok {
-					return false
-				}
-			case '[':
-				kind = uint8(Array)
-				i++
-			case '{':
-				kind = uint8(Object)
-				i++
-			default:
-				if c := fastByteAt(base, i); c != '-' && !isDigit(c) {
-					return false
-				}
-				var ok bool
-				i, ok = scanNumberFast(base, n, i)
-				if !ok {
-					return false
-				}
-			}
-
-			if kind == 0 {
-				completed = true
-			} else {
-				if depth == inlineDepth {
-					return Validate(src) == nil
-				}
-				fastStateSet(containerBase, depth, kind)
-				depth++
-				i = skipSpaceFast(base, n, i)
-				close := byte(']')
-				if kind == uint8(Object) {
-					close = '}'
-				}
-				if i < n && fastByteAt(base, i) == close {
-					i++
-					depth--
-					completed = true
-				} else {
-					needObjectKey = kind == uint8(Object)
-					continue
-				}
+// validStringFast consumes a string starting at the opening quote, taking one
+// SWAR word inline for the short clean case before the general scanner.
+func validStringFast(src []byte, base unsafe.Pointer, n, i int) (int, bool) {
+	start := i + 1
+	if start+8 <= n {
+		if m := stringSpecialMask(binary.LittleEndian.Uint64(src[start:])); m != 0 {
+			j := start + bits.TrailingZeros64(m)/8
+			if fastByteAt(base, j) == '"' {
+				return j + 1, true
 			}
 		}
+	}
+	end, _, ok := scanJSONStringFastLong(src, base, i)
+	return end, ok
+}
 
-		for completed {
-			if depth == 0 {
-				return skipSpaceFast(base, n, i) == n
-			}
-			kind := fastStateAt(containerBase, depth-1)
-			i = skipSpaceFast(base, n, i)
-			if i >= n {
-				return false
-			}
-			if kind == uint8(Array) {
-				switch fastByteAt(base, i) {
-				case ',':
-					i++
-					completed = false
-				case ']':
-					i++
-					depth--
-				default:
-					return false
-				}
-			} else {
-				switch fastByteAt(base, i) {
-				case ',':
-					i++
-					needObjectKey = true
-					completed = false
-				case '}':
-					i++
-					depth--
-				default:
-					return false
-				}
-			}
+func validValueFast(src []byte, base unsafe.Pointer, n, i int, c byte, depth int) (int, bool) {
+	switch c {
+	case '{':
+		if depth >= defaultMaxDepth {
+			return i, false
 		}
+		i++
+		i, c = nextSignificantFast(base, n, i)
+		if i >= n {
+			return i, false
+		}
+		if c == '}' {
+			return i + 1, true
+		}
+		for {
+			if c != '"' {
+				return i, false
+			}
+			var ok bool
+			i, ok = validStringFast(src, base, n, i)
+			if !ok {
+				return i, false
+			}
+			i, c = nextSignificantFast(base, n, i)
+			if i >= n || c != ':' {
+				return i, false
+			}
+			i, c = nextSignificantFast(base, n, i+1)
+			if i >= n {
+				return i, false
+			}
+			i, ok = validValueFast(src, base, n, i, c, depth+1)
+			if !ok {
+				return i, false
+			}
+			i, c = nextSignificantFast(base, n, i)
+			if i >= n {
+				return i, false
+			}
+			if c == ',' {
+				i, c = nextSignificantFast(base, n, i+1)
+				if i >= n {
+					return i, false
+				}
+				continue
+			}
+			if c == '}' {
+				return i + 1, true
+			}
+			return i, false
+		}
+	case '[':
+		if depth >= defaultMaxDepth {
+			return i, false
+		}
+		i++
+		i, c = nextSignificantFast(base, n, i)
+		if i >= n {
+			return i, false
+		}
+		if c == ']' {
+			return i + 1, true
+		}
+		for {
+			var ok bool
+			i, ok = validValueFast(src, base, n, i, c, depth+1)
+			if !ok {
+				return i, false
+			}
+			i, c = nextSignificantFast(base, n, i)
+			if i >= n {
+				return i, false
+			}
+			if c == ',' {
+				i, c = nextSignificantFast(base, n, i+1)
+				if i >= n {
+					return i, false
+				}
+				continue
+			}
+			if c == ']' {
+				return i + 1, true
+			}
+			return i, false
+		}
+	case '"':
+		return validStringFast(src, base, n, i)
+	case 't':
+		if i+4 > n || fastByteAt(base, i+1) != 'r' || fastByteAt(base, i+2) != 'u' || fastByteAt(base, i+3) != 'e' {
+			return i, false
+		}
+		return i + 4, true
+	case 'f':
+		if i+5 > n || fastByteAt(base, i+1) != 'a' || fastByteAt(base, i+2) != 'l' || fastByteAt(base, i+3) != 's' || fastByteAt(base, i+4) != 'e' {
+			return i, false
+		}
+		return i + 5, true
+	case 'n':
+		if i+4 > n || fastByteAt(base, i+1) != 'u' || fastByteAt(base, i+2) != 'l' || fastByteAt(base, i+3) != 'l' {
+			return i, false
+		}
+		return i + 4, true
+	default:
+		if c != '-' && !isDigit(c) {
+			return i, false
+		}
+		return scanNumberFast(base, n, i)
 	}
 }
 
@@ -257,6 +264,19 @@ func scanShortJSONString(base unsafe.Pointer, n, quote int) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// nextSignificantFast skips insignificant whitespace and returns the first
+// significant byte, saving the reload every caller performed afterwards.
+func nextSignificantFast(base unsafe.Pointer, n, i int) (int, byte) {
+	for i < n {
+		c := fastByteAt(base, i)
+		if c > ' ' || (c != ' ' && c != '\n' && c != '\r' && c != '\t') {
+			return i, c
+		}
+		i++
+	}
+	return i, 0
 }
 
 func skipSpaceFast(base unsafe.Pointer, n, i int) int {
