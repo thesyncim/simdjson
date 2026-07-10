@@ -222,3 +222,50 @@ func FuzzEncoderMatchesStdlib(f *testing.F) {
 		}
 	})
 }
+
+// TestEncoderRandomFloatsMatchStdlib hammers the float fast paths with a
+// deterministic mix of exact decimals, integers, and raw bit patterns.
+func TestEncoderRandomFloatsMatchStdlib(t *testing.T) {
+	type wrapper struct {
+		F64 float64 `json:"f64"`
+		F32 float32 `json:"f32"`
+	}
+	state := uint64(0x9E3779B97F4A7C15)
+	next := func() uint64 {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		return state
+	}
+	for i := 0; i < 200000; i++ {
+		var f float64
+		switch i % 4 {
+		case 0: // small exact decimals
+			f = float64(int64(next()%2_000_000)-1_000_000) / 100
+		case 1: // integers across the fast-path boundary
+			f = float64(int64(next()%(1<<51)) - 1<<50)
+		case 2: // arbitrary bit patterns (skip NaN/Inf)
+			f = math.Float64frombits(next())
+			if math.IsNaN(f) || math.IsInf(f, 0) {
+				continue
+			}
+		default: // tenths near the scaled boundary
+			f = float64(int64(next()%20_000_000_000)-10_000_000_000) / 10
+		}
+		value := wrapper{F64: f, F32: float32(f)}
+		if math.IsInf(float64(value.F32), 0) {
+			continue
+		}
+		want, err := stdlibCompactJSON(t, &value)
+		if err != nil {
+			continue
+		}
+		got, err := Marshal(&value)
+		if err != nil {
+			t.Fatalf("float %g (bits %#x): %v", f, math.Float64bits(f), err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("float %g (bits %#x):\nsimdjson %s\nstdlib   %s", f, math.Float64bits(f), got, want)
+		}
+	}
+}

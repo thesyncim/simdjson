@@ -92,8 +92,8 @@ decodes a top-level array and reuses caller-provided slice capacity.
 Encoding mirrors decoding. `Marshal` matches `encoding/json.Marshal` with HTML
 escaping disabled (including its float formats, `omitempty`, and escape
 rules), and a compiled `Encoder` reused with `AppendJSON` encodes with zero
-allocations — the 1,024-record fixture encodes in 139 us at about 1 GB/s,
-roughly twice `encoding/json` throughput:
+allocations — the 1,024-record fixture encodes in 73 us at about 1.9 GB/s,
+roughly 3.7x `encoding/json` throughput:
 
 ```go
 encoder, err := simdjson.CompileEncoder[Event]()
