@@ -414,7 +414,40 @@ func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 }
 
 func decodeCompiledFloatArray[T floatValue](cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+	src := cursor.src
 	for index, first := 0, true; ; index, first = index+1, false {
+		// Fused fast path: consume the delimiter and a short float without the
+		// general element iterator. cursor.i stays untouched until the whole
+		// element is accepted, so every partial match falls through cleanly.
+		i := cursor.i
+		if i < len(src) && src[i] <= ' ' {
+			i = skipSpace(src, i)
+		}
+		if i < len(src) && index < node.length {
+			c := src[i]
+			if c == ']' {
+				cursor.i = i + 1
+				cursor.depth--
+				return nil
+			}
+			if !first {
+				if c != ',' {
+					goto general
+				}
+				i++
+				if i < len(src) && src[i] <= ' ' {
+					i = skipSpace(src, i)
+				}
+			}
+			if i < len(src) && (src[i] == '-' || isDigit(src[i])) {
+				if value, end, ok := shortTypedFloatAt(src, i); ok {
+					*(*T)(unsafe.Add(dst, uintptr(index)*node.elem.size)) = T(value)
+					cursor.i = end
+					continue
+				}
+			}
+		}
+	general:
 		more, err := cursor.NextArrayElement(first)
 		if err != nil {
 			return err
