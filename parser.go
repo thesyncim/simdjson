@@ -1,6 +1,7 @@
 package simdjson
 
 import (
+	"bytes"
 	"fmt"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -16,6 +17,9 @@ type Options struct {
 
 	// ZeroCopy reuses src storage for unescaped strings and numbers.
 	// Callers must not mutate src for as long as the returned Value is used.
+	// When false, results are independent of src: decoded strings alias at
+	// most one private copy of the input, so retaining any decoded string
+	// retains that copy.
 	ZeroCopy bool
 
 	// Preallocate validates once up front and allocates shared backing storage
@@ -65,6 +69,7 @@ type parser struct {
 	i        int
 	maxDepth int
 	zeroCopy bool
+	ownedSrc []byte
 
 	layout       layout
 	prealloc     bool
@@ -289,11 +294,22 @@ func (p *parser) parseString() (string, error) {
 	}
 }
 
+// string converts a subslice of p.src into a result string. Zero-copy results
+// alias p.src directly. Owned results alias one lazily made private copy of
+// the input, so a document's strings cost one allocation in total rather than
+// one allocation each; retaining any decoded string retains that copy.
 func (p *parser) string(b []byte) string {
-	if !p.zeroCopy || len(b) == 0 {
-		return string(b)
+	if len(b) == 0 {
+		return ""
 	}
-	return unsafe.String(unsafe.SliceData(b), len(b))
+	if p.zeroCopy {
+		return unsafe.String(unsafe.SliceData(b), len(b))
+	}
+	if p.ownedSrc == nil {
+		p.ownedSrc = bytes.Clone(p.src)
+	}
+	offset := uintptr(unsafe.Pointer(unsafe.SliceData(b))) - uintptr(unsafe.Pointer(unsafe.SliceData(p.src)))
+	return unsafe.String(&p.ownedSrc[offset], len(b))
 }
 
 func ownedBytesString(b []byte) string {

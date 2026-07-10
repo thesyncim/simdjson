@@ -16,7 +16,9 @@ type AnyOptions struct {
 
 	// ZeroCopy aliases unescaped strings and, when UseNumber is enabled,
 	// json.Number text into src. Callers must not mutate src while the decoded
-	// value is in use.
+	// value is in use. When false, results are independent of src: decoded
+	// strings alias at most one private copy of the input, so retaining any
+	// decoded string retains that copy.
 	ZeroCopy bool
 
 	// UseNumber decodes numbers as json.Number instead of float64.

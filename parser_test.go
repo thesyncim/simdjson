@@ -2531,3 +2531,32 @@ func parseMinAllocForTest(src []byte) (Value, error) {
 func parseAnyZeroCopyForTest(src []byte) (any, error) {
 	return ParseAnyOptions(src, AnyOptions{ZeroCopy: true})
 }
+
+func TestOwnedResultsSurviveSourceMutation(t *testing.T) {
+	src := []byte(`{"name":"keepsake","n":12345,"nested":["alpha","beta"]}`)
+
+	value, err := Parse(bytes.Clone(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed := bytes.Clone(src)
+	dynamic, err := ParseAny(parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range parsed {
+		parsed[i] = 'x'
+	}
+
+	name, _ := value.Get("name")
+	if got, _ := name.Text(); got != "keepsake" {
+		t.Fatalf("Parse string = %q, want keepsake", got)
+	}
+	object := dynamic.(map[string]any)
+	if got := object["name"]; got != "keepsake" {
+		t.Fatalf("ParseAny string = %v, want keepsake", got)
+	}
+	if got := object["nested"].([]any)[1]; got != "beta" {
+		t.Fatalf("ParseAny nested string = %v, want beta", got)
+	}
+}

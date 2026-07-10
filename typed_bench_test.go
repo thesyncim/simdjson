@@ -157,3 +157,25 @@ func BenchmarkDecodeLargeOwned(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkParseAnyLarge(b *testing.B) {
+	src := benchRecordsJSON(1024)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	for range b.N {
+		if _, err := ParseAny(src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkParseLarge(b *testing.B) {
+	src := benchRecordsJSON(1024)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	for range b.N {
+		if _, err := ParseOptions(src, Options{ZeroCopy: true, Preallocate: true}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
