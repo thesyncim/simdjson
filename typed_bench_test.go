@@ -175,7 +175,7 @@ func BenchmarkParseLarge(b *testing.B) {
 	b.SetBytes(int64(len(src)))
 	b.ReportAllocs()
 	for range b.N {
-		if _, err := ParseOptions(src, Options{ZeroCopy: true, Preallocate: true}); err != nil {
+		if _, err := ParseOptions(src, Options{ZeroCopy: true}); err != nil {
 			b.Fatal(err)
 		}
 	}

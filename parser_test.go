@@ -828,7 +828,7 @@ func assertDepthAccepted(t *testing.T, src []byte, opts Options) {
 	if _, err := ParseOptions(src, opts); err != nil {
 		t.Fatalf("ParseOptions(%q) = %v", src, err)
 	}
-	if _, err := ParseOptions(src, Options{MaxDepth: opts.MaxDepth, ZeroCopy: true, Preallocate: true}); err != nil {
+	if _, err := ParseOptions(src, Options{MaxDepth: opts.MaxDepth, ZeroCopy: true}); err != nil {
 		t.Fatalf("ParseOptions prealloc(%q) = %v", src, err)
 	}
 	if _, _, err := GetRawOptions(src, "", opts); err != nil {
@@ -850,7 +850,7 @@ func assertDepthRejected(t *testing.T, src []byte, opts Options) {
 	if _, err := ParseOptions(src, opts); err == nil {
 		t.Fatalf("ParseOptions(%q) succeeded, want depth error", src)
 	}
-	if _, err := ParseOptions(src, Options{MaxDepth: opts.MaxDepth, ZeroCopy: true, Preallocate: true}); err == nil {
+	if _, err := ParseOptions(src, Options{MaxDepth: opts.MaxDepth, ZeroCopy: true}); err == nil {
 		t.Fatalf("ParseOptions prealloc(%q) succeeded, want depth error", src)
 	}
 	if _, _, err := GetRawOptions(src, "", opts); err == nil {
@@ -2525,7 +2525,7 @@ func parseZeroCopyForTest(src []byte) (Value, error) {
 }
 
 func parseMinAllocForTest(src []byte) (Value, error) {
-	return ParseOptions(src, Options{ZeroCopy: true, Preallocate: true})
+	return ParseOptions(src, Options{ZeroCopy: true})
 }
 
 func parseAnyZeroCopyForTest(src []byte) (any, error) {

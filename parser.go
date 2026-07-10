@@ -2,7 +2,7 @@ package simdjson
 
 import (
 	"bytes"
-	"fmt"
+	"sync"
 	"unicode/utf16"
 	"unicode/utf8"
 	"unsafe"
@@ -22,9 +22,6 @@ type Options struct {
 	// retains that copy.
 	ZeroCopy bool
 
-	// Preallocate validates once up front and allocates shared backing storage
-	// for arrays and objects, reducing one allocation per non-empty container.
-	Preallocate bool
 }
 
 // Parse parses src into an ordered JSON AST.
@@ -32,53 +29,158 @@ func Parse(src []byte) (Value, error) {
 	return ParseOptions(src, Options{})
 }
 
-// ParseOptions parses src using opts.
-func ParseOptions(src []byte, opts Options) (Value, error) {
-	p := parser{src: src, maxDepth: opts.MaxDepth, zeroCopy: opts.ZeroCopy}
-	if p.maxDepth <= 0 {
-		p.maxDepth = defaultMaxDepth
-	}
-	if opts.Preallocate {
-		layout, err := countLayout(src, p.maxDepth)
-		if err != nil {
-			return Value{}, err
-		}
-		p.layout = layout
-		p.prealloc = true
-		if layout.values > 0 {
-			p.valueArena = make([]Value, layout.values)
-		}
-		if layout.members > 0 {
-			p.memberArena = make([]Member, layout.members)
-		}
-	}
-	p.skipSpace()
-	v, err := p.parseValue(0)
-	if err != nil {
-		return Value{}, err
-	}
-	p.skipSpace()
-	if p.i != len(src) {
-		return Value{}, p.err(p.i, "unexpected data after top-level value")
-	}
-	return v, nil
+// parseTapePool recycles tape storage between ParseOptions calls; the tape
+// is consumed before the call returns and never escapes.
+var parseTapePool = sync.Pool{
+	New: func() any {
+		storage := make([]IndexEntry, 0, 1024)
+		return &storage
+	},
 }
 
+// ParseOptions parses src using opts. It builds the structural tape first,
+// so containers allocate exactly once from shared arenas sized by the tape.
+func ParseOptions(src []byte, opts Options) (Value, error) {
+	maxDepth := opts.MaxDepth
+	if maxDepth <= 0 {
+		maxDepth = defaultMaxDepth
+	}
+	pooled := parseTapePool.Get().(*[]IndexEntry)
+	storage := (*pooled)[:cap(*pooled)]
+	estimate := len(src)/8 + 8
+	var entries []IndexEntry
+	for {
+		if cap(storage) < estimate {
+			storage = make([]IndexEntry, estimate)
+		}
+		index, err := BuildIndexOptions(src, storage[:cap(storage)], IndexOptions{MaxDepth: maxDepth})
+		if err == ErrIndexFull {
+			estimate = cap(storage) * 2
+			continue
+		}
+		if err != nil {
+			*pooled = storage[:0]
+			parseTapePool.Put(pooled)
+			return Value{}, err
+		}
+		entries = index.entries
+		break
+	}
+	defer func() {
+		*pooled = storage[:0]
+		parseTapePool.Put(pooled)
+	}()
+	if len(entries) == 0 {
+		return Value{}, syntaxError(src, 0, "expected value")
+	}
+	builder := astBuilder{src: src, entries: entries, zeroCopy: opts.ZeroCopy}
+	values, members := 0, 0
+	for i := range entries {
+		if entries[i].flags&tapeFlagKey != 0 {
+			members++
+		} else {
+			values++
+		}
+	}
+	// Object member values live inside Member entries, so the value arena
+	// only holds array elements: every non-key entry except the root and
+	// the object member values (one per key).
+	if arrayValues := values - members - 1; arrayValues > 0 {
+		builder.valueArena = make([]Value, arrayValues)
+	}
+	if members > 0 {
+		builder.memberArena = make([]Member, members)
+	}
+	value, _ := builder.build(0)
+	return value, nil
+}
+
+// astBuilder turns a validated structural tape into the ordered Value tree.
+type astBuilder struct {
+	src         []byte
+	entries     []IndexEntry
+	valueArena  []Value
+	valuePos    int
+	memberArena []Member
+	memberPos   int
+	zeroCopy    bool
+	ownedSrc    []byte
+}
+
+func (b *astBuilder) build(idx int) (Value, int) {
+	entry := &b.entries[idx]
+	switch entry.kind {
+	case Object:
+		count := int(entry.count)
+		var members []Member
+		if count > 0 {
+			members = b.memberArena[b.memberPos : b.memberPos+count]
+			b.memberPos += count
+		}
+		i := idx + 1
+		for m := 0; m < count; m++ {
+			key := b.stringAt(&b.entries[i])
+			var value Value
+			value, i = b.build(i + 1)
+			members[m] = Member{Key: key, Value: value}
+		}
+		return Value{kind: Object, o: members}, i
+	case Array:
+		count := int(entry.count)
+		var values []Value
+		if count > 0 {
+			values = b.valueArena[b.valuePos : b.valuePos+count]
+			b.valuePos += count
+		}
+		i := idx + 1
+		for m := 0; m < count; m++ {
+			values[m], i = b.build(i)
+		}
+		return Value{kind: Array, a: values}, i
+	case String:
+		return Value{kind: String, s: b.stringAt(entry)}, idx + 1
+	case Number:
+		return Value{kind: Number, n: b.text(entry.start, entry.end)}, idx + 1
+	case Bool:
+		return Value{kind: Bool, b: b.src[entry.start] == 't'}, idx + 1
+	default:
+		return Value{kind: Null}, idx + 1
+	}
+}
+
+// stringAt decodes a string entry: escaped strings decode into owned storage,
+// clean strings follow the parser's ownership rules.
+func (b *astBuilder) stringAt(entry *IndexEntry) string {
+	if entry.flags&tapeFlagEscaped != 0 {
+		return ownedBytesString(appendDecodedJSONString(nil, b.src[entry.start+1:entry.end-1]))
+	}
+	return b.text(entry.start+1, entry.end-1)
+}
+
+// text returns src[start:end] under the parser's ownership rules: zero copy
+// aliases src, owned mode aliases one lazily made private copy of the input.
+func (b *astBuilder) text(start, end uint32) string {
+	if start == end {
+		return ""
+	}
+	if b.zeroCopy {
+		return unsafe.String(unsafe.SliceData(b.src[start:end]), int(end-start))
+	}
+	if b.ownedSrc == nil {
+		b.ownedSrc = append([]byte(nil), b.src...)
+	}
+	return unsafe.String(&b.ownedSrc[start], int(end-start))
+}
+
+// parser holds shared low-level scanning state for the dynamic decoding
+// paths and the typed decoder's slow paths.
 type parser struct {
 	src      []byte
 	i        int
 	maxDepth int
 	zeroCopy bool
 	ownedSrc []byte
-
-	layout       layout
-	prealloc     bool
-	containerPos int
-	valueArena   []Value
-	valuePos     int
-	memberArena  []Member
-	memberPos    int
-	anyArena     *anyValueArena
+	anyArena *anyValueArena
 }
 
 func (p *parser) err(off int, msg string) error {
@@ -87,163 +189,6 @@ func (p *parser) err(off int, msg string) error {
 
 func (p *parser) skipSpace() {
 	p.i = skipSpace(p.src, p.i)
-}
-
-func (p *parser) parseValue(depth int) (Value, error) {
-	if depth > p.maxDepth {
-		return Value{}, p.err(p.i, "maximum nesting depth exceeded")
-	}
-	if p.i >= len(p.src) {
-		return Value{}, p.err(p.i, "expected value")
-	}
-	switch p.src[p.i] {
-	case 'n':
-		return p.parseLiteral("null", Value{kind: Null})
-	case 't':
-		return p.parseLiteral("true", Value{kind: Bool, b: true})
-	case 'f':
-		return p.parseLiteral("false", Value{kind: Bool})
-	case '"':
-		s, err := p.parseString()
-		if err != nil {
-			return Value{}, err
-		}
-		return Value{kind: String, s: s}, nil
-	case '[':
-		return p.parseArray(depth + 1)
-	case '{':
-		return p.parseObject(depth + 1)
-	default:
-		if p.src[p.i] == '-' || isDigit(p.src[p.i]) {
-			return p.parseNumber()
-		}
-		return Value{}, p.err(p.i, fmt.Sprintf("unexpected byte %q while parsing value", p.src[p.i]))
-	}
-}
-
-func (p *parser) parseLiteral(lit string, v Value) (Value, error) {
-	if !matchStringAt(p.src, p.i, lit) {
-		return Value{}, p.err(p.i, "invalid literal")
-	}
-	p.i += len(lit)
-	return v, nil
-}
-
-func (p *parser) parseArray(depth int) (Value, error) {
-	if depth > p.maxDepth {
-		return Value{}, p.err(p.i, "maximum nesting depth exceeded")
-	}
-	p.i++
-	var a []Value
-	if p.prealloc {
-		a = p.allocValues(p.nextContainerCount())
-	}
-	p.skipSpace()
-	if p.i < len(p.src) && p.src[p.i] == ']' {
-		p.i++
-		return Value{kind: Array, a: a}, nil
-	}
-
-	if !p.prealloc {
-		a = make([]Value, 0, 4)
-	}
-	idx := 0
-	for {
-		p.skipSpace()
-		v, err := p.parseValue(depth)
-		if err != nil {
-			return Value{}, err
-		}
-		if !p.prealloc {
-			a = append(a, v)
-		} else {
-			a[idx] = v
-			idx++
-		}
-		p.skipSpace()
-		if p.i >= len(p.src) {
-			return Value{}, p.err(p.i, "unterminated array")
-		}
-		switch p.src[p.i] {
-		case ',':
-			p.i++
-		case ']':
-			p.i++
-			return Value{kind: Array, a: a}, nil
-		default:
-			return Value{}, p.err(p.i, "expected comma or closing bracket in array")
-		}
-	}
-}
-
-func (p *parser) parseObject(depth int) (Value, error) {
-	if depth > p.maxDepth {
-		return Value{}, p.err(p.i, "maximum nesting depth exceeded")
-	}
-	p.i++
-	var o []Member
-	if p.prealloc {
-		o = p.allocMembers(p.nextContainerCount())
-	}
-	p.skipSpace()
-	if p.i < len(p.src) && p.src[p.i] == '}' {
-		p.i++
-		return Value{kind: Object, o: o}, nil
-	}
-
-	if !p.prealloc {
-		o = make([]Member, 0, 4)
-	}
-	idx := 0
-	for {
-		p.skipSpace()
-		if p.i >= len(p.src) || p.src[p.i] != '"' {
-			return Value{}, p.err(p.i, "expected object key string")
-		}
-		key, err := p.parseString()
-		if err != nil {
-			return Value{}, err
-		}
-		p.skipSpace()
-		if p.i >= len(p.src) || p.src[p.i] != ':' {
-			return Value{}, p.err(p.i, "expected colon after object key")
-		}
-		p.i++
-		p.skipSpace()
-		v, err := p.parseValue(depth)
-		if err != nil {
-			return Value{}, err
-		}
-		if !p.prealloc {
-			o = append(o, Member{Key: key, Value: v})
-		} else {
-			o[idx] = Member{Key: key, Value: v}
-			idx++
-		}
-		p.skipSpace()
-		if p.i >= len(p.src) {
-			return Value{}, p.err(p.i, "unterminated object")
-		}
-		switch p.src[p.i] {
-		case ',':
-			p.i++
-		case '}':
-			p.i++
-			return Value{kind: Object, o: o}, nil
-		default:
-			return Value{}, p.err(p.i, "expected comma or closing brace in object")
-		}
-	}
-}
-
-func (p *parser) parseNumber() (Value, error) {
-	start := p.i
-	end, msg := scanNumber(p.src, p.i)
-	if msg != "" {
-		return Value{}, p.err(start, msg)
-	}
-	p.i = end
-	return Value{kind: Number, n: p.string(p.src[start:p.i])}, nil
 }
 
 func (p *parser) parseString() (string, error) {
@@ -317,30 +262,6 @@ func ownedBytesString(b []byte) string {
 		return ""
 	}
 	return unsafe.String(unsafe.SliceData(b), len(b))
-}
-
-func (p *parser) nextContainerCount() int {
-	n := p.layout.container(p.containerPos)
-	p.containerPos++
-	return n
-}
-
-func (p *parser) allocValues(n int) []Value {
-	if n == 0 {
-		return nil
-	}
-	start := p.valuePos
-	p.valuePos += n
-	return p.valueArena[start:p.valuePos]
-}
-
-func (p *parser) allocMembers(n int) []Member {
-	if n == 0 {
-		return nil
-	}
-	start := p.memberPos
-	p.memberPos += n
-	return p.memberArena[start:p.memberPos]
 }
 
 func (p *parser) appendEscape(out *[]byte) error {
