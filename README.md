@@ -22,22 +22,21 @@ On an Apple M4 Max, `CompileDecoder[T]` parsed the benchmark fixtures in:
 
 | Mode | 31 B object | 4.2 KB / 32 records | 136.6 KB / 1,024 records |
 |---|---:|---:|---:|
-| **SIMD, source-backed** | **27.8 ns / 0 allocs** | **2.26 us / 2 allocs** | **67.8 us / 2 allocs** |
-| Pure Go, source-backed | 28.2 ns / 0 allocs | 2.41 us / 2 allocs | 71.6 us / 2 allocs |
-| **SIMD, owned strings** | **43.2 ns / 1 alloc** | **2.52 us / 3 allocs** | **74.3 us / 3 allocs** |
+| **SIMD, source-backed** | **29.9 ns / 0 allocs** | **2.36 us / 2 allocs** | **75.9 us / 2 allocs** |
+| **SIMD, owned strings** | **43.3 ns / 1 alloc** | **2.62 us / 3 allocs** | **84.1 us / 3 allocs** |
 
-The large source-backed fixture decodes at 2.0 GB/s. Reusing the destination
+The large source-backed fixture decodes at 1.8 GB/s. Reusing the destination
 removes the remaining container allocation in source-backed mode:
-`2.15 us / 0 allocs` for 32 records and `66.4 us / 0 allocs` for 1,024
-records. Pretty-printed input stays on the fast path: the same large document
-indented with two spaces (222 KB) decodes at 1.9 GB/s. So do documents whose
-member order does not match the struct (rotated order decodes within 16% of
-in-order) and untagged structs matching lowercase keys case-insensitively
-(within 2% of exact-case matching).
+`2.20 us / 0 allocs` for 32 records and `74.8 us / 0 allocs` for 1,024
+records. Robustness of the fast path, measured on the same large document:
+two-space indentation (222 KB) decodes at 1.9 GB/s, rotating every record's
+member order costs 3%, and untagged Go field names matching lowercase keys
+case-insensitively cost under 1%.
 
-These are medians of five one-second samples, not claims about every schema.
-The [benchmark methodology](#benchmark-methodology) records the exact compiler,
-ownership rules, fixtures, competitor versions, and commands.
+Every number in this README comes from one measurement session on one
+machine, as medians of five one-second samples; they are not claims about
+every schema. The [benchmark methodology](#benchmark-methodology) records the
+exact compiler, ownership rules, fixtures, competitor versions, and commands.
 
 ## Quick Start
 
@@ -116,12 +115,12 @@ Encoding the 1,024-record fixture:
 
 | Encoder | Time | Allocations |
 |---|---:|---:|
-| **simdjson `AppendJSON`, reused buffer** | **72.7 us** | **0** |
-| simdjson `Marshal` | 80.5 us | 1 |
-| Segment encoding v0.5.4 | 131.6 us | 1 |
-| go-json v0.10.6 | 145.6 us | 1 |
-| `encoding/json`, Go tip | 248.6 us | 1 |
-| jsoniter v1.1.12 | 325.7 us | 2 |
+| **simdjson `AppendJSON`, reused buffer** | **87.1 us** | **0** |
+| simdjson `Marshal` | 93.2 us | 1 |
+| Segment encoding v0.5.4 | 133.7 us | 1 |
+| go-json v0.10.6 | 159.2 us | 1 |
+| `encoding/json`, Go tip | 287.1 us | 1 |
+| jsoniter v1.1.12 | 335.4 us | 2 |
 
 ## Decode Errors Carry Paths
 
@@ -161,13 +160,15 @@ excluded from the benchmark timer. The plan uses packed expected-key matching,
 exact scalar operations, lazy replacement resets, and specialized fixed-float
 arrays.
 
+The root module's own benchmarks compare the SIMD and scalar builds of the
+same decode:
+
 | Workload | SIMD | Pure Go |
 |---|---:|---:|
-| 31 B, fresh | **27.77 ns / 0 allocs** | 28.23 ns / 0 allocs |
-| 4.2 KB, fresh | **2.260 us / 2 allocs** | 2.410 us / 2 allocs |
-| 4.2 KB, reused | **2.152 us / 0 allocs** | 2.200 us / 0 allocs |
-| 136.6 KB, fresh | **67.768 us / 2 allocs** | 71.565 us / 2 allocs |
-| 136.6 KB, reused | **66.374 us / 0 allocs** | 68.429 us / 0 allocs |
+| 31 B, fresh | **28.4 ns / 0 allocs** | 29.2 ns / 0 allocs |
+| 4.2 KB, fresh | **2.48 us / 2 allocs** | 2.51 us / 2 allocs |
+| 136.6 KB, fresh | **74.4 us / 2 allocs** | 76.5 us / 2 allocs |
+| 136.6 KB, reused | **70.8 us / 0 allocs** | 73.2 us / 0 allocs |
 
 ## Zero-Allocation Traversal
 
@@ -255,26 +256,37 @@ keeps comparisons honest by separating:
   `encoding/json` on Go 1.27 tip;
 - all comparison dependencies from simdjson's dependency-free root `go.mod`.
 
-Source-backed comparison:
+Source-backed comparison (the Sonic rows come from its isolated Go 1.26.4
+module, measured on the same machine and fixtures):
 
 | Decoder | 31 B | 4.2 KB | 136.6 KB |
 |---|---:|---:|---:|
-| **simdjson compiled, SIMD** | **27.8 ns / 0** | **2.26 us / 2** | **67.8 us / 2** |
-| simdjson compiled, pure Go | 28.2 ns / 0 | 2.41 us / 2 | 71.6 us / 2 |
+| **simdjson compiled, SIMD** | **29.9 ns / 0** | **2.36 us / 2** | **75.9 us / 2** |
 | Sonic v1.15.2 Fastest, Go 1.26.4 | 187.9 ns / 4 | 5.74 us / 6 | 170.5 us / 6 |
 
 Owned-string comparison:
 
 | Decoder | 31 B | 4.2 KB | 136.6 KB |
 |---|---:|---:|---:|
-| **simdjson compiled, SIMD** | **43.2 ns / 1** | **2.52 us / 3** | **74.3 us / 3** |
-| go-json v0.10.6 | 53.0 ns / 2 | 5.60 us / 35 | 175.3 us / 1,027 |
-| Segment encoding v0.5.4 | 58.0 ns / 2 | 5.41 us / 69 | 167.7 us / 2,058 |
-| jsoniter v1.1.12 | 83.8 ns / 2 | 6.53 us / 104 | 195.7 us / 3,085 |
-| easyjson v0.9.2 generated | 85.7 ns / 1 | 8.29 us / 71 | 259.3 us / 2,060 |
-| `encoding/json/v2`, Go tip | 170.6 ns / 1 | 12.48 us / 39 | 379.5 us / 1,037 |
-| `encoding/json`, Go tip | 200.5 ns / 1 | 15.19 us / 39 | 455.9 us / 1,037 |
+| **simdjson compiled, SIMD** | **43.3 ns / 1** | **2.62 us / 3** | **84.1 us / 3** |
+| go-json v0.10.6 | 55.8 ns / 2 | 5.65 us / 35 | 182.3 us / 1,027 |
+| Segment encoding v0.5.4 | 62.7 ns / 2 | 5.62 us / 69 | 180.6 us / 2,058 |
+| jsoniter v1.1.12 | 90.2 ns / 2 | 6.71 us / 104 | 212.8 us / 3,085 |
+| easyjson v0.9.2 generated | 88.4 ns / 1 | 8.97 us / 71 | 282.7 us / 2,060 |
+| `encoding/json/v2`, Go tip | 198.2 ns / 1 | 14.82 us / 39 | 464.6 us / 1,037 |
+| `encoding/json`, Go tip | 206.6 ns / 1 | 15.01 us / 39 | 460.2 us / 1,037 |
 | Sonic v1.15.2 Std, Go 1.26.4 | 233.0 ns / 5 | 7.82 us / 71 | 227.9 us / 2,055 |
+
+Dynamic decoding into `any`:
+
+| Decoder | 31 B | 4.2 KB | 136.6 KB |
+|---|---:|---:|---:|
+| **simdjson `ParseAny`, zero copy** | **185.6 ns / 4** | **9.80 us / 297** | **198.8 us / 9,225** |
+| simdjson `ParseAny`, owned | 203.7 ns / 5 | 12.01 us / 298 | 206.7 us / 9,226 |
+| Segment encoding v0.5.4 | 302.8 ns / 9 | 28.92 us / 559 | 947.9 us / 17,428 |
+| go-json v0.10.6 | 306.2 ns / 12 | 27.54 us / 818 | 745.9 us / 25,619 |
+| jsoniter v1.1.12 | 331.6 ns / 12 | 24.75 us / 950 | 810.3 us / 29,724 |
+| `encoding/json`, Go tip | 758.7 ns / 12 | 47.69 us / 823 | 1,599.6 us / 25,651 |
 
 Run the primary comparison:
 
@@ -294,9 +306,10 @@ Sonic, environment capture, and result comparison commands.
 
 | Validator | 31 B | 4.2 KB | 136.6 KB |
 |---|---:|---:|---:|
-| **simdjson** | **25.8 ns** | **2.17 us** | **60.6 us** |
-| Segment encoding v0.5.4 | 36.2 ns | 3.03 us | 83.6 us |
-| `encoding/json`, Go tip | 57.1 ns | 3.53 us | 96.4 us |
+| **simdjson** | **22.5 ns** | **1.94 us** | **63.2 us** |
+| Segment encoding v0.5.4 | 31.1 ns | 2.65 us | 99.5 us |
+| `encoding/json`, Go tip | 50.3 ns | 3.08 us | 98.4 us |
+| fastjson v1.6.4 | 37.5 ns | 3.89 us | 151.5 us |
 
 ## Correctness
 

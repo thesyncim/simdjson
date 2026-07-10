@@ -26,13 +26,16 @@ records). Published results use the median of five one-second samples.
 These results exclude `CompileDecoder[T]` construction. Plans are initialized
 before timing with case-sensitive field matching.
 
-| Workload | SIMD, source-backed | Pure Go, source-backed | SIMD, owned |
-|---|---:|---:|---:|
-| Small, fresh | **27.77 ns / 0** | 28.23 ns / 0 | 43.21 ns / 1 |
-| Medium, fresh | **2.260 us / 2** | 2.410 us / 2 | 2.522 us / 3 |
-| Medium, reused | **2.152 us / 0** | 2.200 us / 0 | 2.412 us / 1 |
-| Large, fresh | **67.768 us / 2** | 71.565 us / 2 | 74.304 us / 3 |
-| Large, reused | **66.374 us / 0** | 68.429 us / 0 | 71.927 us / 1 |
+| Workload | SIMD, source-backed | SIMD, owned |
+|---|---:|---:|
+| Small, fresh | **29.9 ns / 0** | 43.3 ns / 1 |
+| Medium, fresh | **2.36 us / 2** | 2.62 us / 3 |
+| Medium, reused | **2.20 us / 0** | 2.48 us / 1 |
+| Large, fresh | **75.9 us / 2** | 84.1 us / 3 |
+| Large, reused | **74.8 us / 0** | 80.8 us / 1 |
+
+The scalar-versus-SIMD control lives in the root module's `BenchmarkDecode*`
+benchmarks, which build in seconds and compare the same binary pair.
 
 Reproduce the compiled rows with:
 
