@@ -1,7 +1,9 @@
 package simdjson
 
 import (
+	"encoding/binary"
 	"errors"
+	"math/bits"
 	"strconv"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -66,12 +68,7 @@ func BuildIndexOptions(src []byte, storage []IndexEntry, opts IndexOptions) (Ind
 		parent:   noTapeParent,
 		maxDepth: maxDepth,
 	}
-	status := tapeParseStatus(0)
-	if len(src) <= 64 {
-		status = b.parseFastSmall()
-	} else {
-		status = b.parseFast()
-	}
+	status := b.parseFast()
 	switch status {
 	case tapeParseOK:
 	case tapeParseFull:
@@ -763,354 +760,217 @@ const (
 	tapeParseFull
 )
 
-func (b *tapeBuilder) parseFastSmall() tapeParseStatus {
+// parseFast is the happy-path tape builder: a recursive descent walk with an
+// inline one-word fast path for short clean strings. It reports full or
+// invalid input so BuildIndex can fall back to the diagnostic parser.
+func (b *tapeBuilder) parseFast() tapeParseStatus {
 	b.skipSpace()
-	completed := false
-	needObjectKey := false
-	for {
-		if !completed {
-			if needObjectKey {
-				b.skipSpace()
-				if b.i >= len(b.src) || fastByteAt(b.base, b.i) != '"' {
-					return tapeParseInvalid
-				}
-				start := b.i
-				end, short := scanShortJSONString(b.base, len(b.src), b.i)
-				escaped, ok := false, short
-				if !short {
-					end, escaped, ok = scanJSONStringFastLong(b.src, b.base, b.i)
-				}
-				if !ok {
-					return tapeParseInvalid
-				}
-				b.i = end
-				flags := uint8(tapeFlagKey)
-				if escaped {
-					flags |= tapeFlagEscaped
-				}
+	if b.i >= len(b.src) {
+		return tapeParseInvalid
+	}
+	if status := b.valueFast(0); status != tapeParseOK {
+		return status
+	}
+	b.skipSpace()
+	if b.i != len(b.src) {
+		return tapeParseInvalid
+	}
+	return tapeParseOK
+}
+
+// stringFast records one string entry starting at the opening quote.
+func (b *tapeBuilder) stringFast(start int, flags uint8) tapeParseStatus {
+	if start+9 <= len(b.src) {
+		if m := stringSpecialMask(binary.LittleEndian.Uint64(b.src[start+1:])); m != 0 {
+			j := start + 1 + bits.TrailingZeros64(m)/8
+			if b.src[j] == '"' {
 				if len(b.entries) == cap(b.entries) {
 					return tapeParseFull
 				}
 				entry := len(b.entries)
 				b.entries = b.entries[:entry+1]
-				b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(end), next: 1, kind: String, flags: flags}
-				b.skipSpace()
-				if b.i >= len(b.src) || fastByteAt(b.base, b.i) != ':' {
-					return tapeParseInvalid
-				}
-				b.i++
-				needObjectKey = false
-			}
-
-			b.skipSpace()
-			if b.i >= len(b.src) {
-				return tapeParseInvalid
-			}
-			start := b.i
-			kind := Invalid
-			entry := 0
-			switch fastByteAt(b.base, b.i) {
-			case 'n':
-				if !matchStringAt(b.src, b.i, "null") {
-					return tapeParseInvalid
-				}
-				b.i += 4
-				kind = Null
-			case 't':
-				if !matchStringAt(b.src, b.i, "true") {
-					return tapeParseInvalid
-				}
-				b.i += 4
-				kind = Bool
-			case 'f':
-				if !matchStringAt(b.src, b.i, "false") {
-					return tapeParseInvalid
-				}
-				b.i += 5
-				kind = Bool
-			case '"':
-				end, short := scanShortJSONString(b.base, len(b.src), b.i)
-				escaped, ok := false, short
-				if !short {
-					end, escaped, ok = scanJSONStringFastLong(b.src, b.base, b.i)
-				}
-				if !ok {
-					return tapeParseInvalid
-				}
-				b.i = end
-				flags := uint8(0)
-				if escaped {
-					flags = tapeFlagEscaped
-				}
-				if len(b.entries) == cap(b.entries) {
-					return tapeParseFull
-				}
-				entry = len(b.entries)
-				b.entries = b.entries[:entry+1]
-				b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(end), next: 1, kind: String, flags: flags}
-				completed = true
-				continue
-			case '[':
-				kind = Array
-				b.i++
-			case '{':
-				kind = Object
-				b.i++
-			default:
-				c := fastByteAt(b.base, b.i)
-				if c != '-' && !isDigit(c) {
-					return tapeParseInvalid
-				}
-				end, ok := scanNumberFast(b.base, len(b.src), b.i)
-				if !ok {
-					return tapeParseInvalid
-				}
-				b.i = end
-				kind = Number
-			}
-
-			if len(b.entries) == cap(b.entries) {
-				return tapeParseFull
-			}
-			entry = len(b.entries)
-			b.entries = b.entries[:entry+1]
-			if kind != Array && kind != Object {
-				b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(b.i), next: 1, kind: kind}
-				completed = true
-				continue
-			}
-
-			b.entries[entry] = IndexEntry{start: uint32(start), kind: kind}
-			if b.sp >= b.maxDepth {
-				return tapeParseInvalid
-			}
-			b.pushContainer(entry)
-			b.skipSpace()
-			close := byte(']')
-			if kind == Object {
-				close = '}'
-			}
-			if b.i < len(b.src) && fastByteAt(b.base, b.i) == close {
-				b.i++
-				b.finishContainer()
-				completed = true
-			} else {
-				needObjectKey = kind == Object
-				continue
-			}
-		}
-
-		for completed {
-			if b.sp == 0 {
-				b.skipSpace()
-				if b.i != len(b.src) {
-					return tapeParseInvalid
-				}
+				b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(j + 1), next: 1, kind: String, flags: flags}
+				b.i = j + 1
 				return tapeParseOK
 			}
-			frame := &b.entries[b.parent]
-			frame.count++
-			b.skipSpace()
-			if b.i >= len(b.src) {
+		}
+	}
+	end, escaped, ok := scanJSONStringFastLong(b.src, b.base, start)
+	if !ok {
+		return tapeParseInvalid
+	}
+	if escaped {
+		flags |= tapeFlagEscaped
+	}
+	if len(b.entries) == cap(b.entries) {
+		return tapeParseFull
+	}
+	entry := len(b.entries)
+	b.entries = b.entries[:entry+1]
+	b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(end), next: 1, kind: String, flags: flags}
+	b.i = end
+	return tapeParseOK
+}
+
+func (b *tapeBuilder) valueFast(depth int) tapeParseStatus {
+	n := len(b.src)
+	base := b.base
+	start := b.i
+	switch fastByteAt(base, start) {
+	case '{':
+		if depth >= b.maxDepth {
+			return tapeParseInvalid
+		}
+		if len(b.entries) == cap(b.entries) {
+			return tapeParseFull
+		}
+		entry := len(b.entries)
+		b.entries = b.entries[:entry+1]
+		b.entries[entry] = IndexEntry{start: uint32(start), kind: Object}
+		i, c := nextSignificantFast(base, n, start+1)
+		if i >= n {
+			return tapeParseInvalid
+		}
+		if c == '}' {
+			b.i = i + 1
+			finished := &b.entries[entry]
+			finished.end = uint32(b.i)
+			finished.next = uint32(len(b.entries) - entry)
+			return tapeParseOK
+		}
+		count := uint32(0)
+		for {
+			if c != '"' {
 				return tapeParseInvalid
 			}
-			if frame.kind == Array {
-				switch fastByteAt(b.base, b.i) {
-				case ',':
-					b.i++
-					completed = false
-				case ']':
-					b.i++
-					b.finishContainer()
-				default:
-					return tapeParseInvalid
-				}
-			} else {
-				switch fastByteAt(b.base, b.i) {
-				case ',':
-					b.i++
-					needObjectKey = true
-					completed = false
-				case '}':
-					b.i++
-					b.finishContainer()
-				default:
-					return tapeParseInvalid
-				}
+			if status := b.stringFast(i, tapeFlagKey); status != tapeParseOK {
+				return status
 			}
+			i, c = nextSignificantFast(base, n, b.i)
+			if i >= n || c != ':' {
+				return tapeParseInvalid
+			}
+			i, _ = nextSignificantFast(base, n, i+1)
+			if i >= n {
+				return tapeParseInvalid
+			}
+			b.i = i
+			if status := b.valueFast(depth + 1); status != tapeParseOK {
+				return status
+			}
+			count++
+			i, c = nextSignificantFast(base, n, b.i)
+			if i >= n {
+				return tapeParseInvalid
+			}
+			if c == ',' {
+				i, c = nextSignificantFast(base, n, i+1)
+				if i >= n {
+					return tapeParseInvalid
+				}
+				continue
+			}
+			if c != '}' {
+				return tapeParseInvalid
+			}
+			b.i = i + 1
+			finished := &b.entries[entry]
+			finished.end = uint32(b.i)
+			finished.count = count
+			finished.next = uint32(len(b.entries) - entry)
+			return tapeParseOK
 		}
+	case '[':
+		if depth >= b.maxDepth {
+			return tapeParseInvalid
+		}
+		if len(b.entries) == cap(b.entries) {
+			return tapeParseFull
+		}
+		entry := len(b.entries)
+		b.entries = b.entries[:entry+1]
+		b.entries[entry] = IndexEntry{start: uint32(start), kind: Array}
+		i, c := nextSignificantFast(base, n, start+1)
+		if i >= n {
+			return tapeParseInvalid
+		}
+		if c == ']' {
+			b.i = i + 1
+			finished := &b.entries[entry]
+			finished.end = uint32(b.i)
+			finished.next = uint32(len(b.entries) - entry)
+			return tapeParseOK
+		}
+		count := uint32(0)
+		for {
+			b.i = i
+			if status := b.valueFast(depth + 1); status != tapeParseOK {
+				return status
+			}
+			count++
+			i, c = nextSignificantFast(base, n, b.i)
+			if i >= n {
+				return tapeParseInvalid
+			}
+			if c == ',' {
+				i, _ = nextSignificantFast(base, n, i+1)
+				if i >= n {
+					return tapeParseInvalid
+				}
+				continue
+			}
+			if c != ']' {
+				return tapeParseInvalid
+			}
+			b.i = i + 1
+			finished := &b.entries[entry]
+			finished.end = uint32(b.i)
+			finished.count = count
+			finished.next = uint32(len(b.entries) - entry)
+			return tapeParseOK
+		}
+	case '"':
+		return b.stringFast(start, 0)
+	case 't':
+		if !matchStringAt(b.src, start, "true") {
+			return tapeParseInvalid
+		}
+		b.i = start + 4
+		return b.emitScalar(start, Bool)
+	case 'f':
+		if !matchStringAt(b.src, start, "false") {
+			return tapeParseInvalid
+		}
+		b.i = start + 5
+		return b.emitScalar(start, Bool)
+	case 'n':
+		if !matchStringAt(b.src, start, "null") {
+			return tapeParseInvalid
+		}
+		b.i = start + 4
+		return b.emitScalar(start, Null)
+	default:
+		c := fastByteAt(base, start)
+		if c != '-' && !isDigit(c) {
+			return tapeParseInvalid
+		}
+		end, ok := scanNumberFast(base, n, start)
+		if !ok {
+			return tapeParseInvalid
+		}
+		b.i = end
+		return b.emitScalar(start, Number)
 	}
 }
 
-func (b *tapeBuilder) parseFast() tapeParseStatus {
-	b.skipSpace()
-	completed := false
-	needObjectKey := false
-	for {
-		if !completed {
-			if needObjectKey {
-				b.skipSpace()
-				if b.i >= len(b.src) || fastByteAt(b.base, b.i) != '"' {
-					return tapeParseInvalid
-				}
-				start := b.i
-				end, escaped, ok := scanJSONStringFastLong(b.src, b.base, b.i)
-				if !ok {
-					return tapeParseInvalid
-				}
-				b.i = end
-				flags := uint8(tapeFlagKey)
-				if escaped {
-					flags |= tapeFlagEscaped
-				}
-				if len(b.entries) == cap(b.entries) {
-					return tapeParseFull
-				}
-				entry := len(b.entries)
-				b.entries = b.entries[:entry+1]
-				b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(end), next: 1, kind: String, flags: flags}
-				b.skipSpace()
-				if b.i >= len(b.src) || fastByteAt(b.base, b.i) != ':' {
-					return tapeParseInvalid
-				}
-				b.i++
-				needObjectKey = false
-			}
-
-			b.skipSpace()
-			if b.i >= len(b.src) {
-				return tapeParseInvalid
-			}
-			start := b.i
-			kind := Invalid
-			entry := 0
-			switch fastByteAt(b.base, b.i) {
-			case 'n':
-				if !matchStringAt(b.src, b.i, "null") {
-					return tapeParseInvalid
-				}
-				b.i += 4
-				kind = Null
-			case 't':
-				if !matchStringAt(b.src, b.i, "true") {
-					return tapeParseInvalid
-				}
-				b.i += 4
-				kind = Bool
-			case 'f':
-				if !matchStringAt(b.src, b.i, "false") {
-					return tapeParseInvalid
-				}
-				b.i += 5
-				kind = Bool
-			case '"':
-				end, escaped, ok := scanJSONStringFastLong(b.src, b.base, b.i)
-				if !ok {
-					return tapeParseInvalid
-				}
-				b.i = end
-				flags := uint8(0)
-				if escaped {
-					flags = tapeFlagEscaped
-				}
-				if len(b.entries) == cap(b.entries) {
-					return tapeParseFull
-				}
-				entry = len(b.entries)
-				b.entries = b.entries[:entry+1]
-				b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(end), next: 1, kind: String, flags: flags}
-				completed = true
-				continue
-			case '[':
-				kind = Array
-				b.i++
-			case '{':
-				kind = Object
-				b.i++
-			default:
-				c := fastByteAt(b.base, b.i)
-				if c != '-' && !isDigit(c) {
-					return tapeParseInvalid
-				}
-				end, ok := scanNumberFast(b.base, len(b.src), b.i)
-				if !ok {
-					return tapeParseInvalid
-				}
-				b.i = end
-				kind = Number
-			}
-
-			if len(b.entries) == cap(b.entries) {
-				return tapeParseFull
-			}
-			entry = len(b.entries)
-			b.entries = b.entries[:entry+1]
-			if kind != Array && kind != Object {
-				b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(b.i), next: 1, kind: kind}
-				completed = true
-				continue
-			}
-
-			b.entries[entry] = IndexEntry{start: uint32(start), kind: kind}
-			if b.sp >= b.maxDepth {
-				return tapeParseInvalid
-			}
-			b.pushContainer(entry)
-			b.skipSpace()
-			close := byte(']')
-			if kind == Object {
-				close = '}'
-			}
-			if b.i < len(b.src) && fastByteAt(b.base, b.i) == close {
-				b.i++
-				b.finishContainer()
-				completed = true
-			} else {
-				needObjectKey = kind == Object
-				continue
-			}
-		}
-
-		for completed {
-			if b.sp == 0 {
-				b.skipSpace()
-				if b.i != len(b.src) {
-					return tapeParseInvalid
-				}
-				return tapeParseOK
-			}
-			frame := &b.entries[b.parent]
-			frame.count++
-			b.skipSpace()
-			if b.i >= len(b.src) {
-				return tapeParseInvalid
-			}
-			if frame.kind == Array {
-				switch fastByteAt(b.base, b.i) {
-				case ',':
-					b.i++
-					completed = false
-				case ']':
-					b.i++
-					b.finishContainer()
-				default:
-					return tapeParseInvalid
-				}
-			} else {
-				switch fastByteAt(b.base, b.i) {
-				case ',':
-					b.i++
-					needObjectKey = true
-					completed = false
-				case '}':
-					b.i++
-					b.finishContainer()
-				default:
-					return tapeParseInvalid
-				}
-			}
-		}
+func (b *tapeBuilder) emitScalar(start int, kind Kind) tapeParseStatus {
+	if len(b.entries) == cap(b.entries) {
+		return tapeParseFull
 	}
+	entry := len(b.entries)
+	b.entries = b.entries[:entry+1]
+	b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(b.i), next: 1, kind: kind}
+	return tapeParseOK
 }
 
 func (b *tapeBuilder) parse() error {
