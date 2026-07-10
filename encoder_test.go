@@ -144,10 +144,10 @@ func TestEncoderErrors(t *testing.T) {
 	}
 
 	type unsupported struct {
-		M map[string]int `json:"m"`
+		C chan int `json:"c"`
 	}
 	if _, err := Marshal(&unsupported{}); err == nil {
-		t.Fatal("map field accepted")
+		t.Fatal("chan field accepted")
 	}
 }
 
@@ -267,5 +267,127 @@ func TestEncoderRandomFloatsMatchStdlib(t *testing.T) {
 		if !bytes.Equal(got, want) {
 			t.Fatalf("float %g (bits %#x):\nsimdjson %s\nstdlib   %s", f, math.Float64bits(f), got, want)
 		}
+	}
+}
+
+type mapKey string
+
+type mapDocument struct {
+	Plain    map[string]int            `json:"plain"`
+	Named    map[mapKey]string         `json:"named"`
+	Nested   map[string]map[string]int `json:"nested"`
+	Structs  map[string]typedTestRecord `json:"structs"`
+	Slices   map[string][]int          `json:"slices"`
+	Optional map[string]int            `json:"optional,omitempty"`
+}
+
+func TestMapsMatchStdlib(t *testing.T) {
+	sources := []string{
+		`{"plain":{"b":2,"a":1},"named":{"x":"y"},"nested":{"outer":{"inner":3}},"structs":{"r":{"id":1,"ok":true,"name":"n","scores":[1,2,3],"number":4}},"slices":{"s":[1,2,3]}}`,
+		`{"plain":{},"named":null,"nested":{"empty":{}},"structs":{},"slices":{"empty":[]}}`,
+		`{"plain":{"esc\"aped":1,"uni ✓":2}}`,
+		`{"optional":{}}`,
+		`{}`,
+	}
+	decoder, err := CompileDecoder[mapDocument](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, src := range sources {
+		var got, want mapDocument
+		gotErr := decoder.Decode([]byte(src), &got)
+		wantErr := json.Unmarshal([]byte(src), &want)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("%s: acceptance differs: simdjson=%v stdlib=%v", src, gotErr, wantErr)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s:\nsimdjson %#v\nstdlib   %#v", src, got, want)
+		}
+
+		gotJSON, gotErr := Marshal(&got)
+		wantJSON, wantErr := stdlibCompactJSON(t, &want)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("%s: encode acceptance differs: simdjson=%v stdlib=%v", src, gotErr, wantErr)
+		}
+		if !bytes.Equal(gotJSON, wantJSON) {
+			t.Fatalf("%s:\nsimdjson %s\nstdlib   %s", src, gotJSON, wantJSON)
+		}
+	}
+}
+
+func TestMapDecodeMergesLikeStdlib(t *testing.T) {
+	decoder, err := CompileDecoder[map[string]int](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int{"keep": 1, "replace": 2}
+	want := map[string]int{"keep": 1, "replace": 2}
+	src := []byte(`{"replace":20,"new":30}`)
+	if err := decoder.Decode(src, &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(src, &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("merge mismatch: simdjson %#v, stdlib %#v", got, want)
+	}
+
+	// Owned map keys must survive input mutation.
+	input := []byte(`{"retained":7}`)
+	owned := map[string]int(nil)
+	if err := decoder.Decode(input, &owned); err != nil {
+		t.Fatal(err)
+	}
+	for i := range input {
+		input[i] = 'x'
+	}
+	if _, ok := owned["retained"]; !ok {
+		t.Fatalf("map key aliases mutated input: %#v", owned)
+	}
+
+	// Slice values must not share backing arrays across entries.
+	sliceDecoder, err := CompileDecoder[map[string][]int](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared := map[string][]int(nil)
+	if err := sliceDecoder.Decode([]byte(`{"a":[1,2,3],"b":[4,5,6]}`), &shared); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(shared["a"], []int{1, 2, 3}) || !reflect.DeepEqual(shared["b"], []int{4, 5, 6}) {
+		t.Fatalf("map slice values share storage: %#v", shared)
+	}
+}
+
+func TestMapErrorsAndPaths(t *testing.T) {
+	decoder, err := CompileDecoder[map[string]map[string]int](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dst map[string]map[string]int
+	decodeErr := decoder.Decode([]byte(`{"outer":{"inner":"nope"}}`), &dst)
+	var typed *DecodeError
+	if !errors.As(decodeErr, &typed) {
+		t.Fatalf("error = %v, want *DecodeError", decodeErr)
+	}
+	if typed.Path != "outer.inner" {
+		t.Fatalf("path = %q, want outer.inner", typed.Path)
+	}
+
+	if _, err := CompileDecoder[map[int]string](DecoderOptions{}); err == nil {
+		t.Fatal("integer map keys accepted")
+	}
+
+	type withNaN struct {
+		M map[string]float64 `json:"m"`
+	}
+	_, encodeErr := Marshal(&withNaN{M: map[string]float64{"bad": math.NaN()}})
+	var enc *EncodeError
+	if !errors.As(encodeErr, &enc) {
+		t.Fatalf("encode error = %v, want *EncodeError", encodeErr)
+	}
+	if enc.Path != "m.bad" {
+		t.Fatalf("encode path = %q, want m.bad", enc.Path)
 	}
 }

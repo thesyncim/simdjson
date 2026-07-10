@@ -40,8 +40,8 @@ type Decoder[T any] struct {
 }
 
 // CompileDecoder builds a decoder for T. Scalar and field dispatch use the
-// compiled plan; runtime reflection is limited to allocating nil pointers and
-// growing dynamic slices.
+// compiled plan; runtime reflection is limited to allocating nil pointers,
+// growing dynamic slices, and inserting map entries.
 func CompileDecoder[T any](opts DecoderOptions) (Decoder[T], error) {
 	typ := reflect.TypeFor[T]()
 	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode)}
@@ -83,6 +83,8 @@ func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 		err = decodeCompiledArray(&cursor, plan.root, unsafe.Pointer(dst))
 	case typedPointer:
 		err = decodeCompiledPointer(&cursor, plan.root, unsafe.Pointer(dst))
+	case typedMap:
+		err = decodeCompiledMap(&cursor, plan.root, unsafe.Pointer(dst))
 	default:
 		err = decodeCompiled(&cursor, plan.root, unsafe.Pointer(dst))
 	}
@@ -192,6 +194,7 @@ const (
 	typedSlice
 	typedArray
 	typedPointer
+	typedMap
 )
 
 type typedOp uint8
@@ -215,6 +218,7 @@ const (
 	typedOpSlice
 	typedOpArray
 	typedOpPointer
+	typedOpMap
 )
 
 type typedNode struct {
@@ -331,6 +335,17 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 		node.op = typedOpArray
 		node.length = typ.Len()
 		elem, err := c.compile(typ.Elem(), path+"[]")
+		if err != nil {
+			return nil, err
+		}
+		node.elem = elem
+	case reflect.Map:
+		if typ.Key().Kind() != reflect.String {
+			return nil, c.unsupported(typ, path, "map keys must have a string kind")
+		}
+		node.kind = typedMap
+		node.op = typedOpMap
+		elem, err := c.compile(typ.Elem(), path+"[key]")
 		if err != nil {
 			return nil, err
 		}
@@ -534,7 +549,7 @@ func resetTyped(node *typedNode, dst unsafe.Pointer) {
 		for i := 0; i < node.length; i++ {
 			resetTyped(node.elem, unsafe.Add(dst, uintptr(i)*node.elem.size))
 		}
-	case typedPointer:
+	case typedPointer, typedMap:
 		*(*unsafe.Pointer)(dst) = nil
 	}
 }

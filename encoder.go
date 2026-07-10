@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -185,6 +186,8 @@ func (e *encodeState) encode(node *typedNode, src unsafe.Pointer) error {
 		return e.encodeSlice(node, src)
 	case typedArray:
 		return e.encodeArray(node, src)
+	case typedMap:
+		return e.encodeMap(node, src)
 	case typedPointer:
 		pointer := *(*unsafe.Pointer)(src)
 		if pointer == nil {
@@ -294,6 +297,51 @@ func (e *encodeState) encodeArray(node *typedNode, src unsafe.Pointer) error {
 		}
 	}
 	e.dst = append(e.dst, ']')
+	e.depth--
+	return nil
+}
+
+// encodeMap writes a map with string keys as an object with byte-sorted
+// members, matching encoding/json. Values are copied into one reusable
+// addressable element before encoding.
+func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
+	if *(*unsafe.Pointer)(src) == nil {
+		e.dst = append(e.dst, "null"...)
+		return nil
+	}
+	if e.depth >= defaultMaxDepth {
+		return &EncodeError{Reason: "maximum nesting depth exceeded"}
+	}
+	e.depth++
+	mapValue := reflect.NewAt(node.typ, src).Elem()
+	keys := make([]string, 0, mapValue.Len())
+	iterator := mapValue.MapRange()
+	for iterator.Next() {
+		keys = append(keys, iterator.Key().String())
+	}
+	sort.Strings(keys)
+	keyType := node.typ.Key()
+	element := reflect.New(node.elem.typ)
+	elementPtr := element.UnsafePointer()
+	elementValue := element.Elem()
+	e.dst = append(e.dst, '{')
+	for i, key := range keys {
+		if i > 0 {
+			e.dst = append(e.dst, ',')
+		}
+		e.dst = appendEncodedJSONString(e.dst, key)
+		e.dst = append(e.dst, ':')
+		keyValue := reflect.ValueOf(key)
+		if keyType != keyValue.Type() {
+			keyValue = keyValue.Convert(keyType)
+		}
+		elementValue.Set(mapValue.MapIndex(keyValue))
+		if err := e.encode(node.elem, elementPtr); err != nil {
+			e.depth--
+			return prependEncodePathField(err, key)
+		}
+	}
+	e.dst = append(e.dst, '}')
 	e.depth--
 	return nil
 }
@@ -438,6 +486,11 @@ func typedValueIsEmpty(node *typedNode, src unsafe.Pointer) bool {
 		return (*typedSliceHeader)(src).len == 0
 	case typedPointer:
 		return *(*unsafe.Pointer)(src) == nil
+	case typedMap:
+		if *(*unsafe.Pointer)(src) == nil {
+			return true
+		}
+		return reflect.NewAt(node.typ, src).Elem().Len() == 0
 	default:
 		return false
 	}

@@ -53,6 +53,8 @@ func decodeCompiled(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) 
 		return decodeCompiledArray(cursor, node, dst)
 	case typedPointer:
 		return decodeCompiledPointer(cursor, node, dst)
+	case typedMap:
+		return decodeCompiledMap(cursor, node, dst)
 	default:
 		return &DecodeError{Offset: cursor.i, Type: node.typ, Reason: "invalid compiled operation"}
 	}
@@ -157,6 +159,8 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 			fieldErr = decodeCompiledArray(cursor, fieldNode, fieldDst)
 		case typedOpPointer:
 			fieldErr = decodeCompiledPointer(cursor, fieldNode, fieldDst)
+		case typedOpMap:
+			fieldErr = decodeCompiledMap(cursor, fieldNode, fieldDst)
 		default:
 			fieldErr = &DecodeError{Offset: cursor.i, Type: fieldNode.typ, Reason: "invalid compiled operation"}
 		}
@@ -321,6 +325,8 @@ func decodeCompiledSlice(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 			elementErr = decodeCompiledArray(cursor, node.elem, element)
 		case typedPointer:
 			elementErr = decodeCompiledPointer(cursor, node.elem, element)
+		case typedMap:
+			elementErr = decodeCompiledMap(cursor, node.elem, element)
 		default:
 			elementErr = decodeCompiled(cursor, node.elem, element)
 		}
@@ -414,6 +420,8 @@ func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 				elementErr = decodeCompiledArray(cursor, node.elem, element)
 			case typedPointer:
 				elementErr = decodeCompiledPointer(cursor, node.elem, element)
+			case typedMap:
+				elementErr = decodeCompiledMap(cursor, node.elem, element)
 			default:
 				elementErr = &DecodeError{Offset: cursor.i, Type: node.elem.typ, Reason: "invalid compiled operation"}
 			}
@@ -504,8 +512,73 @@ func decodeCompiledPointer(cursor *decoderCursor, node *typedNode, dst unsafe.Po
 		return decodeCompiledArray(cursor, node.elem, pointer)
 	case typedPointer:
 		return decodeCompiledPointer(cursor, node.elem, pointer)
+	case typedMap:
+		return decodeCompiledMap(cursor, node.elem, pointer)
 	default:
 		return decodeCompiled(cursor, node.elem, pointer)
+	}
+}
+
+// decodeCompiledMap decodes a JSON object into a map with string keys. Like
+// encoding/json it allocates a map only when dst holds nil and otherwise
+// merges into the existing entries. Entries decode through one reusable
+// element that is zeroed between entries, so nested slice capacity is never
+// shared between values.
+func decodeCompiledMap(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+	null, err := cursor.TryNull()
+	if err != nil {
+		return err
+	}
+	if null {
+		*(*unsafe.Pointer)(dst) = nil
+		return nil
+	}
+	if err := cursor.BeginObject(node.name); err != nil {
+		return err
+	}
+	// Map keys are retained by the result, so switch owned decodes to the
+	// private input copy before the first key string is sliced.
+	cursor.ownSource()
+	mapValue := reflect.NewAt(node.typ, dst).Elem()
+	if mapValue.IsNil() {
+		mapValue.Set(reflect.MakeMap(node.typ))
+	}
+	keyType := node.typ.Key()
+	element := reflect.New(node.elem.typ)
+	elementPtr := element.UnsafePointer()
+	elementValue := element.Elem()
+	for first := true; ; first = false {
+		key, ok, err := cursor.NextObjectField(first)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		elementValue.SetZero()
+		var entryErr error
+		switch node.elem.kind {
+		case typedStruct:
+			entryErr = decodeCompiledStruct(cursor, node.elem, elementPtr)
+		case typedSlice:
+			entryErr = decodeCompiledSlice(cursor, node.elem, elementPtr)
+		case typedArray:
+			entryErr = decodeCompiledArray(cursor, node.elem, elementPtr)
+		case typedPointer:
+			entryErr = decodeCompiledPointer(cursor, node.elem, elementPtr)
+		case typedMap:
+			entryErr = decodeCompiledMap(cursor, node.elem, elementPtr)
+		default:
+			entryErr = decodeCompiled(cursor, node.elem, elementPtr)
+		}
+		if entryErr != nil {
+			return prependDecodePathField(entryErr, key)
+		}
+		keyValue := reflect.ValueOf(key)
+		if keyType.Kind() == reflect.String && keyType != keyValue.Type() {
+			keyValue = keyValue.Convert(keyType)
+		}
+		mapValue.SetMapIndex(keyValue, elementValue)
 	}
 }
 
@@ -573,7 +646,7 @@ func appendTypedReset(ops []typedResetOp, node *typedNode, offset uintptr) []typ
 		return append(ops, typedResetOp{offset: offset, kind: typedResetString})
 	case typedSlice:
 		return append(ops, typedResetOp{offset: offset, kind: typedResetSlice})
-	case typedPointer:
+	case typedPointer, typedMap:
 		return append(ops, typedResetOp{offset: offset, kind: typedResetPointer})
 	case typedStruct:
 		for i := range node.fields {
