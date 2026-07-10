@@ -215,3 +215,31 @@ func BenchmarkDecodeLargeShuffledKeys(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkBuildIndexLarge(b *testing.B) {
+	src := benchRecordsJSON(1024)
+	needed, err := RequiredIndexEntries(src)
+	if err != nil {
+		b.Fatal(err)
+	}
+	storage := make([]IndexEntry, needed)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := BuildIndex(src, storage); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkValidLarge(b *testing.B) {
+	src := benchRecordsJSON(1024)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	for range b.N {
+		if !Valid(src) {
+			b.Fatal("invalid")
+		}
+	}
+}
