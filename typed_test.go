@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"unsafe"
 )
@@ -365,4 +366,58 @@ func TestUnmarshalMatchesCompiledDecoder(t *testing.T) {
 	if owned.Items[0].Name != "keepsake" {
 		t.Fatalf("Unmarshal string aliases input: %q", owned.Items[0].Name)
 	}
+}
+
+// TestFieldOrderPermutationsMatchStdlib exercises adaptive expected-field
+// matching: every member order, with and without unknown members, duplicate
+// keys, and case-folded keys, must decode exactly like encoding/json.
+func TestFieldOrderPermutationsMatchStdlib(t *testing.T) {
+	members := []string{
+		`"id":42`,
+		`"ok":true`,
+		`"name":"perm"`,
+		`"scores":[1,2.5,3]`,
+		`"number":7`,
+	}
+	extras := [][]string{
+		nil,
+		{`"unknown":{"nested":[1,2]}`},
+		{`"id":43`},          // duplicate key, last wins
+		{`"NAME":"folded"`},  // case-insensitive fallback, last wins
+	}
+	decoder, err := CompileDecoder[typedTestRecord](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var permute func(rest, current []string)
+	permute = func(rest, current []string) {
+		if len(rest) == 0 {
+			for _, extra := range extras {
+				for insert := 0; insert <= len(current); insert += 2 {
+					ordered := make([]string, 0, len(current)+len(extra))
+					ordered = append(ordered, current[:insert]...)
+					ordered = append(ordered, extra...)
+					ordered = append(ordered, current[insert:]...)
+					src := []byte("{" + strings.Join(ordered, ",") + "}")
+
+					var got, want typedTestRecord
+					gotErr := decoder.Decode(src, &got)
+					wantErr := json.Unmarshal(src, &want)
+					if (gotErr == nil) != (wantErr == nil) {
+						t.Fatalf("%s: acceptance differs: simdjson=%v stdlib=%v", src, gotErr, wantErr)
+					}
+					if !reflect.DeepEqual(got, want) {
+						t.Fatalf("%s: simdjson=%#v stdlib=%#v", src, got, want)
+					}
+				}
+			}
+			return
+		}
+		for i := range rest {
+			next := append(append([]string{}, rest[:i]...), rest[i+1:]...)
+			permute(next, append(current, rest[i]))
+		}
+	}
+	permute(members, nil)
 }
