@@ -1,6 +1,7 @@
 package simdjson
 
 import (
+	"encoding/base64"
 	"fmt"
 	"math"
 	"reflect"
@@ -190,6 +191,17 @@ func (e *encodeState) encode(node *typedNode, src unsafe.Pointer) error {
 		return e.encodeMap(node, src)
 	case typedAny:
 		return e.encodeAny(src)
+	case typedBytes:
+		header := (*typedSliceHeader)(src)
+		if header.data == nil {
+			e.dst = append(e.dst, "null"...)
+			return nil
+		}
+		raw := unsafe.Slice((*byte)(header.data), header.len)
+		e.dst = append(e.dst, '"')
+		e.dst = base64.StdEncoding.AppendEncode(e.dst, raw)
+		e.dst = append(e.dst, '"')
+		return nil
 	case typedPointer:
 		pointer := *(*unsafe.Pointer)(src)
 		if pointer == nil {
@@ -548,7 +560,7 @@ func typedValueIsEmpty(node *typedNode, src unsafe.Pointer) bool {
 			return *(*float32)(src) == 0
 		}
 		return *(*float64)(src) == 0
-	case typedSlice:
+	case typedSlice, typedBytes:
 		return (*typedSliceHeader)(src).len == 0
 	case typedPointer:
 		return *(*unsafe.Pointer)(src) == nil

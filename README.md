@@ -293,7 +293,8 @@ floats, and `json.Number`. Map decoding merges into existing maps and map
 encoding sorts keys, both matching `encoding/json`. Values decoded into
 `any` use the standard dynamic shapes and always replace the previous value;
 encoding an interface compiles a plan for its concrete type on first use.
-Non-empty interfaces, `[]byte`, non-string map keys, the `string` tag
+Byte slices decode from and encode to standard base64, reusing destination
+capacity. Non-empty interfaces, non-string map keys, the `string` tag
 option, and custom unmarshaler dispatch are not supported. Untagged
 anonymous fields are rejected rather than flattened.
 

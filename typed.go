@@ -196,6 +196,7 @@ const (
 	typedPointer
 	typedMap
 	typedAny
+	typedBytes
 )
 
 type typedOp uint8
@@ -221,6 +222,7 @@ const (
 	typedOpPointer
 	typedOpMap
 	typedOpAny
+	typedOpBytes
 )
 
 type typedNode struct {
@@ -323,7 +325,9 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 		node.elem = elem
 	case reflect.Slice:
 		if typ.Elem().Kind() == reflect.Uint8 {
-			return nil, c.unsupported(typ, path, "byte slices require base64 semantics")
+			node.kind = typedBytes
+			node.op = typedOpBytes
+			break
 		}
 		node.kind = typedSlice
 		node.op = typedOpSlice
@@ -551,7 +555,7 @@ func resetTyped(node *typedNode, dst unsafe.Pointer) {
 			field := &node.fields[i]
 			resetTyped(field.node, unsafe.Add(dst, field.offset))
 		}
-	case typedSlice:
+	case typedSlice, typedBytes:
 		(*typedSliceHeader)(dst).len = 0
 	case typedArray:
 		for i := 0; i < node.length; i++ {

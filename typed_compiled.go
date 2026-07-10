@@ -1,6 +1,7 @@
 package simdjson
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"math/bits"
 	"reflect"
@@ -57,6 +58,8 @@ func decodeCompiled(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) 
 		return decodeCompiledMap(cursor, node, dst)
 	case typedAny:
 		return decodeCompiledAny(cursor, dst)
+	case typedBytes:
+		return decodeCompiledBytes(cursor, node, dst)
 	default:
 		return &DecodeError{Offset: cursor.i, Type: node.typ, Reason: "invalid compiled operation"}
 	}
@@ -165,6 +168,8 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 			fieldErr = decodeCompiledMap(cursor, fieldNode, fieldDst)
 		case typedOpAny:
 			fieldErr = decodeCompiledAny(cursor, fieldDst)
+		case typedOpBytes:
+			fieldErr = decodeCompiledBytes(cursor, fieldNode, fieldDst)
 		default:
 			fieldErr = &DecodeError{Offset: cursor.i, Type: fieldNode.typ, Reason: "invalid compiled operation"}
 		}
@@ -428,6 +433,8 @@ func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 				elementErr = decodeCompiledMap(cursor, node.elem, element)
 			case typedAny:
 				elementErr = decodeCompiledAny(cursor, element)
+			case typedBytes:
+				elementErr = decodeCompiledBytes(cursor, node.elem, element)
 			default:
 				elementErr = &DecodeError{Offset: cursor.i, Type: node.elem.typ, Reason: "invalid compiled operation"}
 			}
@@ -607,6 +614,52 @@ func decodeCompiledAny(cursor *decoderCursor, dst unsafe.Pointer) error {
 	return nil
 }
 
+// decodeCompiledBytes decodes a base64 JSON string into a byte slice,
+// reusing destination capacity when possible.
+func decodeCompiledBytes(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+	null, err := cursor.TryNull()
+	if err != nil {
+		return err
+	}
+	header := (*typedSliceHeader)(dst)
+	if null {
+		*header = typedSliceHeader{}
+		return nil
+	}
+	i := cursor.i
+	if i >= len(cursor.src) || cursor.src[i] != '"' {
+		return &DecodeError{Offset: i, Type: node.typ, Reason: "expected base64 string"}
+	}
+	start := i + 1
+	end := scanStringSpecial(cursor.src, start)
+	var encoded []byte
+	if end < len(cursor.src) && cursor.src[end] == '"' {
+		encoded = cursor.src[start:end]
+		cursor.i = end + 1
+	} else {
+		p := cursor.slowParser()
+		text, err := p.parseString()
+		cursor.i = p.i
+		if err != nil {
+			return err
+		}
+		encoded = unsafe.Slice(unsafe.StringData(text), len(text))
+	}
+	decodedLen := base64.StdEncoding.DecodedLen(len(encoded))
+	if header.data == nil || header.cap < decodedLen {
+		buffer := make([]byte, decodedLen)
+		header.data = unsafe.Pointer(unsafe.SliceData(buffer))
+		header.cap = decodedLen
+	}
+	target := unsafe.Slice((*byte)(header.data), header.cap)
+	n, err := base64.StdEncoding.Decode(target, encoded)
+	if err != nil {
+		return &DecodeError{Offset: i, Type: node.typ, Reason: "invalid base64: " + err.Error()}
+	}
+	header.len = n
+	return nil
+}
+
 func allocateTypedPointer(node *typedNode, dst unsafe.Pointer) unsafe.Pointer {
 	value := reflect.New(node.elem.typ)
 	pointer := value.UnsafePointer()
@@ -670,7 +723,7 @@ func appendTypedReset(ops []typedResetOp, node *typedNode, offset uintptr) []typ
 		return appendTypedClear(ops, offset, node.size)
 	case typedString, typedNumber:
 		return append(ops, typedResetOp{offset: offset, kind: typedResetString})
-	case typedSlice:
+	case typedSlice, typedBytes:
 		return append(ops, typedResetOp{offset: offset, kind: typedResetSlice})
 	case typedPointer, typedMap:
 		return append(ops, typedResetOp{offset: offset, kind: typedResetPointer})

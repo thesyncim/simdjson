@@ -461,3 +461,62 @@ func TestAnyEncodeConcreteTypes(t *testing.T) {
 		t.Fatal("chan inside any accepted")
 	}
 }
+
+type bytesDocument struct {
+	Data   []byte            `json:"data"`
+	Named  namedBlob         `json:"named"`
+	Map    map[string][]byte `json:"map"`
+	Option []byte            `json:"option,omitempty"`
+}
+
+type namedBlob []byte
+
+func TestByteSlicesMatchStdlib(t *testing.T) {
+	sources := []string{
+		`{"data":"aGVsbG8gd29ybGQ=","named":"AQID","map":{"k":"eA=="}}`,
+		`{"data":"","named":null}`,
+		`{"data":"aGk="}`,
+		`{"data":"aGk="}`,
+		`{"data":"!!!invalid!!!"}`,
+		`{"data":123}`,
+	}
+	decoder, err := CompileDecoder[bytesDocument](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, src := range sources {
+		var got, want bytesDocument
+		gotErr := decoder.Decode([]byte(src), &got)
+		wantErr := json.Unmarshal([]byte(src), &want)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("%s: acceptance differs: simdjson=%v stdlib=%v", src, gotErr, wantErr)
+		}
+		if gotErr != nil {
+			continue
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s:\nsimdjson %#v\nstdlib   %#v", src, got, want)
+		}
+		gotJSON, gotEncErr := Marshal(&got)
+		wantJSON, wantEncErr := stdlibCompactJSON(t, &want)
+		if gotEncErr != nil || wantEncErr != nil {
+			t.Fatalf("%s: encode errors: simdjson=%v stdlib=%v", src, gotEncErr, wantEncErr)
+		}
+		if !bytes.Equal(gotJSON, wantJSON) {
+			t.Fatalf("%s:\nsimdjson %s\nstdlib   %s", src, gotJSON, wantJSON)
+		}
+	}
+
+	// Byte-slice capacity is reused across decodes.
+	reuse := bytesDocument{Data: make([]byte, 0, 64)}
+	base := &reuse.Data[:1][0]
+	if err := decoder.Decode([]byte(`{"data":"aGVsbG8="}`), &reuse); err != nil {
+		t.Fatal(err)
+	}
+	if string(reuse.Data) != "hello" {
+		t.Fatalf("decoded bytes = %q", reuse.Data)
+	}
+	if &reuse.Data[0] != base {
+		t.Fatal("byte slice capacity was not reused")
+	}
+}
