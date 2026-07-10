@@ -1,10 +1,15 @@
 # simdjson
 
-Fast, strict JSON for Go tip, written entirely in Go.
+Fast, strict JSON for Go tip, written entirely in Go: a drop-in
+`encoding/json` replacement that leads every measured category — typed
+decoding, encoding, validation, and dynamic parsing — by significant margins.
 
-simdjson combines compiled typed decoders, source-backed selectors, caller-owned
-structural indexes, and runtime-selected SIMD. The root module has no third-party
-dependencies, assembly, C, `go:linkname`, or runtime map-layout tricks.
+simdjson combines compiled typed decoders and encoders, source-backed
+selectors, caller-owned structural indexes, and runtime-selected SIMD. The
+root module has no third-party dependencies, assembly, C, `go:linkname`, or
+runtime map-layout tricks. Behavior matches `encoding/json` and is enforced
+by differential tests and fuzzers: field resolution, custom marshalers,
+merge semantics, escape rules, and byte-identical Marshal output.
 
 > **Toolchain status:** simdjson currently requires a pinned **Go 1.27 development
 > toolchain**. Typed decoding uses generic methods, and SIMD builds use the
@@ -282,6 +287,16 @@ GOEXPERIMENT=simd gotip test -run='^$' \
 
 See [`benchmarks/README.md`](benchmarks/README.md) for pure-Go, json/v2, native
 Sonic, environment capture, and result comparison commands.
+
+## Validation
+
+`Valid` is a recursive descent validator with SWAR and SIMD string scanning:
+
+| Validator | 31 B | 4.2 KB | 136.6 KB |
+|---|---:|---:|---:|
+| **simdjson** | **25.8 ns** | **2.17 us** | **60.6 us** |
+| Segment encoding v0.5.4 | 36.2 ns | 3.03 us | 83.6 us |
+| `encoding/json`, Go tip | 57.1 ns | 3.53 us | 96.4 us |
 
 ## Correctness
 
