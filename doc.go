@@ -21,8 +21,8 @@
 //
 // # Encoding structs
 //
-// [Marshal] behaves like encoding/json.Marshal with HTML escaping disabled
-// and caches one compiled encoder per source type:
+// [Marshal] produces byte-identical output to encoding/json.Marshal and
+// caches one compiled encoder per source type:
 //
 //	data, err := simdjson.Marshal(&event)
 //

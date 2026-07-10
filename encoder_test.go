@@ -10,17 +10,11 @@ import (
 	"testing"
 )
 
-// stdlibCompactJSON encodes v like encoding/json with HTML escaping disabled,
-// which is the byte format the compiled encoder targets.
+// stdlibCompactJSON is plain encoding/json.Marshal: the default byte format
+// the compiled encoder targets, HTML escaping included.
 func stdlibCompactJSON(t *testing.T, v any) ([]byte, error) {
 	t.Helper()
-	var buffer bytes.Buffer
-	stdEncoder := json.NewEncoder(&buffer)
-	stdEncoder.SetEscapeHTML(false)
-	if err := stdEncoder.Encode(v); err != nil {
-		return nil, err
-	}
-	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
+	return json.Marshal(v)
 }
 
 type encodeOmitEmpty struct {
@@ -152,7 +146,7 @@ func TestEncoderErrors(t *testing.T) {
 }
 
 func TestEncoderAppendJSONReusesBuffer(t *testing.T) {
-	encoder, err := CompileEncoder[typedTestRecord]()
+	encoder, err := CompileEncoder[typedTestRecord](EncoderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,5 +512,110 @@ func TestByteSlicesMatchStdlib(t *testing.T) {
 	}
 	if &reuse.Data[0] != base {
 		t.Fatal("byte slice capacity was not reused")
+	}
+}
+
+type quotedDocument struct {
+	I   int     `json:"i,string"`
+	I8  int8    `json:"i8,string"`
+	U   uint32  `json:"u,string"`
+	F   float64 `json:"f,string"`
+	B   bool    `json:"b,string"`
+	S   string  `json:"s,string"`
+	N   json.Number `json:"n,string"`
+	Ptr *int    `json:"ptr,string"` // stdlib ignores the option here
+}
+
+func TestStringTagOptionMatchesStdlib(t *testing.T) {
+	one := 1
+	// Encode side.
+	values := []quotedDocument{
+		{I: -42, I8: 7, U: 9, F: 2.5, B: true, S: `quo"ted <&>`, N: json.Number("5.5"), Ptr: &one},
+		{},
+		{F: 1e21, S: ""},
+	}
+	for _, value := range values {
+		want, wantErr := stdlibCompactJSON(t, &value)
+		got, gotErr := Marshal(&value)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("%#v: encode acceptance differs: simdjson=%v stdlib=%v", value, gotErr, wantErr)
+		}
+		if gotErr == nil && !bytes.Equal(got, want) {
+			t.Fatalf("%#v:\nsimdjson %s\nstdlib   %s", value, got, want)
+		}
+	}
+
+	// Decode side, including malformed corners.
+	decoder, err := CompileDecoder[quotedDocument](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := []string{
+		`{"i":"-42","i8":"7","u":"9","f":"2.5","b":"true","s":"\"hi\"","n":"5.5"}`,
+		`{"i":null,"s":null}`,
+		`{"i":42}`,
+		`{"i":"nope"}`,
+		`{"i":"42 "}`,
+		`{"i8":"300"}`,
+		`{"b":"maybe"}`,
+		`{"s":"unquoted"}`,
+		`{"f":"1e999"}`,
+		`{"n":"not-a-number"}`,
+		`{"i":""}`,
+		`{"ptr":"1"}`,
+		`{"ptr":null}`,
+		`{"ptr":1}`,
+	}
+	for _, src := range sources {
+		var got, want quotedDocument
+		gotErr := decoder.Decode([]byte(src), &got)
+		wantErr := json.Unmarshal([]byte(src), &want)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("%s: acceptance differs: simdjson=%v stdlib=%v", src, gotErr, wantErr)
+		}
+		if gotErr == nil && !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s:\nsimdjson %#v\nstdlib   %#v", src, got, want)
+		}
+	}
+
+	// Round trip.
+	original := quotedDocument{I: 3, F: -0.25, B: true, S: "wrap", N: json.Number("8")}
+	encoded, err := Marshal(&original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded quotedDocument
+	if err := decoder.Decode(encoded, &decoded); err != nil {
+		t.Fatalf("round trip decode of %s: %v", encoded, err)
+	}
+	if !reflect.DeepEqual(decoded, original) {
+		t.Fatalf("round trip mismatch: %#v vs %#v", decoded, original)
+	}
+}
+
+func TestDisableHTMLEscaping(t *testing.T) {
+	type doc struct {
+		S string `json:"s"`
+	}
+	value := doc{S: `<a href="x">&  </a>`}
+
+	var buffer bytes.Buffer
+	stdEncoder := json.NewEncoder(&buffer)
+	stdEncoder.SetEscapeHTML(false)
+	if err := stdEncoder.Encode(&value); err != nil {
+		t.Fatal(err)
+	}
+	want := bytes.TrimSuffix(buffer.Bytes(), []byte("\n"))
+
+	encoder, err := CompileEncoder[doc](EncoderOptions{DisableHTMLEscaping: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := encoder.AppendJSON(nil, &value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("no-escape mode:\nsimdjson %s\nstdlib   %s", got, want)
 	}
 }

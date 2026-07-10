@@ -2,8 +2,10 @@ package simdjson
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"math"
+	"math/bits"
 	"reflect"
 	"sort"
 	"strconv"
@@ -13,24 +15,33 @@ import (
 	"unsafe"
 )
 
+// EncoderOptions controls encoding output.
+type EncoderOptions struct {
+	// DisableHTMLEscaping leaves <, >, and & unescaped in strings, like
+	// json.Encoder.SetEscapeHTML(false). The zero value matches
+	// encoding/json.Marshal, which escapes them.
+	DisableHTMLEscaping bool
+}
+
 // Encoder is an immutable encoder for one concrete Go type. Compile it once
 // and reuse it concurrently; AppendJSON keeps all mutable state local to the
-// call. Output matches encoding/json with HTML escaping disabled: compact,
-// with U+2028 and U+2029 escaped and invalid UTF-8 replaced by �.
+// call. Output matches encoding/json byte for byte: compact, with U+2028 and
+// U+2029 escaped and invalid UTF-8 replaced by the replacement character.
 type Encoder[T any] struct {
-	root *typedNode
+	root       *typedNode
+	escapeHTML bool
 }
 
 // CompileEncoder builds an encoder for T. It supports the same types as
-// CompileDecoder plus the omitempty tag option.
-func CompileEncoder[T any]() (Encoder[T], error) {
+// CompileDecoder plus the omitempty and string tag options.
+func CompileEncoder[T any](opts EncoderOptions) (Encoder[T], error) {
 	typ := reflect.TypeFor[T]()
 	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode)}
 	root, err := compiler.compile(typ, typ.String())
 	if err != nil {
 		return Encoder[T]{}, err
 	}
-	return Encoder[T]{root: root}, nil
+	return Encoder[T]{root: root, escapeHTML: !opts.DisableHTMLEscaping}, nil
 }
 
 // AppendJSON appends src encoded as compact JSON to dst.
@@ -41,7 +52,7 @@ func (plan Encoder[T]) AppendJSON(dst []byte, src *T) ([]byte, error) {
 	if src == nil {
 		return dst, fmt.Errorf("simdjson: encode source is nil")
 	}
-	e := encodeState{dst: dst}
+	e := encodeState{dst: dst, escapeHTML: plan.escapeHTML}
 	if err := e.encode(plan.root, unsafe.Pointer(src)); err != nil {
 		return dst, err
 	}
@@ -88,7 +99,7 @@ func Marshal[T any](src *T) ([]byte, error) {
 
 //go:noinline
 func newCachedEncoder[T any]() any {
-	encoder, err := CompileEncoder[T]()
+	encoder, err := CompileEncoder[T](EncoderOptions{})
 	entry, _ := unmarshalEncoders.LoadOrStore(reflect.TypeFor[T](), &cachedEncoder[T]{encoder: encoder, err: err})
 	return entry
 }
@@ -138,8 +149,9 @@ func prependEncodePathIndex(err error, index int) error {
 }
 
 type encodeState struct {
-	dst   []byte
-	depth int
+	dst        []byte
+	depth      int
+	escapeHTML bool
 }
 
 func (e *encodeState) encode(node *typedNode, src unsafe.Pointer) error {
@@ -151,7 +163,7 @@ func (e *encodeState) encode(node *typedNode, src unsafe.Pointer) error {
 			e.dst = append(e.dst, "false"...)
 		}
 	case typedString:
-		e.dst = appendEncodedJSONString(e.dst, *(*string)(src))
+		e.dst = appendEncodedJSONString(e.dst, *(*string)(src), e.escapeHTML)
 	case typedNumber:
 		return e.encodeNumberLiteral(*(*string)(src))
 	case typedInt:
@@ -238,7 +250,11 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 			e.dst = append(e.dst, ',')
 		}
 		first = false
-		e.dst = append(e.dst, field.encName...)
+		if e.escapeHTML {
+			e.dst = append(e.dst, field.encName...)
+		} else {
+			e.dst = append(e.dst, field.encNamePlain...)
+		}
 		var err error
 		switch field.op {
 		case typedOpBool:
@@ -248,13 +264,15 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 				e.dst = append(e.dst, "false"...)
 			}
 		case typedOpString:
-			e.dst = appendEncodedJSONString(e.dst, *(*string)(fieldSrc))
+			e.dst = appendEncodedJSONString(e.dst, *(*string)(fieldSrc), e.escapeHTML)
 		case typedOpInt64:
 			e.dst = appendCompactInt(e.dst, *(*int64)(fieldSrc))
 		case typedOpUint64:
 			e.dst = appendCompactUint(e.dst, *(*uint64)(fieldSrc))
 		case typedOpFloat64:
 			err = e.encodeFloat(*(*float64)(fieldSrc), 64)
+		case typedOpQuoted:
+			err = e.encodeQuoted(field.node, fieldSrc)
 		default:
 			err = e.encode(field.node, fieldSrc)
 		}
@@ -352,7 +370,7 @@ func (e *encodeState) encodeAny(src unsafe.Pointer) error {
 		}
 		return nil
 	case string:
-		e.dst = appendEncodedJSONString(e.dst, concrete)
+		e.dst = appendEncodedJSONString(e.dst, concrete, e.escapeHTML)
 		return nil
 	case float64:
 		return e.encodeFloat(concrete, 64)
@@ -407,7 +425,7 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		if i > 0 {
 			e.dst = append(e.dst, ',')
 		}
-		e.dst = appendEncodedJSONString(e.dst, key)
+		e.dst = appendEncodedJSONString(e.dst, key, e.escapeHTML)
 		e.dst = append(e.dst, ':')
 		keyValue := reflect.ValueOf(key)
 		if keyType != keyValue.Type() {
@@ -421,6 +439,33 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	}
 	e.dst = append(e.dst, '}')
 	e.depth--
+	return nil
+}
+
+// encodeQuoted writes a scalar tagged with the string option: the value's
+// JSON form wrapped in a string. Non-string scalars contain no characters
+// that need escaping, so they are wrapped directly; strings are encoded and
+// then re-encoded as string contents, like encoding/json.
+func (e *encodeState) encodeQuoted(node *typedNode, src unsafe.Pointer) error {
+	if node.kind == typedPointer {
+		pointer := *(*unsafe.Pointer)(src)
+		if pointer == nil {
+			e.dst = append(e.dst, "null"...)
+			return nil
+		}
+		node = node.elem
+		src = pointer
+	}
+	if node.kind == typedString {
+		inner := appendEncodedJSONString(nil, *(*string)(src), e.escapeHTML)
+		e.dst = appendEncodedJSONString(e.dst, string(inner), false)
+		return nil
+	}
+	e.dst = append(e.dst, '"')
+	if err := e.encode(node, src); err != nil {
+		return err
+	}
+	e.dst = append(e.dst, '"')
 	return nil
 }
 
@@ -624,14 +669,19 @@ func appendCompactInt(dst []byte, v int64) []byte {
 // appendEncodedJSONString appends s as a quoted JSON string, matching encoding/json
 // with HTML escaping disabled: control bytes, quotes, and backslashes are
 // escaped, invalid UTF-8 becomes �, and U+2028/U+2029 are escaped.
-func appendEncodedJSONString(dst []byte, s string) []byte {
+func appendEncodedJSONString(dst []byte, s string, escapeHTML bool) []byte {
 	dst = append(dst, '"')
 	src := unsafe.Slice(unsafe.StringData(s), len(s))
 	start := 0
 	for i := 0; i < len(s); {
-		// scanStringSpecial stops at exactly the escape-relevant set: quotes,
-		// backslashes, control bytes, and non-ASCII.
-		i = scanStringSpecial(src, i)
+		// The scanners stop at exactly the escape-relevant set: quotes,
+		// backslashes, control bytes, non-ASCII, and in HTML mode the
+		// angle brackets and ampersand encoding/json escapes by default.
+		if escapeHTML {
+			i = scanEncodedHTMLSpecial(src, i)
+		} else {
+			i = scanStringSpecial(src, i)
+		}
 		if i >= len(s) {
 			break
 		}
@@ -679,4 +729,23 @@ func appendEncodedJSONString(dst []byte, s string) []byte {
 	}
 	dst = append(dst, s[start:]...)
 	return append(dst, '"')
+}
+
+func scanEncodedHTMLSpecial(src []byte, i int) int {
+	for i+8 <= len(src) {
+		x := binary.LittleEndian.Uint64(src[i:])
+		m := stringSpecialMask(x) | byteEqMask(x, '<') | byteEqMask(x, '>') | byteEqMask(x, '&')
+		if m != 0 {
+			return i + bits.TrailingZeros64(m)/8
+		}
+		i += 8
+	}
+	for i < len(src) {
+		c := src[i]
+		if c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' || c < 0x20 || c >= 0x80 {
+			return i
+		}
+		i++
+	}
+	return len(src)
 }

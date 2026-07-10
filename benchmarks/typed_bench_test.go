@@ -261,7 +261,7 @@ var (
 )
 
 func mustTypedEncoder[T any]() simdjson.Encoder[T] {
-	encoder, err := simdjson.CompileEncoder[T]()
+	encoder, err := simdjson.CompileEncoder[T](simdjson.EncoderOptions{})
 	if err != nil {
 		panic(err)
 	}

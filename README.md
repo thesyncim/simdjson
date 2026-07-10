@@ -89,13 +89,14 @@ if err := decoder.Decode(payload, &event); err != nil {
 Leave `ZeroCopy` false when decoded strings must own their storage. `DecodeArray`
 decodes a top-level array and reuses caller-provided slice capacity.
 
-Encoding mirrors decoding. `Marshal` matches `encoding/json.Marshal` with HTML
-escaping disabled (including its float formats, `omitempty`, and escape
-rules), and a compiled `Encoder` reused with `AppendJSON` encodes with zero
-allocations:
+Encoding mirrors decoding. `Marshal` is byte-identical to
+`encoding/json.Marshal` — float formats, `omitempty`, the `string` tag
+option, HTML escaping, and escape rules included.
+`EncoderOptions.DisableHTMLEscaping` matches `SetEscapeHTML(false)` instead.
+A compiled `Encoder` reused with `AppendJSON` encodes with zero allocations:
 
 ```go
-encoder, err := simdjson.CompileEncoder[Event]()
+encoder, err := simdjson.CompileEncoder[Event](simdjson.EncoderOptions{})
 if err != nil {
 	return err
 }
@@ -294,8 +295,9 @@ encoding sorts keys, both matching `encoding/json`. Values decoded into
 `any` use the standard dynamic shapes and always replace the previous value;
 encoding an interface compiles a plan for its concrete type on first use.
 Byte slices decode from and encode to standard base64, reusing destination
-capacity. Non-empty interfaces, non-string map keys, the `string` tag
-option, and custom unmarshaler dispatch are not supported. Untagged
+capacity, and the `string` tag option quotes scalars exactly like
+encoding/json. Non-empty interfaces, non-string map keys, untagged anonymous
+fields, and custom unmarshaler dispatch are not supported yet. Untagged
 anonymous fields are rejected rather than flattened.
 
 Run scalar and SIMD verification against the pinned compiler:

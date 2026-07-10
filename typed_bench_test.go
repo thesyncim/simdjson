@@ -284,7 +284,7 @@ func BenchmarkEncodeLarge(b *testing.B) {
 	if err := decoder.Decode(src, &doc); err != nil {
 		b.Fatal(err)
 	}
-	encoder, err := CompileEncoder[benchDocument]()
+	encoder, err := CompileEncoder[benchDocument](EncoderOptions{})
 	if err != nil {
 		b.Fatal(err)
 	}

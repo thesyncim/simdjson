@@ -223,6 +223,7 @@ const (
 	typedOpMap
 	typedOpAny
 	typedOpBytes
+	typedOpQuoted
 )
 
 type typedNode struct {
@@ -241,18 +242,20 @@ type typedNode struct {
 }
 
 type typedField struct {
-	name      string
-	encName   string
-	offset    uintptr
-	node      *typedNode
-	seen      uint64
-	key       uint64
-	keyMask   uint64
-	keyFold   uint64
-	pos       int32
-	keyLen    uint8
-	op        typedOp
-	omitEmpty bool
+	name         string
+	encName      string
+	encNamePlain string
+	offset       uintptr
+	node         *typedNode
+	seen         uint64
+	key          uint64
+	keyMask      uint64
+	keyFold      uint64
+	pos          int32
+	keyLen       uint8
+	op           typedOp
+	omitEmpty    bool
+	quoted       bool
 }
 
 type typedCompiler struct {
@@ -398,9 +401,6 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 			if field.Anonymous && !tagged {
 				return nil, c.unsupported(typ, path+"."+field.Name, "untagged anonymous fields are not yet flattened")
 			}
-			if quoted {
-				return nil, c.unsupported(typ, path+"."+field.Name, "the string tag option is not supported")
-			}
 			if _, ok := seen[name]; ok {
 				return nil, c.unsupported(typ, path+"."+field.Name, "duplicate JSON field name "+strconv.Quote(name))
 			}
@@ -411,13 +411,27 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 			}
 			fieldIndex := len(node.fields)
 			compiledField := typedField{
-				name:      name,
-				encName:   string(appendEncodedJSONString(nil, name)) + ":",
-				omitEmpty: omitEmpty,
-				offset:    field.Offset,
-				node:      fieldNode,
-				op:        fieldNode.op,
-				pos:       int32(fieldIndex),
+				name:         name,
+				encName:      string(appendEncodedJSONString(nil, name, true)) + ":",
+				encNamePlain: string(appendEncodedJSONString(nil, name, false)) + ":",
+				omitEmpty:    omitEmpty,
+				offset:       field.Offset,
+				node:         fieldNode,
+				op:           fieldNode.op,
+				pos:          int32(fieldIndex),
+			}
+			if quoted {
+				// Like encoding/json, the option looks through one unnamed
+				// pointer level when deciding eligibility.
+				quotedNode := fieldNode
+				if quotedNode.kind == typedPointer && field.Type.Name() == "" {
+					quotedNode = quotedNode.elem
+				}
+				switch quotedNode.kind {
+				case typedBool, typedString, typedNumber, typedInt, typedUint, typedFloat:
+					compiledField.quoted = true
+					compiledField.op = typedOpQuoted
+				}
 			}
 			if fieldIndex < 64 {
 				compiledField.seen = uint64(1) << fieldIndex

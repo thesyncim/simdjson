@@ -170,6 +170,8 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 			fieldErr = decodeCompiledAny(cursor, fieldDst)
 		case typedOpBytes:
 			fieldErr = decodeCompiledBytes(cursor, fieldNode, fieldDst)
+		case typedOpQuoted:
+			fieldErr = decodeQuotedField(cursor, fieldNode, fieldDst)
 		default:
 			fieldErr = &DecodeError{Offset: cursor.i, Type: fieldNode.typ, Reason: "invalid compiled operation"}
 		}
@@ -611,6 +613,63 @@ func decodeCompiledAny(cursor *decoderCursor, dst unsafe.Pointer) error {
 		return err
 	}
 	*(*any)(dst) = value
+	return nil
+}
+
+// decodeQuotedField decodes a scalar tagged with the string option: the JSON
+// value is a string whose contents are one JSON scalar. Bare null resets the
+// field like encoding/json; anything but a string is rejected.
+func decodeQuotedField(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+	null, err := cursor.TryNull()
+	if err != nil {
+		return err
+	}
+	if null {
+		resetTyped(node, dst)
+		return nil
+	}
+	i := cursor.i
+	if i >= len(cursor.src) || cursor.src[i] != '"' {
+		return &DecodeError{Offset: i, Type: node.typ, Reason: "expected quoted value for string-tagged field"}
+	}
+	var inner []byte
+	start := i + 1
+	end := scanStringSpecial(cursor.src, start)
+	if end < len(cursor.src) && cursor.src[end] == '"' {
+		inner = cursor.src[start:end]
+		cursor.i = end + 1
+	} else {
+		p := cursor.slowParser()
+		text, err := p.parseString()
+		cursor.i = p.i
+		if err != nil {
+			return err
+		}
+		inner = unsafe.Slice(unsafe.StringData(text), len(text))
+	}
+	// The inner scalar may alias a temporary unescape buffer, so decoded
+	// strings must never alias it.
+	flags := cursor.flags &^ (decoderZeroCopy | decoderSourceOwned)
+	sub := decoderCursor{src: inner, maxDepth: cursor.maxDepth, flags: flags}
+	scalar := node
+	if scalar.kind == typedPointer {
+		scalar = scalar.elem
+	}
+	if scalar.kind == typedString {
+		// The contents must themselves be a JSON string.
+		if len(inner) == 0 || inner[0] != '"' {
+			return &DecodeError{Offset: i, Type: node.typ, Reason: "string-tagged field does not contain a JSON string"}
+		}
+	}
+	if err := decodeCompiled(&sub, node, dst); err != nil {
+		if typed, ok := err.(*DecodeError); ok {
+			typed.Offset = i
+		}
+		return err
+	}
+	if sub.i != len(inner) {
+		return &DecodeError{Offset: i, Type: node.typ, Reason: "string-tagged field contains trailing data"}
+	}
 	return nil
 }
 
