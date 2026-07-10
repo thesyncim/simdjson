@@ -1,6 +1,7 @@
 package simdjson
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
@@ -268,6 +269,60 @@ func BenchmarkDecodeLargeUntagged(b *testing.B) {
 	for range b.N {
 		var dst benchUntaggedDocument
 		if err := decoder.Decode(src, &dst); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkEncodeLarge(b *testing.B) {
+	src := benchRecordsJSON(1024)
+	decoder, err := CompileDecoder[benchDocument](DecoderOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	var doc benchDocument
+	if err := decoder.Decode(src, &doc); err != nil {
+		b.Fatal(err)
+	}
+	encoder, err := CompileEncoder[benchDocument]()
+	if err != nil {
+		b.Fatal(err)
+	}
+	out, err := encoder.AppendJSON(nil, &doc)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(out)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		var encodeErr error
+		out, encodeErr = encoder.AppendJSON(out[:0], &doc)
+		if encodeErr != nil {
+			b.Fatal(encodeErr)
+		}
+	}
+}
+
+func BenchmarkEncodeLargeStdlib(b *testing.B) {
+	src := benchRecordsJSON(1024)
+	decoder, err := CompileDecoder[benchDocument](DecoderOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	var doc benchDocument
+	if err := decoder.Decode(src, &doc); err != nil {
+		b.Fatal(err)
+	}
+	out, err := json.Marshal(&doc)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(out)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := json.Marshal(&doc); err != nil {
 			b.Fatal(err)
 		}
 	}

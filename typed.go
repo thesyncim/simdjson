@@ -233,16 +233,18 @@ type typedNode struct {
 }
 
 type typedField struct {
-	name    string
-	offset  uintptr
-	node    *typedNode
-	seen    uint64
-	key     uint64
-	keyMask uint64
-	keyFold uint64
-	pos     int32
-	keyLen  uint8
-	op      typedOp
+	name      string
+	encName   string
+	offset    uintptr
+	node      *typedNode
+	seen      uint64
+	key       uint64
+	keyMask   uint64
+	keyFold   uint64
+	pos       int32
+	keyLen    uint8
+	op        typedOp
+	omitEmpty bool
 }
 
 type typedCompiler struct {
@@ -344,17 +346,33 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 			}
 			tag, tagged := field.Tag.Lookup("json")
 			name := field.Name
+			omitEmpty := false
+			quoted := false
 			if tagged {
-				name, _, _ = strings.Cut(tag, ",")
-				if name == "-" {
+				if tag == "-" {
 					continue
 				}
+				var options string
+				name, options, _ = strings.Cut(tag, ",")
 				if !validTypedTag(name) {
 					name = field.Name
+				}
+				for options != "" {
+					var option string
+					option, options, _ = strings.Cut(options, ",")
+					switch option {
+					case "omitempty":
+						omitEmpty = true
+					case "string":
+						quoted = true
+					}
 				}
 			}
 			if field.Anonymous && !tagged {
 				return nil, c.unsupported(typ, path+"."+field.Name, "untagged anonymous fields are not yet flattened")
+			}
+			if quoted {
+				return nil, c.unsupported(typ, path+"."+field.Name, "the string tag option is not supported")
 			}
 			if _, ok := seen[name]; ok {
 				return nil, c.unsupported(typ, path+"."+field.Name, "duplicate JSON field name "+strconv.Quote(name))
@@ -365,7 +383,15 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 				return nil, err
 			}
 			fieldIndex := len(node.fields)
-			compiledField := typedField{name: name, offset: field.Offset, node: fieldNode, op: fieldNode.op, pos: int32(fieldIndex)}
+			compiledField := typedField{
+				name:      name,
+				encName:   string(appendEncodedJSONString(nil, name)) + ":",
+				omitEmpty: omitEmpty,
+				offset:    field.Offset,
+				node:      fieldNode,
+				op:        fieldNode.op,
+				pos:       int32(fieldIndex),
+			}
 			if fieldIndex < 64 {
 				compiledField.seen = uint64(1) << fieldIndex
 			}

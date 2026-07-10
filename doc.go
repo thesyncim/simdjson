@@ -19,6 +19,19 @@
 // constructed only when an error unwinds, so successful decodes pay nothing
 // for it.
 //
+// # Encoding structs
+//
+// [Marshal] behaves like encoding/json.Marshal with HTML escaping disabled
+// and caches one compiled encoder per source type:
+//
+//	data, err := simdjson.Marshal(&event)
+//
+// Hot paths should compile with [CompileEncoder] and reuse the [Encoder];
+// its AppendJSON method appends to a caller-owned buffer, so steady-state
+// encoding does not allocate. Unrepresentable values (NaN, infinities,
+// malformed json.Number) return an [EncodeError] carrying the same style of
+// value path as [DecodeError].
+//
 // # Validation and selection
 //
 // [Valid] and [Validate] check strict JSON syntax without building any

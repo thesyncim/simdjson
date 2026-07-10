@@ -23,6 +23,17 @@ func ExampleUnmarshal() {
 	// Output: 7 launch true
 }
 
+func ExampleMarshal() {
+	event := exampleEvent{ID: 7, Name: "launch", Enabled: true}
+	data, err := simdjson.Marshal(&event)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println(string(data))
+	// Output: {"id":7,"name":"launch","enabled":true}
+}
+
 func ExampleDecodeError() {
 	type batch struct {
 		Events []exampleEvent `json:"events"`

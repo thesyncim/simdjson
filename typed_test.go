@@ -382,8 +382,8 @@ func TestFieldOrderPermutationsMatchStdlib(t *testing.T) {
 	extras := [][]string{
 		nil,
 		{`"unknown":{"nested":[1,2]}`},
-		{`"id":43`},          // duplicate key, last wins
-		{`"NAME":"folded"`},  // case-insensitive fallback, last wins
+		{`"id":43`},         // duplicate key, last wins
+		{`"NAME":"folded"`}, // case-insensitive fallback, last wins
 	}
 	decoder, err := CompileDecoder[typedTestRecord](DecoderOptions{})
 	if err != nil {
