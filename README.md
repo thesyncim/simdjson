@@ -25,7 +25,10 @@ The large source-backed fixture decodes at 2.0 GB/s. Reusing the destination
 removes the remaining container allocation in source-backed mode:
 `2.15 us / 0 allocs` for 32 records and `66.4 us / 0 allocs` for 1,024
 records. Pretty-printed input stays on the fast path: the same large document
-indented with two spaces (222 KB) decodes at 1.9 GB/s.
+indented with two spaces (222 KB) decodes at 1.9 GB/s. So do documents whose
+member order does not match the struct (rotated order decodes within 16% of
+in-order) and untagged structs matching lowercase keys case-insensitively
+(within 2% of exact-case matching).
 
 These are medians of five one-second samples, not claims about every schema.
 The [benchmark methodology](#benchmark-methodology) records the exact compiler,
