@@ -619,3 +619,121 @@ func TestDisableHTMLEscaping(t *testing.T) {
 		t.Fatalf("no-escape mode:\nsimdjson %s\nstdlib   %s", got, want)
 	}
 }
+
+type embBase struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+type embShadow struct {
+	embBase
+	Name string `json:"name"` // shadows the embedded name
+}
+
+type embPointer struct {
+	*embBase
+	Extra string `json:"extra"`
+}
+
+type embTagged struct {
+	embBase `json:"base"` // tagged: nested object, not flattened
+}
+
+type embConflictA struct{ X int `json:"same"` }
+type embConflictB struct{ Y int `json:"same"` }
+type embConflict struct {
+	embConflictA
+	embConflictB // same depth, same name: both dropped
+	Z int `json:"z"`
+}
+
+type embInt int
+
+type embNonStruct struct {
+	embInt // named by its type
+	V int  `json:"v"`
+}
+
+type embUnexported struct {
+	hidden
+	Top int `json:"top"`
+}
+
+type hidden struct {
+	Inner string `json:"inner"`
+}
+
+type embDeep struct {
+	embMid
+	Own int `json:"own"`
+}
+
+type embMid struct {
+	embBase
+	Mid int `json:"mid"`
+}
+
+func TestEmbeddedFieldsMatchStdlib(t *testing.T) {
+	type roundTrip func(src string) (gotErr, wantErr error, got, want any)
+	cases := []struct {
+		name string
+		run  roundTrip
+	}{
+		{"value embedding", differential[embMid](t, `{"id":1,"name":"n","mid":2}`)},
+		{"shadowing", differential[embShadow](t, `{"id":3,"name":"outer"}`)},
+		{"pointer embedding", differential[embPointer](t, `{"id":4,"name":"p","extra":"e"}`)},
+		{"pointer embedding absent", differential[embPointer](t, `{"extra":"only"}`)},
+		{"tagged anonymous", differential[embTagged](t, `{"base":{"id":5,"name":"tag"}}`)},
+		{"same depth conflict", differential[embConflict](t, `{"same":9,"z":1}`)},
+		{"embedded scalar", differential[embNonStruct](t, `{"embInt":7,"v":8}`)},
+		{"unexported embedded struct", differential[embUnexported](t, `{"inner":"i","top":9}`)},
+		{"deep nesting", differential[embDeep](t, `{"id":1,"name":"d","mid":2,"own":3}`)},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			gotErr, wantErr, got, want := testCase.run("")
+			if (gotErr == nil) != (wantErr == nil) {
+				t.Fatalf("acceptance differs: simdjson=%v stdlib=%v", gotErr, wantErr)
+			}
+			if gotErr == nil && !reflect.DeepEqual(got, want) {
+				t.Fatalf("decoded differs:\nsimdjson %#v\nstdlib   %#v", got, want)
+			}
+		})
+	}
+}
+
+// differential returns a closure decoding src into T with both libraries and
+// then re-encoding, comparing bytes.
+func differential[T any](t *testing.T, src string) func(string) (error, error, any, any) {
+	return func(string) (error, error, any, any) {
+		var got, want T
+		gotErr := Unmarshal([]byte(src), &got)
+		wantErr := json.Unmarshal([]byte(src), &want)
+		if gotErr == nil && wantErr == nil {
+			gotJSON, gotEncErr := Marshal(&got)
+			wantJSON, wantEncErr := stdlibCompactJSON(t, &want)
+			if (gotEncErr == nil) != (wantEncErr == nil) {
+				t.Fatalf("%s: encode acceptance differs: simdjson=%v stdlib=%v", src, gotEncErr, wantEncErr)
+			}
+			if gotEncErr == nil && !bytes.Equal(gotJSON, wantJSON) {
+				t.Fatalf("%s:\nsimdjson %s\nstdlib   %s", src, gotJSON, wantJSON)
+			}
+		}
+		return gotErr, wantErr, got, want
+	}
+}
+
+func TestEmbeddedPointerEncodeNil(t *testing.T) {
+	value := embPointer{Extra: "only"}
+	want, err := stdlibCompactJSON(t, &value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Marshal(&value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("nil embedded pointer:\nsimdjson %s\nstdlib   %s", got, want)
+	}
+}

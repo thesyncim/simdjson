@@ -34,7 +34,14 @@ type typedEdgePointer *typedEdgeValue
 
 type typedEdgeInt int
 
+type typedEdgeEmbedded struct {
+	Promoted int    `json:"promoted"`
+	Shadowed string `json:"shadowed"`
+}
+
 type typedEdgeValue struct {
+	typedEdgeEmbedded
+	Shadowed string `json:"shadowed"` // outer wins over the embedded field
 	ID      int              `json:"id"`
 	Long    string           `json:"long_field_name"`
 	Escaped string           `json:"escaped"`

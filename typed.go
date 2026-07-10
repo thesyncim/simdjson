@@ -237,6 +237,8 @@ type typedNode struct {
 	elem      *typedNode
 	fields    []typedField
 	encFields []typedEncField
+	fieldHops [][]typedFieldHop
+	hopResets []uintptr
 	reset     []typedResetOp
 	ready     bool
 	allSet    uint64
@@ -251,6 +253,7 @@ type typedField struct {
 	keyMask uint64
 	keyFold uint64
 	pos     int32
+	hop     int16
 	keyLen  uint8
 	op      typedOp
 }
@@ -373,65 +376,39 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 	case reflect.Struct:
 		node.kind = typedStruct
 		node.op = typedOpStruct
-		seen := make(map[string]struct{}, typ.NumField())
-		for i := 0; i < typ.NumField(); i++ {
-			field := typ.Field(i)
-			if !field.IsExported() {
-				continue
-			}
-			tag, tagged := field.Tag.Lookup("json")
-			name := field.Name
-			omitEmpty := false
-			quoted := false
-			if tagged {
-				if tag == "-" {
-					continue
-				}
-				var options string
-				name, options, _ = strings.Cut(tag, ",")
-				if !validTypedTag(name) {
-					name = field.Name
-				}
-				for options != "" {
-					var option string
-					option, options, _ = strings.Cut(options, ",")
-					switch option {
-					case "omitempty":
-						omitEmpty = true
-					case "string":
-						quoted = true
-					}
-				}
-			}
-			if field.Anonymous && !tagged {
-				return nil, c.unsupported(typ, path+"."+field.Name, "untagged anonymous fields are not yet flattened")
-			}
-			if _, ok := seen[name]; ok {
-				return nil, c.unsupported(typ, path+"."+field.Name, "duplicate JSON field name "+strconv.Quote(name))
-			}
-			seen[name] = struct{}{}
-			fieldNode, err := c.compile(field.Type, path+"."+field.Name)
+		for _, resolved := range resolveStructFields(typ) {
+			fieldNode, err := c.compile(resolved.typ, path+"."+resolved.name)
 			if err != nil {
 				return nil, err
 			}
+			offset, hops, hopErr := c.fieldHops(typ, resolved.index, path+"."+resolved.name)
+			if hopErr != nil {
+				return nil, hopErr
+			}
 			fieldIndex := len(node.fields)
 			compiledField := typedField{
-				name:   name,
-				offset: field.Offset,
+				name:   resolved.name,
+				offset: offset,
 				node:   fieldNode,
 				op:     fieldNode.op,
 				pos:    int32(fieldIndex),
+				hop:    -1,
+			}
+			if hops != nil {
+				compiledField.hop = int16(len(node.fieldHops))
+				node.fieldHops = append(node.fieldHops, hops)
+				// The embedded pointer slot is not a leaf field, so replace
+				// style resets must clear it explicitly.
+				node.hopResets = append(node.hopResets, hops[0].offset)
 			}
 			node.encFields = append(node.encFields, typedEncField{
-				encName:      string(appendEncodedJSONString(nil, name, true)) + ":",
-				encNamePlain: string(appendEncodedJSONString(nil, name, false)) + ":",
-				omitEmpty:    omitEmpty,
+				encName:      string(appendEncodedJSONString(nil, resolved.name, true)) + ":",
+				encNamePlain: string(appendEncodedJSONString(nil, resolved.name, false)) + ":",
+				omitEmpty:    resolved.omitEmpty,
 			})
-			if quoted {
-				// Like encoding/json, the option looks through one unnamed
-				// pointer level when deciding eligibility.
+			if resolved.quoted {
 				quotedNode := fieldNode
-				if quotedNode.kind == typedPointer && field.Type.Name() == "" {
+				if quotedNode.kind == typedPointer && resolved.typ.Name() == "" {
 					quotedNode = quotedNode.elem
 				}
 				switch quotedNode.kind {
@@ -442,6 +419,7 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 			if fieldIndex < 64 {
 				compiledField.seen = uint64(1) << fieldIndex
 			}
+			name := resolved.name
 			if len(name) <= 7 {
 				for byteIndex := range len(name) {
 					c := name[byteIndex]
@@ -491,6 +469,35 @@ func validTypedTag(name string) bool {
 		}
 	}
 	return true
+}
+
+// fieldHops turns a flattened field's index path into a cumulative offset
+// plus the embedded pointer dereferences on the way.
+func (c *typedCompiler) fieldHops(root reflect.Type, index []int, path string) (uintptr, []typedFieldHop, error) {
+	var hops []typedFieldHop
+	offset := uintptr(0)
+	current := root
+	for position, fieldIndex := range index {
+		structField := current.Field(fieldIndex)
+		offset += structField.Offset
+		if position == len(index)-1 {
+			break
+		}
+		next := structField.Type
+		if next.Kind() == reflect.Pointer {
+			// Like encoding/json, an unexported embedded pointer only fails
+			// when decoding must allocate through it.
+			hops = append(hops, typedFieldHop{
+				offset:     offset,
+				pointee:    next.Elem(),
+				unexported: !structField.IsExported(),
+			})
+			offset = 0
+			next = next.Elem()
+		}
+		current = next
+	}
+	return offset, hops, nil
 }
 
 func (c *typedCompiler) unsupported(typ reflect.Type, path, reason string) error {
@@ -573,7 +580,13 @@ func resetTyped(node *typedNode, dst unsafe.Pointer) {
 	case typedStruct:
 		for i := range node.fields {
 			field := &node.fields[i]
+			if field.hop >= 0 {
+				continue
+			}
 			resetTyped(field.node, unsafe.Add(dst, field.offset))
+		}
+		for _, hopOffset := range node.hopResets {
+			*(*unsafe.Pointer)(unsafe.Add(dst, hopOffset)) = nil
 		}
 	case typedSlice, typedBytes:
 		(*typedSliceHeader)(dst).len = 0

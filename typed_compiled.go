@@ -127,7 +127,15 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 		}
 		seen |= field.seen
 		fieldNode := field.node
-		fieldDst := unsafe.Add(dst, field.offset)
+		fieldBase := dst
+		if field.hop >= 0 {
+			resolved, hopErr := resolveDecodeHops(dst, node.fieldHops[field.hop], cursor.i)
+			if hopErr != nil {
+				return prependDecodePathField(hopErr, field.name)
+			}
+			fieldBase = resolved
+		}
+		fieldDst := unsafe.Add(fieldBase, field.offset)
 		var fieldErr error
 		switch field.op {
 		case typedOpBool:
@@ -275,9 +283,17 @@ func resetMissingTypedFields(node *typedNode, dst unsafe.Pointer, seen uint64) {
 	missing := node.allSet &^ seen
 	for i := range node.fields {
 		field := &node.fields[i]
-		if missing&field.seen != 0 {
-			resetTyped(field.node, unsafe.Add(dst, field.offset))
+		if missing&field.seen == 0 {
+			continue
 		}
+		target := dst
+		if field.hop >= 0 {
+			target = resolveResetHops(dst, node.fieldHops[field.hop])
+			if target == nil {
+				continue
+			}
+		}
+		resetTyped(field.node, unsafe.Add(target, field.offset))
 	}
 }
 
@@ -727,6 +743,41 @@ func decodeCompiledBytes(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 	return nil
 }
 
+// resolveDecodeHops walks embedded pointer hops toward a flattened field,
+// allocating nil intermediates like encoding/json, which also only rejects
+// unexported embedded pointers at the moment an allocation is required.
+func resolveDecodeHops(dst unsafe.Pointer, hops []typedFieldHop, offset int) (unsafe.Pointer, error) {
+	for i := range hops {
+		hop := &hops[i]
+		slot := (*unsafe.Pointer)(unsafe.Add(dst, hop.offset))
+		pointer := *slot
+		if pointer == nil {
+			if hop.unexported {
+				return nil, &DecodeError{Offset: offset, TypeName: hop.pointee.String(), Reason: "cannot set embedded pointer to unexported struct type"}
+			}
+			value := reflect.New(hop.pointee)
+			pointer = value.UnsafePointer()
+			*slot = pointer
+			runtime.KeepAlive(value)
+		}
+		dst = pointer
+	}
+	return dst, nil
+}
+
+// resolveResetHops walks hops without allocating; a nil link means the field
+// is already zero.
+func resolveResetHops(dst unsafe.Pointer, hops []typedFieldHop) unsafe.Pointer {
+	for i := range hops {
+		pointer := *(*unsafe.Pointer)(unsafe.Add(dst, hops[i].offset))
+		if pointer == nil {
+			return nil
+		}
+		dst = pointer
+	}
+	return dst
+}
+
 func allocateTypedPointer(node *typedNode, dst unsafe.Pointer) unsafe.Pointer {
 	value := reflect.New(node.elem.typ)
 	pointer := value.UnsafePointer()
@@ -799,7 +850,13 @@ func appendTypedReset(ops []typedResetOp, node *typedNode, offset uintptr) []typ
 	case typedStruct:
 		for i := range node.fields {
 			field := &node.fields[i]
+			if field.hop >= 0 {
+				continue
+			}
 			ops = appendTypedReset(ops, field.node, offset+field.offset)
+		}
+		for _, hopOffset := range node.hopResets {
+			ops = append(ops, typedResetOp{offset: offset + hopOffset, kind: typedResetPointer})
 		}
 		return ops
 	case typedArray:

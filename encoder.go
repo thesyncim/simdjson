@@ -243,7 +243,15 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 	for i := range node.fields {
 		field := &node.fields[i]
 		encField := &node.encFields[i]
-		fieldSrc := unsafe.Add(src, field.offset)
+		fieldBase := src
+		if field.hop >= 0 {
+			fieldBase = resolveResetHops(src, node.fieldHops[field.hop])
+			if fieldBase == nil {
+				// A nil embedded pointer omits its promoted fields entirely.
+				continue
+			}
+		}
+		fieldSrc := unsafe.Add(fieldBase, field.offset)
 		if encField.omitEmpty && typedValueIsEmpty(field.node, fieldSrc) {
 			continue
 		}
