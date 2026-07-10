@@ -234,28 +234,33 @@ type typedNode struct {
 	size   uintptr
 	bits   int
 	length int
-	elem   *typedNode
-	fields []typedField
-	reset  []typedResetOp
-	ready  bool
-	allSet uint64
+	elem      *typedNode
+	fields    []typedField
+	encFields []typedEncField
+	reset     []typedResetOp
+	ready     bool
+	allSet    uint64
 }
 
 type typedField struct {
-	name         string
+	name    string
+	offset  uintptr
+	node    *typedNode
+	seen    uint64
+	key     uint64
+	keyMask uint64
+	keyFold uint64
+	pos     int32
+	keyLen  uint8
+	op      typedOp
+}
+
+// typedEncField holds the encoder-only view of a struct field, parallel to
+// typedNode.fields, so decoder field records stay within two cache lines.
+type typedEncField struct {
 	encName      string
 	encNamePlain string
-	offset       uintptr
-	node         *typedNode
-	seen         uint64
-	key          uint64
-	keyMask      uint64
-	keyFold      uint64
-	pos          int32
-	keyLen       uint8
-	op           typedOp
 	omitEmpty    bool
-	quoted       bool
 }
 
 type typedCompiler struct {
@@ -411,15 +416,17 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 			}
 			fieldIndex := len(node.fields)
 			compiledField := typedField{
-				name:         name,
+				name:   name,
+				offset: field.Offset,
+				node:   fieldNode,
+				op:     fieldNode.op,
+				pos:    int32(fieldIndex),
+			}
+			node.encFields = append(node.encFields, typedEncField{
 				encName:      string(appendEncodedJSONString(nil, name, true)) + ":",
 				encNamePlain: string(appendEncodedJSONString(nil, name, false)) + ":",
 				omitEmpty:    omitEmpty,
-				offset:       field.Offset,
-				node:         fieldNode,
-				op:           fieldNode.op,
-				pos:          int32(fieldIndex),
-			}
+			})
 			if quoted {
 				// Like encoding/json, the option looks through one unnamed
 				// pointer level when deciding eligibility.
@@ -429,7 +436,6 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 				}
 				switch quotedNode.kind {
 				case typedBool, typedString, typedNumber, typedInt, typedUint, typedFloat:
-					compiledField.quoted = true
 					compiledField.op = typedOpQuoted
 				}
 			}

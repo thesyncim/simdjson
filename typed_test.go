@@ -456,3 +456,27 @@ func TestCaseFoldedKeysMatchStdlib(t *testing.T) {
 		}
 	}
 }
+
+// TestDecodeDestinationStaysOnStack guards against escape-analysis
+// contamination: passing dst-derived pointers into reflect (as the map path
+// once did) forces every Decode destination onto the heap, which shows up
+// here as an allocation for the local value.
+func TestDecodeDestinationStaysOnStack(t *testing.T) {
+	decoder, err := CompileDecoder[typedTestRecord](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := []byte(`{"id":1,"ok":true,"name":"sim","scores":[1,2,3],"number":4}`)
+	var sink int
+	allocs := testing.AllocsPerRun(200, func() {
+		var value typedTestRecord
+		if err := decoder.Decode(src, &value); err != nil {
+			panic(err)
+		}
+		sink += value.ID
+	})
+	_ = sink
+	if allocs != 0 {
+		t.Fatalf("Decode into a local destination allocated %v times per run, want 0", allocs)
+	}
+}

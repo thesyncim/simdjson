@@ -242,8 +242,9 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 	first := true
 	for i := range node.fields {
 		field := &node.fields[i]
+		encField := &node.encFields[i]
 		fieldSrc := unsafe.Add(src, field.offset)
-		if field.omitEmpty && typedValueIsEmpty(field.node, fieldSrc) {
+		if encField.omitEmpty && typedValueIsEmpty(field.node, fieldSrc) {
 			continue
 		}
 		if !first {
@@ -251,9 +252,9 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 		}
 		first = false
 		if e.escapeHTML {
-			e.dst = append(e.dst, field.encName...)
+			e.dst = append(e.dst, encField.encName...)
 		} else {
-			e.dst = append(e.dst, field.encNamePlain...)
+			e.dst = append(e.dst, encField.encNamePlain...)
 		}
 		var err error
 		switch field.op {
@@ -409,7 +410,10 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		return &EncodeError{Reason: "maximum nesting depth exceeded"}
 	}
 	e.depth++
-	mapValue := reflect.NewAt(node.typ, src).Elem()
+	// Keep src out of reflect so encode sources never escape; the map value
+	// is one pointer word.
+	local := *(*unsafe.Pointer)(src)
+	mapValue := reflect.NewAt(node.typ, unsafe.Pointer(&local)).Elem()
 	keys := make([]string, 0, mapValue.Len())
 	iterator := mapValue.MapRange()
 	for iterator.Next() {
@@ -613,7 +617,8 @@ func typedValueIsEmpty(node *typedNode, src unsafe.Pointer) bool {
 		if *(*unsafe.Pointer)(src) == nil {
 			return true
 		}
-		return reflect.NewAt(node.typ, src).Elem().Len() == 0
+		local := *(*unsafe.Pointer)(src)
+		return reflect.NewAt(node.typ, unsafe.Pointer(&local)).Elem().Len() == 0
 	case typedAny:
 		return *(*any)(src) == nil
 	default:
