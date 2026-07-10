@@ -59,7 +59,11 @@ type Event struct {
 
 `Unmarshal` is a drop-in replacement for `encoding/json.Unmarshal`. It compiles
 a decoder for each destination type once, caches it for the process lifetime,
-and matches stdlib semantics (owned strings, case-insensitive field fallback):
+and matches stdlib semantics: owned strings, case-insensitive field fallback,
+and merge behavior (absent members leave existing values untouched; null
+clears pointers, maps, slices, and interfaces but not scalars). Destinations
+reused across decodes usually want `DecoderOptions{Replace: true}`, which
+resets everything the document does not mention:
 
 ```go
 var event Event

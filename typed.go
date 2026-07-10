@@ -29,6 +29,13 @@ type DecoderOptions struct {
 	// CaseSensitive disables the encoding/json-compatible case-insensitive
 	// fallback used after exact field-name matching.
 	CaseSensitive bool
+
+	// Replace resets destination state that the document does not mention:
+	// absent struct fields become zero and null always clears. The default
+	// matches encoding/json, which merges into existing values and treats
+	// null as a no-op for scalars, strings, structs, and arrays. Replace is
+	// the right mode for destinations reused across decodes.
+	Replace bool
 }
 
 // Decoder is an immutable decoder for one concrete Go type. Compile it

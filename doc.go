@@ -13,7 +13,8 @@
 // Hot paths should compile the decoder once with [CompileDecoder] and reuse
 // it; the returned [Decoder] is immutable and safe for concurrent use.
 // [DecoderOptions] selects string ownership (ZeroCopy), unknown-field
-// handling, and case sensitivity. When decoding fails against the Go type,
+// handling, case sensitivity, and merge-versus-replace semantics for
+// existing destination state (the default merges like encoding/json). When decoding fails against the Go type,
 // the returned [DecodeError] reports the byte offset and the path of the
 // offending value (for example "items[3].scores[1]"); the path is
 // constructed only when an error unwinds, so successful decodes pay nothing

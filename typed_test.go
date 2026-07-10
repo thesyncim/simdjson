@@ -115,7 +115,7 @@ func TestTypedDecoderOptionsAndUnsupportedTypes(t *testing.T) {
 }
 
 func TestTypedDecoderReplacementAndFieldFallbacks(t *testing.T) {
-	decoder, err := CompileDecoder[typedEdgeValue](DecoderOptions{ZeroCopy: true})
+	decoder, err := CompileDecoder[typedEdgeValue](DecoderOptions{ZeroCopy: true, Replace: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -485,4 +485,86 @@ func TestDecodeDestinationStaysOnStack(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("Decode into a local destination allocated %v times per run, want 0", allocs)
 	}
+}
+
+// mergeFixture pre-populates every kind of destination state so differential
+// decodes expose any divergence from encoding/json's merge semantics.
+func mergeFixture() typedTestDocument {
+	next := typedTestRecord{ID: 42, OK: true, Name: "keep", Scores: [3]float64{7, 8, 9}, Number: json.Number("11")}
+	return typedTestDocument{
+		Items: []typedTestRecord{
+			{ID: 1, OK: true, Name: "stale-a", Scores: [3]float64{1, 2, 3}, Number: json.Number("5")},
+			{ID: 2, Name: "stale-b", Scores: [3]float64{4, 5, 6}},
+		},
+		Count: 9,
+		Next:  &next,
+	}
+}
+
+func TestMergeSemanticsMatchStdlib(t *testing.T) {
+	decoder, err := CompileDecoder[typedTestDocument](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := []string{
+		`{}`,
+		`{"count":1}`,
+		`{"items":[{"id":100}]}`,
+		`{"items":[{"id":100},{"name":"only-name"},{"ok":true}]}`,
+		`{"next":{"scores":[50]}}`,
+		`{"next":null,"count":null}`,
+		`{"items":null}`,
+		`{"items":[{"scores":null,"number":null,"name":null}]}`,
+		`{"next":{"id":null,"ok":null}}`,
+	}
+	for _, src := range sources {
+		got := mergeFixture()
+		want := mergeFixture()
+		gotErr := decoder.Decode([]byte(src), &got)
+		wantErr := json.Unmarshal([]byte(src), &want)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("%s: acceptance differs: simdjson=%v stdlib=%v", src, gotErr, wantErr)
+		}
+		if gotErr == nil && !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s:\nsimdjson %#v\nstdlib   %#v", src, got, want)
+		}
+	}
+}
+
+func TestReplaceSemantics(t *testing.T) {
+	decoder, err := CompileDecoder[typedTestDocument](DecoderOptions{Replace: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := mergeFixture()
+	if err := decoder.Decode([]byte(`{"count":3}`), &dst); err != nil {
+		t.Fatal(err)
+	}
+	if dst.Count != 3 || dst.Items != nil && len(dst.Items) != 0 || dst.Next != nil {
+		t.Fatalf("replace decode kept stale state: %#v", dst)
+	}
+}
+
+func FuzzMergeSemanticsMatchStdlib(f *testing.F) {
+	f.Add([]byte(`{"items":[{"id":7},{"name":"x"}],"count":null}`))
+	f.Add([]byte(`{"next":{"scores":[1]},"items":null}`))
+	decoder, err := CompileDecoder[typedTestDocument](DecoderOptions{})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Fuzz(func(t *testing.T, src []byte) {
+		if len(src) > 1<<13 || !Valid(src) {
+			return
+		}
+		got := mergeFixture()
+		want := mergeFixture()
+		gotErr := decoder.Decode(src, &got)
+		wantErr := json.Unmarshal(src, &want)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("acceptance differs: simdjson=%v stdlib=%v", gotErr, wantErr)
+		}
+		if gotErr == nil && !reflect.DeepEqual(got, want) {
+			t.Fatalf("merge decode differs:\nsimdjson %#v\nstdlib   %#v", got, want)
+		}
+	})
 }

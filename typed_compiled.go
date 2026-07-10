@@ -89,7 +89,10 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 			return err
 		}
 		if null {
-			resetTyped(node, dst)
+			// encoding/json treats null on a struct as a no-op.
+			if cursor.flags&decoderReplace != 0 {
+				resetTyped(node, dst)
+			}
 			return nil
 		}
 		if err := cursor.BeginObject(node.name); err != nil {
@@ -97,7 +100,7 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 		}
 	}
 	var seen uint64
-	if node.allSet == 0 && len(node.fields) > 0 {
+	if cursor.flags&decoderReplace != 0 && node.allSet == 0 && len(node.fields) > 0 {
 		resetTyped(node, dst)
 	}
 	position, first := 0, true
@@ -116,7 +119,9 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 			return err
 		}
 		if !ok {
-			resetMissingTypedFields(node, dst, seen)
+			if cursor.flags&decoderReplace != 0 {
+				resetMissingTypedFields(node, dst, seen)
+			}
 			return nil
 		}
 		first = false
@@ -382,18 +387,27 @@ func decodeCompiledSlice(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 }
 
 func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+	replace := cursor.flags&decoderReplace != 0
 	if i := cursor.i; i < len(cursor.src) && cursor.src[i] == '[' && cursor.depth < cursor.maxDepth {
 		cursor.depth++
 		cursor.i = i + 1
-		resetTyped(node, dst)
+		if replace {
+			resetTyped(node, dst)
+		}
 	} else {
 		null, err := cursor.TryNull()
 		if err != nil {
 			return err
 		}
-		resetTyped(node, dst)
 		if null {
+			// encoding/json treats null on an array as a no-op.
+			if replace {
+				resetTyped(node, dst)
+			}
 			return nil
+		}
+		if replace {
+			resetTyped(node, dst)
 		}
 		if err := cursor.BeginArray(node.name); err != nil {
 			return err
@@ -417,6 +431,9 @@ func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 			return err
 		}
 		if !more {
+			if !replace {
+				zeroTypedArrayTail(node, dst, index)
+			}
 			return nil
 		}
 		if index < node.length {
@@ -493,6 +510,7 @@ func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 }
 
 func decodeCompiledFloatArray[T floatValue](cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+	replace := cursor.flags&decoderReplace != 0
 	src := cursor.src
 	for index, first := 0, true; ; index, first = index+1, false {
 		// Fused fast path: consume the delimiter and a short float without the
@@ -507,6 +525,9 @@ func decodeCompiledFloatArray[T floatValue](cursor *decoderCursor, node *typedNo
 			if c == ']' {
 				cursor.i = i + 1
 				cursor.depth--
+				if !replace {
+					zeroTypedArrayTail(node, dst, index)
+				}
 				return nil
 			}
 			if !first {
@@ -532,6 +553,9 @@ func decodeCompiledFloatArray[T floatValue](cursor *decoderCursor, node *typedNo
 			return err
 		}
 		if !more {
+			if !replace {
+				zeroTypedArrayTail(node, dst, index)
+			}
 			return nil
 		}
 		if index < node.length {
@@ -542,6 +566,14 @@ func decodeCompiledFloatArray[T floatValue](cursor *decoderCursor, node *typedNo
 		} else if err := cursor.Skip(); err != nil {
 			return err
 		}
+	}
+}
+
+// zeroTypedArrayTail zeroes fixed-array elements past the document's length,
+// matching encoding/json's array padding in merge mode.
+func zeroTypedArrayTail(node *typedNode, dst unsafe.Pointer, from int) {
+	for index := from; index < node.length; index++ {
+		resetTyped(node.elem, unsafe.Add(dst, uintptr(index)*node.elem.size))
 	}
 }
 
@@ -785,7 +817,9 @@ func decodeQuotedField(cursor *decoderCursor, node *typedNode, dst unsafe.Pointe
 		return err
 	}
 	if null {
-		resetTyped(node, dst)
+		if node.baseKind == typedPointer || cursor.flags&decoderReplace != 0 {
+			resetTyped(node, dst)
+		}
 		return nil
 	}
 	i := cursor.i

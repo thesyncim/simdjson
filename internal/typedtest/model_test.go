@@ -65,7 +65,7 @@ func TestCompiledDecoderReuseAndOptions(t *testing.T) {
 	if err := strict.Decode([]byte(`{"unknown":1}`), &dst); err == nil {
 		t.Fatal("strict compiled decoder accepted unknown field")
 	}
-	caseSensitive := mustCompile[Document](t, simdjson.DecoderOptions{CaseSensitive: true})
+	caseSensitive := mustCompile[Document](t, simdjson.DecoderOptions{CaseSensitive: true, Replace: true})
 	if err := caseSensitive.Decode([]byte(`{"ITEMS":[]}`), &dst); err != nil {
 		t.Fatal(err)
 	}

@@ -41,6 +41,7 @@ const (
 	decoderDisallowUnknown
 	decoderCaseSensitive
 	decoderSourceOwned
+	decoderReplace
 )
 
 // decoderCursor is the concrete, interface-free parser used by compiled typed
@@ -68,6 +69,9 @@ func newDecoderCursor(src []byte, opts DecoderOptions) decoderCursor {
 	}
 	if opts.CaseSensitive {
 		flags |= decoderCaseSensitive
+	}
+	if opts.Replace {
+		flags |= decoderReplace
 	}
 	return decoderCursor{
 		src:      src,
@@ -383,7 +387,9 @@ func (c *decoderCursor) boolSlow[T boolValue](dst *T) error {
 		if !matchStringAt(c.src, i, "null") {
 			return c.err(i, "invalid literal")
 		}
-		*dst = false
+		if c.flags&decoderReplace != 0 {
+			*dst = false
+		}
 		c.i = i + 4
 		return nil
 	}
@@ -428,7 +434,9 @@ func (c *decoderCursor) stringSlow[T stringValue](dst *T) error {
 		if !matchStringAt(c.src, c.i, "null") {
 			return c.err(c.i, "invalid literal")
 		}
-		*dst = ""
+		if c.flags&decoderReplace != 0 {
+			*dst = ""
+		}
 		c.i += 4
 		return nil
 	}
@@ -461,7 +469,9 @@ func (c *decoderCursor) Number[T stringValue](dst *T) error {
 		if !matchStringAt(c.src, c.i, "null") {
 			return c.err(c.i, "invalid literal")
 		}
-		*dst = ""
+		if c.flags&decoderReplace != 0 {
+			*dst = ""
+		}
 		c.i += 4
 		return nil
 	}
@@ -483,7 +493,9 @@ func (c *decoderCursor) Int[T signedInteger](dst *T) error {
 		if !matchStringAt(c.src, c.i, "null") {
 			return c.err(c.i, "invalid literal")
 		}
-		*dst = 0
+		if c.flags&decoderReplace != 0 {
+			*dst = 0
+		}
 		c.i += 4
 		return nil
 	}
@@ -547,7 +559,9 @@ func (c *decoderCursor) Uint[T unsignedInteger](dst *T) error {
 		if !matchStringAt(c.src, c.i, "null") {
 			return c.err(c.i, "invalid literal")
 		}
-		*dst = 0
+		if c.flags&decoderReplace != 0 {
+			*dst = 0
+		}
 		c.i += 4
 		return nil
 	}
@@ -609,7 +623,9 @@ func (c *decoderCursor) floatSlow[T floatValue](dst *T) error {
 		if !matchStringAt(c.src, c.i, "null") {
 			return c.err(c.i, "invalid literal")
 		}
-		*dst = 0
+		if c.flags&decoderReplace != 0 {
+			*dst = 0
+		}
 		c.i += 4
 		return nil
 	}
