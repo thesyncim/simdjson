@@ -243,3 +243,32 @@ func BenchmarkValidLarge(b *testing.B) {
 		}
 	}
 }
+
+type benchUntaggedRecord struct {
+	ID      int
+	Active  bool
+	Name    string
+	Message string
+	Scores  [3]float64
+}
+
+type benchUntaggedDocument struct {
+	Items []benchUntaggedRecord
+	Meta  benchMeta `json:"meta"`
+}
+
+func BenchmarkDecodeLargeUntagged(b *testing.B) {
+	src := benchRecordsJSON(1024)
+	decoder, err := CompileDecoder[benchUntaggedDocument](DecoderOptions{ZeroCopy: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	for range b.N {
+		var dst benchUntaggedDocument
+		if err := decoder.Decode(src, &dst); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

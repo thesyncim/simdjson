@@ -215,15 +215,23 @@ func (cursor *decoderCursor) nextObjectFieldExpected(first bool, expected *typed
 		return key, false, ok, err
 	}
 	word := binary.LittleEndian.Uint64(cursor.src[keyStart:])
-	if mask := expected.keyMask; mask != 0 && (word^expected.key)&mask == 0 {
-		// The masked compare covers the key bytes and the closing quote.
-		keyEnd := keyStart + int(expected.keyLen)
-		if keyEnd+1 < len(cursor.src) && cursor.src[keyEnd+1] == ':' {
-			cursor.i = keyEnd + 2
-			if cursor.i < len(cursor.src) && cursor.src[cursor.i] <= ' ' {
-				cursor.skipSpace()
+	if mask := expected.keyMask; mask != 0 {
+		// The masked compare covers the key bytes and the closing quote. When
+		// the exact compare misses and folding applies, retry with the ASCII
+		// case bits of the key's letters masked out.
+		diff := (word ^ expected.key) & mask
+		if diff != 0 && diff&^expected.keyFold == 0 && cursor.flags&decoderCaseSensitive == 0 {
+			diff = 0
+		}
+		if diff == 0 {
+			keyEnd := keyStart + int(expected.keyLen)
+			if keyEnd+1 < len(cursor.src) && cursor.src[keyEnd+1] == ':' {
+				cursor.i = keyEnd + 2
+				if cursor.i < len(cursor.src) && cursor.src[cursor.i] <= ' ' {
+					cursor.skipSpace()
+				}
+				return "", true, true, nil
 			}
-			return "", true, true, nil
 		}
 	}
 	special := stringSpecialMask(word)

@@ -239,6 +239,7 @@ type typedField struct {
 	seen    uint64
 	key     uint64
 	keyMask uint64
+	keyFold uint64
 	pos     int32
 	keyLen  uint8
 	op      typedOp
@@ -370,7 +371,11 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 			}
 			if len(name) <= 7 {
 				for byteIndex := range len(name) {
-					compiledField.key |= uint64(name[byteIndex]) << (byteIndex * 8)
+					c := name[byteIndex]
+					compiledField.key |= uint64(c) << (byteIndex * 8)
+					if lower := c | 0x20; 'a' <= lower && lower <= 'z' {
+						compiledField.keyFold |= 0x20 << (byteIndex * 8)
+					}
 				}
 				compiledField.key |= uint64('"') << (len(name) * 8)
 				compiledField.keyMask = ^uint64(0) >> ((7 - len(name)) * 8)
@@ -383,6 +388,15 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 				node.allSet = ^uint64(0)
 			} else {
 				node.allSet = uint64(1)<<len(node.fields) - 1
+			}
+		}
+		// A fold-based fast match must never shadow another field's exact
+		// match, so folding is disabled where two field names fold together.
+		for i := range node.fields {
+			for j := range node.fields {
+				if i != j && strings.EqualFold(node.fields[i].name, node.fields[j].name) {
+					node.fields[i].keyFold = 0
+				}
 			}
 		}
 	default:

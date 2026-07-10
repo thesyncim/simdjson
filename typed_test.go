@@ -421,3 +421,36 @@ func TestFieldOrderPermutationsMatchStdlib(t *testing.T) {
 	}
 	permute(members, nil)
 }
+
+func TestCaseFoldedKeysMatchStdlib(t *testing.T) {
+	type untagged struct {
+		ID     int
+		Name   string
+		OK     bool
+		Id     string // folds with ID: exact matches must win for both
+		Corner int    `json:"x_y"`
+	}
+	decoder, err := CompileDecoder[untagged](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := []string{
+		`{"id":1,"name":"a","ok":true}`,
+		`{"ID":2,"NAME":"b","OK":false}`,
+		`{"Id":"exact","ID":3}`,
+		`{"iD":4,"Name":"c"}`,
+		`{"x_y":5,"X_y":6,"x_Y":7}`,
+		`{"id":8,"Id":"both"}`,
+	}
+	for _, src := range sources {
+		var got, want untagged
+		gotErr := decoder.Decode([]byte(src), &got)
+		wantErr := json.Unmarshal([]byte(src), &want)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("%s: acceptance differs: simdjson=%v stdlib=%v", src, gotErr, wantErr)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s: simdjson=%#v stdlib=%#v", src, got, want)
+		}
+	}
+}
