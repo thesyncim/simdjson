@@ -11,8 +11,8 @@ import (
 	"unsafe"
 )
 
-// TypedOptions controls decoding directly into caller-owned Go values.
-type TypedOptions struct {
+// DecoderOptions controls decoding directly into caller-owned Go values.
+type DecoderOptions struct {
 	// MaxDepth limits nested arrays and objects. Values <= 0 use the default.
 	MaxDepth int
 
@@ -30,27 +30,27 @@ type TypedOptions struct {
 	CaseSensitive bool
 }
 
-// TypedDecoder is an immutable decoder for one concrete Go type. Compile it
+// Decoder is an immutable decoder for one concrete Go type. Compile it
 // once and reuse it concurrently; Decode keeps all mutable parser state local
 // to the call.
-type TypedDecoder[T any] struct {
+type Decoder[T any] struct {
 	root      *typedNode
 	rootSlice *typedNode
-	options   TypedOptions
+	options   DecoderOptions
 }
 
 // CompileDecoder builds a decoder for T. Scalar and field dispatch use the
 // compiled plan; runtime reflection is limited to allocating nil pointers and
 // growing dynamic slices.
-func CompileDecoder[T any](opts TypedOptions) (TypedDecoder[T], error) {
+func CompileDecoder[T any](opts DecoderOptions) (Decoder[T], error) {
 	typ := reflect.TypeFor[T]()
 	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode)}
 	root, err := compiler.compile(typ, typ.String())
 	if err != nil {
-		return TypedDecoder[T]{}, err
+		return Decoder[T]{}, err
 	}
 	prepareTypedResets(root, make(map[*typedNode]bool))
-	return TypedDecoder[T]{
+	return Decoder[T]{
 		root: root,
 		rootSlice: &typedNode{
 			kind: typedSlice,
@@ -64,9 +64,9 @@ func CompileDecoder[T any](opts TypedOptions) (TypedDecoder[T], error) {
 
 // Decode replaces dst with one JSON value. Slice capacities already reachable
 // through dst are retained where their fields are decoded again.
-func (plan TypedDecoder[T]) Decode(src []byte, dst *T) error {
+func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 	if plan.root == nil {
-		return fmt.Errorf("simdjson: zero TypedDecoder")
+		return fmt.Errorf("simdjson: zero Decoder")
 	}
 	if dst == nil {
 		return fmt.Errorf("simdjson: typed Decode destination is nil")
@@ -94,9 +94,9 @@ func (plan TypedDecoder[T]) Decode(src []byte, dst *T) error {
 
 // DecodeArray decodes a top-level JSON array into dst, reusing its capacity.
 // The returned slice is always the authoritative result.
-func (plan TypedDecoder[T]) DecodeArray(src []byte, dst []T) ([]T, error) {
+func (plan Decoder[T]) DecodeArray(src []byte, dst []T) ([]T, error) {
 	if plan.rootSlice == nil {
-		return dst[:0], fmt.Errorf("simdjson: zero TypedDecoder")
+		return dst[:0], fmt.Errorf("simdjson: zero Decoder")
 	}
 	cursor := newDecoderCursor(src, plan.options)
 	cursor.skipSpace()
@@ -121,21 +121,61 @@ func (e *UnsupportedTypeError) Error() string {
 	return fmt.Sprintf("simdjson: typed decoder does not support %s at %s: %s", e.Type, e.Path, e.Reason)
 }
 
-// TypedDecodeError reports valid JSON that cannot be stored in the requested
+// DecodeError reports valid JSON that cannot be stored in the requested
 // Go type.
-type TypedDecodeError struct {
-	Offset   int
+type DecodeError struct {
+	// Offset is the byte position of the offending value within the input.
+	Offset int
+
+	// Path locates the offending value using JSON member names and array
+	// indexes, for example "items[3].scores[1]". It is empty when the
+	// top-level value itself failed. Building the path costs nothing until
+	// an error actually unwinds.
+	Path string
+
 	Type     reflect.Type
 	TypeName string
 	Reason   string
 }
 
-func (e *TypedDecodeError) Error() string {
+func (e *DecodeError) Error() string {
 	typeName := e.TypeName
 	if e.Type != nil {
 		typeName = e.Type.String()
 	}
+	if e.Path != "" {
+		return fmt.Sprintf("simdjson: cannot decode JSON at byte %d into %s at %s: %s", e.Offset, typeName, e.Path, e.Reason)
+	}
 	return fmt.Sprintf("simdjson: cannot decode JSON at byte %d into %s: %s", e.Offset, typeName, e.Reason)
+}
+
+// prependDecodePathField and prependDecodePathIndex annotate decode errors
+// while they unwind the compiled decode stack, so only failing decodes pay
+// for path construction.
+func prependDecodePathField(err error, name string) error {
+	if e, ok := err.(*DecodeError); ok {
+		switch {
+		case e.Path == "":
+			e.Path = name
+		case e.Path[0] == '[':
+			e.Path = name + e.Path
+		default:
+			e.Path = name + "." + e.Path
+		}
+	}
+	return err
+}
+
+func prependDecodePathIndex(err error, index int) error {
+	if e, ok := err.(*DecodeError); ok {
+		segment := "[" + strconv.Itoa(index) + "]"
+		if e.Path == "" || e.Path[0] == '[' {
+			e.Path = segment + e.Path
+		} else {
+			e.Path = segment + "." + e.Path
+		}
+	}
+	return err
 }
 
 type typedKind uint8
@@ -370,358 +410,10 @@ func (c *typedCompiler) unsupported(typ reflect.Type, path, reason string) error
 	return &UnsupportedTypeError{Type: typ, Path: path, Reason: reason}
 }
 
-func (p *parser) decodeTyped(node *typedNode, dst unsafe.Pointer, depth int, opts TypedOptions) error {
-	if depth > p.maxDepth {
-		return p.err(p.i, "maximum nesting depth exceeded")
-	}
-	if p.i >= len(p.src) {
-		return p.err(p.i, "expected value")
-	}
-	if p.src[p.i] == 'n' {
-		if !matchStringAt(p.src, p.i, "null") {
-			return p.err(p.i, "invalid literal")
-		}
-		p.i += 4
-		resetTyped(node, dst)
-		return nil
-	}
-
-	switch node.kind {
-	case typedBool:
-		return p.decodeTypedBool(node, dst)
-	case typedString:
-		return p.decodeTypedString(node, dst)
-	case typedNumber:
-		return p.decodeTypedNumber(node, dst)
-	case typedInt:
-		return p.decodeTypedInt(node, dst)
-	case typedUint:
-		return p.decodeTypedUint(node, dst)
-	case typedFloat:
-		return p.decodeTypedFloat(node, dst)
-	case typedStruct:
-		return p.decodeTypedStruct(node, dst, depth+1, opts)
-	case typedSlice:
-		return p.decodeTypedSlice(node, dst, depth+1, opts)
-	case typedArray:
-		return p.decodeTypedArray(node, dst, depth+1, opts)
-	case typedPointer:
-		return p.decodeTypedPointer(node, dst, depth, opts)
-	default:
-		return &TypedDecodeError{Offset: p.i, Type: node.typ, Reason: "invalid compiled operation"}
-	}
-}
-
-func (p *parser) decodeTypedBool(node *typedNode, dst unsafe.Pointer) error {
-	switch p.src[p.i] {
-	case 't':
-		if !matchStringAt(p.src, p.i, "true") {
-			return p.err(p.i, "invalid literal")
-		}
-		*(*bool)(dst) = true
-		p.i += 4
-		return nil
-	case 'f':
-		if !matchStringAt(p.src, p.i, "false") {
-			return p.err(p.i, "invalid literal")
-		}
-		*(*bool)(dst) = false
-		p.i += 5
-		return nil
-	default:
-		return p.typedMismatch(node, "expected boolean")
-	}
-}
-
-func (p *parser) decodeTypedString(node *typedNode, dst unsafe.Pointer) error {
-	if p.src[p.i] != '"' {
-		return p.typedMismatch(node, "expected string")
-	}
-	text, err := p.parseString()
-	if err != nil {
-		return err
-	}
-	*(*string)(dst) = text
-	return nil
-}
-
-func (p *parser) decodeTypedNumber(node *typedNode, dst unsafe.Pointer) error {
-	if p.src[p.i] != '-' && !isDigit(p.src[p.i]) {
-		return p.typedMismatch(node, "expected number")
-	}
-	start := p.i
-	base := unsafe.Pointer(unsafe.SliceData(p.src))
-	end, ok := scanNumberFast(base, len(p.src), start)
-	if !ok {
-		_, msg := scanNumber(p.src, start)
-		return p.err(start, msg)
-	}
-	p.i = end
-	text := unsafe.String((*byte)(unsafe.Add(base, start)), end-start)
-	if !p.zeroCopy {
-		text = string(p.src[start:end])
-	}
-	*(*string)(dst) = text
-	return nil
-}
-
-func (p *parser) decodeTypedInt(node *typedNode, dst unsafe.Pointer) error {
-	start, end, text, err := p.typedNumberToken(node)
-	if err != nil {
-		return err
-	}
-	if strings.IndexAny(text, ".eE") >= 0 {
-		return &TypedDecodeError{Offset: start, Type: node.typ, Reason: "fractional number cannot be stored in an integer"}
-	}
-	value, parseErr := strconv.ParseInt(text, 10, node.bits)
-	if parseErr != nil {
-		return &TypedDecodeError{Offset: start, Type: node.typ, Reason: "integer overflow"}
-	}
-	p.i = end
-	switch node.bits {
-	case 8:
-		*(*int8)(dst) = int8(value)
-	case 16:
-		*(*int16)(dst) = int16(value)
-	case 32:
-		*(*int32)(dst) = int32(value)
-	case 64:
-		*(*int64)(dst) = value
-	}
-	return nil
-}
-
-func (p *parser) decodeTypedUint(node *typedNode, dst unsafe.Pointer) error {
-	start, end, text, err := p.typedNumberToken(node)
-	if err != nil {
-		return err
-	}
-	if strings.IndexAny(text, ".eE") >= 0 {
-		return &TypedDecodeError{Offset: start, Type: node.typ, Reason: "fractional number cannot be stored in an unsigned integer"}
-	}
-	value, parseErr := strconv.ParseUint(text, 10, node.bits)
-	if parseErr != nil {
-		return &TypedDecodeError{Offset: start, Type: node.typ, Reason: "unsigned integer overflow"}
-	}
-	p.i = end
-	switch node.bits {
-	case 8:
-		*(*uint8)(dst) = uint8(value)
-	case 16:
-		*(*uint16)(dst) = uint16(value)
-	case 32:
-		*(*uint32)(dst) = uint32(value)
-	case 64:
-		*(*uint64)(dst) = value
-	}
-	return nil
-}
-
-func (p *parser) decodeTypedFloat(node *typedNode, dst unsafe.Pointer) error {
-	start, end, text, err := p.typedNumberToken(node)
-	if err != nil {
-		return err
-	}
-	var value float64
-	if node.bits == 64 {
-		base := unsafe.Pointer(unsafe.SliceData(p.src))
-		if exact, ok := exactJSONFloat64(base, start, end); ok {
-			value = exact
-		} else {
-			value, err = strconv.ParseFloat(text, 64)
-		}
-	} else {
-		value, err = strconv.ParseFloat(text, 32)
-	}
-	if err != nil {
-		return &TypedDecodeError{Offset: start, Type: node.typ, Reason: "number out of range"}
-	}
-	p.i = end
-	if node.bits == 32 {
-		*(*float32)(dst) = float32(value)
-	} else {
-		*(*float64)(dst) = value
-	}
-	return nil
-}
-
-func (p *parser) typedNumberToken(node *typedNode) (start, end int, text string, err error) {
-	if p.src[p.i] != '-' && !isDigit(p.src[p.i]) {
-		return p.i, p.i, "", p.typedMismatch(node, "expected number")
-	}
-	start = p.i
-	base := unsafe.Pointer(unsafe.SliceData(p.src))
-	end, ok := scanNumberFast(base, len(p.src), start)
-	if !ok {
-		_, msg := scanNumber(p.src, start)
-		return start, end, "", p.err(start, msg)
-	}
-	return start, end, unsafe.String((*byte)(unsafe.Add(base, start)), end-start), nil
-}
-
-func (p *parser) decodeTypedPointer(node *typedNode, dst unsafe.Pointer, depth int, opts TypedOptions) error {
-	pointer := *(*unsafe.Pointer)(dst)
-	if pointer == nil {
-		value := reflect.New(node.elem.typ)
-		if value.Type() != node.typ {
-			value = value.Convert(node.typ)
-		}
-		reflect.NewAt(node.typ, dst).Elem().Set(value)
-		pointer = value.UnsafePointer()
-	}
-	return p.decodeTyped(node.elem, pointer, depth, opts)
-}
-
-func (p *parser) decodeTypedStruct(node *typedNode, dst unsafe.Pointer, depth int, opts TypedOptions) error {
-	if p.src[p.i] != '{' {
-		return p.typedMismatch(node, "expected object")
-	}
-	resetTyped(node, dst)
-	p.i++
-	p.skipSpace()
-	if p.i < len(p.src) && p.src[p.i] == '}' {
-		p.i++
-		return nil
-	}
-
-	fieldPosition := 0
-	for {
-		p.skipSpace()
-		if p.i >= len(p.src) || p.src[p.i] != '"' {
-			return p.err(p.i, "expected object key string")
-		}
-		key, err := p.typedKey()
-		if err != nil {
-			return err
-		}
-		p.skipSpace()
-		if p.i >= len(p.src) || p.src[p.i] != ':' {
-			return p.err(p.i, "expected colon after object key")
-		}
-		p.i++
-		p.skipSpace()
-		field := node.findFieldSlow(key, !opts.CaseSensitive)
-		if field == nil {
-			if opts.DisallowUnknownFields {
-				return &TypedDecodeError{Offset: p.i, Type: node.typ, Reason: "unknown field " + strconv.Quote(key)}
-			}
-			if err := p.skipTypedValue(depth); err != nil {
-				return err
-			}
-		} else if err := p.decodeTyped(field.node, unsafe.Add(dst, field.offset), depth, opts); err != nil {
-			return err
-		}
-		fieldPosition++
-		p.skipSpace()
-		if p.i >= len(p.src) {
-			return p.err(p.i, "unterminated object")
-		}
-		switch p.src[p.i] {
-		case ',':
-			p.i++
-		case '}':
-			p.i++
-			return nil
-		default:
-			return p.err(p.i, "expected comma or closing brace in object")
-		}
-	}
-}
-
 type typedSliceHeader struct {
 	data unsafe.Pointer
 	len  int
 	cap  int
-}
-
-func (p *parser) decodeTypedSlice(node *typedNode, dst unsafe.Pointer, depth int, opts TypedOptions) error {
-	if p.src[p.i] != '[' {
-		return p.typedMismatch(node, "expected array")
-	}
-	header := (*typedSliceHeader)(dst)
-	header.len = 0
-	p.i++
-	p.skipSpace()
-	if p.i < len(p.src) && p.src[p.i] == ']' {
-		p.i++
-		if header.data == nil {
-			reflect.NewAt(node.typ, dst).Elem().Set(reflect.MakeSlice(node.typ, 0, 0))
-		}
-		return nil
-	}
-
-	for index := 0; ; index++ {
-		p.skipSpace()
-		if index == header.cap {
-			capacity := nextTypedSliceCapacity(header.cap, index+1)
-			if header.cap == 0 && node.elem.kind == typedStruct && depth <= 3 {
-				if estimate := (len(p.src) - p.i) / 128; estimate > capacity {
-					capacity = estimate
-					if capacity > 1024 {
-						capacity = 1024
-					}
-				}
-			}
-			growTypedSlice(node, dst, capacity)
-			header = (*typedSliceHeader)(dst)
-		}
-		header.len = index + 1
-		element := unsafe.Add(header.data, uintptr(index)*node.elem.size)
-		if err := p.decodeTyped(node.elem, element, depth, opts); err != nil {
-			return err
-		}
-		p.skipSpace()
-		if p.i >= len(p.src) {
-			return p.err(p.i, "unterminated array")
-		}
-		switch p.src[p.i] {
-		case ',':
-			p.i++
-		case ']':
-			p.i++
-			return nil
-		default:
-			return p.err(p.i, "expected comma or closing bracket in array")
-		}
-	}
-}
-
-func (p *parser) decodeTypedArray(node *typedNode, dst unsafe.Pointer, depth int, opts TypedOptions) error {
-	if p.src[p.i] != '[' {
-		return p.typedMismatch(node, "expected array")
-	}
-	resetTyped(node, dst)
-	p.i++
-	p.skipSpace()
-	if p.i < len(p.src) && p.src[p.i] == ']' {
-		p.i++
-		return nil
-	}
-
-	for index := 0; ; index++ {
-		p.skipSpace()
-		if index < node.length {
-			element := unsafe.Add(dst, uintptr(index)*node.elem.size)
-			if err := p.decodeTyped(node.elem, element, depth, opts); err != nil {
-				return err
-			}
-		} else if err := p.skipTypedValue(depth); err != nil {
-			return err
-		}
-		p.skipSpace()
-		if p.i >= len(p.src) {
-			return p.err(p.i, "unterminated array")
-		}
-		switch p.src[p.i] {
-		case ',':
-			p.i++
-		case ']':
-			p.i++
-			return nil
-		default:
-			return p.err(p.i, "expected comma or closing bracket in array")
-		}
-	}
 }
 
 func (p *parser) typedKey() (string, error) {
@@ -745,10 +437,6 @@ func (p *parser) skipTypedValue(depth int) error {
 	}
 	p.i = value.i
 	return nil
-}
-
-func (p *parser) typedMismatch(node *typedNode, reason string) error {
-	return &TypedDecodeError{Offset: p.i, Type: node.typ, Reason: reason}
 }
 
 func (node *typedNode) findFieldSlow(key string, fold bool) *typedField {

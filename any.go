@@ -29,12 +29,6 @@ func ParseAny(src []byte) (any, error) {
 	return ParseAnyOptions(src, AnyOptions{})
 }
 
-// ParseAnyZeroCopy is ParseAny with source-backed unescaped strings. Callers
-// must not mutate src while the decoded value is in use.
-func ParseAnyZeroCopy(src []byte) (any, error) {
-	return ParseAnyOptions(src, AnyOptions{ZeroCopy: true})
-}
-
 // ParseAnyOptions decodes src directly according to opts.
 func ParseAnyOptions(src []byte, opts AnyOptions) (any, error) {
 	if len(src) <= 64 {

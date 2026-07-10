@@ -54,7 +54,7 @@ func decodeCompiled(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) 
 	case typedPointer:
 		return decodeCompiledPointer(cursor, node, dst)
 	default:
-		return &TypedDecodeError{Offset: cursor.i, Type: node.typ, Reason: "invalid compiled operation"}
+		return &DecodeError{Offset: cursor.i, Type: node.typ, Reason: "invalid compiled operation"}
 	}
 	if err == nil {
 		return nil
@@ -150,13 +150,13 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 		case typedOpPointer:
 			fieldErr = decodeCompiledPointer(cursor, fieldNode, fieldDst)
 		default:
-			fieldErr = &TypedDecodeError{Offset: cursor.i, Type: fieldNode.typ, Reason: "invalid compiled operation"}
+			fieldErr = &DecodeError{Offset: cursor.i, Type: fieldNode.typ, Reason: "invalid compiled operation"}
 		}
 		if fieldErr != nil {
 			if field.op > typedOpInvalid && field.op < typedOpStruct {
-				return retagCompiledError(fieldErr, fieldNode.typ)
+				fieldErr = retagCompiledError(fieldErr, fieldNode.typ)
 			}
-			return fieldErr
+			return prependDecodePathField(fieldErr, field.name)
 		}
 	}
 }
@@ -309,7 +309,7 @@ func decodeCompiledSlice(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 			elementErr = decodeCompiled(cursor, node.elem, element)
 		}
 		if elementErr != nil {
-			return elementErr
+			return prependDecodePathIndex(elementErr, index)
 		}
 	}
 }
@@ -399,13 +399,13 @@ func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 			case typedPointer:
 				elementErr = decodeCompiledPointer(cursor, node.elem, element)
 			default:
-				elementErr = &TypedDecodeError{Offset: cursor.i, Type: node.elem.typ, Reason: "invalid compiled operation"}
+				elementErr = &DecodeError{Offset: cursor.i, Type: node.elem.typ, Reason: "invalid compiled operation"}
 			}
 			if elementErr != nil {
 				if node.elem.kind <= typedFloat {
-					return retagCompiledError(elementErr, node.elem.typ)
+					elementErr = retagCompiledError(elementErr, node.elem.typ)
 				}
-				return elementErr
+				return prependDecodePathIndex(elementErr, index)
 			}
 		} else if err := cursor.Skip(); err != nil {
 			return err
@@ -458,7 +458,7 @@ func decodeCompiledFloatArray[T floatValue](cursor *decoderCursor, node *typedNo
 		if index < node.length {
 			element := (*T)(unsafe.Add(dst, uintptr(index)*node.elem.size))
 			if err := cursor.Float(element); err != nil {
-				return err
+				return prependDecodePathIndex(err, index)
 			}
 		} else if err := cursor.Skip(); err != nil {
 			return err
@@ -508,7 +508,7 @@ func setTypedEmptySlice(node *typedNode, dst unsafe.Pointer) {
 }
 
 func retagCompiledError(err error, typ reflect.Type) error {
-	if typed, ok := err.(*TypedDecodeError); ok {
+	if typed, ok := err.(*DecodeError); ok {
 		typed.Type = typ
 		typed.TypeName = ""
 	}

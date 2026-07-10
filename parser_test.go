@@ -497,7 +497,7 @@ func TestParseAnyLargeDocumentKeepsValuesAlive(t *testing.T) {
 	}
 	src.WriteString(`]}`)
 
-	value, err := ParseAnyZeroCopy([]byte(src.String()))
+	value, err := parseAnyZeroCopyForTest([]byte(src.String()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -523,7 +523,7 @@ func TestParseAnyLargeDocumentKeepsValuesAlive(t *testing.T) {
 
 func detachedAnyValue() (any, error) {
 	src := []byte(`{"items":[{"name":"still alive","score":1234567890123456},{"name":"second","score":2.5}],"wide":{"a":1,"b":2,"c":3,"d":4,"e":5,"f":6,"g":7,"h":8},"padding":"plain ascii payload keeps this input on the arena path"}`)
-	return ParseAnyZeroCopy(src)
+	return parseAnyZeroCopyForTest(src)
 }
 
 func TestIndexValueKeepsSourceAndEntriesAlive(t *testing.T) {
@@ -628,8 +628,8 @@ func TestValidateMatchesStdlibGrammarCorpus(t *testing.T) {
 			if _, err := Parse(src); err != nil {
 				t.Fatalf("Parse(%q) = %v", src, err)
 			}
-			if _, err := ParseMinAlloc(src); err != nil {
-				t.Fatalf("ParseMinAlloc(%q) = %v", src, err)
+			if _, err := parseMinAllocForTest(src); err != nil {
+				t.Fatalf("parseMinAllocForTest(%q) = %v", src, err)
 			}
 			if out, err := AppendCompact(nil, src); err != nil || !json.Valid(out) {
 				t.Fatalf("AppendCompact(%q) = %q, %v", src, out, err)
@@ -912,7 +912,7 @@ func FuzzParseAny(f *testing.F) {
 		}
 		var want any
 		wantErr := json.Unmarshal(src, &want)
-		for _, parse := range []func([]byte) (any, error){ParseAny, ParseAnyZeroCopy} {
+		for _, parse := range []func([]byte) (any, error){ParseAny, parseAnyZeroCopyForTest} {
 			got, gotErr := parse(src)
 			if (gotErr == nil) != (wantErr == nil) {
 				t.Fatalf("parse error = %v, encoding/json error = %v", gotErr, wantErr)
@@ -1471,12 +1471,12 @@ func TestParseAnyDirect(t *testing.T) {
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("ParseAny(%s) = %#v, want %#v", src, got, want)
 		}
-		got, err = ParseAnyZeroCopy(src)
+		got, err = parseAnyZeroCopyForTest(src)
 		if err != nil {
-			t.Fatalf("ParseAnyZeroCopy(%s): %v", src, err)
+			t.Fatalf("parseAnyZeroCopyForTest(%s): %v", src, err)
 		}
 		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("ParseAnyZeroCopy(%s) = %#v, want %#v", src, got, want)
+			t.Fatalf("parseAnyZeroCopyForTest(%s) = %#v, want %#v", src, got, want)
 		}
 	}
 }
@@ -1491,7 +1491,7 @@ func TestParseAnyLongNumberArrayFastPath(t *testing.T) {
 		if err := json.Unmarshal(src, &want); err != nil {
 			t.Fatal(err)
 		}
-		for _, parse := range []func([]byte) (any, error){ParseAny, ParseAnyZeroCopy} {
+		for _, parse := range []func([]byte) (any, error){ParseAny, parseAnyZeroCopyForTest} {
 			got, err := parse(src)
 			if err != nil {
 				t.Fatalf("parse(%s): %v", src, err)
@@ -1524,7 +1524,7 @@ func TestParseAnyRepeatedObjectSchemas(t *testing.T) {
 	if err := json.Unmarshal(src, &want); err != nil {
 		t.Fatal(err)
 	}
-	for _, parse := range []func([]byte) (any, error){ParseAny, ParseAnyZeroCopy} {
+	for _, parse := range []func([]byte) (any, error){ParseAny, parseAnyZeroCopyForTest} {
 		got, err := parse(src)
 		if err != nil {
 			t.Fatalf("parse: %v", err)
@@ -1675,7 +1675,7 @@ func assertParseAnyFloatBits(t testing.TB, text string) {
 
 func TestParseAnyZeroCopyAliasesStrings(t *testing.T) {
 	src := []byte(`["abc"]`)
-	zeroCopy, err := ParseAnyZeroCopy(src)
+	zeroCopy, err := parseAnyZeroCopyForTest(src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1890,7 +1890,7 @@ func BenchmarkParseZeroCopy(b *testing.B) {
 	src := benchmarkJSON()
 	b.SetBytes(int64(len(src)))
 	for i := 0; i < b.N; i++ {
-		if _, err := ParseZeroCopy(src); err != nil {
+		if _, err := parseZeroCopyForTest(src); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -2226,7 +2226,7 @@ func BenchmarkParseZeroCopySmall(b *testing.B) {
 	src := smallJSON()
 	b.SetBytes(int64(len(src)))
 	for i := 0; i < b.N; i++ {
-		if _, err := ParseZeroCopy(src); err != nil {
+		if _, err := parseZeroCopyForTest(src); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -2248,7 +2248,7 @@ func BenchmarkParseMinAlloc(b *testing.B) {
 	src := benchmarkJSON()
 	b.SetBytes(int64(len(src)))
 	for i := 0; i < b.N; i++ {
-		if _, err := ParseMinAlloc(src); err != nil {
+		if _, err := parseMinAllocForTest(src); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -2518,4 +2518,16 @@ func rawObjectJSON() []byte {
 		"tags": ["simd", "json", "go"],
 		"meta": {"version": 1, "status": "fast"}
 	}`)
+}
+
+func parseZeroCopyForTest(src []byte) (Value, error) {
+	return ParseOptions(src, Options{ZeroCopy: true})
+}
+
+func parseMinAllocForTest(src []byte) (Value, error) {
+	return ParseOptions(src, Options{ZeroCopy: true, Preallocate: true})
+}
+
+func parseAnyZeroCopyForTest(src []byte) (any, error) {
+	return ParseAnyOptions(src, AnyOptions{ZeroCopy: true})
 }

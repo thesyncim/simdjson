@@ -12,8 +12,8 @@ import (
 )
 
 var (
-	typedBenchmarkOptions = simdjson.TypedOptions{ZeroCopy: true, CaseSensitive: true}
-	typedOwnedOptions     = simdjson.TypedOptions{CaseSensitive: true}
+	typedBenchmarkOptions = simdjson.DecoderOptions{ZeroCopy: true, CaseSensitive: true}
+	typedOwnedOptions     = simdjson.DecoderOptions{CaseSensitive: true}
 )
 
 var (
@@ -27,7 +27,7 @@ var (
 	typedDocOwned     = mustTypedDecoder[TypedDocument](typedOwnedOptions)
 )
 
-func mustTypedDecoder[T any](opts simdjson.TypedOptions) simdjson.TypedDecoder[T] {
+func mustTypedDecoder[T any](opts simdjson.DecoderOptions) simdjson.Decoder[T] {
 	decoder, err := simdjson.CompileDecoder[T](opts)
 	if err != nil {
 		panic(err)

@@ -260,7 +260,7 @@ func benchmarkParseAny(b *testing.B, src []byte) {
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			value, err := simdjson.ParseMinAlloc(src)
+			value, err := simdjson.ParseOptions(src, simdjson.Options{ZeroCopy: true, Preallocate: true})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -282,7 +282,7 @@ func benchmarkParseAny(b *testing.B, src []byte) {
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			value, err := simdjson.ParseAnyZeroCopy(src)
+			value, err := simdjson.ParseAnyOptions(src, simdjson.AnyOptions{ZeroCopy: true})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -304,7 +304,7 @@ func benchmarkParseNative(b *testing.B, src []byte) {
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			value, err := simdjson.ParseMinAlloc(src)
+			value, err := simdjson.ParseOptions(src, simdjson.Options{ZeroCopy: true, Preallocate: true})
 			if err != nil {
 				b.Fatal(err)
 			}

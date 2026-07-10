@@ -59,7 +59,7 @@ func benchRecordsJSON(count int) []byte {
 }
 
 func BenchmarkDecodeSmall(b *testing.B) {
-	decoder, err := CompileDecoder[benchSmall](TypedOptions{ZeroCopy: true, CaseSensitive: true})
+	decoder, err := CompileDecoder[benchSmall](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func BenchmarkDecodeSmall(b *testing.B) {
 
 func BenchmarkDecodeMedium(b *testing.B) {
 	src := benchRecordsJSON(32)
-	decoder, err := CompileDecoder[benchDocument](TypedOptions{ZeroCopy: true, CaseSensitive: true})
+	decoder, err := CompileDecoder[benchDocument](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func BenchmarkDecodeMedium(b *testing.B) {
 
 func BenchmarkDecodeLarge(b *testing.B) {
 	src := benchRecordsJSON(1024)
-	decoder, err := CompileDecoder[benchDocument](TypedOptions{ZeroCopy: true, CaseSensitive: true})
+	decoder, err := CompileDecoder[benchDocument](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func BenchmarkDecodeLarge(b *testing.B) {
 
 func BenchmarkDecodeLargeReused(b *testing.B) {
 	src := benchRecordsJSON(1024)
-	decoder, err := CompileDecoder[benchDocument](TypedOptions{ZeroCopy: true, CaseSensitive: true})
+	decoder, err := CompileDecoder[benchDocument](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func BenchmarkDecodeLargeIndented(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	decoder, err := CompileDecoder[benchDocument](TypedOptions{ZeroCopy: true, CaseSensitive: true})
+	decoder, err := CompileDecoder[benchDocument](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func BenchmarkDecodeLargeIndented(b *testing.B) {
 
 func BenchmarkDecodeLargeOwned(b *testing.B) {
 	src := benchRecordsJSON(1024)
-	decoder, err := CompileDecoder[benchDocument](TypedOptions{CaseSensitive: true})
+	decoder, err := CompileDecoder[benchDocument](DecoderOptions{CaseSensitive: true})
 	if err != nil {
 		b.Fatal(err)
 	}

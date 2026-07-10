@@ -67,7 +67,7 @@ func Indent(src []byte, prefix, indent string) ([]byte, error) {
 
 // AppendIndent parses src and appends pretty JSON using prefix and indent.
 func AppendIndent(dst, src []byte, prefix, indent string) ([]byte, error) {
-	v, err := ParseZeroCopy(src)
+	v, err := ParseOptions(src, Options{ZeroCopy: true})
 	if err != nil {
 		return dst, err
 	}
@@ -178,7 +178,7 @@ func Canonicalize(src []byte) ([]byte, error) {
 
 // AppendCanonicalize sorts object members recursively and appends compact JSON.
 func AppendCanonicalize(dst, src []byte) ([]byte, error) {
-	v, err := ParseZeroCopy(src)
+	v, err := ParseOptions(src, Options{ZeroCopy: true})
 	if err != nil {
 		return dst, err
 	}

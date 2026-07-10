@@ -115,11 +115,11 @@ func checkValidationConsistency(t *testing.T, src []byte, want bool) {
 	if (parseErr == nil) != want {
 		t.Fatalf("Parse error = %v, want valid %v", parseErr, want)
 	}
-	_, zeroCopyErr := ParseZeroCopy(src)
+	_, zeroCopyErr := parseZeroCopyForTest(src)
 	if (zeroCopyErr == nil) != want {
 		t.Fatalf("ParseZeroCopy error = %v, want valid %v", zeroCopyErr, want)
 	}
-	_, minAllocErr := ParseMinAlloc(src)
+	_, minAllocErr := parseMinAllocForTest(src)
 	if (minAllocErr == nil) != want {
 		t.Fatalf("ParseMinAlloc error = %v, want valid %v", minAllocErr, want)
 	}

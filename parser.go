@@ -28,23 +28,6 @@ func Parse(src []byte) (Value, error) {
 	return ParseOptions(src, Options{})
 }
 
-// ParseString parses s into an ordered JSON AST.
-func ParseString(s string) (Value, error) {
-	return Parse([]byte(s))
-}
-
-// ParseZeroCopy parses src and aliases unescaped strings and numbers into src.
-// Callers must not mutate src for as long as the returned Value is used.
-func ParseZeroCopy(src []byte) (Value, error) {
-	return ParseOptions(src, Options{ZeroCopy: true})
-}
-
-// ParseMinAlloc parses src with zero-copy strings and shared container backing.
-// Callers must not mutate src for as long as the returned Value is used.
-func ParseMinAlloc(src []byte) (Value, error) {
-	return ParseOptions(src, Options{ZeroCopy: true, Preallocate: true})
-}
-
 // ParseOptions parses src using opts.
 func ParseOptions(src []byte, opts Options) (Value, error) {
 	p := parser{src: src, maxDepth: opts.MaxDepth, zeroCopy: opts.ZeroCopy}

@@ -54,7 +54,7 @@ type decoderCursor struct {
 }
 
 // newDecoderCursor starts decoding src with opts.
-func newDecoderCursor(src []byte, opts TypedOptions) decoderCursor {
+func newDecoderCursor(src []byte, opts DecoderOptions) decoderCursor {
 	maxDepth := opts.MaxDepth
 	if maxDepth <= 0 {
 		maxDepth = defaultMaxDepth
@@ -341,7 +341,7 @@ func (c *decoderCursor) Skip() error {
 // Unknown skips key unless unknown fields are disallowed.
 func (c *decoderCursor) Unknown(typeName, key string) error {
 	if c.flags&decoderDisallowUnknown != 0 {
-		return &TypedDecodeError{Offset: c.i, TypeName: typeName, Reason: "unknown field " + strconv.Quote(key)}
+		return &DecodeError{Offset: c.i, TypeName: typeName, Reason: "unknown field " + strconv.Quote(key)}
 	}
 	return c.Skip()
 }
@@ -767,9 +767,9 @@ func (c *decoderCursor) genericExpected[T any](jsonType string) error {
 }
 
 func (c *decoderCursor) genericError[T any](offset int, reason string) error {
-	return &TypedDecodeError{Offset: offset, Type: reflect.TypeFor[T](), Reason: reason}
+	return &DecodeError{Offset: offset, Type: reflect.TypeFor[T](), Reason: reason}
 }
 
 func (c *decoderCursor) expected(typeName, jsonType string) error {
-	return &TypedDecodeError{Offset: c.i, TypeName: typeName, Reason: "expected " + jsonType}
+	return &DecodeError{Offset: c.i, TypeName: typeName, Reason: "expected " + jsonType}
 }

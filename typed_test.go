@@ -51,7 +51,7 @@ func TestTypedDecoderMatchesStdlib(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	decoder, err := CompileDecoder[typedTestDocument](TypedOptions{ZeroCopy: true})
+	decoder, err := CompileDecoder[typedTestDocument](DecoderOptions{ZeroCopy: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestTypedDecoderMatchesStdlib(t *testing.T) {
 
 func TestTypedDecoderReuseAndAllocations(t *testing.T) {
 	src := []byte(`{"items":[{"id":1,"ok":true,"name":"one","scores":[1,2.5,-3e4],"number":1},{"id":2,"ok":false,"name":"two","scores":[4,5,6],"number":2}],"count":2,"next":null}`)
-	decoder, err := CompileDecoder[typedTestDocument](TypedOptions{ZeroCopy: true, CaseSensitive: true})
+	decoder, err := CompileDecoder[typedTestDocument](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestTypedDecoderReuseAndAllocations(t *testing.T) {
 }
 
 func TestTypedDecoderOptionsAndUnsupportedTypes(t *testing.T) {
-	strict, err := CompileDecoder[typedTestRecord](TypedOptions{DisallowUnknownFields: true})
+	strict, err := CompileDecoder[typedTestRecord](DecoderOptions{DisallowUnknownFields: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,16 +97,16 @@ func TestTypedDecoderOptionsAndUnsupportedTypes(t *testing.T) {
 	if err := strict.Decode([]byte(`{"unknown":1}`), &record); err == nil {
 		t.Fatal("typed decoder accepted unknown field")
 	}
-	if _, err := CompileDecoder[map[string]int](TypedOptions{}); err == nil {
+	if _, err := CompileDecoder[map[string]int](DecoderOptions{}); err == nil {
 		t.Fatal("typed decoder accepted map type")
 	}
-	if _, err := CompileDecoder[struct{ Value any }](TypedOptions{}); err == nil {
+	if _, err := CompileDecoder[struct{ Value any }](DecoderOptions{}); err == nil {
 		t.Fatal("typed decoder accepted interface field")
 	}
 }
 
 func TestTypedDecoderReplacementAndFieldFallbacks(t *testing.T) {
-	decoder, err := CompileDecoder[typedEdgeValue](TypedOptions{ZeroCopy: true})
+	decoder, err := CompileDecoder[typedEdgeValue](DecoderOptions{ZeroCopy: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,15 +154,15 @@ func TestTypedDecoderReplacementAndFieldFallbacks(t *testing.T) {
 }
 
 func TestTypedDecoderNestedErrorType(t *testing.T) {
-	decoder, err := CompileDecoder[typedEdgeValue](TypedOptions{})
+	decoder, err := CompileDecoder[typedEdgeValue](DecoderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var dst typedEdgeValue
 	err = decoder.Decode([]byte(`{"fixed":[1,1.5]}`), &dst)
-	var typedErr *TypedDecodeError
+	var typedErr *DecodeError
 	if !errors.As(err, &typedErr) {
-		t.Fatalf("error = %v, want TypedDecodeError", err)
+		t.Fatalf("error = %v, want DecodeError", err)
 	}
 	if typedErr.Type != reflect.TypeFor[typedEdgeInt]() {
 		t.Fatalf("error type = %v, want %v", typedErr.Type, reflect.TypeFor[typedEdgeInt]())
@@ -170,7 +170,7 @@ func TestTypedDecoderNestedErrorType(t *testing.T) {
 }
 
 func TestTypedDecoderSliceGrowthAndNamedPointer(t *testing.T) {
-	decoder, err := CompileDecoder[typedEdgeValue](TypedOptions{ZeroCopy: true, CaseSensitive: true})
+	decoder, err := CompileDecoder[typedEdgeValue](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestTypedDecoderSliceGrowthAndNamedPointer(t *testing.T) {
 }
 
 func TestTypedDecoderDecodeArray(t *testing.T) {
-	decoder, err := CompileDecoder[typedEdgeValue](TypedOptions{ZeroCopy: true, CaseSensitive: true})
+	decoder, err := CompileDecoder[typedEdgeValue](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +231,7 @@ func TestTypedDecoderSmallDecodeAllocations(t *testing.T) {
 		ID   int    `json:"id"`
 		OK   bool   `json:"ok"`
 		Name string `json:"name"`
-	}](TypedOptions{ZeroCopy: true, CaseSensitive: true})
+	}](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func FuzzTypedDecoderMatchesStdlib(f *testing.F) {
 	} {
 		f.Add(src)
 	}
-	decoder, err := CompileDecoder[typedEdgeValue](TypedOptions{})
+	decoder, err := CompileDecoder[typedEdgeValue](DecoderOptions{})
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -277,4 +277,92 @@ func FuzzTypedDecoderMatchesStdlib(f *testing.F) {
 			t.Fatalf("decoded value differs: simdjson=%#v stdlib=%#v", got, want)
 		}
 	})
+}
+
+func TestDecodeErrorReportsPath(t *testing.T) {
+	decoder, err := CompileDecoder[typedTestDocument](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		src  string
+		path string
+	}{
+		{
+			name: "nested array element",
+			src:  `{"items":[{"id":1,"ok":true,"name":"a","scores":[1,2,3],"number":1},{"id":2,"ok":true,"name":"b","scores":[1,"x",3],"number":2}],"count":1}`,
+			path: "items[1].scores[1]",
+		},
+		{
+			name: "scalar field",
+			src:  `{"items":[{"id":"nope"}],"count":1}`,
+			path: "items[0].id",
+		},
+		{
+			name: "container mismatch",
+			src:  `{"items":[7],"count":1}`,
+			path: "items[0]",
+		},
+		{
+			name: "pointer target field",
+			src:  `{"count":1,"next":{"id":1,"ok":"broken"}}`,
+			path: "next.ok",
+		},
+		{
+			name: "top level",
+			src:  `[1]`,
+			path: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var dst typedTestDocument
+			err := decoder.Decode([]byte(tc.src), &dst)
+			var decodeErr *DecodeError
+			if !errors.As(err, &decodeErr) {
+				t.Fatalf("Decode(%q) error = %v, want *DecodeError", tc.src, err)
+			}
+			if decodeErr.Path != tc.path {
+				t.Fatalf("Decode(%q) path = %q, want %q", tc.src, decodeErr.Path, tc.path)
+			}
+		})
+	}
+}
+
+func TestUnmarshalMatchesCompiledDecoder(t *testing.T) {
+	src := []byte(`{"items":[{"ID":1,"ok":true,"name":"one","scores":[1,2.5,-3e4],"number":9}],"count":7}`)
+	var want typedTestDocument
+	if err := json.Unmarshal(src, &want); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		var got typedTestDocument
+		if err := Unmarshal(src, &got); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("Unmarshal = %#v, want %#v", got, want)
+		}
+	}
+
+	var invalid func()
+	err := Unmarshal([]byte(`1`), &invalid)
+	var unsupported *UnsupportedTypeError
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("Unmarshal into func = %v, want *UnsupportedTypeError", err)
+	}
+
+	// Owned strings must survive input mutation.
+	input := []byte(`{"items":[{"id":1,"ok":true,"name":"keepsake","scores":[1,2,3],"number":1}],"count":1}`)
+	var owned typedTestDocument
+	if err := Unmarshal(input, &owned); err != nil {
+		t.Fatal(err)
+	}
+	for i := range input {
+		input[i] = 'x'
+	}
+	if owned.Items[0].Name != "keepsake" {
+		t.Fatalf("Unmarshal string aliases input: %q", owned.Items[0].Name)
+	}
 }
