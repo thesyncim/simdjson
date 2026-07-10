@@ -60,6 +60,10 @@ func decodeCompiled(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) 
 		return decodeCompiledAny(cursor, dst)
 	case typedBytes:
 		return decodeCompiledBytes(cursor, node, dst)
+	case typedUnmarshalerJSON:
+		return decodeViaUnmarshaler(cursor, node, dst)
+	case typedUnmarshalerText:
+		return decodeViaTextUnmarshaler(cursor, node, dst)
 	default:
 		return &DecodeError{Offset: cursor.i, Type: node.typ, Reason: "invalid compiled operation"}
 	}
@@ -180,6 +184,12 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 			fieldErr = decodeCompiledBytes(cursor, fieldNode, fieldDst)
 		case typedOpQuoted:
 			fieldErr = decodeQuotedField(cursor, fieldNode, fieldDst)
+		case typedOpUnmarshaler:
+			if fieldNode.kind == typedUnmarshalerJSON {
+				fieldErr = decodeViaUnmarshaler(cursor, fieldNode, fieldDst)
+			} else {
+				fieldErr = decodeViaTextUnmarshaler(cursor, fieldNode, fieldDst)
+			}
 		default:
 			fieldErr = &DecodeError{Offset: cursor.i, Type: fieldNode.typ, Reason: "invalid compiled operation"}
 		}
@@ -453,6 +463,10 @@ func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 				elementErr = decodeCompiledAny(cursor, element)
 			case typedBytes:
 				elementErr = decodeCompiledBytes(cursor, node.elem, element)
+			case typedUnmarshalerJSON:
+				elementErr = decodeViaUnmarshaler(cursor, node.elem, element)
+			case typedUnmarshalerText:
+				elementErr = decodeViaTextUnmarshaler(cursor, node.elem, element)
 			default:
 				elementErr = &DecodeError{Offset: cursor.i, Type: node.elem.typ, Reason: "invalid compiled operation"}
 			}
@@ -836,7 +850,7 @@ func prepareTypedResets(node *typedNode, seen map[*typedNode]bool) {
 }
 
 func appendTypedReset(ops []typedResetOp, node *typedNode, offset uintptr) []typedResetOp {
-	switch node.kind {
+	switch node.baseKind {
 	case typedBool, typedInt, typedUint, typedFloat:
 		return appendTypedClear(ops, offset, node.size)
 	case typedString, typedNumber:
@@ -871,7 +885,7 @@ func appendTypedReset(ops []typedResetOp, node *typedNode, offset uintptr) []typ
 }
 
 func typedRawClearable(node *typedNode) bool {
-	switch node.kind {
+	switch node.baseKind {
 	case typedBool, typedInt, typedUint, typedFloat:
 		return true
 	case typedArray:

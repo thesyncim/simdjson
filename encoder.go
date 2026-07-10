@@ -155,7 +155,7 @@ type encodeState struct {
 }
 
 func (e *encodeState) encode(node *typedNode, src unsafe.Pointer) error {
-	switch node.kind {
+	switch node.encKind {
 	case typedBool:
 		if *(*bool)(src) {
 			e.dst = append(e.dst, "true"...)
@@ -203,6 +203,8 @@ func (e *encodeState) encode(node *typedNode, src unsafe.Pointer) error {
 		return e.encodeMap(node, src)
 	case typedAny:
 		return e.encodeAny(src)
+	case typedMarshalerJSON, typedMarshalerText:
+		return e.encodeMarshaler(node, src)
 	case typedBytes:
 		header := (*typedSliceHeader)(src)
 		if header.data == nil {
@@ -265,7 +267,7 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 			e.dst = append(e.dst, encField.encNamePlain...)
 		}
 		var err error
-		switch field.op {
+		switch encField.encOp {
 		case typedOpBool:
 			if *(*bool)(fieldSrc) {
 				e.dst = append(e.dst, "true"...)
@@ -282,6 +284,8 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 			err = e.encodeFloat(*(*float64)(fieldSrc), 64)
 		case typedOpQuoted:
 			err = e.encodeQuoted(field.node, fieldSrc)
+		case typedOpMarshaler:
+			err = e.encodeMarshaler(field.node, fieldSrc)
 		default:
 			err = e.encode(field.node, fieldSrc)
 		}
@@ -585,7 +589,7 @@ func (e *encodeState) encodeNumberLiteral(literal string) error {
 // matching encoding/json: false, zero numbers, empty strings, nil pointers,
 // and zero-length slices.
 func typedValueIsEmpty(node *typedNode, src unsafe.Pointer) bool {
-	switch node.kind {
+	switch node.baseKind {
 	case typedBool:
 		return !*(*bool)(src)
 	case typedString, typedNumber:

@@ -1,6 +1,7 @@
 package simdjson
 
 import (
+	"encoding"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -53,10 +54,14 @@ func CompileDecoder[T any](opts DecoderOptions) (Decoder[T], error) {
 	return Decoder[T]{
 		root: root,
 		rootSlice: &typedNode{
-			kind: typedSlice,
-			typ:  reflect.TypeFor[[]T](),
-			name: reflect.TypeFor[[]T]().String(),
-			elem: root,
+			kind:     typedSlice,
+			encKind:  typedSlice,
+			baseKind: typedSlice,
+			op:       typedOpSlice,
+			encOp:    typedOpSlice,
+			typ:      reflect.TypeFor[[]T](),
+			name:     reflect.TypeFor[[]T]().String(),
+			elem:     root,
 		},
 		options: opts,
 	}, nil
@@ -197,6 +202,10 @@ const (
 	typedMap
 	typedAny
 	typedBytes
+	typedUnmarshalerJSON
+	typedUnmarshalerText
+	typedMarshalerJSON
+	typedMarshalerText
 )
 
 type typedOp uint8
@@ -224,12 +233,17 @@ const (
 	typedOpAny
 	typedOpBytes
 	typedOpQuoted
+	typedOpUnmarshaler
+	typedOpMarshaler
 )
 
 type typedNode struct {
-	kind   typedKind
-	op     typedOp
-	typ    reflect.Type
+	kind     typedKind // decode dispatch
+	encKind  typedKind // encode dispatch
+	baseKind typedKind // structural layout, for resets and emptiness
+	op       typedOp
+	encOp    typedOp
+	typ      reflect.Type
 	name   string
 	size   uintptr
 	bits   int
@@ -263,6 +277,7 @@ type typedField struct {
 type typedEncField struct {
 	encName      string
 	encNamePlain string
+	encOp        typedOp
 	omitEmpty    bool
 }
 
@@ -279,10 +294,35 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 	node := &typedNode{typ: typ, name: typ.String(), size: typ.Size()}
 	c.nodes[typ] = node
 
+	if err := c.compileStructural(node, typ, path); err != nil {
+		// A custom un/marshaler stands in for the broken structural layout;
+		// a direction that still needs structure reports failure at runtime.
+		node.kind, node.encKind, node.baseKind = typedInvalid, typedInvalid, typedInvalid
+		node.op, node.encOp = typedOpInvalid, typedOpInvalid
+		node.fields, node.encFields, node.fieldHops, node.hopResets = nil, nil, nil, nil
+		node.elem = nil
+		if !c.applyInterfaceKinds(node, typ) {
+			return nil, err
+		}
+		if node.kind == typedInvalid && node.encKind == typedInvalid {
+			return nil, err
+		}
+		c.nodes[typ] = node
+		return node, nil
+	}
+	node.baseKind = node.kind
+	node.encKind = node.kind
+	node.encOp = node.op
+	c.applyInterfaceKinds(node, typ)
+	return node, nil
+}
+
+// compileStructural fills node with typ's structural layout.
+func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, path string) error {
 	if typ == jsonNumberReflectType {
 		node.kind = typedNumber
 		node.op = typedOpNumber
-		return node, nil
+		return nil
 	}
 
 	switch typ.Kind() {
@@ -331,7 +371,7 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 		node.op = typedOpPointer
 		elem, err := c.compile(typ.Elem(), path+"*")
 		if err != nil {
-			return nil, err
+			return err
 		}
 		node.elem = elem
 	case reflect.Slice:
@@ -344,7 +384,7 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 		node.op = typedOpSlice
 		elem, err := c.compile(typ.Elem(), path+"[]")
 		if err != nil {
-			return nil, err
+			return err
 		}
 		node.elem = elem
 	case reflect.Array:
@@ -353,24 +393,24 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 		node.length = typ.Len()
 		elem, err := c.compile(typ.Elem(), path+"[]")
 		if err != nil {
-			return nil, err
+			return err
 		}
 		node.elem = elem
 	case reflect.Interface:
 		if typ.NumMethod() != 0 {
-			return nil, c.unsupported(typ, path, "non-empty interfaces would require dynamic dispatch")
+			return c.unsupported(typ, path, "non-empty interfaces would require dynamic dispatch")
 		}
 		node.kind = typedAny
 		node.op = typedOpAny
 	case reflect.Map:
 		if typ.Key().Kind() != reflect.String {
-			return nil, c.unsupported(typ, path, "map keys must have a string kind")
+			return c.unsupported(typ, path, "map keys must have a string kind")
 		}
 		node.kind = typedMap
 		node.op = typedOpMap
 		elem, err := c.compile(typ.Elem(), path+"[key]")
 		if err != nil {
-			return nil, err
+			return err
 		}
 		node.elem = elem
 	case reflect.Struct:
@@ -379,11 +419,11 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 		for _, resolved := range resolveStructFields(typ) {
 			fieldNode, err := c.compile(resolved.typ, path+"."+resolved.name)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			offset, hops, hopErr := c.fieldHops(typ, resolved.index, path+"."+resolved.name)
 			if hopErr != nil {
-				return nil, hopErr
+				return hopErr
 			}
 			fieldIndex := len(node.fields)
 			compiledField := typedField{
@@ -401,21 +441,24 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 				// style resets must clear it explicitly.
 				node.hopResets = append(node.hopResets, hops[0].offset)
 			}
-			node.encFields = append(node.encFields, typedEncField{
+			encField := typedEncField{
 				encName:      string(appendEncodedJSONString(nil, resolved.name, true)) + ":",
 				encNamePlain: string(appendEncodedJSONString(nil, resolved.name, false)) + ":",
+				encOp:        fieldNode.encOp,
 				omitEmpty:    resolved.omitEmpty,
-			})
+			}
 			if resolved.quoted {
 				quotedNode := fieldNode
 				if quotedNode.kind == typedPointer && resolved.typ.Name() == "" {
 					quotedNode = quotedNode.elem
 				}
-				switch quotedNode.kind {
+				switch quotedNode.baseKind {
 				case typedBool, typedString, typedNumber, typedInt, typedUint, typedFloat:
 					compiledField.op = typedOpQuoted
+					encField.encOp = typedOpQuoted
 				}
 			}
+			node.encFields = append(node.encFields, encField)
 			if fieldIndex < 64 {
 				compiledField.seen = uint64(1) << fieldIndex
 			}
@@ -451,10 +494,47 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 			}
 		}
 	default:
-		return nil, c.unsupported(typ, path, "kind "+typ.Kind().String()+" would require interface or reflective value dispatch")
+		return c.unsupported(typ, path, "kind "+typ.Kind().String()+" would require interface or reflective value dispatch")
 	}
-	return node, nil
+	return nil
 }
+
+var (
+	jsonMarshalerReflectType   = reflect.TypeFor[json.Marshaler]()
+	jsonUnmarshalerReflectType = reflect.TypeFor[json.Unmarshaler]()
+	textMarshalerReflectType   = reflect.TypeFor[encoding.TextMarshaler]()
+	textUnmarshalerReflectType = reflect.TypeFor[encoding.TextUnmarshaler]()
+)
+
+// applyInterfaceKinds overrides dispatch for types with custom un/marshalers,
+// reporting whether any interface applies. json.Number keeps its fast path.
+func (c *typedCompiler) applyInterfaceKinds(node *typedNode, typ reflect.Type) bool {
+	if typ == jsonNumberReflectType {
+		return false
+	}
+	pointerType := reflect.PointerTo(typ)
+	applied := false
+	if typ.Implements(jsonUnmarshalerReflectType) || pointerType.Implements(jsonUnmarshalerReflectType) {
+		node.kind = typedUnmarshalerJSON
+		node.op = typedOpUnmarshaler
+		applied = true
+	} else if typ.Implements(textUnmarshalerReflectType) || pointerType.Implements(textUnmarshalerReflectType) {
+		node.kind = typedUnmarshalerText
+		node.op = typedOpUnmarshaler
+		applied = true
+	}
+	if typ.Implements(jsonMarshalerReflectType) || pointerType.Implements(jsonMarshalerReflectType) {
+		node.encKind = typedMarshalerJSON
+		node.encOp = typedOpMarshaler
+		applied = true
+	} else if typ.Implements(textMarshalerReflectType) || pointerType.Implements(textMarshalerReflectType) {
+		node.encKind = typedMarshalerText
+		node.encOp = typedOpMarshaler
+		applied = true
+	}
+	return applied
+}
+
 
 func validTypedTag(name string) bool {
 	if name == "" {
@@ -555,7 +635,7 @@ func resetTyped(node *typedNode, dst unsafe.Pointer) {
 		applyTypedReset(node.reset, dst)
 		return
 	}
-	switch node.kind {
+	switch node.baseKind {
 	case typedBool:
 		*(*bool)(dst) = false
 	case typedString, typedNumber:

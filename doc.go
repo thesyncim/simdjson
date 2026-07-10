@@ -32,6 +32,15 @@
 // malformed json.Number) return an [EncodeError] carrying the same style of
 // value path as [DecodeError].
 //
+// # Custom marshalers
+//
+// Types implementing json.Marshaler, json.Unmarshaler,
+// encoding.TextMarshaler, or encoding.TextUnmarshaler — including time.Time —
+// are dispatched through those interfaces like encoding/json. One rule is
+// stricter than stdlib: implementations must not retain their receiver after
+// the call returns, mirroring the existing rule that UnmarshalJSON must not
+// retain its input slice.
+//
 // # Validation and selection
 //
 // [Valid] and [Validate] check strict JSON syntax without building any

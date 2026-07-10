@@ -639,8 +639,8 @@ type embTagged struct {
 	embBase `json:"base"` // tagged: nested object, not flattened
 }
 
-type embConflictA struct{ X int `json:"same"` }
-type embConflictB struct{ Y int `json:"same"` }
+type embConflictA struct{ Same int }
+type embConflictB struct{ Same int }
 type embConflict struct {
 	embConflictA
 	embConflictB // same depth, same name: both dropped
@@ -684,7 +684,7 @@ func TestEmbeddedFieldsMatchStdlib(t *testing.T) {
 		{"pointer embedding", differential[embPointer](t, `{"id":4,"name":"p","extra":"e"}`)},
 		{"pointer embedding absent", differential[embPointer](t, `{"extra":"only"}`)},
 		{"tagged anonymous", differential[embTagged](t, `{"base":{"id":5,"name":"tag"}}`)},
-		{"same depth conflict", differential[embConflict](t, `{"same":9,"z":1}`)},
+		{"same depth conflict", differential[embConflict](t, `{"Same":9,"z":1}`)},
 		{"embedded scalar", differential[embNonStruct](t, `{"embInt":7,"v":8}`)},
 		{"unexported embedded struct", differential[embUnexported](t, `{"inner":"i","top":9}`)},
 		{"deep nesting", differential[embDeep](t, `{"id":1,"name":"d","mid":2,"own":3}`)},

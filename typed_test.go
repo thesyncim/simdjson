@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -50,6 +51,7 @@ type typedEdgeValue struct {
 	Next    typedEdgePointer `json:"next"`
 	Extra   map[string]int   `json:"extra"`
 	Meta    any              `json:"meta"`
+	When    *time.Time       `json:"when"`
 }
 
 func TestTypedDecoderMatchesStdlib(t *testing.T) {
