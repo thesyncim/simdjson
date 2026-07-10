@@ -1,0 +1,667 @@
+package simdjson
+
+import (
+	"strconv"
+)
+
+// RawValue is an exact JSON value slice aliasing the source passed to GetRaw.
+type RawValue struct {
+	src []byte
+}
+
+// Bytes returns the raw JSON bytes. The returned slice aliases the input.
+func (r RawValue) Bytes() []byte {
+	return r.src
+}
+
+// AppendJSON appends the raw JSON value to dst.
+func (r RawValue) AppendJSON(dst []byte) []byte {
+	return append(dst, r.src...)
+}
+
+// String returns the raw JSON value as a string.
+func (r RawValue) String() string {
+	return string(r.src)
+}
+
+// Kind returns the top-level kind of the raw JSON value.
+func (r RawValue) Kind() Kind {
+	if len(r.src) == 0 {
+		return Invalid
+	}
+	switch r.src[0] {
+	case 'n':
+		return Null
+	case 't', 'f':
+		return Bool
+	case '"':
+		return String
+	case '[':
+		return Array
+	case '{':
+		return Object
+	default:
+		if r.src[0] == '-' || isDigit(r.src[0]) {
+			return Number
+		}
+		return Invalid
+	}
+}
+
+// Valid reports whether r is strict JSON.
+func (r RawValue) Valid() bool {
+	return Valid(r.src)
+}
+
+// IsNull reports whether r is the JSON null value.
+func (r RawValue) IsNull() bool {
+	return len(r.src) == 4 && r.src[0] == 'n' && r.src[1] == 'u' && r.src[2] == 'l' && r.src[3] == 'l'
+}
+
+// Bool returns r as a bool when it is a JSON boolean.
+func (r RawValue) Bool() (bool, bool) {
+	switch {
+	case len(r.src) == 4 && r.src[0] == 't' && r.src[1] == 'r' && r.src[2] == 'u' && r.src[3] == 'e':
+		return true, true
+	case len(r.src) == 5 && r.src[0] == 'f' && r.src[1] == 'a' && r.src[2] == 'l' && r.src[3] == 's' && r.src[4] == 'e':
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// NumberBytes returns r's original JSON number spelling.
+func (r RawValue) NumberBytes() ([]byte, bool) {
+	if !ValidNumber(r.src) {
+		return nil, false
+	}
+	return r.src, true
+}
+
+// NumberText returns r's original JSON number spelling as a string aliasing the input.
+func (r RawValue) NumberText() (string, bool) {
+	if !ValidNumber(r.src) {
+		return "", false
+	}
+	return ownedBytesString(r.src), true
+}
+
+// Int64 parses r as an int64 JSON number.
+func (r RawValue) Int64() (int64, bool) {
+	s, ok := r.NumberText()
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	return n, err == nil
+}
+
+// Float64 parses r as a float64 JSON number.
+func (r RawValue) Float64() (float64, bool) {
+	s, ok := r.NumberText()
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseFloat(s, 64)
+	return n, err == nil
+}
+
+// Text returns r as an unquoted JSON string.
+//
+// Unescaped strings return a string aliasing the input. Escaped strings allocate
+// only for the unescaped output.
+func (r RawValue) Text() (string, bool, error) {
+	if len(r.src) == 0 || r.src[0] != '"' {
+		return "", false, nil
+	}
+	s := rawSeeker{src: r.src, maxDepth: defaultMaxDepth}
+	start, end, escaped, err := s.parseStringRaw()
+	if err != nil {
+		return "", true, err
+	}
+	if s.i != len(r.src) {
+		return "", true, syntaxError(r.src, s.i, "unexpected data after string")
+	}
+	if !escaped {
+		return ownedBytesString(r.src[start:end]), true, nil
+	}
+	p := parser{src: r.src, maxDepth: defaultMaxDepth, zeroCopy: true}
+	text, err := p.parseString()
+	if err != nil {
+		return "", true, err
+	}
+	if p.i != len(r.src) {
+		return "", true, syntaxError(r.src, p.i, "unexpected data after string")
+	}
+	return text, true, nil
+}
+
+// Get returns a strict raw JSON Pointer target within r.
+func (r RawValue) Get(pointer string) (RawValue, bool, error) {
+	return GetRaw(r.src, pointer)
+}
+
+// Scan returns a raw JSON Pointer target within r and stops after validating
+// the target. It does not validate bytes after the match.
+func (r RawValue) Scan(pointer string) (RawValue, bool, error) {
+	return ScanRaw(r.src, pointer)
+}
+
+// GetCompiled returns a strict precompiled JSON Pointer target within r.
+func (r RawValue) GetCompiled(pointer CompiledPointer) (RawValue, bool, error) {
+	return pointer.GetRaw(r.src)
+}
+
+// ScanCompiled is Scan with a precompiled pointer.
+func (r RawValue) ScanCompiled(pointer CompiledPointer) (RawValue, bool, error) {
+	return pointer.ScanRaw(r.src)
+}
+
+// GetRaw validates src and returns the JSON Pointer target as a raw source slice.
+func GetRaw(src []byte, pointer string) (RawValue, bool, error) {
+	return GetRawOptions(src, pointer, Options{})
+}
+
+// ScanRaw returns the JSON Pointer target as a raw source slice and stops as
+// soon as that target has been validated. It validates the traversed path and
+// skipped siblings before the target, but unlike GetRaw it does not validate the
+// remainder of the document after a match.
+func ScanRaw(src []byte, pointer string) (RawValue, bool, error) {
+	return ScanRawOptions(src, pointer, Options{})
+}
+
+// ScanRawOptions is ScanRaw with parser options.
+func ScanRawOptions(src []byte, pointer string, opts Options) (RawValue, bool, error) {
+	if err := validatePointerSyntax(pointer); err != nil {
+		return RawValue{}, false, err
+	}
+	s := rawSeeker{src: src, maxDepth: opts.MaxDepth, stopAfterFound: true}
+	if s.maxDepth <= 0 {
+		s.maxDepth = defaultMaxDepth
+	}
+	s.skipSpace()
+	if pointer == "" {
+		return s.captureValue(0)
+	}
+	return s.findValue(0, 1, pointer)
+}
+
+// GetRaw validates src and returns p's target as a raw source slice.
+func (p CompiledPointer) GetRaw(src []byte) (RawValue, bool, error) {
+	return p.GetRawOptions(src, Options{})
+}
+
+// GetRawOptions is GetRaw with parser options.
+func (p CompiledPointer) GetRawOptions(src []byte, opts Options) (RawValue, bool, error) {
+	s := rawSeeker{src: src, maxDepth: opts.MaxDepth}
+	if s.maxDepth <= 0 {
+		s.maxDepth = defaultMaxDepth
+	}
+	s.skipSpace()
+	raw, ok, err := s.findCompiledValue(0, 0, p)
+	if err != nil {
+		return RawValue{}, false, err
+	}
+	s.skipSpace()
+	if s.i != len(src) {
+		return RawValue{}, false, syntaxError(src, s.i, "unexpected data after top-level value")
+	}
+	return raw, ok, nil
+}
+
+// ScanRaw returns p's target as a raw source slice and stops as soon as that
+// target has been validated.
+func (p CompiledPointer) ScanRaw(src []byte) (RawValue, bool, error) {
+	return p.ScanRawOptions(src, Options{})
+}
+
+// ScanRawOptions is ScanRaw with parser options.
+func (p CompiledPointer) ScanRawOptions(src []byte, opts Options) (RawValue, bool, error) {
+	s := rawSeeker{src: src, maxDepth: opts.MaxDepth, stopAfterFound: true}
+	if s.maxDepth <= 0 {
+		s.maxDepth = defaultMaxDepth
+	}
+	s.skipSpace()
+	return s.findCompiledValue(0, 0, p)
+}
+
+// GetRawOptions validates src using opts and returns the JSON Pointer target as
+// a raw source slice. The returned value aliases src.
+func GetRawOptions(src []byte, pointer string, opts Options) (RawValue, bool, error) {
+	if err := validatePointerSyntax(pointer); err != nil {
+		return RawValue{}, false, err
+	}
+	s := rawSeeker{src: src, maxDepth: opts.MaxDepth}
+	if s.maxDepth <= 0 {
+		s.maxDepth = defaultMaxDepth
+	}
+	s.skipSpace()
+	var (
+		raw RawValue
+		ok  bool
+		err error
+	)
+	if pointer == "" {
+		raw, ok, err = s.captureValue(0)
+	} else {
+		raw, ok, err = s.findValue(0, 1, pointer)
+	}
+	if err != nil {
+		return RawValue{}, false, err
+	}
+	s.skipSpace()
+	if s.i != len(src) {
+		return RawValue{}, false, syntaxError(src, s.i, "unexpected data after top-level value")
+	}
+	return raw, ok, nil
+}
+
+type rawSeeker struct {
+	src            []byte
+	i              int
+	maxDepth       int
+	stopAfterFound bool
+	done           bool
+}
+
+func (s *rawSeeker) skipSpace() {
+	s.i = skipSpace(s.src, s.i)
+}
+
+func (s *rawSeeker) captureValue(depth int) (RawValue, bool, error) {
+	start := s.i
+	if err := s.skipValue(depth); err != nil {
+		return RawValue{}, false, err
+	}
+	if s.stopAfterFound {
+		s.done = true
+	}
+	return RawValue{src: s.src[start:s.i]}, true, nil
+}
+
+func (s *rawSeeker) findValue(depth, tokenStart int, pointer string) (RawValue, bool, error) {
+	if tokenStart > len(pointer) {
+		return s.captureValue(depth)
+	}
+	if depth > s.maxDepth {
+		return RawValue{}, false, syntaxError(s.src, s.i, "maximum nesting depth exceeded")
+	}
+	if s.i >= len(s.src) {
+		return RawValue{}, false, syntaxError(s.src, s.i, "expected value")
+	}
+	switch s.src[s.i] {
+	case '{':
+		return s.findObject(depth+1, tokenStart, pointer)
+	case '[':
+		return s.findArray(depth+1, tokenStart, pointer)
+	default:
+		if err := s.skipValue(depth); err != nil {
+			return RawValue{}, false, err
+		}
+		return RawValue{}, false, nil
+	}
+}
+
+func (s *rawSeeker) findArray(depth, tokenStart int, pointer string) (RawValue, bool, error) {
+	if depth > s.maxDepth {
+		return RawValue{}, false, syntaxError(s.src, s.i, "maximum nesting depth exceeded")
+	}
+	tokenEnd, nextToken := pointerToken(pointer, tokenStart)
+	token, err := unescapePointerToken(pointer[tokenStart:tokenEnd])
+	if err != nil {
+		return RawValue{}, false, err
+	}
+	index, indexOK, err := parsePointerIndex(token)
+	if err != nil {
+		return RawValue{}, false, err
+	}
+
+	s.i++
+	s.skipSpace()
+	if s.i < len(s.src) && s.src[s.i] == ']' {
+		s.i++
+		return RawValue{}, false, nil
+	}
+
+	var (
+		raw RawValue
+		ok  bool
+	)
+	for elem := 0; ; elem++ {
+		s.skipSpace()
+		if indexOK && elem == index {
+			raw, ok, err = s.findValue(depth, nextToken, pointer)
+			if err != nil || s.done {
+				return raw, ok, err
+			}
+		} else {
+			err = s.skipValue(depth)
+		}
+		if err != nil {
+			return RawValue{}, false, err
+		}
+		s.skipSpace()
+		if s.i >= len(s.src) {
+			return RawValue{}, false, syntaxError(s.src, s.i, "unterminated array")
+		}
+		switch s.src[s.i] {
+		case ',':
+			s.i++
+		case ']':
+			s.i++
+			return raw, ok, nil
+		default:
+			return RawValue{}, false, syntaxError(s.src, s.i, "expected comma or closing bracket in array")
+		}
+	}
+}
+
+func (s *rawSeeker) findObject(depth, tokenStart int, pointer string) (RawValue, bool, error) {
+	if depth > s.maxDepth {
+		return RawValue{}, false, syntaxError(s.src, s.i, "maximum nesting depth exceeded")
+	}
+	tokenEnd, nextToken := pointerToken(pointer, tokenStart)
+	token, err := unescapePointerToken(pointer[tokenStart:tokenEnd])
+	if err != nil {
+		return RawValue{}, false, err
+	}
+
+	s.i++
+	s.skipSpace()
+	if s.i < len(s.src) && s.src[s.i] == '}' {
+		s.i++
+		return RawValue{}, false, nil
+	}
+
+	var (
+		raw RawValue
+		ok  bool
+	)
+	for {
+		s.skipSpace()
+		if s.i >= len(s.src) || s.src[s.i] != '"' {
+			return RawValue{}, false, syntaxError(s.src, s.i, "expected object key string")
+		}
+		keyStart, keyEnd, escaped, err := s.parseStringRaw()
+		if err != nil {
+			return RawValue{}, false, err
+		}
+		matched, err := s.keyMatches(token, keyStart, keyEnd, escaped)
+		if err != nil {
+			return RawValue{}, false, err
+		}
+		s.skipSpace()
+		if s.i >= len(s.src) || s.src[s.i] != ':' {
+			return RawValue{}, false, syntaxError(s.src, s.i, "expected colon after object key")
+		}
+		s.i++
+		s.skipSpace()
+		if matched {
+			raw, ok, err = s.findValue(depth, nextToken, pointer)
+			if err != nil || s.done {
+				return raw, ok, err
+			}
+		} else {
+			err = s.skipValue(depth)
+		}
+		if err != nil {
+			return RawValue{}, false, err
+		}
+		s.skipSpace()
+		if s.i >= len(s.src) {
+			return RawValue{}, false, syntaxError(s.src, s.i, "unterminated object")
+		}
+		switch s.src[s.i] {
+		case ',':
+			s.i++
+		case '}':
+			s.i++
+			return raw, ok, nil
+		default:
+			return RawValue{}, false, syntaxError(s.src, s.i, "expected comma or closing brace in object")
+		}
+	}
+}
+
+func (s *rawSeeker) findCompiledValue(depth, tokenIndex int, pointer CompiledPointer) (RawValue, bool, error) {
+	if tokenIndex >= len(pointer.tokens) {
+		return s.captureValue(depth)
+	}
+	if depth > s.maxDepth {
+		return RawValue{}, false, syntaxError(s.src, s.i, "maximum nesting depth exceeded")
+	}
+	if s.i >= len(s.src) {
+		return RawValue{}, false, syntaxError(s.src, s.i, "expected value")
+	}
+	switch s.src[s.i] {
+	case '{':
+		return s.findCompiledObject(depth+1, tokenIndex, pointer)
+	case '[':
+		return s.findCompiledArray(depth+1, tokenIndex, pointer)
+	default:
+		if err := s.skipValue(depth); err != nil {
+			return RawValue{}, false, err
+		}
+		return RawValue{}, false, nil
+	}
+}
+
+func (s *rawSeeker) findCompiledArray(depth, tokenIndex int, pointer CompiledPointer) (RawValue, bool, error) {
+	if depth > s.maxDepth {
+		return RawValue{}, false, syntaxError(s.src, s.i, "maximum nesting depth exceeded")
+	}
+	token := pointer.tokens[tokenIndex]
+	index, indexOK, err := token.arrayIndex()
+	if err != nil {
+		return RawValue{}, false, err
+	}
+
+	s.i++
+	s.skipSpace()
+	if s.i < len(s.src) && s.src[s.i] == ']' {
+		s.i++
+		return RawValue{}, false, nil
+	}
+
+	var (
+		raw RawValue
+		ok  bool
+	)
+	nextToken := tokenIndex + 1
+	for elem := 0; ; elem++ {
+		s.skipSpace()
+		if indexOK && elem == index {
+			raw, ok, err = s.findCompiledValue(depth, nextToken, pointer)
+			if err != nil || s.done {
+				return raw, ok, err
+			}
+		} else {
+			err = s.skipValue(depth)
+		}
+		if err != nil {
+			return RawValue{}, false, err
+		}
+		s.skipSpace()
+		if s.i >= len(s.src) {
+			return RawValue{}, false, syntaxError(s.src, s.i, "unterminated array")
+		}
+		switch s.src[s.i] {
+		case ',':
+			s.i++
+		case ']':
+			s.i++
+			return raw, ok, nil
+		default:
+			return RawValue{}, false, syntaxError(s.src, s.i, "expected comma or closing bracket in array")
+		}
+	}
+}
+
+func (s *rawSeeker) findCompiledObject(depth, tokenIndex int, pointer CompiledPointer) (RawValue, bool, error) {
+	if depth > s.maxDepth {
+		return RawValue{}, false, syntaxError(s.src, s.i, "maximum nesting depth exceeded")
+	}
+	token := pointer.tokens[tokenIndex].text
+
+	s.i++
+	s.skipSpace()
+	if s.i < len(s.src) && s.src[s.i] == '}' {
+		s.i++
+		return RawValue{}, false, nil
+	}
+
+	var (
+		raw RawValue
+		ok  bool
+	)
+	nextToken := tokenIndex + 1
+	for {
+		s.skipSpace()
+		if s.i >= len(s.src) || s.src[s.i] != '"' {
+			return RawValue{}, false, syntaxError(s.src, s.i, "expected object key string")
+		}
+		keyStart, keyEnd, escaped, err := s.parseStringRaw()
+		if err != nil {
+			return RawValue{}, false, err
+		}
+		matched, err := s.keyMatches(token, keyStart, keyEnd, escaped)
+		if err != nil {
+			return RawValue{}, false, err
+		}
+		s.skipSpace()
+		if s.i >= len(s.src) || s.src[s.i] != ':' {
+			return RawValue{}, false, syntaxError(s.src, s.i, "expected colon after object key")
+		}
+		s.i++
+		s.skipSpace()
+		if matched {
+			raw, ok, err = s.findCompiledValue(depth, nextToken, pointer)
+			if err != nil || s.done {
+				return raw, ok, err
+			}
+		} else {
+			err = s.skipValue(depth)
+		}
+		if err != nil {
+			return RawValue{}, false, err
+		}
+		s.skipSpace()
+		if s.i >= len(s.src) {
+			return RawValue{}, false, syntaxError(s.src, s.i, "unterminated object")
+		}
+		switch s.src[s.i] {
+		case ',':
+			s.i++
+		case '}':
+			s.i++
+			return raw, ok, nil
+		default:
+			return RawValue{}, false, syntaxError(s.src, s.i, "expected comma or closing brace in object")
+		}
+	}
+}
+
+func (s *rawSeeker) keyMatches(token string, keyStart, keyEnd int, escaped bool) (bool, error) {
+	if !escaped {
+		return bytesEqualString(s.src[keyStart:keyEnd], token), nil
+	}
+	p := parser{src: s.src, i: keyStart - 1, maxDepth: s.maxDepth, zeroCopy: true}
+	key, err := p.parseString()
+	if err != nil {
+		return false, err
+	}
+	return key == token, nil
+}
+
+func (s *rawSeeker) parseStringRaw() (start, end int, escaped bool, err error) {
+	s.i++
+	start = s.i
+	for {
+		j := scanStringSpecial(s.src, s.i)
+		if j >= len(s.src) {
+			return 0, 0, false, syntaxError(s.src, len(s.src), "unterminated string")
+		}
+		s.i = j
+		c := s.src[s.i]
+		switch {
+		case c == '"':
+			end = s.i
+			s.i++
+			return start, end, escaped, nil
+		case c == '\\':
+			escaped = true
+			s.i++
+			if s.i >= len(s.src) {
+				return 0, 0, false, syntaxError(s.src, s.i, "unterminated escape sequence")
+			}
+			v := validator{src: s.src, i: s.i, maxDepth: s.maxDepth}
+			if err := v.validateEscape(); err != nil {
+				return 0, 0, false, err
+			}
+			s.i = v.i
+		case c < 0x20:
+			return 0, 0, false, syntaxError(s.src, s.i, "unescaped control byte in string")
+		default:
+			next, bad := scanStringUnicodeRun(s.src, s.i)
+			if bad >= 0 {
+				return 0, 0, false, syntaxError(s.src, bad, "invalid UTF-8 in string")
+			}
+			s.i = next
+		}
+	}
+}
+
+func (s *rawSeeker) skipValue(depth int) error {
+	v := validator{src: s.src, i: s.i, maxDepth: s.maxDepth}
+	if err := v.parseValue(depth); err != nil {
+		return err
+	}
+	s.i = v.i
+	return nil
+}
+
+func pointerToken(pointer string, start int) (end, next int) {
+	end = start
+	for end < len(pointer) && pointer[end] != '/' {
+		end++
+	}
+	if end == len(pointer) {
+		return end, len(pointer) + 1
+	}
+	return end, end + 1
+}
+
+func validatePointerSyntax(pointer string) error {
+	if pointer == "" {
+		return nil
+	}
+	if pointer[0] != '/' {
+		return &PointerError{Pointer: pointer, Message: "pointer must be empty or start with slash"}
+	}
+	for i := 1; i < len(pointer); i++ {
+		if pointer[i] != '~' {
+			continue
+		}
+		if i+1 >= len(pointer) || (pointer[i+1] != '0' && pointer[i+1] != '1') {
+			msg := "unknown tilde escape"
+			if i+1 >= len(pointer) {
+				msg = "dangling tilde escape"
+			}
+			return &PointerError{Pointer: pointer, Message: msg}
+		}
+		i++
+	}
+	return nil
+}
+
+func bytesEqualString(b []byte, s string) bool {
+	if len(b) != len(s) {
+		return false
+	}
+	for i := range b {
+		if b[i] != s[i] {
+			return false
+		}
+	}
+	return true
+}
