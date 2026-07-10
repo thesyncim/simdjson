@@ -63,16 +63,21 @@ func decodeCompiled(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) 
 }
 
 func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
-	null, err := cursor.TryNull()
-	if err != nil {
-		return err
-	}
-	if null {
-		resetTyped(node, dst)
-		return nil
-	}
-	if err := cursor.BeginObject(node.name); err != nil {
-		return err
+	if i := cursor.i; i < len(cursor.src) && cursor.src[i] == '{' && cursor.depth < cursor.maxDepth {
+		cursor.depth++
+		cursor.i = i + 1
+	} else {
+		null, err := cursor.TryNull()
+		if err != nil {
+			return err
+		}
+		if null {
+			resetTyped(node, dst)
+			return nil
+		}
+		if err := cursor.BeginObject(node.name); err != nil {
+			return err
+		}
 	}
 	var seen uint64
 	if node.allSet == 0 && len(node.fields) > 0 {
@@ -82,6 +87,7 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 		var field *typedField
 		var key string
 		var ok, matched bool
+		var err error
 		if position < len(node.fields) {
 			field = &node.fields[position]
 			key, matched, ok, err = cursor.nextObjectFieldExpected(first, field)
@@ -157,6 +163,9 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 
 func (cursor *decoderCursor) nextObjectFieldExpected(first bool, expected *typedField) (key string, matched, ok bool, err error) {
 	i := cursor.i
+	if i < len(cursor.src) && cursor.src[i] <= ' ' {
+		i = skipSpace(cursor.src, i)
+	}
 	if i >= len(cursor.src) {
 		key, ok, err = cursor.NextObjectField(first)
 		return key, false, ok, err
@@ -179,6 +188,9 @@ func (cursor *decoderCursor) nextObjectFieldExpected(first bool, expected *typed
 			return "", false, false, nil
 		case ',':
 			i++
+			if i < len(cursor.src) && cursor.src[i] <= ' ' {
+				i = skipSpace(cursor.src, i)
+			}
 			if i >= len(cursor.src) || cursor.src[i] != '"' {
 				key, ok, err = cursor.NextObjectField(first)
 				return key, false, ok, err
@@ -195,6 +207,17 @@ func (cursor *decoderCursor) nextObjectFieldExpected(first bool, expected *typed
 		return key, false, ok, err
 	}
 	word := binary.LittleEndian.Uint64(cursor.src[keyStart:])
+	if mask := expected.keyMask; mask != 0 && (word^expected.key)&mask == 0 {
+		// The masked compare covers the key bytes and the closing quote.
+		keyEnd := keyStart + int(expected.keyLen)
+		if keyEnd+1 < len(cursor.src) && cursor.src[keyEnd+1] == ':' {
+			cursor.i = keyEnd + 2
+			if cursor.i < len(cursor.src) && cursor.src[cursor.i] <= ' ' {
+				cursor.skipSpace()
+			}
+			return "", true, true, nil
+		}
+	}
 	special := stringSpecialMask(word)
 	if special == 0 {
 		key, ok, err = cursor.NextObjectField(first)
@@ -202,14 +225,13 @@ func (cursor *decoderCursor) nextObjectFieldExpected(first bool, expected *typed
 	}
 	keyLen := bits.TrailingZeros64(special) / 8
 	keyEnd := keyStart + keyLen
-	if cursor.src[keyEnd] != '"' || keyEnd+1 >= len(cursor.src) || cursor.src[keyEnd+1] != ':' ||
-		(keyEnd+2 < len(cursor.src) && cursor.src[keyEnd+2] <= ' ') {
+	if cursor.src[keyEnd] != '"' || keyEnd+1 >= len(cursor.src) || cursor.src[keyEnd+1] != ':' {
 		key, ok, err = cursor.NextObjectField(first)
 		return key, false, ok, err
 	}
 	cursor.i = keyEnd + 2
-	if expected.key != 0 && (word^expected.key)<<((7-keyLen)*8) == 0 {
-		return "", true, true, nil
+	if cursor.i < len(cursor.src) && cursor.src[cursor.i] <= ' ' {
+		cursor.skipSpace()
 	}
 	key = unsafe.String(unsafe.SliceData(cursor.src[keyStart:keyEnd]), keyLen)
 	return key, false, true, nil
@@ -229,18 +251,23 @@ func resetMissingTypedFields(node *typedNode, dst unsafe.Pointer, seen uint64) {
 }
 
 func decodeCompiledSlice(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
-	null, err := cursor.TryNull()
-	if err != nil {
-		return err
+	if i := cursor.i; i < len(cursor.src) && cursor.src[i] == '[' && cursor.depth < cursor.maxDepth {
+		cursor.depth++
+		cursor.i = i + 1
+	} else {
+		null, err := cursor.TryNull()
+		if err != nil {
+			return err
+		}
+		if null {
+			*(*typedSliceHeader)(dst) = typedSliceHeader{}
+			return nil
+		}
+		if err := cursor.BeginArray(node.name); err != nil {
+			return err
+		}
 	}
 	header := (*typedSliceHeader)(dst)
-	if null {
-		*header = typedSliceHeader{}
-		return nil
-	}
-	if err := cursor.BeginArray(node.name); err != nil {
-		return err
-	}
 	header.len = 0
 	for index, first := 0, true; ; index, first = index+1, false {
 		more, err := cursor.NextArrayElement(first)
@@ -288,17 +315,24 @@ func decodeCompiledSlice(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 }
 
 func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
-	null, err := cursor.TryNull()
-	if err != nil {
-		return err
+	if i := cursor.i; i < len(cursor.src) && cursor.src[i] == '[' && cursor.depth < cursor.maxDepth {
+		cursor.depth++
+		cursor.i = i + 1
+		resetTyped(node, dst)
+	} else {
+		null, err := cursor.TryNull()
+		if err != nil {
+			return err
+		}
+		resetTyped(node, dst)
+		if null {
+			return nil
+		}
+		if err := cursor.BeginArray(node.name); err != nil {
+			return err
+		}
 	}
-	resetTyped(node, dst)
-	if null {
-		return nil
-	}
-	if err := cursor.BeginArray(node.name); err != nil {
-		return err
-	}
+	var err error
 	if node.elem.kind == typedFloat {
 		if node.elem.bits == 32 {
 			err = decodeCompiledFloatArray[float32](cursor, node, dst)

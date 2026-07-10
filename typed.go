@@ -193,12 +193,14 @@ type typedNode struct {
 }
 
 type typedField struct {
-	name   string
-	offset uintptr
-	node   *typedNode
-	seen   uint64
-	key    uint64
-	op     typedOp
+	name    string
+	offset  uintptr
+	node    *typedNode
+	seen    uint64
+	key     uint64
+	keyMask uint64
+	keyLen  uint8
+	op      typedOp
 }
 
 type typedCompiler struct {
@@ -330,6 +332,8 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 					compiledField.key |= uint64(name[byteIndex]) << (byteIndex * 8)
 				}
 				compiledField.key |= uint64('"') << (len(name) * 8)
+				compiledField.keyMask = ^uint64(0) >> ((7 - len(name)) * 8)
+				compiledField.keyLen = uint8(len(name))
 			}
 			node.fields = append(node.fields, compiledField)
 		}

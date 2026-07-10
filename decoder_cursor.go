@@ -183,12 +183,14 @@ func (c *decoderCursor) NextObjectField(first bool) (key string, ok bool, err er
 	} else {
 		keyEnd = scanStringSpecial(c.src, keyStart)
 	}
-	if keyEnd >= len(c.src) || c.src[keyEnd] != '"' || keyEnd+1 >= len(c.src) || c.src[keyEnd+1] != ':' ||
-		(keyEnd+2 < len(c.src) && c.src[keyEnd+2] <= ' ') {
+	if keyEnd >= len(c.src) || c.src[keyEnd] != '"' || keyEnd+1 >= len(c.src) || c.src[keyEnd+1] != ':' {
 		return c.nextObjectFieldSlow(first)
 	}
 	key = unsafe.String(unsafe.SliceData(c.src[keyStart:keyEnd]), keyEnd-keyStart)
 	c.i = keyEnd + 2
+	if c.i < len(c.src) && c.src[c.i] <= ' ' {
+		c.skipSpace()
+	}
 	return key, true, nil
 }
 
@@ -293,10 +295,11 @@ func (c *decoderCursor) NextArrayElement(first bool) (bool, error) {
 		c.depth--
 		return false, nil
 	case ',':
-		if i+1 < len(c.src) && c.src[i+1] > ' ' {
-			c.i = i + 1
-			return true, nil
+		c.i = i + 1
+		if c.i < len(c.src) && c.src[c.i] <= ' ' {
+			c.skipSpace()
 		}
+		return true, nil
 	}
 	return c.nextArrayElementSlow(first)
 }
