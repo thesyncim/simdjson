@@ -59,6 +59,54 @@ func ExampleCompileDecoder() {
 	// Output: 7 launch true
 }
 
+func ExampleGetRaw() {
+	src := []byte(`{"user":{"name":"ada","tags":["admin","ops"]}}`)
+
+	tag, ok, err := simdjson.GetRaw(src, "/user/tags/1")
+	if err != nil {
+		panic(err)
+	}
+	if !ok {
+		panic("missing tag")
+	}
+	text, _, err := tag.Text()
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println(text)
+	// Output: ops
+}
+
+func ExampleParseAny() {
+	value, err := simdjson.ParseAny([]byte(`{"name":"ada","scores":[1,2.5]}`))
+	if err != nil {
+		panic(err)
+	}
+
+	object := value.(map[string]any)
+	fmt.Println(object["name"], object["scores"].([]any)[1])
+	// Output: ada 2.5
+}
+
+func ExampleValid() {
+	fmt.Println(simdjson.Valid([]byte(`{"strict":true}`)))
+	fmt.Println(simdjson.Valid([]byte(`{"trailing":1,}`)))
+	// Output:
+	// true
+	// false
+}
+
+func ExampleAppendCompact() {
+	compact, err := simdjson.AppendCompact(nil, []byte("{\n  \"a\": [1, 2]\n}"))
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println(string(compact))
+	// Output: {"a":[1,2]}
+}
+
 func ExampleBuildIndex() {
 	src := []byte(`{"items":[{"id":7}]}`)
 	var storage [8]simdjson.IndexEntry
