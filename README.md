@@ -303,25 +303,38 @@ Sonic, environment capture, and result comparison commands.
 simdjson validates UTF-8, escapes, surrogate pairs, number grammar, integer overflow,
 depth, and trailing data. The suite includes all 318 Nicolas Seriot
 JSONTestSuite cases, simdjson-derived edge cases, compiled numeric boundaries,
-allocation contracts, differential fuzzing, race and `checkptr=2` runs, and
-Linux cross-compiles for arm64 and amd64.
+allocation contracts, differential tests and fuzzers against encoding/json
+for every stdlib behavior claimed above, and Linux cross-compiles for arm64
+and amd64. Memory-safety runs use race and `checkptr=2` instrumentation with
+the allocation-contract tests skipped, since instrumentation itself
+allocates:
 
-Compiled decoders and encoders support exported structs, nested named
-structs, pointers, slices, fixed arrays, maps with string keys, empty
-interfaces, named scalar types, booleans, strings, every integer width,
-floats, and `json.Number`. Map decoding merges into existing maps and map
-encoding sorts keys, both matching `encoding/json`. Values decoded into
-`any` use the standard dynamic shapes and always replace the previous value;
-encoding an interface compiles a plan for its concrete type on first use.
-Byte slices decode from and encode to standard base64, reusing destination
-capacity, and the `string` tag option quotes scalars exactly like
-encoding/json. Non-empty interfaces, non-string map keys, untagged anonymous
-fields, and custom unmarshaler dispatch are not supported yet. Untagged
-anonymous fields are rejected rather than flattened.
+```sh
+GOEXPERIMENT=simd gotip test -gcflags='all=-d=checkptr=2' \
+  -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
+```
+
+The compiled decoder and encoder cover encoding/json's supported type
+universe: structs with flattened anonymous embedding and stdlib's exact
+dominance rules, pointers, slices, fixed arrays, maps with string, integer,
+and text-marshaling keys, empty and non-empty interfaces with stdlib's
+pointer-indirection rules, byte slices as base64, custom
+json.Marshaler/Unmarshaler and TextMarshaler/TextUnmarshaler dispatch
+(including time.Time), the omitempty and string tag options, named scalar
+types, every integer width, floats, and json.Number. Decoding merges into
+existing values like encoding/json unless DecoderOptions.Replace is set.
+Types stdlib rejects (channels, functions, complex numbers) are rejected at
+compile time. One rule is stricter than stdlib: custom un/marshalers must
+not retain their receiver after returning.
 
 Run scalar and SIMD verification against the pinned compiler:
 
 ```sh
 gotip test ./...
 GOEXPERIMENT=simd gotip test ./...
+gotip vet -unsafeptr=false ./...
 ```
+
+The vet flag is required because noescape.go deliberately uses the runtime's
+pointer-hiding idiom, documented in that file, to keep decode destinations
+off the heap while supporting custom un/marshalers.
