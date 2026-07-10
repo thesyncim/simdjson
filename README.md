@@ -29,9 +29,9 @@ These are medians of five one-second samples, not claims about every schema.
 The [benchmark methodology](#benchmark-methodology) records the exact compiler,
 ownership rules, fixtures, competitor versions, and commands.
 
-Generation is a material optimization over `CompileDecoder[T]`, not just a
-convenience: it is `2.79x` faster for the 31-byte object and approximately
-`1.9x-2.0x` faster for the medium and large fixtures in a dedicated paired run.
+`CompileDecoder[T]` is close to generated code without a generation step. In a
+dedicated paired run, generated code was `1.08x` faster for the 31-byte object
+and `1.03x-1.05x` faster for the medium and large fixtures.
 
 ## Quick Start
 
@@ -123,17 +123,17 @@ steady-state decoding only. Both paths use `ZeroCopy` and `CaseSensitive`.
 
 | Workload | `CompileDecoder[T]` | Generated decoder | Generated speedup |
 |---|---:|---:|---:|
-| 31 B, fresh | 84.59 ns / 1 alloc | 30.31 ns / 0 allocs | **2.79x** |
-| 4.2 KB, fresh | 5.462 us / 3 allocs | 2.926 us / 1 alloc | **1.87x** |
-| 4.2 KB, reused | 5.191 us / 0 allocs | 2.706 us / 0 allocs | **1.92x** |
-| 136.6 KB, fresh | 175.894 us / 3 allocs | 88.830 us / 1 alloc | **1.98x** |
-| 136.6 KB, reused | 169.482 us / 0 allocs | 85.051 us / 0 allocs | **1.99x** |
+| 31 B, fresh | 33.34 ns / 0 allocs | 30.79 ns / 0 allocs | **1.08x** |
+| 4.2 KB, fresh | 3.036 us / 2 allocs | 2.902 us / 1 alloc | **1.05x** |
+| 4.2 KB, reused | 2.775 us / 0 allocs | 2.647 us / 0 allocs | **1.05x** |
+| 136.6 KB, fresh | 89.939 us / 2 allocs | 87.389 us / 1 alloc | **1.03x** |
+| 136.6 KB, reused | 86.742 us / 0 allocs | 82.891 us / 0 allocs | **1.05x** |
 
-`CompileDecoder[T]` removes reflection from the token loop, but still walks a
-runtime type graph and performs node-kind and field dispatch. Generation emits
-concrete key switches and direct, type-specialized cursor calls that the Go
-compiler can inline. Use the compiled decoder when avoiding generation matters;
-use generation for hot schemas.
+The compiled plan uses packed expected-key matching, exact scalar operations,
+lazy replacement resets, and specialized fixed-float arrays. The residual gap
+is direct generated field access; fresh dynamic slices also require one 24-byte
+reflection allocation that generated `make` calls avoid. Reused and small
+decodes allocate nothing.
 
 ## Zero-Allocation Traversal
 

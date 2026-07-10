@@ -29,11 +29,11 @@ matching.
 
 | Workload | Compiled once | Generated | Generated speedup |
 |---|---:|---:|---:|
-| Small, fresh | 84.59 ns / 1 alloc | 30.31 ns / 0 allocs | **2.79x** |
-| Medium, fresh | 5.462 us / 3 allocs | 2.926 us / 1 alloc | **1.87x** |
-| Medium, reused | 5.191 us / 0 allocs | 2.706 us / 0 allocs | **1.92x** |
-| Large, fresh | 175.894 us / 3 allocs | 88.830 us / 1 alloc | **1.98x** |
-| Large, reused | 169.482 us / 0 allocs | 85.051 us / 0 allocs | **1.99x** |
+| Small, fresh | 33.34 ns / 0 allocs | 30.79 ns / 0 allocs | **1.08x** |
+| Medium, fresh | 3.036 us / 2 allocs | 2.902 us / 1 alloc | **1.05x** |
+| Medium, reused | 2.775 us / 0 allocs | 2.647 us / 0 allocs | **1.05x** |
+| Large, fresh | 89.939 us / 2 allocs | 87.389 us / 1 alloc | **1.03x** |
+| Large, reused | 86.742 us / 0 allocs | 82.891 us / 0 allocs | **1.05x** |
 
 The speedup column is `compiled time / generated time`. Reproduce the paired
 run with:

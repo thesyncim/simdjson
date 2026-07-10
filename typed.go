@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
+	"unicode"
 	"unsafe"
 )
 
@@ -37,8 +39,9 @@ type TypedDecoder[T any] struct {
 	options   TypedOptions
 }
 
-// CompileDecoder builds a decoder for T. Reflection is confined to this call
-// and is never used for scalar or field dispatch in the token loop.
+// CompileDecoder builds a decoder for T. Scalar and field dispatch use the
+// compiled plan; runtime reflection is limited to allocating nil pointers and
+// growing dynamic slices.
 func CompileDecoder[T any](opts TypedOptions) (TypedDecoder[T], error) {
 	typ := reflect.TypeFor[T]()
 	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode)}
@@ -46,11 +49,13 @@ func CompileDecoder[T any](opts TypedOptions) (TypedDecoder[T], error) {
 	if err != nil {
 		return TypedDecoder[T]{}, err
 	}
+	prepareTypedResets(root, make(map[*typedNode]bool))
 	return TypedDecoder[T]{
 		root: root,
 		rootSlice: &typedNode{
 			kind: typedSlice,
 			typ:  reflect.TypeFor[[]T](),
+			name: reflect.TypeFor[[]T]().String(),
 			elem: root,
 		},
 		options: opts,
@@ -66,23 +71,25 @@ func (plan TypedDecoder[T]) Decode(src []byte, dst *T) error {
 	if dst == nil {
 		return fmt.Errorf("simdjson: typed Decode destination is nil")
 	}
-	p := parser{
-		src:      src,
-		maxDepth: plan.options.MaxDepth,
-		zeroCopy: plan.options.ZeroCopy,
+	cursor := NewDecoderCursor(src, plan.options)
+	cursor.skipSpace()
+	var err error
+	switch plan.root.kind {
+	case typedStruct:
+		err = decodeCompiledStruct(&cursor, plan.root, unsafe.Pointer(dst))
+	case typedSlice:
+		err = decodeCompiledSlice(&cursor, plan.root, unsafe.Pointer(dst))
+	case typedArray:
+		err = decodeCompiledArray(&cursor, plan.root, unsafe.Pointer(dst))
+	case typedPointer:
+		err = decodeCompiledPointer(&cursor, plan.root, unsafe.Pointer(dst))
+	default:
+		err = decodeCompiled(&cursor, plan.root, unsafe.Pointer(dst))
 	}
-	if p.maxDepth <= 0 {
-		p.maxDepth = defaultMaxDepth
-	}
-	p.skipSpace()
-	if err := p.decodeTyped(plan.root, unsafe.Pointer(dst), 0, plan.options); err != nil {
+	if err != nil {
 		return err
 	}
-	p.skipSpace()
-	if p.i != len(src) {
-		return p.err(p.i, "unexpected data after top-level value")
-	}
-	return nil
+	return cursor.Finish()
 }
 
 // DecodeArray decodes a top-level JSON array into dst, reusing its capacity.
@@ -91,21 +98,13 @@ func (plan TypedDecoder[T]) DecodeArray(src []byte, dst []T) ([]T, error) {
 	if plan.rootSlice == nil {
 		return dst[:0], fmt.Errorf("simdjson: zero TypedDecoder")
 	}
-	p := parser{
-		src:      src,
-		maxDepth: plan.options.MaxDepth,
-		zeroCopy: plan.options.ZeroCopy,
-	}
-	if p.maxDepth <= 0 {
-		p.maxDepth = defaultMaxDepth
-	}
-	p.skipSpace()
-	if err := p.decodeTyped(plan.rootSlice, unsafe.Pointer(&dst), 0, plan.options); err != nil {
+	cursor := NewDecoderCursor(src, plan.options)
+	cursor.skipSpace()
+	if err := decodeCompiledSlice(&cursor, plan.rootSlice, unsafe.Pointer(&dst)); err != nil {
 		return dst, err
 	}
-	p.skipSpace()
-	if p.i != len(src) {
-		return dst, p.err(p.i, "unexpected data after top-level value")
+	if err := cursor.Finish(); err != nil {
+		return dst, err
 	}
 	return dst, nil
 }
@@ -155,20 +154,51 @@ const (
 	typedPointer
 )
 
+type typedOp uint8
+
+const (
+	typedOpInvalid typedOp = iota
+	typedOpBool
+	typedOpString
+	typedOpNumber
+	typedOpInt8
+	typedOpInt16
+	typedOpInt32
+	typedOpInt64
+	typedOpUint8
+	typedOpUint16
+	typedOpUint32
+	typedOpUint64
+	typedOpFloat32
+	typedOpFloat64
+	typedOpStruct
+	typedOpSlice
+	typedOpArray
+	typedOpPointer
+)
+
 type typedNode struct {
 	kind   typedKind
+	op     typedOp
 	typ    reflect.Type
+	name   string
 	size   uintptr
 	bits   int
 	length int
 	elem   *typedNode
 	fields []typedField
+	reset  []typedResetOp
+	ready  bool
+	allSet uint64
 }
 
 type typedField struct {
 	name   string
 	offset uintptr
 	node   *typedNode
+	seen   uint64
+	key    uint64
+	op     typedOp
 }
 
 type typedCompiler struct {
@@ -181,30 +211,59 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 	if node := c.nodes[typ]; node != nil {
 		return node, nil
 	}
-	node := &typedNode{typ: typ, size: typ.Size()}
+	node := &typedNode{typ: typ, name: typ.String(), size: typ.Size()}
 	c.nodes[typ] = node
 
 	if typ == jsonNumberReflectType {
 		node.kind = typedNumber
+		node.op = typedOpNumber
 		return node, nil
 	}
 
 	switch typ.Kind() {
 	case reflect.Bool:
 		node.kind = typedBool
+		node.op = typedOpBool
 	case reflect.String:
 		node.kind = typedString
+		node.op = typedOpString
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		node.kind = typedInt
 		node.bits = typ.Bits()
+		switch node.bits {
+		case 8:
+			node.op = typedOpInt8
+		case 16:
+			node.op = typedOpInt16
+		case 32:
+			node.op = typedOpInt32
+		case 64:
+			node.op = typedOpInt64
+		}
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 		node.kind = typedUint
 		node.bits = typ.Bits()
+		switch node.bits {
+		case 8:
+			node.op = typedOpUint8
+		case 16:
+			node.op = typedOpUint16
+		case 32:
+			node.op = typedOpUint32
+		case 64:
+			node.op = typedOpUint64
+		}
 	case reflect.Float32, reflect.Float64:
 		node.kind = typedFloat
 		node.bits = typ.Bits()
+		if node.bits == 32 {
+			node.op = typedOpFloat32
+		} else {
+			node.op = typedOpFloat64
+		}
 	case reflect.Pointer:
 		node.kind = typedPointer
+		node.op = typedOpPointer
 		elem, err := c.compile(typ.Elem(), path+"*")
 		if err != nil {
 			return nil, err
@@ -215,6 +274,7 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 			return nil, c.unsupported(typ, path, "byte slices require base64 semantics")
 		}
 		node.kind = typedSlice
+		node.op = typedOpSlice
 		elem, err := c.compile(typ.Elem(), path+"[]")
 		if err != nil {
 			return nil, err
@@ -222,6 +282,7 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 		node.elem = elem
 	case reflect.Array:
 		node.kind = typedArray
+		node.op = typedOpArray
 		node.length = typ.Len()
 		elem, err := c.compile(typ.Elem(), path+"[]")
 		if err != nil {
@@ -230,6 +291,7 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 		node.elem = elem
 	case reflect.Struct:
 		node.kind = typedStruct
+		node.op = typedOpStruct
 		seen := make(map[string]struct{}, typ.NumField())
 		for i := 0; i < typ.NumField(); i++ {
 			field := typ.Field(i)
@@ -243,7 +305,7 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 				if name == "-" {
 					continue
 				}
-				if name == "" {
+				if !validTypedTag(name) {
 					name = field.Name
 				}
 			}
@@ -258,12 +320,45 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 			if err != nil {
 				return nil, err
 			}
-			node.fields = append(node.fields, typedField{name: name, offset: field.Offset, node: fieldNode})
+			fieldIndex := len(node.fields)
+			compiledField := typedField{name: name, offset: field.Offset, node: fieldNode, op: fieldNode.op}
+			if fieldIndex < 64 {
+				compiledField.seen = uint64(1) << fieldIndex
+			}
+			if len(name) <= 7 {
+				for byteIndex := range len(name) {
+					compiledField.key |= uint64(name[byteIndex]) << (byteIndex * 8)
+				}
+				compiledField.key |= uint64('"') << (len(name) * 8)
+			}
+			node.fields = append(node.fields, compiledField)
+		}
+		if len(node.fields) <= 64 {
+			if len(node.fields) == 64 {
+				node.allSet = ^uint64(0)
+			} else {
+				node.allSet = uint64(1)<<len(node.fields) - 1
+			}
 		}
 	default:
 		return nil, c.unsupported(typ, path, "kind "+typ.Kind().String()+" would require interface or reflective value dispatch")
 	}
 	return node, nil
+}
+
+func validTypedTag(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, char := range name {
+		if strings.ContainsRune("!#$%&()*+-./:;<=>?@[]^_{|}~ ", char) {
+			continue
+		}
+		if !unicode.IsLetter(char) && !unicode.IsDigit(char) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *typedCompiler) unsupported(typ reflect.Type, path, reason string) error {
@@ -501,7 +596,7 @@ func (p *parser) decodeTypedStruct(node *typedNode, dst unsafe.Pointer, depth in
 		}
 		p.i++
 		p.skipSpace()
-		field := node.findField(key, fieldPosition, !opts.CaseSensitive)
+		field := node.findFieldSlow(key, !opts.CaseSensitive)
 		if field == nil {
 			if opts.DisallowUnknownFields {
 				return &TypedDecodeError{Offset: p.i, Type: node.typ, Reason: "unknown field " + strconv.Quote(key)}
@@ -652,10 +747,7 @@ func (p *parser) typedMismatch(node *typedNode, reason string) error {
 	return &TypedDecodeError{Offset: p.i, Type: node.typ, Reason: reason}
 }
 
-func (node *typedNode) findField(key string, position int, fold bool) *typedField {
-	if position < len(node.fields) && node.fields[position].name == key {
-		return &node.fields[position]
-	}
+func (node *typedNode) findFieldSlow(key string, fold bool) *typedField {
 	for i := range node.fields {
 		if node.fields[i].name == key {
 			return &node.fields[i]
@@ -672,6 +764,10 @@ func (node *typedNode) findField(key string, position int, fold bool) *typedFiel
 }
 
 func resetTyped(node *typedNode, dst unsafe.Pointer) {
+	if node.ready {
+		applyTypedReset(node.reset, dst)
+		return
+	}
 	switch node.kind {
 	case typedBool:
 		*(*bool)(dst) = false
@@ -711,10 +807,23 @@ func resetTyped(node *typedNode, dst unsafe.Pointer) {
 }
 
 func growTypedSlice(node *typedNode, dst unsafe.Pointer, capacity int) {
-	current := reflect.NewAt(node.typ, dst).Elem()
-	next := reflect.MakeSlice(node.typ, current.Len(), capacity)
-	reflect.Copy(next, current)
-	current.Set(next)
+	header := (*typedSliceHeader)(dst)
+	currentHeader := *header
+	next := reflect.MakeSlice(node.typ, currentHeader.len, capacity)
+	if currentHeader.len != 0 {
+		copyTypedSlice(node, currentHeader, next)
+	}
+	*header = typedSliceHeader{
+		data: next.UnsafePointer(),
+		len:  currentHeader.len,
+		cap:  capacity,
+	}
+	runtime.KeepAlive(next)
+}
+
+func copyTypedSlice(node *typedNode, header typedSliceHeader, dst reflect.Value) {
+	src := reflect.NewAt(node.typ, unsafe.Pointer(&header)).Elem()
+	reflect.Copy(dst, src)
 }
 
 func nextTypedSliceCapacity(current, required int) int {
