@@ -83,7 +83,8 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 	if node.allSet == 0 && len(node.fields) > 0 {
 		resetTyped(node, dst)
 	}
-	for position, first := 0, true; ; position, first = position+1, false {
+	position, first := 0, true
+	for {
 		var field *typedField
 		var key string
 		var ok, matched bool
@@ -101,14 +102,21 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 			resetMissingTypedFields(node, dst, seen)
 			return nil
 		}
-		if !matched {
+		first = false
+		if matched {
+			position++
+		} else {
 			field = node.findFieldSlow(key, !cursor.CaseSensitive())
-		}
-		if field == nil {
-			if err := cursor.Unknown(node.name, key); err != nil {
-				return err
+			if field == nil {
+				if err := cursor.Unknown(node.name, key); err != nil {
+					return err
+				}
+				continue
 			}
-			continue
+			// Resume expected-key matching after the matched field, so
+			// documents whose member order is shifted from the struct order
+			// (extra members, rotations) recover the fast path.
+			position = int(field.pos) + 1
 		}
 		seen |= field.seen
 		fieldNode := field.node

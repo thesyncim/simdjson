@@ -239,6 +239,7 @@ type typedField struct {
 	seen    uint64
 	key     uint64
 	keyMask uint64
+	pos     int32
 	keyLen  uint8
 	op      typedOp
 }
@@ -363,7 +364,7 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 				return nil, err
 			}
 			fieldIndex := len(node.fields)
-			compiledField := typedField{name: name, offset: field.Offset, node: fieldNode, op: fieldNode.op}
+			compiledField := typedField{name: name, offset: field.Offset, node: fieldNode, op: fieldNode.op, pos: int32(fieldIndex)}
 			if fieldIndex < 64 {
 				compiledField.seen = uint64(1) << fieldIndex
 			}

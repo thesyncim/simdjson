@@ -179,3 +179,39 @@ func BenchmarkParseLarge(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkDecodeLargeShuffledKeys(b *testing.B) {
+	// Same schema as benchRecordsJSON, but record members are rotated so the
+	// JSON order never matches the struct field order.
+	var out strings.Builder
+	count := 1024
+	out.Grow(count * 128)
+	out.WriteString(`{"items":[`)
+	for i := 0; i < count; i++ {
+		if i != 0 {
+			out.WriteByte(',')
+		}
+		out.WriteString(`{"message":"plain ascii payload sized to exercise vector scanners","scores":[1,2.5,-3e4],"id":`)
+		out.WriteString(strconv.Itoa(i))
+		out.WriteString(`,"active":true,"name":"record-`)
+		out.WriteString(strconv.Itoa(i))
+		out.WriteString(`"}`)
+	}
+	out.WriteString(`],"meta":{"count":`)
+	out.WriteString(strconv.Itoa(count))
+	out.WriteString(`,"source":"benchmark"}}`)
+	src := []byte(out.String())
+
+	decoder, err := CompileDecoder[benchDocument](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	for range b.N {
+		var dst benchDocument
+		if err := decoder.Decode(src, &dst); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
