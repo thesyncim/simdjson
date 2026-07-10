@@ -18,7 +18,7 @@ type TypedOptions struct {
 
 	// ZeroCopy aliases unescaped strings into src. Callers must not mutate src
 	// while decoded strings are in use. When false, decoded strings are
-	// independent of src; generated decoders may retain one private copy of the
+	// independent of src; the decoder may retain one private copy of the
 	// input instead of allocating each string separately.
 	ZeroCopy bool
 
@@ -71,7 +71,7 @@ func (plan TypedDecoder[T]) Decode(src []byte, dst *T) error {
 	if dst == nil {
 		return fmt.Errorf("simdjson: typed Decode destination is nil")
 	}
-	cursor := NewDecoderCursor(src, plan.options)
+	cursor := newDecoderCursor(src, plan.options)
 	cursor.skipSpace()
 	var err error
 	switch plan.root.kind {
@@ -98,7 +98,7 @@ func (plan TypedDecoder[T]) DecodeArray(src []byte, dst []T) ([]T, error) {
 	if plan.rootSlice == nil {
 		return dst[:0], fmt.Errorf("simdjson: zero TypedDecoder")
 	}
-	cursor := NewDecoderCursor(src, plan.options)
+	cursor := newDecoderCursor(src, plan.options)
 	cursor.skipSpace()
 	if err := decodeCompiledSlice(&cursor, plan.rootSlice, unsafe.Pointer(&dst)); err != nil {
 		return dst, err

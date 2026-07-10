@@ -1,8 +1,6 @@
-package gentest
+package typedtest
 
 import "encoding/json"
-
-//go:generate go run ../../cmd/simdjsongen -type Document,Numeric -output model_simdjson.go
 
 type Score float64
 

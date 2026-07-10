@@ -9,28 +9,28 @@ import (
 	"unsafe"
 )
 
-// Signed is the set of integer types accepted by DecoderCursor.Int.
-type Signed interface {
+// signedInteger is the set of integer types accepted by decoderCursor.Int.
+type signedInteger interface {
 	~int | ~int8 | ~int16 | ~int32 | ~int64
 }
 
-// Unsigned is the set of integer types accepted by DecoderCursor.Uint.
-type Unsigned interface {
+// unsignedInteger is the set of integer types accepted by decoderCursor.Uint.
+type unsignedInteger interface {
 	~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr
 }
 
-// Float is the set of floating-point types accepted by DecoderCursor.Float.
-type Float interface {
+// floatValue is the set of floating-point types accepted by decoderCursor.Float.
+type floatValue interface {
 	~float32 | ~float64
 }
 
-// StringLike is the set of string types accepted by DecoderCursor.String.
-type StringLike interface {
+// stringValue is the set of string types accepted by decoderCursor.String.
+type stringValue interface {
 	~string
 }
 
-// BoolLike is the set of boolean types accepted by DecoderCursor.Bool.
-type BoolLike interface {
+// boolValue is the set of boolean types accepted by decoderCursor.Bool.
+type boolValue interface {
 	~bool
 }
 
@@ -43,9 +43,9 @@ const (
 	decoderSourceOwned
 )
 
-// DecoderCursor is the concrete, interface-free parser surface used by generated
-// decoders. Its generic scalar methods are specialized at each generated field.
-type DecoderCursor struct {
+// decoderCursor is the concrete, interface-free parser used by compiled typed
+// decoders. Its generic scalar methods are specialized by destination width.
+type decoderCursor struct {
 	src      []byte
 	i        int
 	maxDepth int
@@ -53,8 +53,8 @@ type DecoderCursor struct {
 	flags    decoderFlags
 }
 
-// NewDecoderCursor starts decoding src with opts.
-func NewDecoderCursor(src []byte, opts TypedOptions) DecoderCursor {
+// newDecoderCursor starts decoding src with opts.
+func newDecoderCursor(src []byte, opts TypedOptions) decoderCursor {
 	maxDepth := opts.MaxDepth
 	if maxDepth <= 0 {
 		maxDepth = defaultMaxDepth
@@ -69,7 +69,7 @@ func NewDecoderCursor(src []byte, opts TypedOptions) DecoderCursor {
 	if opts.CaseSensitive {
 		flags |= decoderCaseSensitive
 	}
-	return DecoderCursor{
+	return decoderCursor{
 		src:      src,
 		maxDepth: maxDepth,
 		flags:    flags,
@@ -77,7 +77,7 @@ func NewDecoderCursor(src []byte, opts TypedOptions) DecoderCursor {
 }
 
 // Finish verifies that exactly one complete JSON value was consumed.
-func (c *DecoderCursor) Finish() error {
+func (c *decoderCursor) Finish() error {
 	if c.i == len(c.src) {
 		return nil
 	}
@@ -85,7 +85,7 @@ func (c *DecoderCursor) Finish() error {
 }
 
 //go:noinline
-func (c *DecoderCursor) finishSlow() error {
+func (c *decoderCursor) finishSlow() error {
 	c.skipSpace()
 	if c.i != len(c.src) {
 		return c.err(c.i, "unexpected data after top-level value")
@@ -94,7 +94,7 @@ func (c *DecoderCursor) finishSlow() error {
 }
 
 // TryNull consumes null and reports true, or leaves a non-null value untouched.
-func (c *DecoderCursor) TryNull() (bool, error) {
+func (c *decoderCursor) TryNull() (bool, error) {
 	i := c.i
 	if i < len(c.src) && c.src[i] > ' ' && c.src[i] != 'n' {
 		return false, nil
@@ -103,7 +103,7 @@ func (c *DecoderCursor) TryNull() (bool, error) {
 }
 
 //go:noinline
-func (c *DecoderCursor) tryNullSlow() (bool, error) {
+func (c *decoderCursor) tryNullSlow() (bool, error) {
 	c.skipSpace()
 	if c.i >= len(c.src) || c.src[c.i] != 'n' {
 		return false, nil
@@ -116,7 +116,7 @@ func (c *DecoderCursor) tryNullSlow() (bool, error) {
 }
 
 // BeginObject consumes an opening object delimiter.
-func (c *DecoderCursor) BeginObject(typeName string) error {
+func (c *decoderCursor) BeginObject(typeName string) error {
 	i := c.i
 	if i < len(c.src) && c.src[i] == '{' && c.depth < c.maxDepth {
 		c.depth++
@@ -127,7 +127,7 @@ func (c *DecoderCursor) BeginObject(typeName string) error {
 }
 
 //go:noinline
-func (c *DecoderCursor) beginObjectSlow(typeName string) error {
+func (c *decoderCursor) beginObjectSlow(typeName string) error {
 	c.skipSpace()
 	if c.i >= len(c.src) || c.src[c.i] != '{' {
 		return c.expected(typeName, "object")
@@ -142,7 +142,7 @@ func (c *DecoderCursor) beginObjectSlow(typeName string) error {
 
 // NextObjectField returns the next decoded key. first must be true only for
 // the first call after BeginObject.
-func (c *DecoderCursor) NextObjectField(first bool) (key string, ok bool, err error) {
+func (c *decoderCursor) NextObjectField(first bool) (key string, ok bool, err error) {
 	i := c.i
 	if i >= len(c.src) {
 		return c.nextObjectFieldSlow(first)
@@ -193,7 +193,7 @@ func (c *DecoderCursor) NextObjectField(first bool) (key string, ok bool, err er
 }
 
 //go:noinline
-func (c *DecoderCursor) nextObjectFieldSlow(first bool) (key string, ok bool, err error) {
+func (c *decoderCursor) nextObjectFieldSlow(first bool) (key string, ok bool, err error) {
 	c.skipSpace()
 	if c.i >= len(c.src) {
 		return "", false, c.err(c.i, "unterminated object")
@@ -245,7 +245,7 @@ func (c *DecoderCursor) nextObjectFieldSlow(first bool) (key string, ok bool, er
 }
 
 // BeginArray consumes an opening array delimiter.
-func (c *DecoderCursor) BeginArray(typeName string) error {
+func (c *decoderCursor) BeginArray(typeName string) error {
 	i := c.i
 	if i < len(c.src) && c.src[i] == '[' && c.depth < c.maxDepth {
 		c.depth++
@@ -256,7 +256,7 @@ func (c *DecoderCursor) BeginArray(typeName string) error {
 }
 
 //go:noinline
-func (c *DecoderCursor) beginArraySlow(typeName string) error {
+func (c *decoderCursor) beginArraySlow(typeName string) error {
 	c.skipSpace()
 	if c.i >= len(c.src) || c.src[c.i] != '[' {
 		return c.expected(typeName, "array")
@@ -271,7 +271,7 @@ func (c *DecoderCursor) beginArraySlow(typeName string) error {
 
 // NextArrayElement reports whether another value is available. first must be
 // true only for the first call after BeginArray.
-func (c *DecoderCursor) NextArrayElement(first bool) (bool, error) {
+func (c *decoderCursor) NextArrayElement(first bool) (bool, error) {
 	i := c.i
 	if i >= len(c.src) {
 		return c.nextArrayElementSlow(first)
@@ -302,7 +302,7 @@ func (c *DecoderCursor) NextArrayElement(first bool) (bool, error) {
 }
 
 //go:noinline
-func (c *DecoderCursor) nextArrayElementSlow(first bool) (bool, error) {
+func (c *decoderCursor) nextArrayElementSlow(first bool) (bool, error) {
 	c.skipSpace()
 	if c.i >= len(c.src) {
 		return false, c.err(c.i, "unterminated array")
@@ -328,7 +328,7 @@ func (c *DecoderCursor) nextArrayElementSlow(first bool) (bool, error) {
 }
 
 // Skip validates and consumes the next value without materializing it.
-func (c *DecoderCursor) Skip() error {
+func (c *decoderCursor) Skip() error {
 	p := c.slowParser()
 	err := p.skipTypedValue(c.depth)
 	c.i = p.i
@@ -336,38 +336,20 @@ func (c *DecoderCursor) Skip() error {
 }
 
 // Unknown skips key unless unknown fields are disallowed.
-func (c *DecoderCursor) Unknown(typeName, key string) error {
+func (c *decoderCursor) Unknown(typeName, key string) error {
 	if c.flags&decoderDisallowUnknown != 0 {
 		return &TypedDecodeError{Offset: c.i, TypeName: typeName, Reason: "unknown field " + strconv.Quote(key)}
 	}
 	return c.Skip()
 }
 
-// CaseSensitive reports the generated field-matching mode.
-func (c *DecoderCursor) CaseSensitive() bool {
+// CaseSensitive reports whether folded field matching is disabled.
+func (c *decoderCursor) CaseSensitive() bool {
 	return c.flags&decoderCaseSensitive != 0
 }
 
-// ReserveSlice gives a generated slice a source-density capacity hint without
-// reflection or interface conversion. Existing capacity is always retained.
-func (c *DecoderCursor) ReserveSlice[T any](dst *[]T, bytesPerElement int) {
-	if cap(*dst) != 0 {
-		return
-	}
-	if bytesPerElement <= 0 {
-		bytesPerElement = 16
-	}
-	capacity := (len(c.src)-c.i)/bytesPerElement + 1
-	if capacity < 4 {
-		capacity = 4
-	} else if capacity > 1024 {
-		capacity = 1024
-	}
-	*dst = make([]T, 0, capacity)
-}
-
 // Bool decodes directly into any defined boolean type.
-func (c *DecoderCursor) Bool[T BoolLike](dst *T) error {
+func (c *decoderCursor) Bool[T boolValue](dst *T) error {
 	i := c.i
 	if i < len(c.src) {
 		switch c.src[i] {
@@ -389,7 +371,7 @@ func (c *DecoderCursor) Bool[T BoolLike](dst *T) error {
 }
 
 //go:noinline
-func (c *DecoderCursor) boolSlow[T BoolLike](dst *T) error {
+func (c *decoderCursor) boolSlow[T boolValue](dst *T) error {
 	i := c.i
 	if i >= len(c.src) {
 		return c.genericExpected[T]("boolean")
@@ -423,7 +405,7 @@ func (c *DecoderCursor) boolSlow[T BoolLike](dst *T) error {
 }
 
 // String decodes directly into any defined string type.
-func (c *DecoderCursor) String[T StringLike](dst *T) error {
+func (c *decoderCursor) String[T stringValue](dst *T) error {
 	i := c.i
 	if i < len(c.src) && c.src[i] == '"' {
 		start := i + 1
@@ -438,7 +420,7 @@ func (c *DecoderCursor) String[T StringLike](dst *T) error {
 }
 
 //go:noinline
-func (c *DecoderCursor) stringSlow[T StringLike](dst *T) error {
+func (c *decoderCursor) stringSlow[T stringValue](dst *T) error {
 	if c.i < len(c.src) && c.src[c.i] == 'n' {
 		if !matchStringAt(c.src, c.i, "null") {
 			return c.err(c.i, "invalid literal")
@@ -471,7 +453,7 @@ func (c *DecoderCursor) stringSlow[T StringLike](dst *T) error {
 }
 
 // Number decodes a JSON number's original spelling into a defined string type.
-func (c *DecoderCursor) Number[T StringLike](dst *T) error {
+func (c *decoderCursor) Number[T stringValue](dst *T) error {
 	if c.i < len(c.src) && c.src[c.i] == 'n' {
 		if !matchStringAt(c.src, c.i, "null") {
 			return c.err(c.i, "invalid literal")
@@ -493,7 +475,7 @@ func (c *DecoderCursor) Number[T StringLike](dst *T) error {
 }
 
 // Int decodes directly into any defined signed integer type.
-func (c *DecoderCursor) Int[T Signed](dst *T) error {
+func (c *decoderCursor) Int[T signedInteger](dst *T) error {
 	if c.i < len(c.src) && c.src[c.i] == 'n' {
 		if !matchStringAt(c.src, c.i, "null") {
 			return c.err(c.i, "invalid literal")
@@ -557,7 +539,7 @@ func (c *DecoderCursor) Int[T Signed](dst *T) error {
 }
 
 // Uint decodes directly into any defined unsigned integer type.
-func (c *DecoderCursor) Uint[T Unsigned](dst *T) error {
+func (c *decoderCursor) Uint[T unsignedInteger](dst *T) error {
 	if c.i < len(c.src) && c.src[c.i] == 'n' {
 		if !matchStringAt(c.src, c.i, "null") {
 			return c.err(c.i, "invalid literal")
@@ -606,7 +588,7 @@ func (c *DecoderCursor) Uint[T Unsigned](dst *T) error {
 }
 
 // Float decodes directly into any defined float32 or float64 type.
-func (c *DecoderCursor) Float[T Float](dst *T) error {
+func (c *decoderCursor) Float[T floatValue](dst *T) error {
 	i := c.i
 	if i < len(c.src) && (c.src[i] == '-' || isDigit(c.src[i])) {
 		if value, end, ok := shortTypedFloatAt(c.src, i); ok {
@@ -619,7 +601,7 @@ func (c *DecoderCursor) Float[T Float](dst *T) error {
 }
 
 //go:noinline
-func (c *DecoderCursor) floatSlow[T Float](dst *T) error {
+func (c *decoderCursor) floatSlow[T floatValue](dst *T) error {
 	if c.i < len(c.src) && c.src[c.i] == 'n' {
 		if !matchStringAt(c.src, c.i, "null") {
 			return c.err(c.i, "invalid literal")
@@ -734,7 +716,7 @@ func typedNumberEnd(src []byte, i int) bool {
 	}
 }
 
-func (c *DecoderCursor) numberToken[T any]() (start, end int, err error) {
+func (c *decoderCursor) numberToken[T any]() (start, end int, err error) {
 	if c.i >= len(c.src) || (c.src[c.i] != '-' && !isDigit(c.src[c.i])) {
 		return c.i, c.i, c.genericExpected[T]("number")
 	}
@@ -750,7 +732,7 @@ func (c *DecoderCursor) numberToken[T any]() (start, end int, err error) {
 
 // ownSource lazily takes ownership of source-backed strings with one copy.
 // Result strings keep the cloned backing array alive after the cursor returns.
-func (c *DecoderCursor) ownSource() {
+func (c *decoderCursor) ownSource() {
 	if c.flags&(decoderZeroCopy|decoderSourceOwned) != 0 {
 		return
 	}
@@ -758,33 +740,33 @@ func (c *DecoderCursor) ownSource() {
 	c.flags |= decoderSourceOwned
 }
 
-func (c *DecoderCursor) skipSpace() {
+func (c *decoderCursor) skipSpace() {
 	c.i = skipSpace(c.src, c.i)
 }
 
-func (c *DecoderCursor) err(offset int, reason string) error {
+func (c *decoderCursor) err(offset int, reason string) error {
 	return syntaxError(c.src, offset, reason)
 }
 
-func (c *DecoderCursor) slowParser() parser {
+func (c *decoderCursor) slowParser() parser {
 	return parser{src: c.src, i: c.i, maxDepth: c.maxDepth, zeroCopy: true}
 }
 
-func (c *DecoderCursor) typedKey() (string, error) {
+func (c *decoderCursor) typedKey() (string, error) {
 	p := c.slowParser()
 	key, err := p.typedKey()
 	c.i = p.i
 	return key, err
 }
 
-func (c *DecoderCursor) genericExpected[T any](jsonType string) error {
+func (c *decoderCursor) genericExpected[T any](jsonType string) error {
 	return c.genericError[T](c.i, "expected "+jsonType)
 }
 
-func (c *DecoderCursor) genericError[T any](offset int, reason string) error {
+func (c *decoderCursor) genericError[T any](offset int, reason string) error {
 	return &TypedDecodeError{Offset: offset, Type: reflect.TypeFor[T](), Reason: reason}
 }
 
-func (c *DecoderCursor) expected(typeName, jsonType string) error {
+func (c *decoderCursor) expected(typeName, jsonType string) error {
 	return &TypedDecodeError{Offset: c.i, TypeName: typeName, Reason: "expected " + jsonType}
 }

@@ -2,36 +2,32 @@
 
 Fast, strict JSON for Go tip, written entirely in Go.
 
-simdjson combines generated typed decoders, source-backed selectors, caller-owned
+simdjson combines compiled typed decoders, source-backed selectors, caller-owned
 structural indexes, and runtime-selected SIMD. The root module has no third-party
 dependencies, assembly, C, `go:linkname`, or runtime map-layout tricks.
 
 > **Toolchain status:** simdjson currently requires a pinned **Go 1.27 development
-> toolchain**. Generated decoders use generic methods, and SIMD builds use the
+> toolchain**. Typed decoding uses generic methods, and SIMD builds use the
 > experimental `simd/archsimd` package. The scalar build works without
 > `GOEXPERIMENT=simd`, but it still requires Go tip today.
 
 ## Results
 
-On an Apple M4 Max, simdjson's generated decoder parsed the benchmark fixtures in:
+On an Apple M4 Max, `CompileDecoder[T]` parsed the benchmark fixtures in:
 
 | Mode | 31 B object | 4.2 KB / 32 records | 136.6 KB / 1,024 records |
 |---|---:|---:|---:|
-| **SIMD, source-backed** | **31.9 ns / 0 allocs** | **2.85 us / 1 alloc** | **86.3 us / 1 alloc** |
-| Pure Go, source-backed | 31.5 ns / 0 allocs | 3.12 us / 1 alloc | 92.8 us / 1 alloc |
-| **SIMD, owned strings** | **49.3 ns / 1 alloc** | **3.12 us / 2 allocs** | **94.2 us / 2 allocs** |
+| **SIMD, source-backed** | **33.4 ns / 0 allocs** | **3.03 us / 2 allocs** | **92.4 us / 2 allocs** |
+| Pure Go, source-backed | 33.5 ns / 0 allocs | 3.21 us / 2 allocs | 97.3 us / 2 allocs |
+| **SIMD, owned strings** | **48.9 ns / 1 alloc** | **3.39 us / 3 allocs** | **101.1 us / 3 allocs** |
 
 Reusing the destination removes the remaining container allocation in
-source-backed mode: `2.68 us / 0 allocs` for 32 records and
-`83.5 us / 0 allocs` for 1,024 records.
+source-backed mode: `2.80 us / 0 allocs` for 32 records and
+`88.2 us / 0 allocs` for 1,024 records.
 
 These are medians of five one-second samples, not claims about every schema.
 The [benchmark methodology](#benchmark-methodology) records the exact compiler,
 ownership rules, fixtures, competitor versions, and commands.
-
-`CompileDecoder[T]` is close to generated code without a generation step. In a
-dedicated paired run, generated code was `1.08x` faster for the 31-byte object
-and `1.03x-1.05x` faster for the medium and large fixtures.
 
 ## Quick Start
 
@@ -43,12 +39,10 @@ gotip download
 gotip get github.com/thesyncim/simdjson
 ```
 
-Add a generation directive next to a model:
+Define a model:
 
 ```go
 package events
-
-//go:generate go run github.com/thesyncim/simdjson/cmd/simdjsongen -type Event -output event_simdjson.go
 
 type Event struct {
 	ID      int       `json:"id"`
@@ -58,48 +52,7 @@ type Event struct {
 }
 ```
 
-Generate and decode:
-
-```sh
-gotip generate ./...
-```
-
-```go
-var event Event
-if err := (EventJSONDecoder{}).Decode(payload, &event); err != nil {
-	return err
-}
-```
-
-The default owns decoded strings. For the fastest source-backed mode:
-
-```go
-decoder := EventJSONDecoder{}
-decoder.Options.ZeroCopy = true
-decoder.Options.CaseSensitive = true
-
-if err := decoder.Decode(payload, &event); err != nil {
-	return err
-}
-```
-
-Generated decoders also expose `DecodeArray`. Existing slice capacity is reused.
-
-## Choose An API
-
-| Job | API | Data model |
-|---|---|---|
-| Fast concrete structs | Generated `TypeJSONDecoder` | Direct field writes, no reflection |
-| Typed decoding without generation | `CompileDecoder[T]` | Reflection once at compile time |
-| Repeated zero-allocation traversal | `BuildIndex`, `Index`, `Node` | Source and caller workspace backed |
-| Strict JSON Pointer lookup | `GetRaw`, `CompilePointer` | Validates the complete document |
-| Early-exit JSON Pointer scan | `ScanRaw`, `CompilePointer` | Stops after validating the target |
-| Ordered syntax tree | `Parse`, `Value` | Owned strings and ordered members |
-| Standard maps and slices | `ParseAny` | Normal Go dynamic values |
-| Validation only | `Valid`, `Validate` | No result allocation |
-| Transforms | `AppendCompact`, `AppendIndent`, `AppendCanonicalize` | Caller-owned destination |
-
-The non-generated typed path is compiled once and reused concurrently:
+Compile the decoder once and reuse it concurrently:
 
 ```go
 decoder, err := simdjson.CompileDecoder[Event](simdjson.TypedOptions{
@@ -110,30 +63,40 @@ if err != nil {
 	return err
 }
 
+var event Event
 if err := decoder.Decode(payload, &event); err != nil {
 	return err
 }
 ```
 
-### Generated vs compile once
+Leave `ZeroCopy` false when decoded strings must own their storage. `DecodeArray`
+decodes a top-level array and reuses caller-provided slice capacity.
 
-Both decoders below were created before the benchmark timer. The
-`CompileDecoder[T]` column therefore excludes schema compilation and measures
-steady-state decoding only. Both paths use `ZeroCopy` and `CaseSensitive`.
+## Choose An API
 
-| Workload | `CompileDecoder[T]` | Generated decoder | Generated speedup |
-|---|---:|---:|---:|
-| 31 B, fresh | 33.34 ns / 0 allocs | 30.79 ns / 0 allocs | **1.08x** |
-| 4.2 KB, fresh | 3.036 us / 2 allocs | 2.902 us / 1 alloc | **1.05x** |
-| 4.2 KB, reused | 2.775 us / 0 allocs | 2.647 us / 0 allocs | **1.05x** |
-| 136.6 KB, fresh | 89.939 us / 2 allocs | 87.389 us / 1 alloc | **1.03x** |
-| 136.6 KB, reused | 86.742 us / 0 allocs | 82.891 us / 0 allocs | **1.05x** |
+| Job | API | Data model |
+|---|---|---|
+| Fast concrete structs | `CompileDecoder[T]` | Compiled fields and scalar operations |
+| Repeated zero-allocation traversal | `BuildIndex`, `Index`, `Node` | Source and caller workspace backed |
+| Strict JSON Pointer lookup | `GetRaw`, `CompilePointer` | Validates the complete document |
+| Early-exit JSON Pointer scan | `ScanRaw`, `CompilePointer` | Stops after validating the target |
+| Ordered syntax tree | `Parse`, `Value` | Owned strings and ordered members |
+| Standard maps and slices | `ParseAny` | Normal Go dynamic values |
+| Validation only | `Valid`, `Validate` | No result allocation |
+| Transforms | `AppendCompact`, `AppendIndent`, `AppendCanonicalize` | Caller-owned destination |
 
-The compiled plan uses packed expected-key matching, exact scalar operations,
-lazy replacement resets, and specialized fixed-float arrays. The residual gap
-is direct generated field access; fresh dynamic slices also require one 24-byte
-reflection allocation that generated `make` calls avoid. Reused and small
-decodes allocate nothing.
+The typed plan is immutable after compilation and safe for concurrent use.
+Compilation is excluded from the benchmark timer. The plan uses packed
+expected-key matching, exact scalar operations, lazy replacement resets, and
+specialized fixed-float arrays.
+
+| Workload | SIMD | Pure Go |
+|---|---:|---:|
+| 31 B, fresh | **33.38 ns / 0 allocs** | 33.49 ns / 0 allocs |
+| 4.2 KB, fresh | **3.029 us / 2 allocs** | 3.207 us / 2 allocs |
+| 4.2 KB, reused | **2.802 us / 0 allocs** | 2.964 us / 0 allocs |
+| 136.6 KB, fresh | **92.409 us / 2 allocs** | 97.271 us / 2 allocs |
+| 136.6 KB, reused | **88.172 us / 0 allocs** | 93.106 us / 0 allocs |
 
 ## Zero-Allocation Traversal
 
@@ -225,15 +188,15 @@ Source-backed comparison:
 
 | Decoder | 31 B | 4.2 KB | 136.6 KB |
 |---|---:|---:|---:|
-| **simdjson generated, SIMD** | **31.9 ns / 0** | **2.85 us / 1** | **86.3 us / 1** |
-| simdjson generated, pure Go | 31.5 ns / 0 | 3.12 us / 1 | 92.8 us / 1 |
+| **simdjson compiled, SIMD** | **33.4 ns / 0** | **3.03 us / 2** | **92.4 us / 2** |
+| simdjson compiled, pure Go | 33.5 ns / 0 | 3.21 us / 2 | 97.3 us / 2 |
 | Sonic v1.15.2 Fastest, Go 1.26.4 | 187.9 ns / 4 | 5.74 us / 6 | 170.5 us / 6 |
 
 Owned-string comparison:
 
 | Decoder | 31 B | 4.2 KB | 136.6 KB |
 |---|---:|---:|---:|
-| **simdjson generated, SIMD** | **49.3 ns / 1** | **3.12 us / 2** | **94.2 us / 2** |
+| **simdjson compiled, SIMD** | **48.9 ns / 1** | **3.39 us / 3** | **101.1 us / 3** |
 | go-json v0.10.6 | 56.2 ns / 2 | 5.78 us / 35 | 174.4 us / 1,027 |
 | Segment encoding v0.5.4 | 59.8 ns / 2 | 5.60 us / 69 | 171.5 us / 2,058 |
 | jsoniter v1.1.12 | 86.4 ns / 2 | 6.68 us / 104 | 201.9 us / 3,085 |
@@ -258,15 +221,15 @@ Sonic, environment capture, and result comparison commands.
 
 simdjson validates UTF-8, escapes, surrogate pairs, number grammar, integer overflow,
 depth, and trailing data. The suite includes all 318 Nicolas Seriot
-JSONTestSuite cases, simdjson-derived edge cases, generated numeric boundaries,
+JSONTestSuite cases, simdjson-derived edge cases, compiled numeric boundaries,
 allocation contracts, differential fuzzing, race and `checkptr=2` runs, and
 Linux cross-compiles for arm64 and amd64.
 
-Generated decoders support exported structs, nested named structs, pointers,
+Compiled decoders support exported structs, nested named structs, pointers,
 slices, fixed arrays, named scalar types, booleans, strings, every integer
-width, floats, and `json.Number`. Maps, interfaces, `[]byte`, anonymous fields,
-generic model types, and custom unmarshaler dispatch are not supported by the
-generated path.
+width, floats, and `json.Number`. Maps, interfaces, `[]byte`, and custom
+unmarshaler dispatch are not supported. Untagged anonymous fields
+are rejected rather than flattened.
 
 Run scalar and SIMD verification against the pinned compiler:
 

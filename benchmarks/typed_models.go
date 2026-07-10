@@ -1,7 +1,5 @@
 package benchmarks
 
-//go:generate go run github.com/thesyncim/simdjson/cmd/simdjsongen -type TypedSmall,TypedDocument -output typed_models_simdjson.go
-
 type TypedSmall struct {
 	ID   int    `json:"id"`
 	OK   bool   `json:"ok"`

@@ -1,4 +1,4 @@
-package gentest
+package typedtest
 
 import (
 	"encoding/json"
@@ -12,13 +12,22 @@ import (
 	"github.com/thesyncim/simdjson"
 )
 
-func TestGeneratedDecoderMatchesStdlib(t *testing.T) {
+func mustCompile[T any](t *testing.T, opts simdjson.TypedOptions) simdjson.TypedDecoder[T] {
+	t.Helper()
+	decoder, err := simdjson.CompileDecoder[T](opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decoder
+}
+
+func TestCompiledDecoderMatchesStdlib(t *testing.T) {
 	sources := [][]byte{
 		[]byte(`{"items":[{"id":1,"active":true,"name":"one","message":"plain","scores":[1,2.5,-3e4],"number":1234567890123456}],"meta":{"count":1,"source":"test"},"optional":{"count":2,"source":"pointer"},"fixed":[3,4],"unknown":[1,{"x":2}]}`),
 		[]byte(`{"ITEMS":[],"META":{"COUNT":0,"SOURCE":"folded"},"optional":null,"fixed":[1,2,3]}`),
 		[]byte(`null`),
 	}
-	decoder := DocumentJSONDecoder{Options: simdjson.TypedOptions{ZeroCopy: true}}
+	decoder := mustCompile[Document](t, simdjson.TypedOptions{ZeroCopy: true})
 	for _, src := range sources {
 		var want Document
 		stdDecoder := json.NewDecoder(strings.NewReader(string(src)))
@@ -28,17 +37,17 @@ func TestGeneratedDecoderMatchesStdlib(t *testing.T) {
 		}
 		var got Document
 		if err := decoder.Decode(src, &got); err != nil {
-			t.Fatalf("generated decode %s: %v", src, err)
+			t.Fatalf("compiled decode %s: %v", src, err)
 		}
 		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("generated decode %s = %#v, want %#v", src, got, want)
+			t.Fatalf("compiled decode %s = %#v, want %#v", src, got, want)
 		}
 	}
 }
 
-func TestGeneratedDecoderReuseAndOptions(t *testing.T) {
+func TestCompiledDecoderReuseAndOptions(t *testing.T) {
 	src := []byte(`{"items":[{"id":7,"active":true,"name":"aliased","message":"m","scores":[1,2,3],"number":7}],"meta":{"count":1,"source":"source"},"optional":null,"fixed":[8,9]}`)
-	decoder := DocumentJSONDecoder{Options: simdjson.TypedOptions{ZeroCopy: true}}
+	decoder := mustCompile[Document](t, simdjson.TypedOptions{ZeroCopy: true})
 	dst := Document{Items: make([]Record, 4, 16), Optional: &Meta{Count: 99}}
 	base := &dst.Items[0]
 	if err := decoder.Decode(src, &dst); err != nil {
@@ -52,11 +61,11 @@ func TestGeneratedDecoderReuseAndOptions(t *testing.T) {
 		t.Fatalf("zero-copy name = %q", dst.Items[0].Name)
 	}
 
-	strict := DocumentJSONDecoder{Options: simdjson.TypedOptions{DisallowUnknownFields: true}}
+	strict := mustCompile[Document](t, simdjson.TypedOptions{DisallowUnknownFields: true})
 	if err := strict.Decode([]byte(`{"unknown":1}`), &dst); err == nil {
-		t.Fatal("strict generated decoder accepted unknown field")
+		t.Fatal("strict compiled decoder accepted unknown field")
 	}
-	caseSensitive := DocumentJSONDecoder{Options: simdjson.TypedOptions{CaseSensitive: true}}
+	caseSensitive := mustCompile[Document](t, simdjson.TypedOptions{CaseSensitive: true})
 	if err := caseSensitive.Decode([]byte(`{"ITEMS":[]}`), &dst); err != nil {
 		t.Fatal(err)
 	}
@@ -65,9 +74,9 @@ func TestGeneratedDecoderReuseAndOptions(t *testing.T) {
 	}
 }
 
-func TestGeneratedDecoderOwnedStringsDoNotAliasInput(t *testing.T) {
+func TestCompiledDecoderOwnedStringsDoNotAliasInput(t *testing.T) {
 	src := []byte(`{"items":[{"name":"owned","message":"plain","number":123}],"meta":{"source":"origin"}}`)
-	decoder := DocumentJSONDecoder{Options: simdjson.TypedOptions{CaseSensitive: true}}
+	decoder := mustCompile[Document](t, simdjson.TypedOptions{CaseSensitive: true})
 	var dst Document
 	if err := decoder.Decode(src, &dst); err != nil {
 		t.Fatal(err)
@@ -82,14 +91,14 @@ func TestGeneratedDecoderOwnedStringsDoNotAliasInput(t *testing.T) {
 	}
 }
 
-func TestGeneratedDecoderSlowPathsMatchStdlib(t *testing.T) {
+func TestCompiledDecoderSlowPathsMatchStdlib(t *testing.T) {
 	src := []byte(" \n { \"it\\u0065ms\" : [ { \"id\" : 1, \"active\" : true, \"name\" : \"caf\xc3\xa9\", \"message\" : \"line\\n\\u263a\", \"scores\" : [ 1, 2.5, -3e4 ], \"number\" : 7 } ], \"meta\" : { \"count\" : 1, \"source\" : \"slow\" }, \"optional\" : null, \"fixed\" : [1, 2], \"unknown-long-key\" : { \"nested\" : [true, null, {\"x\":1}] } } \t")
 	var want Document
 	if err := json.Unmarshal(src, &want); err != nil {
 		t.Fatal(err)
 	}
 	var got Document
-	decoder := DocumentJSONDecoder{Options: simdjson.TypedOptions{ZeroCopy: true}}
+	decoder := mustCompile[Document](t, simdjson.TypedOptions{ZeroCopy: true})
 	if err := decoder.Decode(src, &got); err != nil {
 		t.Fatal(err)
 	}
@@ -98,10 +107,10 @@ func TestGeneratedDecoderSlowPathsMatchStdlib(t *testing.T) {
 	}
 }
 
-func TestGeneratedDecoderAllocationContracts(t *testing.T) {
+func TestCompiledDecoderAllocationContracts(t *testing.T) {
 	src := []byte(`{"items":[{"id":7,"active":true,"name":"name","message":"message","scores":[1,2.5,-3e4],"number":7}],"meta":{"count":1,"source":"source"},"fixed":[1,2]}`)
 	dst := Document{Items: make([]Record, 0, 4)}
-	zeroCopy := DocumentJSONDecoder{Options: simdjson.TypedOptions{ZeroCopy: true, CaseSensitive: true}}
+	zeroCopy := mustCompile[Document](t, simdjson.TypedOptions{ZeroCopy: true, CaseSensitive: true})
 	if err := zeroCopy.Decode(src, &dst); err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +122,7 @@ func TestGeneratedDecoderAllocationContracts(t *testing.T) {
 		t.Fatalf("zero-copy reused allocs = %v, want 0", allocs)
 	}
 
-	owned := DocumentJSONDecoder{Options: simdjson.TypedOptions{CaseSensitive: true}}
+	owned := mustCompile[Document](t, simdjson.TypedOptions{CaseSensitive: true})
 	if allocs := testing.AllocsPerRun(1000, func() {
 		if err := owned.Decode(src, &dst); err != nil {
 			panic(err)
@@ -123,9 +132,9 @@ func TestGeneratedDecoderAllocationContracts(t *testing.T) {
 	}
 }
 
-func TestGeneratedDecoderDecodeArray(t *testing.T) {
+func TestCompiledDecoderDecodeArray(t *testing.T) {
 	src := []byte(`[{"items":[],"meta":{"count":1,"source":"a"},"optional":null,"fixed":[1,2]},{"items":[],"meta":{"count":2,"source":"b"},"optional":null,"fixed":[3,4]}]`)
-	decoder := DocumentJSONDecoder{Options: simdjson.TypedOptions{ZeroCopy: true}}
+	decoder := mustCompile[Document](t, simdjson.TypedOptions{ZeroCopy: true})
 	dst := make([]Document, 0, 4)
 	got, err := decoder.DecodeArray(src, dst)
 	if err != nil {
@@ -136,7 +145,7 @@ func TestGeneratedDecoderDecodeArray(t *testing.T) {
 	}
 }
 
-func TestGeneratedNumericBoundariesMatchStdlib(t *testing.T) {
+func TestCompiledNumericBoundariesMatchStdlib(t *testing.T) {
 	intMin := "-9223372036854775808"
 	uintMax := "18446744073709551615"
 	if strconv.IntSize == 32 {
@@ -150,7 +159,7 @@ func TestGeneratedNumericBoundariesMatchStdlib(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got Numeric
-	decoder := NumericJSONDecoder{Options: simdjson.TypedOptions{ZeroCopy: true, CaseSensitive: true}}
+	decoder := mustCompile[Numeric](t, simdjson.TypedOptions{ZeroCopy: true, CaseSensitive: true})
 	if err := decoder.Decode(src, &got); err != nil {
 		t.Fatal(err)
 	}
@@ -159,13 +168,13 @@ func TestGeneratedNumericBoundariesMatchStdlib(t *testing.T) {
 	}
 }
 
-func TestGeneratedNumericShortFloatsAndNegativeZero(t *testing.T) {
+func TestCompiledNumericShortFloatsAndNegativeZero(t *testing.T) {
 	tests := []string{
 		`{"f32":2.5,"f64":-3e4}`,
 		`{"f32":1e-9,"f64":3e+4}`,
 		`{"f32":-0,"f64":-0.0}`,
 	}
-	decoder := NumericJSONDecoder{Options: simdjson.TypedOptions{CaseSensitive: true}}
+	decoder := mustCompile[Numeric](t, simdjson.TypedOptions{CaseSensitive: true})
 	for _, source := range tests {
 		var want, got Numeric
 		if err := json.Unmarshal([]byte(source), &want); err != nil {
@@ -180,7 +189,7 @@ func TestGeneratedNumericShortFloatsAndNegativeZero(t *testing.T) {
 	}
 }
 
-func TestGeneratedNumericRejectsInvalidValues(t *testing.T) {
+func TestCompiledNumericRejectsInvalidValues(t *testing.T) {
 	tests := []struct {
 		name string
 		src  []byte
@@ -202,7 +211,7 @@ func TestGeneratedNumericRejectsInvalidValues(t *testing.T) {
 		{name: "wrong string type", src: []byte(`{"text":1}`)},
 		{name: "invalid UTF-8", src: []byte{'{', '"', 't', 'e', 'x', 't', '"', ':', '"', 0xff, '"', '}'}},
 	}
-	decoder := NumericJSONDecoder{Options: simdjson.TypedOptions{CaseSensitive: true}}
+	decoder := mustCompile[Numeric](t, simdjson.TypedOptions{CaseSensitive: true})
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var dst Numeric
@@ -213,7 +222,7 @@ func TestGeneratedNumericRejectsInvalidValues(t *testing.T) {
 	}
 }
 
-func FuzzGeneratedNumericAcceptance(f *testing.F) {
+func FuzzCompiledNumericAcceptance(f *testing.F) {
 	for _, seed := range [][]byte{
 		[]byte(`null`),
 		[]byte(`{}`),
@@ -224,7 +233,10 @@ func FuzzGeneratedNumericAcceptance(f *testing.F) {
 	} {
 		f.Add(seed)
 	}
-	decoder := NumericJSONDecoder{}
+	decoder, err := simdjson.CompileDecoder[Numeric](simdjson.TypedOptions{})
+	if err != nil {
+		f.Fatal(err)
+	}
 	f.Fuzz(func(t *testing.T, src []byte) {
 		if len(src) > 4096 {
 			t.Skip()
@@ -233,14 +245,14 @@ func FuzzGeneratedNumericAcceptance(f *testing.F) {
 		gotErr := decoder.Decode(src, &got)
 		if !simdjson.Valid(src) {
 			if gotErr == nil {
-				t.Fatalf("generated decoder accepted invalid JSON %q", src)
+				t.Fatalf("compiled decoder accepted invalid JSON %q", src)
 			}
 			return
 		}
 		var want Numeric
 		wantErr := json.Unmarshal(src, &want)
 		if (gotErr == nil) != (wantErr == nil) {
-			t.Fatalf("acceptance mismatch for %q: generated=%v stdlib=%v", src, gotErr, wantErr)
+			t.Fatalf("acceptance mismatch for %q: compiled=%v stdlib=%v", src, gotErr, wantErr)
 		}
 	})
 }

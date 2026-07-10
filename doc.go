@@ -1,4 +1,4 @@
-// Package simdjson implements strict JSON validation, generated typed decoding,
+// Package simdjson implements strict JSON validation, compiled typed decoding,
 // caller-backed structural indexes, source selectors, and JSON transforms.
 //
 // The current module requires a Go 1.27 development toolchain for generic

@@ -17,9 +17,9 @@ type typedTestRecord struct {
 	Number json.Number `json:"number"`
 }
 
-func TestDecoderCursorStaysCompact(t *testing.T) {
-	if size := unsafe.Sizeof(DecoderCursor{}); size > 64 {
-		t.Fatalf("DecoderCursor size = %d bytes, want <= 64", size)
+func TestTypedDecoderCursorStaysCompact(t *testing.T) {
+	if size := unsafe.Sizeof(decoderCursor{}); size > 64 {
+		t.Fatalf("typed decoder cursor size = %d bytes, want <= 64", size)
 	}
 }
 

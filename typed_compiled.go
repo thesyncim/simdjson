@@ -8,7 +8,7 @@ import (
 	"unsafe"
 )
 
-func decodeCompiled(cursor *DecoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func decodeCompiled(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
 	var err error
 	switch node.kind {
 	case typedBool:
@@ -62,7 +62,7 @@ func decodeCompiled(cursor *DecoderCursor, node *typedNode, dst unsafe.Pointer) 
 	return retagCompiledError(err, node.typ)
 }
 
-func decodeCompiledStruct(cursor *DecoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
 	null, err := cursor.TryNull()
 	if err != nil {
 		return err
@@ -155,7 +155,7 @@ func decodeCompiledStruct(cursor *DecoderCursor, node *typedNode, dst unsafe.Poi
 	}
 }
 
-func (cursor *DecoderCursor) nextObjectFieldExpected(first bool, expected *typedField) (key string, matched, ok bool, err error) {
+func (cursor *decoderCursor) nextObjectFieldExpected(first bool, expected *typedField) (key string, matched, ok bool, err error) {
 	i := cursor.i
 	if i >= len(cursor.src) {
 		key, ok, err = cursor.NextObjectField(first)
@@ -228,7 +228,7 @@ func resetMissingTypedFields(node *typedNode, dst unsafe.Pointer, seen uint64) {
 	}
 }
 
-func decodeCompiledSlice(cursor *DecoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func decodeCompiledSlice(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
 	null, err := cursor.TryNull()
 	if err != nil {
 		return err
@@ -287,7 +287,7 @@ func decodeCompiledSlice(cursor *DecoderCursor, node *typedNode, dst unsafe.Poin
 	}
 }
 
-func decodeCompiledArray(cursor *DecoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
 	null, err := cursor.TryNull()
 	if err != nil {
 		return err
@@ -379,7 +379,7 @@ func decodeCompiledArray(cursor *DecoderCursor, node *typedNode, dst unsafe.Poin
 	}
 }
 
-func decodeCompiledFloatArray[T Float](cursor *DecoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func decodeCompiledFloatArray[T floatValue](cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
 	for index, first := 0, true; ; index, first = index+1, false {
 		more, err := cursor.NextArrayElement(first)
 		if err != nil {
@@ -399,7 +399,7 @@ func decodeCompiledFloatArray[T Float](cursor *DecoderCursor, node *typedNode, d
 	}
 }
 
-func decodeCompiledPointer(cursor *DecoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func decodeCompiledPointer(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
 	null, err := cursor.TryNull()
 	if err != nil {
 		return err

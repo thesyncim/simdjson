@@ -1,7 +1,7 @@
 # simdjson comparison benchmarks
 
-This directory is a separate Go module. Comparison-only dependencies and code
-generation tools never enter simdjson's root module graph.
+This directory is a separate Go module. Comparison-only dependencies never
+enter simdjson's root module graph.
 
 ## Fairness rules
 
@@ -10,7 +10,7 @@ generation tools never enter simdjson's root module graph.
 - easyjson types live in `easyjsonmodel`. Attaching easyjson's generated
   `UnmarshalJSON` method to the shared types would cause stdlib, Segment,
   go-json, and jsoniter to call easyjson instead of their own decoder.
-- `simdjson-Generated-zero-copy` is compared with Sonic `ConfigFastest`, whose
+- `simdjson-Compiled-zero-copy` is compared with Sonic `ConfigFastest`, whose
   `CopyString` setting is false. Owned simdjson is compared with owned-string rows.
 - Fresh and reused destinations have different benchmark names.
 - Sonic native results come from `legacy`, because Sonic v1.15.2 falls back to
@@ -21,27 +21,25 @@ generation tools never enter simdjson's root module graph.
 Fixtures are 31 bytes, 4,240 bytes (32 records), and 136,586 bytes (1,024
 records). Published results use the median of five one-second samples.
 
-## Generated vs compile once
+## Compiled decoder
 
-This comparison excludes `CompileDecoder[T]` construction. Both decoders are
-initialized before timing with source-backed strings and case-sensitive field
-matching.
+These results exclude `CompileDecoder[T]` construction. Plans are initialized
+before timing with case-sensitive field matching.
 
-| Workload | Compiled once | Generated | Generated speedup |
+| Workload | SIMD, source-backed | Pure Go, source-backed | SIMD, owned |
 |---|---:|---:|---:|
-| Small, fresh | 33.34 ns / 0 allocs | 30.79 ns / 0 allocs | **1.08x** |
-| Medium, fresh | 3.036 us / 2 allocs | 2.902 us / 1 alloc | **1.05x** |
-| Medium, reused | 2.775 us / 0 allocs | 2.647 us / 0 allocs | **1.05x** |
-| Large, fresh | 89.939 us / 2 allocs | 87.389 us / 1 alloc | **1.03x** |
-| Large, reused | 86.742 us / 0 allocs | 82.891 us / 0 allocs | **1.05x** |
+| Small, fresh | **33.38 ns / 0** | 33.49 ns / 0 | 48.90 ns / 1 |
+| Medium, fresh | **3.029 us / 2** | 3.207 us / 2 | 3.394 us / 3 |
+| Medium, reused | **2.802 us / 0** | 2.964 us / 0 | 3.216 us / 1 |
+| Large, fresh | **92.409 us / 2** | 97.271 us / 2 | 101.147 us / 3 |
+| Large, reused | **88.172 us / 0** | 93.106 us / 0 | 96.587 us / 1 |
 
-The speedup column is `compiled time / generated time`. Reproduce the paired
-run with:
+Reproduce the compiled rows with:
 
 ```sh
 GOEXPERIMENT=simd /Users/thesyncim/sdk/gotip/bin/go test \
   -run='^$' \
-  -bench='^BenchmarkParseTyped/(small|medium|large)/simdjson-(Compiled|Generated)-zero-copy(-reused)?$' \
+  -bench='^BenchmarkParseTyped/(small|medium|large)/simdjson-Compiled-(zero-copy|owned)(-reused)?$' \
   -benchmem -benchtime=1s -count=5 .
 ```
 
@@ -60,7 +58,7 @@ Pure-Go simdjson control:
 ```sh
 /Users/thesyncim/sdk/gotip/bin/go test \
   -run='^$' \
-  -bench='BenchmarkParseTyped/(small|medium|large)/(simdjson-Generated-(zero-copy|owned)(-reused)?)$' \
+  -bench='BenchmarkParseTyped/(small|medium|large)/simdjson-Compiled-(zero-copy|owned)(-reused)?$' \
   -benchmem -benchtime=1s -count=5 .
 ```
 
@@ -99,7 +97,7 @@ another pinned environment.
 ## Benchmark groups
 
 - `BenchmarkParseTyped`: typed fresh and reused decoding across conventional,
-  generated, compiled, zero-copy, and owned modes.
+  compiled zero-copy, compiled owned, and competitor modes.
 - `BenchmarkParseTypedJSONV2`: direct `encoding/json/v2` typed decoding.
 - `Valid`: syntax validation only.
 - `ParseAny`: full conventional `any` materialization.

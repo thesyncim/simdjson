@@ -17,20 +17,18 @@ var (
 )
 
 var (
-	typedSmallSink      TypedSmall
-	typedDocumentSink   TypedDocument
-	easySmallSink       easyjsonmodel.TypedSmall
-	easyDocumentSink    easyjsonmodel.TypedDocument
-	typedSmallDecoder   = mustTypedDecoder[TypedSmall]()
-	typedDocDecoder     = mustTypedDecoder[TypedDocument]()
-	typedSmallGenerated = TypedSmallJSONDecoder{Options: typedBenchmarkOptions}
-	typedDocGenerated   = TypedDocumentJSONDecoder{Options: typedBenchmarkOptions}
-	typedSmallOwned     = TypedSmallJSONDecoder{Options: typedOwnedOptions}
-	typedDocOwned       = TypedDocumentJSONDecoder{Options: typedOwnedOptions}
+	typedSmallSink    TypedSmall
+	typedDocumentSink TypedDocument
+	easySmallSink     easyjsonmodel.TypedSmall
+	easyDocumentSink  easyjsonmodel.TypedDocument
+	typedSmallDecoder = mustTypedDecoder[TypedSmall](typedBenchmarkOptions)
+	typedDocDecoder   = mustTypedDecoder[TypedDocument](typedBenchmarkOptions)
+	typedSmallOwned   = mustTypedDecoder[TypedSmall](typedOwnedOptions)
+	typedDocOwned     = mustTypedDecoder[TypedDocument](typedOwnedOptions)
 )
 
-func mustTypedDecoder[T any]() simdjson.TypedDecoder[T] {
-	decoder, err := simdjson.CompileDecoder[T](typedBenchmarkOptions)
+func mustTypedDecoder[T any](opts simdjson.TypedOptions) simdjson.TypedDecoder[T] {
+	decoder, err := simdjson.CompileDecoder[T](opts)
 	if err != nil {
 		panic(err)
 	}
@@ -116,18 +114,7 @@ func benchmarkTypedSmall(b *testing.B, src []byte) {
 			typedSmallSink = dst
 		}
 	})
-	b.Run("simdjson-Generated-zero-copy", func(b *testing.B) {
-		b.SetBytes(int64(len(src)))
-		b.ReportAllocs()
-		for range b.N {
-			var dst TypedSmall
-			if err := typedSmallGenerated.Decode(src, &dst); err != nil {
-				b.Fatal(err)
-			}
-			typedSmallSink = dst
-		}
-	})
-	b.Run("simdjson-Generated-owned", func(b *testing.B) {
+	b.Run("simdjson-Compiled-owned", func(b *testing.B) {
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
 		for range b.N {
@@ -207,18 +194,7 @@ func benchmarkTypedDocument(b *testing.B, src []byte) {
 			typedDocumentSink = dst
 		}
 	})
-	b.Run("simdjson-Generated-zero-copy", func(b *testing.B) {
-		b.SetBytes(int64(len(src)))
-		b.ReportAllocs()
-		for range b.N {
-			var dst TypedDocument
-			if err := typedDocGenerated.Decode(src, &dst); err != nil {
-				b.Fatal(err)
-			}
-			typedDocumentSink = dst
-		}
-	})
-	b.Run("simdjson-Generated-owned", func(b *testing.B) {
+	b.Run("simdjson-Compiled-owned", func(b *testing.B) {
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
 		for range b.N {
@@ -265,19 +241,7 @@ func benchmarkTypedDocument(b *testing.B, src []byte) {
 			typedDocumentSink = dst
 		}
 	})
-	b.Run("simdjson-Generated-zero-copy-reused", func(b *testing.B) {
-		dst := TypedDocument{Items: make([]TypedRecord, 0, 1024)}
-		b.SetBytes(int64(len(src)))
-		b.ReportAllocs()
-		b.ResetTimer()
-		for range b.N {
-			if err := typedDocGenerated.Decode(src, &dst); err != nil {
-				b.Fatal(err)
-			}
-			typedDocumentSink = dst
-		}
-	})
-	b.Run("simdjson-Generated-owned-reused", func(b *testing.B) {
+	b.Run("simdjson-Compiled-owned-reused", func(b *testing.B) {
 		dst := TypedDocument{Items: make([]TypedRecord, 0, 1024)}
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
