@@ -109,11 +109,8 @@ func TestTypedDecoderOptionsAndUnsupportedTypes(t *testing.T) {
 	if err := strict.Decode([]byte(`{"unknown":1}`), &record); err == nil {
 		t.Fatal("typed decoder accepted unknown field")
 	}
-	if _, err := CompileDecoder[map[int]string](DecoderOptions{}); err == nil {
-		t.Fatal("typed decoder accepted non-string map keys")
-	}
-	if _, err := CompileDecoder[struct{ Value interface{ M() } }](DecoderOptions{}); err == nil {
-		t.Fatal("typed decoder accepted non-empty interface field")
+	if _, err := CompileDecoder[struct{ Value func() }](DecoderOptions{}); err == nil {
+		t.Fatal("typed decoder accepted func field")
 	}
 }
 

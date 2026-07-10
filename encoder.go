@@ -1,8 +1,10 @@
 package simdjson
 
 import (
+	"encoding"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"math/bits"
@@ -205,6 +207,13 @@ func (e *encodeState) encode(node *typedNode, src unsafe.Pointer) error {
 		return e.encodeAny(src)
 	case typedMarshalerJSON, typedMarshalerText:
 		return e.encodeMarshaler(node, src)
+	case typedIface:
+		value := reflect.NewAt(node.typ, noescape(src)).Elem()
+		if value.IsNil() {
+			e.dst = append(e.dst, "null"...)
+			return nil
+		}
+		return e.encodeDynamicValue(value.Elem())
 	case typedBytes:
 		header := (*typedSliceHeader)(src)
 		if header.data == nil {
@@ -397,13 +406,21 @@ func (e *encodeState) encodeAny(src unsafe.Pointer) error {
 	if e.depth >= defaultMaxDepth {
 		return &EncodeError{Reason: "maximum nesting depth exceeded"}
 	}
-	dynamicValue := reflect.ValueOf(value)
-	node, err := dynamicEncodeNode(dynamicValue.Type())
+	return e.encodeDynamicValue(reflect.ValueOf(value))
+}
+
+// encodeDynamicValue encodes a concrete reflect value through a cached plan
+// for its type.
+func (e *encodeState) encodeDynamicValue(value reflect.Value) error {
+	if e.depth >= defaultMaxDepth {
+		return &EncodeError{Reason: "maximum nesting depth exceeded"}
+	}
+	node, err := dynamicEncodeNode(value.Type())
 	if err != nil {
 		return &EncodeError{Reason: err.Error()}
 	}
-	box := reflect.New(dynamicValue.Type())
-	box.Elem().Set(dynamicValue)
+	box := reflect.New(value.Type())
+	box.Elem().Set(value)
 	e.depth++
 	encodeErr := e.encode(node, box.UnsafePointer())
 	e.depth--
@@ -426,36 +443,65 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	// is one pointer word.
 	local := *(*unsafe.Pointer)(src)
 	mapValue := reflect.NewAt(node.typ, unsafe.Pointer(&local)).Elem()
-	keys := make([]string, 0, mapValue.Len())
+	entries := make([]mapEncodeEntry, 0, mapValue.Len())
 	iterator := mapValue.MapRange()
 	for iterator.Next() {
-		keys = append(keys, iterator.Key().String())
+		name, err := mapKeyName(node, iterator.Key())
+		if err != nil {
+			e.depth--
+			return &EncodeError{Reason: err.Error()}
+		}
+		entries = append(entries, mapEncodeEntry{name: name, key: iterator.Key()})
 	}
-	sort.Strings(keys)
-	keyType := node.typ.Key()
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
 	element := reflect.New(node.elem.typ)
 	elementPtr := element.UnsafePointer()
 	elementValue := element.Elem()
 	e.dst = append(e.dst, '{')
-	for i, key := range keys {
+	for i := range entries {
 		if i > 0 {
 			e.dst = append(e.dst, ',')
 		}
-		e.dst = appendEncodedJSONString(e.dst, key, e.escapeHTML)
+		e.dst = appendEncodedJSONString(e.dst, entries[i].name, e.escapeHTML)
 		e.dst = append(e.dst, ':')
-		keyValue := reflect.ValueOf(key)
-		if keyType != keyValue.Type() {
-			keyValue = keyValue.Convert(keyType)
-		}
-		elementValue.Set(mapValue.MapIndex(keyValue))
+		elementValue.Set(mapValue.MapIndex(entries[i].key))
 		if err := e.encode(node.elem, elementPtr); err != nil {
 			e.depth--
-			return prependEncodePathField(err, key)
+			return prependEncodePathField(err, entries[i].name)
 		}
 	}
 	e.dst = append(e.dst, '}')
 	e.depth--
 	return nil
+}
+
+type mapEncodeEntry struct {
+	name string
+	key  reflect.Value
+}
+
+// mapKeyName renders a map key as its JSON member name, following
+// encoding/json: a value-method-set TextMarshaler wins, then string kinds,
+// then base 10 integers.
+func mapKeyName(node *typedNode, key reflect.Value) (string, error) {
+	if node.mapKeyTextEncode {
+		marshaler := key.Interface().(encoding.TextMarshaler)
+		text, err := marshaler.MarshalText()
+		if err != nil {
+			return "", err
+		}
+		return string(text), nil
+	}
+	switch node.mapKeyKind {
+	case mapKeyString:
+		return key.String(), nil
+	case mapKeyInt:
+		return strconv.FormatInt(key.Int(), 10), nil
+	case mapKeyUint:
+		return strconv.FormatUint(key.Uint(), 10), nil
+	default:
+		return "", errors.New("map key type " + key.Type().String() + " cannot be encoded")
+	}
 }
 
 // encodeQuoted writes a scalar tagged with the string option: the value's
@@ -631,8 +677,8 @@ func typedValueIsEmpty(node *typedNode, src unsafe.Pointer) bool {
 		}
 		local := *(*unsafe.Pointer)(src)
 		return reflect.NewAt(node.typ, unsafe.Pointer(&local)).Elem().Len() == 0
-	case typedAny:
-		return *(*any)(src) == nil
+	case typedAny, typedIface:
+		return *(*unsafe.Pointer)(src) == nil && *(*any)(src) == nil
 	default:
 		return false
 	}

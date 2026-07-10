@@ -206,6 +206,7 @@ const (
 	typedUnmarshalerText
 	typedMarshalerJSON
 	typedMarshalerText
+	typedIface
 )
 
 type typedOp uint8
@@ -235,6 +236,7 @@ const (
 	typedOpQuoted
 	typedOpUnmarshaler
 	typedOpMarshaler
+	typedOpIface
 )
 
 type typedNode struct {
@@ -248,9 +250,12 @@ type typedNode struct {
 	size   uintptr
 	bits   int
 	length int
-	elem      *typedNode
-	fields    []typedField
-	encFields []typedEncField
+	elem             *typedNode
+	mapKeyKind       typedMapKeyKind
+	mapKeyTextDecode bool
+	mapKeyTextEncode bool
+	fields     []typedField
+	encFields  []typedEncField
 	fieldHops [][]typedFieldHop
 	hopResets []uintptr
 	reset     []typedResetOp
@@ -398,14 +403,21 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 		node.elem = elem
 	case reflect.Interface:
 		if typ.NumMethod() != 0 {
-			return c.unsupported(typ, path, "non-empty interfaces would require dynamic dispatch")
+			node.kind = typedIface
+			node.op = typedOpIface
+			break
 		}
 		node.kind = typedAny
 		node.op = typedOpAny
 	case reflect.Map:
-		if typ.Key().Kind() != reflect.String {
-			return c.unsupported(typ, path, "map keys must have a string kind")
+		keyKind, keyOK := classifyMapKey(typ.Key())
+		if !keyOK {
+			return c.unsupported(typ, path, "unsupported map key type")
 		}
+		node.mapKeyKind = keyKind
+		node.mapKeyTextDecode = reflect.PointerTo(typ.Key()).Implements(textUnmarshalerReflectType)
+		// encoding/json only consults the value method set for key encoding.
+		node.mapKeyTextEncode = typ.Key().Implements(textMarshalerReflectType)
 		node.kind = typedMap
 		node.op = typedOpMap
 		elem, err := c.compile(typ.Elem(), path+"[key]")
@@ -499,6 +511,36 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 	return nil
 }
 
+// typedMapKeyKind classifies how map keys convert to and from JSON member
+// names, following encoding/json: text unmarshalers win on decode, string
+// kinds win on encode, and integer kinds round trip through base 10.
+type typedMapKeyKind uint8
+
+const (
+	mapKeyString typedMapKeyKind = iota
+	mapKeyInt
+	mapKeyUint
+	mapKeyText
+)
+
+func classifyMapKey(keyType reflect.Type) (typedMapKeyKind, bool) {
+	implementsText := keyType.Implements(textMarshalerReflectType) ||
+		reflect.PointerTo(keyType).Implements(textUnmarshalerReflectType)
+	switch keyType.Kind() {
+	case reflect.String:
+		return mapKeyString, true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return mapKeyInt, true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return mapKeyUint, true
+	default:
+		if implementsText {
+			return mapKeyText, true
+		}
+		return 0, false
+	}
+}
+
 var (
 	jsonMarshalerReflectType   = reflect.TypeFor[json.Marshaler]()
 	jsonUnmarshalerReflectType = reflect.TypeFor[json.Unmarshaler]()
@@ -509,7 +551,9 @@ var (
 // applyInterfaceKinds overrides dispatch for types with custom un/marshalers,
 // reporting whether any interface applies. json.Number keeps its fast path.
 func (c *typedCompiler) applyInterfaceKinds(node *typedNode, typ reflect.Type) bool {
-	if typ == jsonNumberReflectType {
+	// Interface values dispatch on their concrete type instead; json.Number
+	// keeps its fast path.
+	if typ == jsonNumberReflectType || typ.Kind() == reflect.Interface {
 		return false
 	}
 	pointerType := reflect.PointerTo(typ)
@@ -676,7 +720,7 @@ func resetTyped(node *typedNode, dst unsafe.Pointer) {
 		}
 	case typedPointer, typedMap:
 		*(*unsafe.Pointer)(dst) = nil
-	case typedAny:
+	case typedAny, typedIface:
 		*(*any)(dst) = nil
 	}
 }

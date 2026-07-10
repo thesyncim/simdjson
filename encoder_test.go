@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -369,8 +370,8 @@ func TestMapErrorsAndPaths(t *testing.T) {
 		t.Fatalf("path = %q, want outer.inner", typed.Path)
 	}
 
-	if _, err := CompileDecoder[map[int]string](DecoderOptions{}); err == nil {
-		t.Fatal("integer map keys accepted")
+	if _, err := CompileDecoder[map[float64]string](DecoderOptions{}); err == nil {
+		t.Fatal("float map keys accepted")
 	}
 
 	type withNaN struct {
@@ -735,5 +736,152 @@ func TestEmbeddedPointerEncodeNil(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("nil embedded pointer:\nsimdjson %s\nstdlib   %s", got, want)
+	}
+}
+
+type textKey struct{ A, B int }
+
+func (k textKey) MarshalText() ([]byte, error) { return fmt.Appendf(nil, "%d-%d", k.A, k.B), nil }
+func (k *textKey) UnmarshalText(text []byte) error {
+	_, err := fmt.Sscanf(string(text), "%d-%d", &k.A, &k.B)
+	return err
+}
+
+type stringTextKey string
+
+func (k stringTextKey) MarshalText() ([]byte, error) { return []byte("SHOULD-NOT-BE-USED"), nil }
+func (k *stringTextKey) UnmarshalText(text []byte) error {
+	*k = stringTextKey("text:" + string(text))
+	return nil
+}
+
+type mapKeyDocument struct {
+	Ints   map[int]string       `json:"ints"`
+	Uints  map[uint8]int        `json:"uints"`
+	Texts  map[textKey]int      `json:"texts"`
+	Asym   map[stringTextKey]int `json:"asym"`
+	Named  map[int32]bool       `json:"named"`
+}
+
+func TestNonStringMapKeysMatchStdlib(t *testing.T) {
+	// Encode: string kinds beat TextMarshaler; ints format base 10; text keys
+	// marshal; everything sorts by rendered name.
+	value := mapKeyDocument{
+		Ints:  map[int]string{-3: "a", 10: "b", 2: "c"},
+		Uints: map[uint8]int{255: 1, 0: 2},
+		Texts: map[textKey]int{{A: 1, B: 2}: 3, {A: 0, B: 0}: 4},
+		Asym:  map[stringTextKey]int{"raw": 5},
+		Named: map[int32]bool{-9: true},
+	}
+	want, wantErr := stdlibCompactJSON(t, &value)
+	got, gotErr := Marshal(&value)
+	if (gotErr == nil) != (wantErr == nil) {
+		t.Fatalf("encode acceptance differs: simdjson=%v stdlib=%v", gotErr, wantErr)
+	}
+	if gotErr == nil && !bytes.Equal(got, want) {
+		t.Fatalf("encode:\nsimdjson %s\nstdlib   %s", got, want)
+	}
+
+	decoder, err := CompileDecoder[mapKeyDocument](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := []string{
+		`{"ints":{"-3":"a","10":"b"},"uints":{"255":1},"texts":{"7-8":9},"asym":{"k":1},"named":{"-9":true}}`,
+		`{"ints":{"not-a-number":"x"}}`,
+		`{"uints":{"-1":1}}`,
+		`{"uints":{"256":1}}`,
+		`{"texts":{"badkey":1}}`,
+		`{"ints":{"1.5":"x"}}`,
+	}
+	for _, src := range sources {
+		var got, want mapKeyDocument
+		gotErr := decoder.Decode([]byte(src), &got)
+		wantErr := json.Unmarshal([]byte(src), &want)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("%s: acceptance differs: simdjson=%v stdlib=%v", src, gotErr, wantErr)
+		}
+		if gotErr == nil && !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s:\nsimdjson %#v\nstdlib   %#v", src, got, want)
+		}
+	}
+}
+
+type speaker interface{ Speak() string }
+
+type dog struct {
+	Sound string `json:"sound"`
+}
+
+func (d *dog) Speak() string { return d.Sound }
+
+type ifaceDocument struct {
+	Animal speaker `json:"animal"`
+	Blob   any     `json:"blob"`
+	Option speaker `json:"option,omitempty"`
+}
+
+func TestNonEmptyInterfacesMatchStdlib(t *testing.T) {
+	// Encode: concrete dynamic dispatch, nil as null, omitempty.
+	values := []ifaceDocument{
+		{Animal: &dog{Sound: "woof"}, Blob: map[string]any{"k": 1.5}},
+		{},
+	}
+	for _, value := range values {
+		want, wantErr := stdlibCompactJSON(t, &value)
+		got, gotErr := Marshal(&value)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("%#v: encode acceptance differs: simdjson=%v stdlib=%v", value, gotErr, wantErr)
+		}
+		if gotErr == nil && !bytes.Equal(got, want) {
+			t.Fatalf("%#v:\nsimdjson %s\nstdlib   %s", value, got, want)
+		}
+	}
+
+	// Decode: null clears; a held non-nil pointer is decoded into; anything
+	// else fails, all matching encoding/json.
+	decoder, err := CompileDecoder[ifaceDocument](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := []string{
+		`{"animal":null}`,
+		`{"animal":{"sound":"nope"}}`,
+	}
+	for _, src := range sources {
+		got := ifaceDocument{Animal: &dog{Sound: "old"}}
+		want := ifaceDocument{Animal: &dog{Sound: "old"}}
+		gotErr := decoder.Decode([]byte(src), &got)
+		wantErr := json.Unmarshal([]byte(src), &want)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("%s: acceptance differs: simdjson=%v stdlib=%v", src, gotErr, wantErr)
+		}
+		if gotErr == nil && !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s:\nsimdjson %#v\nstdlib   %#v", src, got.Animal, want.Animal)
+		}
+	}
+
+	// Empty interface holding a pointer is decoded into, keeping identity.
+	target := &dog{Sound: "before"}
+	holder := struct {
+		Blob any `json:"blob"`
+	}{Blob: target}
+	if err := Unmarshal([]byte(`{"blob":{"sound":"after"}}`), &holder); err != nil {
+		t.Fatal(err)
+	}
+	if target.Sound != "after" {
+		t.Fatalf("pointer held by interface not decoded into: %#v", target)
+	}
+	if holder.Blob != any(target) {
+		t.Fatalf("interface identity lost: %#v", holder.Blob)
+	}
+
+	// Fresh interface without a pointer errors like stdlib.
+	var fresh ifaceDocument
+	gotErr := decoder.Decode([]byte(`{"animal":{"sound":"x"}}`), &fresh)
+	var want ifaceDocument
+	wantErr := json.Unmarshal([]byte(`{"animal":{"sound":"x"}}`), &want)
+	if (gotErr == nil) != (wantErr == nil) {
+		t.Fatalf("fresh non-empty interface: simdjson=%v stdlib=%v", gotErr, wantErr)
 	}
 }

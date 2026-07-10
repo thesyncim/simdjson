@@ -1,11 +1,15 @@
 package simdjson
 
 import (
+	"encoding"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"math/bits"
 	"reflect"
 	"runtime"
+	"strconv"
+	"sync"
 	"unsafe"
 )
 
@@ -64,6 +68,8 @@ func decodeCompiled(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) 
 		return decodeViaUnmarshaler(cursor, node, dst)
 	case typedUnmarshalerText:
 		return decodeViaTextUnmarshaler(cursor, node, dst)
+	case typedIface:
+		return decodeCompiledIface(cursor, node, dst)
 	default:
 		return &DecodeError{Offset: cursor.i, Type: node.typ, Reason: "invalid compiled operation"}
 	}
@@ -190,6 +196,8 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 			} else {
 				fieldErr = decodeViaTextUnmarshaler(cursor, fieldNode, fieldDst)
 			}
+		case typedOpIface:
+			fieldErr = decodeCompiledIface(cursor, fieldNode, fieldDst)
 		default:
 			fieldErr = &DecodeError{Offset: cursor.i, Type: fieldNode.typ, Reason: "invalid compiled operation"}
 		}
@@ -467,6 +475,8 @@ func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 				elementErr = decodeViaUnmarshaler(cursor, node.elem, element)
 			case typedUnmarshalerText:
 				elementErr = decodeViaTextUnmarshaler(cursor, node.elem, element)
+			case typedIface:
+				elementErr = decodeCompiledIface(cursor, node.elem, element)
 			default:
 				elementErr = &DecodeError{Offset: cursor.i, Type: node.elem.typ, Reason: "invalid compiled operation"}
 			}
@@ -627,11 +637,53 @@ func decodeCompiledMap(cursor *decoderCursor, node *typedNode, dst unsafe.Pointe
 		if entryErr != nil {
 			return prependDecodePathField(entryErr, key)
 		}
-		keyValue := reflect.ValueOf(key)
-		if keyType.Kind() == reflect.String && keyType != keyValue.Type() {
-			keyValue = keyValue.Convert(keyType)
+		keyValue, keyErr := mapKeyValue(node, keyType, key)
+		if keyErr != nil {
+			return prependDecodePathField(&DecodeError{Offset: cursor.i, Type: keyType, Reason: keyErr.Error()}, key)
 		}
 		mapValue.SetMapIndex(keyValue, elementValue)
+	}
+}
+
+// mapKeyValue converts a decoded member name into the map's key type,
+// following encoding/json: text unmarshalers first, then string kinds, then
+// base-10 integers with range checks.
+func mapKeyValue(node *typedNode, keyType reflect.Type, key string) (reflect.Value, error) {
+	if node.mapKeyTextDecode {
+		boxed := reflect.New(keyType)
+		unmarshaler := boxed.Interface().(encoding.TextUnmarshaler)
+		if err := unmarshaler.UnmarshalText([]byte(key)); err != nil {
+			return reflect.Value{}, err
+		}
+		return boxed.Elem(), nil
+	}
+	switch node.mapKeyKind {
+	case mapKeyString:
+		keyValue := reflect.ValueOf(key)
+		if keyType != keyValue.Type() {
+			keyValue = keyValue.Convert(keyType)
+		}
+		return keyValue, nil
+	case mapKeyText:
+		return reflect.Value{}, errors.New("map key type " + keyType.String() + " cannot be decoded")
+	case mapKeyInt:
+		parsed, err := strconv.ParseInt(key, 10, 64)
+		if err != nil || reflect.Zero(keyType).OverflowInt(parsed) {
+			return reflect.Value{}, errors.New("cannot parse map key as " + keyType.String())
+		}
+		keyValue := reflect.New(keyType).Elem()
+		keyValue.SetInt(parsed)
+		return keyValue, nil
+	case mapKeyUint:
+		parsed, err := strconv.ParseUint(key, 10, 64)
+		if err != nil || reflect.Zero(keyType).OverflowUint(parsed) {
+			return reflect.Value{}, errors.New("cannot parse map key as " + keyType.String())
+		}
+		keyValue := reflect.New(keyType).Elem()
+		keyValue.SetUint(parsed)
+		return keyValue, nil
+	default:
+		return reflect.Value{}, errors.New("map key type " + keyType.String() + " cannot be decoded")
 	}
 }
 
@@ -640,6 +692,26 @@ func decodeCompiledMap(cursor *decoderCursor, node *typedNode, dst unsafe.Pointe
 // nil. The destination is always replaced; unlike encoding/json, a pointer
 // already stored in the interface is not decoded into.
 func decodeCompiledAny(cursor *decoderCursor, dst unsafe.Pointer) error {
+	// Like encoding/json, an interface already holding a non-nil pointer is
+	// decoded into rather than replaced, except by null.
+	if existing := *(*any)(dst); existing != nil {
+		null, err := cursor.TryNull()
+		if err != nil {
+			return err
+		}
+		if null {
+			*(*any)(dst) = nil
+			return nil
+		}
+		existingValue := reflect.ValueOf(existing)
+		if existingValue.Kind() == reflect.Pointer && !existingValue.IsNil() {
+			inner, err := dynamicDecodeNode(existingValue.Type().Elem())
+			if err != nil {
+				return &DecodeError{Offset: cursor.i, Type: existingValue.Type(), Reason: err.Error()}
+			}
+			return decodeCompiled(cursor, inner, existingValue.UnsafePointer())
+		}
+	}
 	// Dynamic strings are retained by the result, so owned decodes switch to
 	// the private input copy first.
 	cursor.ownSource()
@@ -652,6 +724,56 @@ func decodeCompiledAny(cursor *decoderCursor, dst unsafe.Pointer) error {
 	}
 	*(*any)(dst) = value
 	return nil
+}
+
+// dynamicDecodeNodes caches one compiled decode plan per concrete type found
+// inside an interface value.
+var dynamicDecodeNodes sync.Map
+
+type dynamicDecodeEntry struct {
+	node *typedNode
+	err  error
+}
+
+func dynamicDecodeNode(typ reflect.Type) (*typedNode, error) {
+	if entry, ok := dynamicDecodeNodes.Load(typ); ok {
+		cached := entry.(*dynamicDecodeEntry)
+		return cached.node, cached.err
+	}
+	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode)}
+	node, err := compiler.compile(typ, typ.String())
+	if err == nil {
+		prepareTypedResets(node, make(map[*typedNode]bool))
+	}
+	entry, _ := dynamicDecodeNodes.LoadOrStore(typ, &dynamicDecodeEntry{node: node, err: err})
+	cached := entry.(*dynamicDecodeEntry)
+	return cached.node, cached.err
+}
+
+// decodeCompiledIface decodes into a non-empty interface: null clears it,
+// and a held non-nil pointer is decoded into like encoding/json; any other
+// state cannot be decoded.
+func decodeCompiledIface(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+	null, err := cursor.TryNull()
+	if err != nil {
+		return err
+	}
+	if null {
+		*(*any)(dst) = nil
+		return nil
+	}
+	value := reflect.NewAt(node.typ, noescape(dst)).Elem()
+	if !value.IsNil() {
+		concrete := value.Elem()
+		if concrete.Kind() == reflect.Pointer && !concrete.IsNil() {
+			inner, innerErr := dynamicDecodeNode(concrete.Type().Elem())
+			if innerErr != nil {
+				return &DecodeError{Offset: cursor.i, Type: concrete.Type(), Reason: innerErr.Error()}
+			}
+			return decodeCompiled(cursor, inner, concrete.UnsafePointer())
+		}
+	}
+	return &DecodeError{Offset: cursor.i, Type: node.typ, Reason: "cannot decode into a non-empty interface"}
 }
 
 // decodeQuotedField decodes a scalar tagged with the string option: the JSON
@@ -859,7 +981,7 @@ func appendTypedReset(ops []typedResetOp, node *typedNode, offset uintptr) []typ
 		return append(ops, typedResetOp{offset: offset, kind: typedResetSlice})
 	case typedPointer, typedMap:
 		return append(ops, typedResetOp{offset: offset, kind: typedResetPointer})
-	case typedAny:
+	case typedAny, typedIface:
 		return append(ops, typedResetOp{offset: offset, kind: typedResetInterface})
 	case typedStruct:
 		for i := range node.fields {
