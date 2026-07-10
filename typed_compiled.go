@@ -55,6 +55,8 @@ func decodeCompiled(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) 
 		return decodeCompiledPointer(cursor, node, dst)
 	case typedMap:
 		return decodeCompiledMap(cursor, node, dst)
+	case typedAny:
+		return decodeCompiledAny(cursor, dst)
 	default:
 		return &DecodeError{Offset: cursor.i, Type: node.typ, Reason: "invalid compiled operation"}
 	}
@@ -161,6 +163,8 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 			fieldErr = decodeCompiledPointer(cursor, fieldNode, fieldDst)
 		case typedOpMap:
 			fieldErr = decodeCompiledMap(cursor, fieldNode, fieldDst)
+		case typedOpAny:
+			fieldErr = decodeCompiledAny(cursor, fieldDst)
 		default:
 			fieldErr = &DecodeError{Offset: cursor.i, Type: fieldNode.typ, Reason: "invalid compiled operation"}
 		}
@@ -422,6 +426,8 @@ func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 				elementErr = decodeCompiledPointer(cursor, node.elem, element)
 			case typedMap:
 				elementErr = decodeCompiledMap(cursor, node.elem, element)
+			case typedAny:
+				elementErr = decodeCompiledAny(cursor, element)
 			default:
 				elementErr = &DecodeError{Offset: cursor.i, Type: node.elem.typ, Reason: "invalid compiled operation"}
 			}
@@ -582,6 +588,25 @@ func decodeCompiledMap(cursor *decoderCursor, node *typedNode, dst unsafe.Pointe
 	}
 }
 
+// decodeCompiledAny decodes one JSON value into an empty interface using the
+// standard dynamic shapes: map[string]any, []any, string, float64, bool, and
+// nil. The destination is always replaced; unlike encoding/json, a pointer
+// already stored in the interface is not decoded into.
+func decodeCompiledAny(cursor *decoderCursor, dst unsafe.Pointer) error {
+	// Dynamic strings are retained by the result, so owned decodes switch to
+	// the private input copy first.
+	cursor.ownSource()
+	p := cursor.slowParser()
+	p.skipSpace()
+	value, err := p.parseAnyValue(cursor.depth, false)
+	cursor.i = p.i
+	if err != nil {
+		return err
+	}
+	*(*any)(dst) = value
+	return nil
+}
+
 func allocateTypedPointer(node *typedNode, dst unsafe.Pointer) unsafe.Pointer {
 	value := reflect.New(node.elem.typ)
 	pointer := value.UnsafePointer()
@@ -615,6 +640,7 @@ const (
 	typedResetString
 	typedResetSlice
 	typedResetPointer
+	typedResetInterface
 )
 
 type typedResetOp struct {
@@ -648,6 +674,8 @@ func appendTypedReset(ops []typedResetOp, node *typedNode, offset uintptr) []typ
 		return append(ops, typedResetOp{offset: offset, kind: typedResetSlice})
 	case typedPointer, typedMap:
 		return append(ops, typedResetOp{offset: offset, kind: typedResetPointer})
+	case typedAny:
+		return append(ops, typedResetOp{offset: offset, kind: typedResetInterface})
 	case typedStruct:
 		for i := range node.fields {
 			field := &node.fields[i]
@@ -712,6 +740,8 @@ func applyTypedReset(ops []typedResetOp, dst unsafe.Pointer) {
 			(*typedSliceHeader)(field).len = 0
 		case typedResetPointer:
 			*(*unsafe.Pointer)(field) = nil
+		case typedResetInterface:
+			*(*any)(field) = nil
 		}
 	}
 }

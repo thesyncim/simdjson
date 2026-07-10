@@ -391,3 +391,73 @@ func TestMapErrorsAndPaths(t *testing.T) {
 		t.Fatalf("encode path = %q, want m.bad", enc.Path)
 	}
 }
+
+type anyDocument struct {
+	Meta   any            `json:"meta"`
+	Blob   map[string]any `json:"blob"`
+	Items  []any          `json:"items"`
+	Option any            `json:"option,omitempty"`
+}
+
+func TestAnyFieldsMatchStdlib(t *testing.T) {
+	sources := []string{
+		`{"meta":{"a":[1,2.5,{"deep":true}],"b":null},"blob":{"s":"x","n":-3e2},"items":[1,"two",false,null,{"k":"v"}]}`,
+		`{"meta":null,"blob":{},"items":[]}`,
+		`{"meta":"just a string","blob":{"nested":{"more":{"even":[{}]}}},"items":[[[1]]]}`,
+		`{"meta":1e15,"blob":{"big":123456789012345678901234567890}}`,
+		`{"option":null}`,
+	}
+	decoder, err := CompileDecoder[anyDocument](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, src := range sources {
+		var got, want anyDocument
+		gotErr := decoder.Decode([]byte(src), &got)
+		wantErr := json.Unmarshal([]byte(src), &want)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("%s: acceptance differs: simdjson=%v stdlib=%v", src, gotErr, wantErr)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s:\nsimdjson %#v\nstdlib   %#v", src, got, want)
+		}
+		if gotErr != nil {
+			continue
+		}
+		gotJSON, gotEncErr := Marshal(&got)
+		wantJSON, wantEncErr := stdlibCompactJSON(t, &want)
+		if (gotEncErr == nil) != (wantEncErr == nil) {
+			t.Fatalf("%s: encode acceptance differs: simdjson=%v stdlib=%v", src, gotEncErr, wantEncErr)
+		}
+		if !bytes.Equal(gotJSON, wantJSON) {
+			t.Fatalf("%s:\nsimdjson %s\nstdlib   %s", src, gotJSON, wantJSON)
+		}
+	}
+}
+
+func TestAnyEncodeConcreteTypes(t *testing.T) {
+	type custom struct {
+		N int `json:"n"`
+	}
+	values := []anyDocument{
+		{Meta: int(7), Blob: map[string]any{"i32": int32(-5), "u": uint16(9)}, Items: []any{int8(1), float32(2.5)}},
+		{Meta: custom{N: 3}, Items: []any{&custom{N: 4}, map[string]int{"z": 1, "a": 2}}},
+		{Meta: []string{"x", "y"}, Blob: map[string]any{"deep": []any{map[string]any{"k": json.Number("5.5")}}}},
+		{Meta: [2]int{1, 2}},
+	}
+	for _, value := range values {
+		want, wantErr := stdlibCompactJSON(t, &value)
+		got, gotErr := Marshal(&value)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("%#v: acceptance differs: simdjson=%v stdlib=%v", value, gotErr, wantErr)
+		}
+		if gotErr == nil && !bytes.Equal(got, want) {
+			t.Fatalf("%#v:\nsimdjson %s\nstdlib   %s", value, got, want)
+		}
+	}
+
+	unsupported := anyDocument{Meta: make(chan int)}
+	if _, err := Marshal(&unsupported); err == nil {
+		t.Fatal("chan inside any accepted")
+	}
+}

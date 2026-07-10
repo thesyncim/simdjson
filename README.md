@@ -287,12 +287,15 @@ allocation contracts, differential fuzzing, race and `checkptr=2` runs, and
 Linux cross-compiles for arm64 and amd64.
 
 Compiled decoders and encoders support exported structs, nested named
-structs, pointers, slices, fixed arrays, maps with string keys, named scalar
-types, booleans, strings, every integer width, floats, and `json.Number`.
-Map decoding merges into existing maps and map encoding sorts keys, both
-matching `encoding/json`. Interfaces, `[]byte`, non-string map keys, the
-`string` tag option, and custom unmarshaler dispatch are not supported.
-Untagged anonymous fields are rejected rather than flattened.
+structs, pointers, slices, fixed arrays, maps with string keys, empty
+interfaces, named scalar types, booleans, strings, every integer width,
+floats, and `json.Number`. Map decoding merges into existing maps and map
+encoding sorts keys, both matching `encoding/json`. Values decoded into
+`any` use the standard dynamic shapes and always replace the previous value;
+encoding an interface compiles a plan for its concrete type on first use.
+Non-empty interfaces, `[]byte`, non-string map keys, the `string` tag
+option, and custom unmarshaler dispatch are not supported. Untagged
+anonymous fields are rejected rather than flattened.
 
 Run scalar and SIMD verification against the pinned compiler:
 

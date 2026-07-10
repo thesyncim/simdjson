@@ -195,6 +195,7 @@ const (
 	typedArray
 	typedPointer
 	typedMap
+	typedAny
 )
 
 type typedOp uint8
@@ -219,6 +220,7 @@ const (
 	typedOpArray
 	typedOpPointer
 	typedOpMap
+	typedOpAny
 )
 
 type typedNode struct {
@@ -339,6 +341,12 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 			return nil, err
 		}
 		node.elem = elem
+	case reflect.Interface:
+		if typ.NumMethod() != 0 {
+			return nil, c.unsupported(typ, path, "non-empty interfaces would require dynamic dispatch")
+		}
+		node.kind = typedAny
+		node.op = typedOpAny
 	case reflect.Map:
 		if typ.Key().Kind() != reflect.String {
 			return nil, c.unsupported(typ, path, "map keys must have a string kind")
@@ -551,6 +559,8 @@ func resetTyped(node *typedNode, dst unsafe.Pointer) {
 		}
 	case typedPointer, typedMap:
 		*(*unsafe.Pointer)(dst) = nil
+	case typedAny:
+		*(*any)(dst) = nil
 	}
 }
 

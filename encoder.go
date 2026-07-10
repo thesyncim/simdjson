@@ -188,6 +188,8 @@ func (e *encodeState) encode(node *typedNode, src unsafe.Pointer) error {
 		return e.encodeArray(node, src)
 	case typedMap:
 		return e.encodeMap(node, src)
+	case typedAny:
+		return e.encodeAny(src)
 	case typedPointer:
 		pointer := *(*unsafe.Pointer)(src)
 		if pointer == nil {
@@ -299,6 +301,70 @@ func (e *encodeState) encodeArray(node *typedNode, src unsafe.Pointer) error {
 	e.dst = append(e.dst, ']')
 	e.depth--
 	return nil
+}
+
+// dynamicEncodeNodes caches one compiled encode plan per concrete type seen
+// inside an interface value.
+var dynamicEncodeNodes sync.Map
+
+type dynamicEncodeEntry struct {
+	node *typedNode
+	err  error
+}
+
+func dynamicEncodeNode(typ reflect.Type) (*typedNode, error) {
+	if entry, ok := dynamicEncodeNodes.Load(typ); ok {
+		cached := entry.(*dynamicEncodeEntry)
+		return cached.node, cached.err
+	}
+	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode)}
+	node, err := compiler.compile(typ, typ.String())
+	entry, _ := dynamicEncodeNodes.LoadOrStore(typ, &dynamicEncodeEntry{node: node, err: err})
+	cached := entry.(*dynamicEncodeEntry)
+	return cached.node, cached.err
+}
+
+// encodeAny encodes the concrete value stored in an empty interface,
+// compiling a plan for its type on first use.
+func (e *encodeState) encodeAny(src unsafe.Pointer) error {
+	value := *(*any)(src)
+	switch concrete := value.(type) {
+	case nil:
+		e.dst = append(e.dst, "null"...)
+		return nil
+	case bool:
+		if concrete {
+			e.dst = append(e.dst, "true"...)
+		} else {
+			e.dst = append(e.dst, "false"...)
+		}
+		return nil
+	case string:
+		e.dst = appendEncodedJSONString(e.dst, concrete)
+		return nil
+	case float64:
+		return e.encodeFloat(concrete, 64)
+	case int:
+		e.dst = appendCompactInt(e.dst, int64(concrete))
+		return nil
+	case int64:
+		e.dst = appendCompactInt(e.dst, concrete)
+		return nil
+	}
+	if e.depth >= defaultMaxDepth {
+		return &EncodeError{Reason: "maximum nesting depth exceeded"}
+	}
+	dynamicValue := reflect.ValueOf(value)
+	node, err := dynamicEncodeNode(dynamicValue.Type())
+	if err != nil {
+		return &EncodeError{Reason: err.Error()}
+	}
+	box := reflect.New(dynamicValue.Type())
+	box.Elem().Set(dynamicValue)
+	e.depth++
+	encodeErr := e.encode(node, box.UnsafePointer())
+	e.depth--
+	return encodeErr
 }
 
 // encodeMap writes a map with string keys as an object with byte-sorted
@@ -491,6 +557,8 @@ func typedValueIsEmpty(node *typedNode, src unsafe.Pointer) bool {
 			return true
 		}
 		return reflect.NewAt(node.typ, src).Elem().Len() == 0
+	case typedAny:
+		return *(*any)(src) == nil
 	default:
 		return false
 	}

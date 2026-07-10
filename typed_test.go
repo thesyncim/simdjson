@@ -42,6 +42,7 @@ type typedEdgeValue struct {
 	Fixed   [3]typedEdgeInt  `json:"fixed"`
 	Next    typedEdgePointer `json:"next"`
 	Extra   map[string]int   `json:"extra"`
+	Meta    any              `json:"meta"`
 }
 
 func TestTypedDecoderMatchesStdlib(t *testing.T) {
@@ -102,8 +103,8 @@ func TestTypedDecoderOptionsAndUnsupportedTypes(t *testing.T) {
 	if _, err := CompileDecoder[map[int]string](DecoderOptions{}); err == nil {
 		t.Fatal("typed decoder accepted non-string map keys")
 	}
-	if _, err := CompileDecoder[struct{ Value any }](DecoderOptions{}); err == nil {
-		t.Fatal("typed decoder accepted interface field")
+	if _, err := CompileDecoder[struct{ Value interface{ M() } }](DecoderOptions{}); err == nil {
+		t.Fatal("typed decoder accepted non-empty interface field")
 	}
 }
 
