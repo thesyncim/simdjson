@@ -17,13 +17,15 @@ On an Apple M4 Max, `CompileDecoder[T]` parsed the benchmark fixtures in:
 
 | Mode | 31 B object | 4.2 KB / 32 records | 136.6 KB / 1,024 records |
 |---|---:|---:|---:|
-| **SIMD, source-backed** | **33.4 ns / 0 allocs** | **3.03 us / 2 allocs** | **92.4 us / 2 allocs** |
-| Pure Go, source-backed | 33.5 ns / 0 allocs | 3.21 us / 2 allocs | 97.3 us / 2 allocs |
-| **SIMD, owned strings** | **48.9 ns / 1 alloc** | **3.39 us / 3 allocs** | **101.1 us / 3 allocs** |
+| **SIMD, source-backed** | **27.8 ns / 0 allocs** | **2.26 us / 2 allocs** | **67.8 us / 2 allocs** |
+| Pure Go, source-backed | 28.2 ns / 0 allocs | 2.41 us / 2 allocs | 71.6 us / 2 allocs |
+| **SIMD, owned strings** | **43.2 ns / 1 alloc** | **2.52 us / 3 allocs** | **74.3 us / 3 allocs** |
 
-Reusing the destination removes the remaining container allocation in
-source-backed mode: `2.80 us / 0 allocs` for 32 records and
-`88.2 us / 0 allocs` for 1,024 records.
+The large source-backed fixture decodes at 2.0 GB/s. Reusing the destination
+removes the remaining container allocation in source-backed mode:
+`2.15 us / 0 allocs` for 32 records and `66.4 us / 0 allocs` for 1,024
+records. Pretty-printed input stays on the fast path: the same large document
+indented with two spaces (222 KB) decodes at 1.9 GB/s.
 
 These are medians of five one-second samples, not claims about every schema.
 The [benchmark methodology](#benchmark-methodology) records the exact compiler,
@@ -52,10 +54,22 @@ type Event struct {
 }
 ```
 
-Compile the decoder once and reuse it concurrently:
+`Unmarshal` is a drop-in replacement for `encoding/json.Unmarshal`. It compiles
+a decoder for each destination type once, caches it for the process lifetime,
+and matches stdlib semantics (owned strings, case-insensitive field fallback):
 
 ```go
-decoder, err := simdjson.CompileDecoder[Event](simdjson.TypedOptions{
+var event Event
+if err := simdjson.Unmarshal(payload, &event); err != nil {
+	return err
+}
+```
+
+Hot paths should compile the decoder once and reuse it concurrently; that also
+unlocks zero-copy strings and the other options:
+
+```go
+decoder, err := simdjson.CompileDecoder[Event](simdjson.DecoderOptions{
 	ZeroCopy:      true,
 	CaseSensitive: true,
 })
@@ -72,10 +86,28 @@ if err := decoder.Decode(payload, &event); err != nil {
 Leave `ZeroCopy` false when decoded strings must own their storage. `DecodeArray`
 decodes a top-level array and reuses caller-provided slice capacity.
 
+## Decode Errors Carry Paths
+
+When valid JSON cannot be stored in the destination type, the returned
+`*DecodeError` reports the byte offset and the path of the offending value:
+
+```go
+err := simdjson.Unmarshal(payload, &doc)
+var decodeErr *simdjson.DecodeError
+if errors.As(err, &decodeErr) {
+	fmt.Println(decodeErr.Path) // items[3].scores[1]
+}
+// simdjson: cannot decode JSON at byte 57 into float64 at items[3].scores[1]: expected number
+```
+
+The path is assembled only while an error unwinds, so successful decodes pay
+nothing for it.
+
 ## Choose An API
 
 | Job | API | Data model |
 |---|---|---|
+| Drop-in `json.Unmarshal` | `Unmarshal[T]` | Cached compiled decoder per type |
 | Fast concrete structs | `CompileDecoder[T]` | Compiled fields and scalar operations |
 | Repeated zero-allocation traversal | `BuildIndex`, `Index`, `Node` | Source and caller workspace backed |
 | Strict JSON Pointer lookup | `GetRaw`, `CompilePointer` | Validates the complete document |
@@ -85,18 +117,18 @@ decodes a top-level array and reuses caller-provided slice capacity.
 | Validation only | `Valid`, `Validate` | No result allocation |
 | Transforms | `AppendCompact`, `AppendIndent`, `AppendCanonicalize` | Caller-owned destination |
 
-The typed plan is immutable after compilation and safe for concurrent use.
-Compilation is excluded from the benchmark timer. The plan uses packed
-expected-key matching, exact scalar operations, lazy replacement resets, and
-specialized fixed-float arrays.
+The compiled plan is immutable and safe for concurrent use. Compilation is
+excluded from the benchmark timer. The plan uses packed expected-key matching,
+exact scalar operations, lazy replacement resets, and specialized fixed-float
+arrays.
 
 | Workload | SIMD | Pure Go |
 |---|---:|---:|
-| 31 B, fresh | **33.38 ns / 0 allocs** | 33.49 ns / 0 allocs |
-| 4.2 KB, fresh | **3.029 us / 2 allocs** | 3.207 us / 2 allocs |
-| 4.2 KB, reused | **2.802 us / 0 allocs** | 2.964 us / 0 allocs |
-| 136.6 KB, fresh | **92.409 us / 2 allocs** | 97.271 us / 2 allocs |
-| 136.6 KB, reused | **88.172 us / 0 allocs** | 93.106 us / 0 allocs |
+| 31 B, fresh | **27.77 ns / 0 allocs** | 28.23 ns / 0 allocs |
+| 4.2 KB, fresh | **2.260 us / 2 allocs** | 2.410 us / 2 allocs |
+| 4.2 KB, reused | **2.152 us / 0 allocs** | 2.200 us / 0 allocs |
+| 136.6 KB, fresh | **67.768 us / 2 allocs** | 71.565 us / 2 allocs |
+| 136.6 KB, reused | **66.374 us / 0 allocs** | 68.429 us / 0 allocs |
 
 ## Zero-Allocation Traversal
 
@@ -134,7 +166,7 @@ source range is needed.
 
 Ownership is explicit because it changes both speed and lifetime:
 
-| Typed mode | Unescaped strings | Cost |
+| Decoder mode | Unescaped strings | Cost |
 |---|---|---|
 | Default | Alias one private copy of the input | One source-sized allocation |
 | `ZeroCopy: true` | Alias caller `src` | No string copy |
@@ -188,21 +220,21 @@ Source-backed comparison:
 
 | Decoder | 31 B | 4.2 KB | 136.6 KB |
 |---|---:|---:|---:|
-| **simdjson compiled, SIMD** | **33.4 ns / 0** | **3.03 us / 2** | **92.4 us / 2** |
-| simdjson compiled, pure Go | 33.5 ns / 0 | 3.21 us / 2 | 97.3 us / 2 |
+| **simdjson compiled, SIMD** | **27.8 ns / 0** | **2.26 us / 2** | **67.8 us / 2** |
+| simdjson compiled, pure Go | 28.2 ns / 0 | 2.41 us / 2 | 71.6 us / 2 |
 | Sonic v1.15.2 Fastest, Go 1.26.4 | 187.9 ns / 4 | 5.74 us / 6 | 170.5 us / 6 |
 
 Owned-string comparison:
 
 | Decoder | 31 B | 4.2 KB | 136.6 KB |
 |---|---:|---:|---:|
-| **simdjson compiled, SIMD** | **48.9 ns / 1** | **3.39 us / 3** | **101.1 us / 3** |
-| go-json v0.10.6 | 56.2 ns / 2 | 5.78 us / 35 | 174.4 us / 1,027 |
-| Segment encoding v0.5.4 | 59.8 ns / 2 | 5.60 us / 69 | 171.5 us / 2,058 |
-| jsoniter v1.1.12 | 86.4 ns / 2 | 6.68 us / 104 | 201.9 us / 3,085 |
-| easyjson v0.9.2 generated | 87.3 ns / 1 | 8.51 us / 71 | 262.4 us / 2,060 |
+| **simdjson compiled, SIMD** | **43.2 ns / 1** | **2.52 us / 3** | **74.3 us / 3** |
+| go-json v0.10.6 | 53.0 ns / 2 | 5.60 us / 35 | 175.3 us / 1,027 |
+| Segment encoding v0.5.4 | 58.0 ns / 2 | 5.41 us / 69 | 167.7 us / 2,058 |
+| jsoniter v1.1.12 | 83.8 ns / 2 | 6.53 us / 104 | 195.7 us / 3,085 |
+| easyjson v0.9.2 generated | 85.7 ns / 1 | 8.29 us / 71 | 259.3 us / 2,060 |
 | `encoding/json/v2`, Go tip | 170.6 ns / 1 | 12.48 us / 39 | 379.5 us / 1,037 |
-| `encoding/json`, Go tip | 206.3 ns / 1 | 15.55 us / 39 | 465.9 us / 1,037 |
+| `encoding/json`, Go tip | 200.5 ns / 1 | 15.19 us / 39 | 455.9 us / 1,037 |
 | Sonic v1.15.2 Std, Go 1.26.4 | 233.0 ns / 5 | 7.82 us / 71 | 227.9 us / 2,055 |
 
 Run the primary comparison:

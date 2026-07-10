@@ -28,11 +28,11 @@ before timing with case-sensitive field matching.
 
 | Workload | SIMD, source-backed | Pure Go, source-backed | SIMD, owned |
 |---|---:|---:|---:|
-| Small, fresh | **33.38 ns / 0** | 33.49 ns / 0 | 48.90 ns / 1 |
-| Medium, fresh | **3.029 us / 2** | 3.207 us / 2 | 3.394 us / 3 |
-| Medium, reused | **2.802 us / 0** | 2.964 us / 0 | 3.216 us / 1 |
-| Large, fresh | **92.409 us / 2** | 97.271 us / 2 | 101.147 us / 3 |
-| Large, reused | **88.172 us / 0** | 93.106 us / 0 | 96.587 us / 1 |
+| Small, fresh | **27.77 ns / 0** | 28.23 ns / 0 | 43.21 ns / 1 |
+| Medium, fresh | **2.260 us / 2** | 2.410 us / 2 | 2.522 us / 3 |
+| Medium, reused | **2.152 us / 0** | 2.200 us / 0 | 2.412 us / 1 |
+| Large, fresh | **67.768 us / 2** | 71.565 us / 2 | 74.304 us / 3 |
+| Large, reused | **66.374 us / 0** | 68.429 us / 0 | 71.927 us / 1 |
 
 Reproduce the compiled rows with:
 
