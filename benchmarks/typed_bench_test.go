@@ -254,3 +254,98 @@ func benchmarkTypedDocument(b *testing.B, src []byte) {
 		}
 	})
 }
+
+var (
+	typedDocEncoder  = mustTypedEncoder[TypedDocument]()
+	encodeOutSink    []byte
+)
+
+func mustTypedEncoder[T any]() simdjson.Encoder[T] {
+	encoder, err := simdjson.CompileEncoder[T]()
+	if err != nil {
+		panic(err)
+	}
+	return encoder
+}
+
+func BenchmarkEncodeTyped(b *testing.B) {
+	src := recordsJSON(1024)
+	var doc TypedDocument
+	if err := stdjson.Unmarshal(src, &doc); err != nil {
+		b.Fatal(err)
+	}
+	out, err := typedDocEncoder.AppendJSON(nil, &doc)
+	if err != nil {
+		b.Fatal(err)
+	}
+	size := int64(len(out))
+
+	b.Run("stdlib", func(b *testing.B) {
+		b.SetBytes(size)
+		b.ReportAllocs()
+		for range b.N {
+			result, err := stdjson.Marshal(&doc)
+			if err != nil {
+				b.Fatal(err)
+			}
+			encodeOutSink = result
+		}
+	})
+	b.Run("go-json", func(b *testing.B) {
+		b.SetBytes(size)
+		b.ReportAllocs()
+		for range b.N {
+			result, err := goccyjson.Marshal(&doc)
+			if err != nil {
+				b.Fatal(err)
+			}
+			encodeOutSink = result
+		}
+	})
+	b.Run("Segment", func(b *testing.B) {
+		b.SetBytes(size)
+		b.ReportAllocs()
+		for range b.N {
+			result, err := segmentjson.Marshal(&doc)
+			if err != nil {
+				b.Fatal(err)
+			}
+			encodeOutSink = result
+		}
+	})
+	b.Run("jsoniter", func(b *testing.B) {
+		b.SetBytes(size)
+		b.ReportAllocs()
+		for range b.N {
+			result, err := jsoniter.Marshal(&doc)
+			if err != nil {
+				b.Fatal(err)
+			}
+			encodeOutSink = result
+		}
+	})
+	b.Run("simdjson-Marshal", func(b *testing.B) {
+		b.SetBytes(size)
+		b.ReportAllocs()
+		for range b.N {
+			result, err := simdjson.Marshal(&doc)
+			if err != nil {
+				b.Fatal(err)
+			}
+			encodeOutSink = result
+		}
+	})
+	b.Run("simdjson-AppendJSON-reused", func(b *testing.B) {
+		buffer := make([]byte, 0, len(out))
+		b.SetBytes(size)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			result, err := typedDocEncoder.AppendJSON(buffer[:0], &doc)
+			if err != nil {
+				b.Fatal(err)
+			}
+			buffer = result
+		}
+	})
+}

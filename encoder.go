@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 	"unsafe"
 )
@@ -49,13 +50,15 @@ func (plan Encoder[T]) AppendJSON(dst []byte, src *T) ([]byte, error) {
 var unmarshalEncoders sync.Map
 
 type cachedEncoder[T any] struct {
-	encoder Encoder[T]
-	err     error
+	encoder  Encoder[T]
+	err      error
+	sizeHint atomic.Uint64
 }
 
 // Marshal encodes src like encoding/json.Marshal with HTML escaping disabled.
 // The encoder for each source type is compiled once and cached for the
-// process lifetime. Hot paths that encode one type repeatedly should call
+// process lifetime, along with a running output-size hint that presizes the
+// result buffer. Hot paths that encode one type repeatedly should call
 // CompileEncoder once and reuse the returned Encoder with AppendJSON to
 // recycle output buffers.
 func Marshal[T any](src *T) ([]byte, error) {
@@ -67,7 +70,18 @@ func Marshal[T any](src *T) ([]byte, error) {
 	if cached.err != nil {
 		return nil, cached.err
 	}
-	return cached.encoder.AppendJSON(nil, src)
+	hint := cached.sizeHint.Load()
+	if hint < 64 {
+		hint = 64
+	}
+	out, err := cached.encoder.AppendJSON(make([]byte, 0, hint), src)
+	if err != nil {
+		return nil, err
+	}
+	if size := uint64(len(out)); size > cached.sizeHint.Load() {
+		cached.sizeHint.Store(size)
+	}
+	return out, nil
 }
 
 //go:noinline
