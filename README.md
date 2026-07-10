@@ -29,6 +29,10 @@ These are medians of five one-second samples, not claims about every schema.
 The [benchmark methodology](#benchmark-methodology) records the exact compiler,
 ownership rules, fixtures, competitor versions, and commands.
 
+Generation is a material optimization over `CompileDecoder[T]`, not just a
+convenience: it is `2.79x` faster for the 31-byte object and approximately
+`1.9x-2.0x` faster for the medium and large fixtures in a dedicated paired run.
+
 ## Quick Start
 
 Install and pin a Go tip toolchain:
@@ -110,6 +114,26 @@ if err := decoder.Decode(payload, &event); err != nil {
 	return err
 }
 ```
+
+### Generated vs compile once
+
+Both decoders below were created before the benchmark timer. The
+`CompileDecoder[T]` column therefore excludes schema compilation and measures
+steady-state decoding only. Both paths use `ZeroCopy` and `CaseSensitive`.
+
+| Workload | `CompileDecoder[T]` | Generated decoder | Generated speedup |
+|---|---:|---:|---:|
+| 31 B, fresh | 84.59 ns / 1 alloc | 30.31 ns / 0 allocs | **2.79x** |
+| 4.2 KB, fresh | 5.462 us / 3 allocs | 2.926 us / 1 alloc | **1.87x** |
+| 4.2 KB, reused | 5.191 us / 0 allocs | 2.706 us / 0 allocs | **1.92x** |
+| 136.6 KB, fresh | 175.894 us / 3 allocs | 88.830 us / 1 alloc | **1.98x** |
+| 136.6 KB, reused | 169.482 us / 0 allocs | 85.051 us / 0 allocs | **1.99x** |
+
+`CompileDecoder[T]` removes reflection from the token loop, but still walks a
+runtime type graph and performs node-kind and field dispatch. Generation emits
+concrete key switches and direct, type-specialized cursor calls that the Go
+compiler can inline. Use the compiled decoder when avoiding generation matters;
+use generation for hot schemas.
 
 ## Zero-Allocation Traversal
 

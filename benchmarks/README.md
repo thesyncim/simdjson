@@ -21,6 +21,30 @@ generation tools never enter simdjson's root module graph.
 Fixtures are 31 bytes, 4,240 bytes (32 records), and 136,586 bytes (1,024
 records). Published results use the median of five one-second samples.
 
+## Generated vs compile once
+
+This comparison excludes `CompileDecoder[T]` construction. Both decoders are
+initialized before timing with source-backed strings and case-sensitive field
+matching.
+
+| Workload | Compiled once | Generated | Generated speedup |
+|---|---:|---:|---:|
+| Small, fresh | 84.59 ns / 1 alloc | 30.31 ns / 0 allocs | **2.79x** |
+| Medium, fresh | 5.462 us / 3 allocs | 2.926 us / 1 alloc | **1.87x** |
+| Medium, reused | 5.191 us / 0 allocs | 2.706 us / 0 allocs | **1.92x** |
+| Large, fresh | 175.894 us / 3 allocs | 88.830 us / 1 alloc | **1.98x** |
+| Large, reused | 169.482 us / 0 allocs | 85.051 us / 0 allocs | **1.99x** |
+
+The speedup column is `compiled time / generated time`. Reproduce the paired
+run with:
+
+```sh
+GOEXPERIMENT=simd /Users/thesyncim/sdk/gotip/bin/go test \
+  -run='^$' \
+  -bench='^BenchmarkParseTyped/(small|medium|large)/simdjson-(Compiled|Generated)-zero-copy(-reused)?$' \
+  -benchmem -benchtime=1s -count=5 .
+```
+
 ## Go tip runs
 
 The published SIMD command was:
@@ -75,7 +99,7 @@ another pinned environment.
 ## Benchmark groups
 
 - `BenchmarkParseTyped`: typed fresh and reused decoding across conventional,
-  generated, plan, zero-copy, and owned modes.
+  generated, compiled, zero-copy, and owned modes.
 - `BenchmarkParseTypedJSONV2`: direct `encoding/json/v2` typed decoding.
 - `Valid`: syntax validation only.
 - `ParseAny`: full conventional `any` materialization.
