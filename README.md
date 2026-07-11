@@ -1,5 +1,7 @@
 # simdjson
 
+[![ci](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml/badge.svg)](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml)
+
 Fast, strict JSON for Go tip, written entirely in Go: a drop-in
 `encoding/json` replacement that leads every measured category — typed
 decoding, encoding, validation, and dynamic parsing — by significant margins.
