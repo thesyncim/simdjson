@@ -28,11 +28,11 @@ before timing with case-sensitive field matching.
 
 | Workload | SIMD, source-backed | SIMD, owned |
 |---|---:|---:|
-| Small, fresh | **29.9 ns / 0** | 43.3 ns / 1 |
-| Medium, fresh | **2.36 us / 2** | 2.62 us / 3 |
-| Medium, reused | **2.20 us / 0** | 2.48 us / 1 |
-| Large, fresh | **75.9 us / 2** | 84.1 us / 3 |
-| Large, reused | **74.8 us / 0** | 80.8 us / 1 |
+| Small, fresh | **28.2 ns / 0** | 42.5 ns / 1 |
+| Medium, fresh | **2.60 us / 2** | 2.57 us / 3 |
+| Medium, reused | **2.20 us / 0** | 2.45 us / 1 |
+| Large, fresh | **70.1 us / 2** | 75.3 us / 3 |
+| Large, reused | **68.5 us / 0** | 73.3 us / 1 |
 
 The scalar-versus-SIMD control lives in the root module's `BenchmarkDecode*`
 benchmarks, which build in seconds and compare the same binary pair.
