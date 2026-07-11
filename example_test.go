@@ -3,6 +3,7 @@ package simdjson_test
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/thesyncim/simdjson"
 )
@@ -140,4 +141,41 @@ func ExampleBuildIndex() {
 
 	fmt.Println(n)
 	// Output: 7
+}
+
+func ExampleDecoderOptions() {
+	decoder, err := simdjson.CompileDecoder[exampleEvent](simdjson.DecoderOptions{Replace: true})
+	if err != nil {
+		panic(err)
+	}
+
+	// Replace resets fields the document does not mention; the default
+	// merges like encoding/json and would keep Name.
+	event := exampleEvent{ID: 1, Name: "stale", Enabled: true}
+	if err := decoder.Decode([]byte(`{"id":2}`), &event); err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("%d %q %t\n", event.ID, event.Name, event.Enabled)
+	// Output: 2 "" false
+}
+
+func ExampleCompileEncoder() {
+	type stamped struct {
+		Name string    `json:"name"`
+		At   time.Time `json:"at"`
+	}
+	encoder, err := simdjson.CompileEncoder[stamped](simdjson.EncoderOptions{})
+	if err != nil {
+		panic(err)
+	}
+
+	value := stamped{Name: "launch", At: time.Date(2026, 7, 11, 1, 30, 0, 0, time.UTC)}
+	out, err := encoder.AppendJSON(nil, &value)
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println(string(out))
+	// Output: {"name":"launch","at":"2026-07-11T01:30:00Z"}
 }

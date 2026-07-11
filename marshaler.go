@@ -24,31 +24,12 @@ func decodeViaUnmarshaler(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 	}
 	raw := cursor.src[start:cursor.i]
 
-	receiver := dst
-	if node.typ.Kind() == reflect.Pointer {
-		// The unmarshaler hangs off the pointer's method set: null assigns
-		// nil like encoding/json, anything else allocates a target first.
-		if len(raw) > 0 && raw[0] == 'n' {
-			*(*unsafe.Pointer)(dst) = nil
-			return nil
-		}
-		pointer := *(*unsafe.Pointer)(dst)
-		if pointer == nil {
-			value := reflect.New(node.typ.Elem())
-			pointer = value.UnsafePointer()
-			*(*unsafe.Pointer)(dst) = pointer
-			runtime.KeepAlive(value)
-		}
-		unmarshaler, ok := interfaceAtPointer(node.typ, pointer).(json.Unmarshaler)
-		if !ok {
-			return &DecodeError{Offset: start, Type: node.typ, Reason: "invalid compiled operation"}
-		}
-		if err := unmarshaler.UnmarshalJSON(raw); err != nil {
-			return &DecodeError{Offset: start, Type: node.typ, Reason: err.Error()}
-		}
+	// A pointer-kind receiver treats null as assignment like encoding/json.
+	if node.typ.Kind() == reflect.Pointer && len(raw) > 0 && raw[0] == 'n' {
+		*(*unsafe.Pointer)(dst) = nil
 		return nil
 	}
-	unmarshaler, ok := interfaceAt(node.typ, receiver).(json.Unmarshaler)
+	unmarshaler, ok := receiverAt(node.typ, dst).(json.Unmarshaler)
 	if !ok {
 		return &DecodeError{Offset: start, Type: node.typ, Reason: "invalid compiled operation"}
 	}
@@ -62,6 +43,22 @@ func decodeViaUnmarshaler(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 func interfaceAtPointer(typ reflect.Type, pointer unsafe.Pointer) any {
 	local := pointer
 	return reflect.NewAt(typ, unsafe.Pointer(&local)).Elem().Interface()
+}
+
+// receiverAt boxes the un/marshaler receiver for the value at dst: pointer
+// kinds are loaded and allocated on demand, other kinds pass their address.
+func receiverAt(typ reflect.Type, dst unsafe.Pointer) any {
+	if typ.Kind() != reflect.Pointer {
+		return interfaceAt(typ, dst)
+	}
+	pointer := *(*unsafe.Pointer)(dst)
+	if pointer == nil {
+		value := reflect.New(typ.Elem())
+		pointer = value.UnsafePointer()
+		*(*unsafe.Pointer)(dst) = pointer
+		runtime.KeepAlive(value)
+	}
+	return interfaceAtPointer(typ, pointer)
 }
 
 // decodeViaTextUnmarshaler decodes a JSON string through UnmarshalText.
@@ -82,41 +79,12 @@ func decodeViaTextUnmarshaler(cursor *decoderCursor, node *typedNode, dst unsafe
 	if start >= len(cursor.src) || cursor.src[start] != '"' {
 		return &DecodeError{Offset: start, Type: node.typ, Reason: "expected string for TextUnmarshaler"}
 	}
-	var text []byte
-	begin := start + 1
-	end := scanStringSpecial(cursor.src, begin)
-	if end < len(cursor.src) && cursor.src[end] == '"' {
-		text = cursor.src[begin:end]
-		cursor.i = end + 1
-	} else {
-		p := cursor.slowParser()
-		decoded, err := p.parseString()
-		cursor.i = p.i
-		if err != nil {
-			return err
-		}
-		text = unsafe.Slice(unsafe.StringData(decoded), len(decoded))
+	text, err := cursor.stringToken()
+	if err != nil {
+		return err
 	}
 
-	receiver := dst
-	if node.typ.Kind() == reflect.Pointer {
-		pointer := *(*unsafe.Pointer)(dst)
-		if pointer == nil {
-			value := reflect.New(node.typ.Elem())
-			pointer = value.UnsafePointer()
-			*(*unsafe.Pointer)(dst) = pointer
-			runtime.KeepAlive(value)
-		}
-		unmarshaler, ok := interfaceAtPointer(node.typ, pointer).(encoding.TextUnmarshaler)
-		if !ok {
-			return &DecodeError{Offset: start, Type: node.typ, Reason: "invalid compiled operation"}
-		}
-		if err := unmarshaler.UnmarshalText(text); err != nil {
-			return &DecodeError{Offset: start, Type: node.typ, Reason: err.Error()}
-		}
-		return nil
-	}
-	unmarshaler, ok := interfaceAt(node.typ, receiver).(encoding.TextUnmarshaler)
+	unmarshaler, ok := receiverAt(node.typ, dst).(encoding.TextUnmarshaler)
 	if !ok {
 		return &DecodeError{Offset: start, Type: node.typ, Reason: "invalid compiled operation"}
 	}

@@ -811,6 +811,29 @@ func decodeCompiledIface(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 // decodeQuotedField decodes a scalar tagged with the string option: the JSON
 // value is a string whose contents are one JSON scalar. Bare null resets the
 // field like encoding/json; anything but a string is rejected.
+// stringToken consumes a JSON string and returns its contents: unescaped
+// strings alias the source, escaped strings alias a transient buffer that
+// callers must not retain.
+func (c *decoderCursor) stringToken() ([]byte, error) {
+	i := c.i
+	if i >= len(c.src) || c.src[i] != '"' {
+		return nil, &DecodeError{Offset: i, Reason: "expected string"}
+	}
+	start := i + 1
+	end := scanStringSpecial(c.src, start)
+	if end < len(c.src) && c.src[end] == '"' {
+		c.i = end + 1
+		return c.src[start:end], nil
+	}
+	p := c.slowParser()
+	text, err := p.parseString()
+	c.i = p.i
+	if err != nil {
+		return nil, err
+	}
+	return unsafe.Slice(unsafe.StringData(text), len(text)), nil
+}
+
 func decodeQuotedField(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
 	null, err := cursor.TryNull()
 	if err != nil {
@@ -826,20 +849,9 @@ func decodeQuotedField(cursor *decoderCursor, node *typedNode, dst unsafe.Pointe
 	if i >= len(cursor.src) || cursor.src[i] != '"' {
 		return &DecodeError{Offset: i, Type: node.typ, Reason: "expected quoted value for string-tagged field"}
 	}
-	var inner []byte
-	start := i + 1
-	end := scanStringSpecial(cursor.src, start)
-	if end < len(cursor.src) && cursor.src[end] == '"' {
-		inner = cursor.src[start:end]
-		cursor.i = end + 1
-	} else {
-		p := cursor.slowParser()
-		text, err := p.parseString()
-		cursor.i = p.i
-		if err != nil {
-			return err
-		}
-		inner = unsafe.Slice(unsafe.StringData(text), len(text))
+	inner, err := cursor.stringToken()
+	if err != nil {
+		return err
 	}
 	// The inner scalar may alias a temporary unescape buffer, so decoded
 	// strings must never alias it.
@@ -883,20 +895,9 @@ func decodeCompiledBytes(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 	if i >= len(cursor.src) || cursor.src[i] != '"' {
 		return &DecodeError{Offset: i, Type: node.typ, Reason: "expected base64 string"}
 	}
-	start := i + 1
-	end := scanStringSpecial(cursor.src, start)
-	var encoded []byte
-	if end < len(cursor.src) && cursor.src[end] == '"' {
-		encoded = cursor.src[start:end]
-		cursor.i = end + 1
-	} else {
-		p := cursor.slowParser()
-		text, err := p.parseString()
-		cursor.i = p.i
-		if err != nil {
-			return err
-		}
-		encoded = unsafe.Slice(unsafe.StringData(text), len(text))
+	encoded, err := cursor.stringToken()
+	if err != nil {
+		return err
 	}
 	decodedLen := base64.StdEncoding.DecodedLen(len(encoded))
 	if header.data == nil || header.cap < decodedLen {
