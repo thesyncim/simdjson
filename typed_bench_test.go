@@ -338,3 +338,24 @@ func BenchmarkValidMedium(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkParseAnyMedium(b *testing.B) {
+	src := benchRecordsJSON(32)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	for range b.N {
+		if _, err := ParseAny(src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkParseAnySmall(b *testing.B) {
+	b.SetBytes(int64(len(benchSmallJSON)))
+	b.ReportAllocs()
+	for range b.N {
+		if _, err := ParseAny(benchSmallJSON); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
