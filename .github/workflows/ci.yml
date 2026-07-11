@@ -9,6 +9,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # go.mod requires Go 1.27, which only exists as tip; keep the stable
+      # bootstrap from trying to auto-download an unreleased toolchain.
+      GOTOOLCHAIN: local
     steps:
       - uses: actions/checkout@v4
 
@@ -16,6 +20,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: stable
+          cache: false
 
       - name: Install Go tip
         run: |
