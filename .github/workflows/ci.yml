@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Go bootstrap
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install Go tip
+        run: |
+          go install golang.org/dl/gotip@latest
+          gotip download
+          gotip version
+
+      - name: Tests, pure Go
+        run: gotip test ./...
+
+      - name: Tests, SIMD (executes the amd64 vector kernels)
+        run: gotip test ./...
+        env:
+          GOEXPERIMENT: simd
+
+      - name: Vet
+        run: gotip vet -unsafeptr=false ./...
+
+      - name: Race
+        run: gotip test -race -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
+        env:
+          GOEXPERIMENT: simd
+
+      - name: Cross-compile linux arm64
+        run: gotip build ./...
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          GOEXPERIMENT: simd
+
+      - name: Fuzz smoke
+        run: |
+          gotip test -run='^$' -fuzz='^FuzzTypedDecoderMatchesStdlib$' -fuzztime=60s .
+          gotip test -run='^$' -fuzz='^FuzzEncoderMatchesStdlib$' -fuzztime=60s .
+        env:
+          GOEXPERIMENT: simd
+
+      - name: Comparison module builds
+        run: gotip test -run 'TestValidatorsAcceptFixtures' ./benchmarks
