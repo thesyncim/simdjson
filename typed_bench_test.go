@@ -359,3 +359,35 @@ func BenchmarkParseAnySmall(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkUnmarshalSmall(b *testing.B) {
+	var warm benchSmall
+	if err := Unmarshal(benchSmallJSON, &warm); err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(benchSmallJSON)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		var dst benchSmall
+		if err := Unmarshal(benchSmallJSON, &dst); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkMarshalSmall(b *testing.B) {
+	value := benchSmall{ID: 1, OK: true, Name: "sim"}
+	out, err := Marshal(&value)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(out)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := Marshal(&value); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
