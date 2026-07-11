@@ -8,19 +8,29 @@ import (
 	"unsafe"
 )
 
+// scanAMD64Level selects the vector width once at startup. Dispatch happens
+// through static calls in a switch rather than function values: indirect
+// calls would make escape analysis treat every scanned buffer as leaking,
+// forcing callers' stack storage onto the heap.
+var scanAMD64Level uint8
+
+const (
+	scanLevelScalar uint8 = iota
+	scanLevelAVX2
+	scanLevelAVX512
+)
+
 func initStringScanner() {
 	scanCPUFeatures = detectX86CPUFeatures()
 	switch {
 	case archsimd.X86.AVX512():
-		scanStringSpecialSelected = scanStringSpecialAVX512
-		scanStringSyntaxSelected = scanStringSyntaxAVX512
+		scanAMD64Level = scanLevelAVX512
 		scanStringSelectedMinBytes = 32
 		scanStringProbeMinBytes = 40
 		scanStringSpecialBackend = "amd64-avx512"
 		scanStringVectorBytes = 64
 	case archsimd.X86.AVX2():
-		scanStringSpecialSelected = scanStringSpecialAVX2
-		scanStringSyntaxSelected = scanStringSyntaxAVX2
+		scanAMD64Level = scanLevelAVX2
 		scanStringSelectedMinBytes = 32
 		scanStringProbeMinBytes = 40
 		scanStringSpecialBackend = "amd64-avx2"
@@ -29,11 +39,25 @@ func initStringScanner() {
 }
 
 func scanStringSpecialRuntime(src []byte, i int) int {
-	return scanStringSpecialSelected(src, i)
+	switch scanAMD64Level {
+	case scanLevelAVX512:
+		return scanStringSpecialAVX512(src, i)
+	case scanLevelAVX2:
+		return scanStringSpecialAVX2(src, i)
+	default:
+		return scanStringSpecialScalar(src, i)
+	}
 }
 
 func scanStringSyntaxRuntime(src []byte, i int) int {
-	return scanStringSyntaxSelected(src, i)
+	switch scanAMD64Level {
+	case scanLevelAVX512:
+		return scanStringSyntaxAVX512(src, i)
+	case scanLevelAVX2:
+		return scanStringSyntaxAVX2(src, i)
+	default:
+		return scanStringSyntaxScalar(src, i)
+	}
 }
 
 func scanStringSpecialAVX2(src []byte, i int) int {

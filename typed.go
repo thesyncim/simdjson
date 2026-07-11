@@ -247,27 +247,27 @@ const (
 )
 
 type typedNode struct {
-	kind     typedKind // decode dispatch
-	encKind  typedKind // encode dispatch
-	baseKind typedKind // structural layout, for resets and emptiness
-	op       typedOp
-	encOp    typedOp
-	typ      reflect.Type
-	name   string
-	size   uintptr
-	bits   int
-	length int
+	kind             typedKind // decode dispatch
+	encKind          typedKind // encode dispatch
+	baseKind         typedKind // structural layout, for resets and emptiness
+	op               typedOp
+	encOp            typedOp
+	typ              reflect.Type
+	name             string
+	size             uintptr
+	bits             int
+	length           int
 	elem             *typedNode
 	mapKeyKind       typedMapKeyKind
 	mapKeyTextDecode bool
 	mapKeyTextEncode bool
-	fields     []typedField
-	encFields  []typedEncField
-	fieldHops [][]typedFieldHop
-	hopResets []uintptr
-	reset     []typedResetOp
-	ready     bool
-	allSet    uint64
+	fields           []typedField
+	encFields        []typedEncField
+	fieldHops        [][]typedFieldHop
+	hopResets        []uintptr
+	reset            []typedResetOp
+	ready            bool
+	allSet           uint64
 }
 
 type typedField struct {
@@ -585,7 +585,6 @@ func (c *typedCompiler) applyInterfaceKinds(node *typedNode, typ reflect.Type) b
 	}
 	return applied
 }
-
 
 func validTypedTag(name string) bool {
 	if name == "" {

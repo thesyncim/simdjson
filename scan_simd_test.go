@@ -4,9 +4,7 @@ package simdjson
 
 import (
 	"fmt"
-	"reflect"
 	"runtime"
-	"strings"
 	"testing"
 )
 
@@ -35,13 +33,10 @@ func TestSIMDScannerDispatch(t *testing.T) {
 	if runtime.GOARCH == "amd64" && !info.Features.Has(CPUFeatureAVX2) {
 		t.Fatalf("amd64 SIMD backend features = %v, want AVX2", info.Features)
 	}
-	fn := runtime.FuncForPC(reflect.ValueOf(scanStringSpecialSelected).Pointer())
-	if fn == nil {
-		t.Fatalf("selected scanner backend %q has no runtime function", backend)
-	}
-	name := fn.Name()
-	if !strings.Contains(name, "scanStringSpecialSIMD") && !strings.Contains(name, "scanStringSpecialAVX512") {
-		t.Fatalf("selected scanner backend %q bound to %s", backend, name)
+	// Dispatch is a static switch now; verifying the reported backend
+	// string is the remaining contract.
+	if backend == "scalar" {
+		t.Fatalf("SIMD build selected the scalar backend")
 	}
 }
 
@@ -207,9 +202,9 @@ func BenchmarkStringScannerASCII(b *testing.B) {
 				scanSink = scanStringSpecial(src, 0)
 			}
 		})
-		b.Run(fmt.Sprintf("selected/%d", n), func(b *testing.B) {
+		b.Run(fmt.Sprintf("runtime/%d", n), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				scanSink = scanStringSpecialSelected(src, 0)
+				scanSink = scanStringSpecialRuntime(src, 0)
 			}
 		})
 		b.Run(fmt.Sprintf("direct/%d", n), func(b *testing.B) {

@@ -5,8 +5,6 @@ package simdjson
 import "simd/archsimd"
 
 func initStringScanner() {
-	scanStringSpecialSelected = scanStringSpecialSIMD
-	scanStringSyntaxSelected = scanStringSyntaxSIMD
 	scanStringSelectedMinBytes = 16
 	scanStringProbeMinBytes = 17
 	scanStringSpecialBackend = "arm64-neon"

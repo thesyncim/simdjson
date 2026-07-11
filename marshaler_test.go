@@ -41,11 +41,11 @@ type failingMarshaler struct{}
 func (failingMarshaler) MarshalJSON() ([]byte, error) { return nil, errors.New("boom") }
 
 type marshalerDocument struct {
-	When    time.Time   `json:"when"`
-	WhenPtr *time.Time  `json:"when_ptr"`
-	Point   textPoint   `json:"point"`
-	Box     rawJSONBox  `json:"box"`
-	Boxes   []rawJSONBox `json:"boxes"`
+	When    time.Time            `json:"when"`
+	WhenPtr *time.Time           `json:"when_ptr"`
+	Point   textPoint            `json:"point"`
+	Box     rawJSONBox           `json:"box"`
+	Boxes   []rawJSONBox         `json:"boxes"`
 	ByKey   map[string]textPoint `json:"by_key"`
 }
 

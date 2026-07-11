@@ -21,7 +21,6 @@ type Options struct {
 	// most one private copy of the input, so retaining any decoded string
 	// retains that copy.
 	ZeroCopy bool
-
 }
 
 // Parse parses src into an ordered JSON AST.

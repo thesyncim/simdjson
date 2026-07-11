@@ -268,12 +268,12 @@ func TestEncoderRandomFloatsMatchStdlib(t *testing.T) {
 type mapKey string
 
 type mapDocument struct {
-	Plain    map[string]int            `json:"plain"`
-	Named    map[mapKey]string         `json:"named"`
-	Nested   map[string]map[string]int `json:"nested"`
+	Plain    map[string]int             `json:"plain"`
+	Named    map[mapKey]string          `json:"named"`
+	Nested   map[string]map[string]int  `json:"nested"`
 	Structs  map[string]typedTestRecord `json:"structs"`
-	Slices   map[string][]int          `json:"slices"`
-	Optional map[string]int            `json:"optional,omitempty"`
+	Slices   map[string][]int           `json:"slices"`
+	Optional map[string]int             `json:"optional,omitempty"`
 }
 
 func TestMapsMatchStdlib(t *testing.T) {
@@ -517,14 +517,14 @@ func TestByteSlicesMatchStdlib(t *testing.T) {
 }
 
 type quotedDocument struct {
-	I   int     `json:"i,string"`
-	I8  int8    `json:"i8,string"`
-	U   uint32  `json:"u,string"`
-	F   float64 `json:"f,string"`
-	B   bool    `json:"b,string"`
-	S   string  `json:"s,string"`
+	I   int         `json:"i,string"`
+	I8  int8        `json:"i8,string"`
+	U   uint32      `json:"u,string"`
+	F   float64     `json:"f,string"`
+	B   bool        `json:"b,string"`
+	S   string      `json:"s,string"`
 	N   json.Number `json:"n,string"`
-	Ptr *int    `json:"ptr,string"` // stdlib ignores the option here
+	Ptr *int        `json:"ptr,string"` // stdlib ignores the option here
 }
 
 func TestStringTagOptionMatchesStdlib(t *testing.T) {
@@ -644,15 +644,15 @@ type embConflictA struct{ Same int }
 type embConflictB struct{ Same int }
 type embConflict struct {
 	embConflictA
-	embConflictB // same depth, same name: both dropped
-	Z int `json:"z"`
+	embConflictB     // same depth, same name: both dropped
+	Z            int `json:"z"`
 }
 
 type embInt int
 
 type embNonStruct struct {
-	embInt // named by its type
-	V int  `json:"v"`
+	embInt     // named by its type
+	V      int `json:"v"`
 }
 
 type embUnexported struct {
@@ -756,11 +756,11 @@ func (k *stringTextKey) UnmarshalText(text []byte) error {
 }
 
 type mapKeyDocument struct {
-	Ints   map[int]string       `json:"ints"`
-	Uints  map[uint8]int        `json:"uints"`
-	Texts  map[textKey]int      `json:"texts"`
-	Asym   map[stringTextKey]int `json:"asym"`
-	Named  map[int32]bool       `json:"named"`
+	Ints  map[int]string        `json:"ints"`
+	Uints map[uint8]int         `json:"uints"`
+	Texts map[textKey]int       `json:"texts"`
+	Asym  map[stringTextKey]int `json:"asym"`
+	Named map[int32]bool        `json:"named"`
 }
 
 func TestNonStringMapKeysMatchStdlib(t *testing.T) {

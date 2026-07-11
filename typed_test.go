@@ -42,16 +42,16 @@ type typedEdgeEmbedded struct {
 
 type typedEdgeValue struct {
 	typedEdgeEmbedded
-	Shadowed string `json:"shadowed"` // outer wins over the embedded field
-	ID      int              `json:"id"`
-	Long    string           `json:"long_field_name"`
-	Escaped string           `json:"escaped"`
-	Values  []int            `json:"values"`
-	Fixed   [3]typedEdgeInt  `json:"fixed"`
-	Next    typedEdgePointer `json:"next"`
-	Extra   map[string]int   `json:"extra"`
-	Meta    any              `json:"meta"`
-	When    *time.Time       `json:"when"`
+	Shadowed string           `json:"shadowed"` // outer wins over the embedded field
+	ID       int              `json:"id"`
+	Long     string           `json:"long_field_name"`
+	Escaped  string           `json:"escaped"`
+	Values   []int            `json:"values"`
+	Fixed    [3]typedEdgeInt  `json:"fixed"`
+	Next     typedEdgePointer `json:"next"`
+	Extra    map[string]int   `json:"extra"`
+	Meta     any              `json:"meta"`
+	When     *time.Time       `json:"when"`
 }
 
 func TestTypedDecoderMatchesStdlib(t *testing.T) {

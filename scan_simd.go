@@ -11,8 +11,6 @@ import (
 
 var (
 	scanStringSpecialBackend   = "scalar"
-	scanStringSpecialSelected  = scanStringSpecialScalar
-	scanStringSyntaxSelected   = scanStringSyntaxScalar
 	scanStringSelectedMinBytes = int(^uint(0) >> 1)
 	scanStringProbeMinBytes    = int(^uint(0) >> 1)
 	scanStringVectorBytes      int
