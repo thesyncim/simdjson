@@ -59,4 +59,5 @@ jobs:
           GOEXPERIMENT: simd
 
       - name: Comparison module builds
-        run: gotip test -run 'TestValidatorsAcceptFixtures' ./benchmarks
+        run: gotip test -run 'TestValidatorsAcceptFixtures' .
+        working-directory: benchmarks
