@@ -7,8 +7,7 @@ Sonic v1.15.2 supports Go 1.26 but selects an `encoding/json` fallback on Go
 1.27 tip. The published native run used Go 1.26.4 on Apple M4 Max:
 
 ```sh
-GOTOOLCHAIN=local \
-  /Users/thesyncim/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.darwin-arm64/bin/go test \
+GOTOOLCHAIN=go1.26.4 go test \
   -run='^$' \
   -bench='BenchmarkSonicNativeParseTyped(Fastest|Std)$|BenchmarkSonicNativeParseTypedReused(Fastest|Std)$' \
   -benchmem -benchtime=1s -count=5 .

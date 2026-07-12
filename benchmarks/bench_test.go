@@ -278,7 +278,7 @@ func benchmarkParseAny(b *testing.B, src []byte) {
 			anySink = value
 		}
 	})
-	b.Run("simdjson-ParseAnyZeroCopy", func(b *testing.B) {
+	b.Run("simdjson-ParseAny-options-zero-copy", func(b *testing.B) {
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {

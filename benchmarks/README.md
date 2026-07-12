@@ -40,7 +40,7 @@ benchmarks, which build in seconds and compare the same binary pair.
 Reproduce the compiled rows with:
 
 ```sh
-GOEXPERIMENT=simd /Users/thesyncim/sdk/gotip/bin/go test \
+GOEXPERIMENT=simd "$TIP_GO" test \
   -run='^$' \
   -bench='^BenchmarkParseTyped/(small|medium|large)/simdjson-Compiled-(zero-copy|owned)(-reused)?$' \
   -benchmem -benchtime=1s -count=5 .
@@ -51,7 +51,7 @@ GOEXPERIMENT=simd /Users/thesyncim/sdk/gotip/bin/go test \
 The published SIMD command was:
 
 ```sh
-GOEXPERIMENT=simd /Users/thesyncim/sdk/gotip/bin/go test \
+GOEXPERIMENT=simd "$TIP_GO" test \
   -run='^$' -bench='^BenchmarkParseTyped$' \
   -benchmem -benchtime=1s -count=5 .
 ```
@@ -59,7 +59,7 @@ GOEXPERIMENT=simd /Users/thesyncim/sdk/gotip/bin/go test \
 Pure-Go simdjson control:
 
 ```sh
-/Users/thesyncim/sdk/gotip/bin/go test \
+"$TIP_GO" test \
   -run='^$' \
   -bench='BenchmarkParseTyped/(small|medium|large)/simdjson-Compiled-(zero-copy|owned)(-reused)?$' \
   -benchmem -benchtime=1s -count=5 .
@@ -68,7 +68,7 @@ Pure-Go simdjson control:
 Direct `encoding/json/v2`:
 
 ```sh
-GOEXPERIMENT=simd,jsonv2 /Users/thesyncim/sdk/gotip/bin/go test \
+GOEXPERIMENT=simd,jsonv2 "$TIP_GO" test \
   -run='^$' -bench='^BenchmarkParseTypedJSONV2' \
   -benchmem -benchtime=1s -count=5 .
 ```
@@ -77,6 +77,14 @@ The measured tip compiler was:
 
 ```text
 go version go1.27-devel_d468ad36 Tue Jul 7 05:58:00 2026 -0700 darwin/arm64
+commit d468ad3648be469ffc4090e4586c29709182d6b6
+```
+
+From the repository root, build that exact toolchain and set `TIP_GO` with:
+
+```sh
+./scripts/bootstrap-gotip.sh "$HOME/sdk/simdjson-gotip"
+export TIP_GO="$HOME/sdk/simdjson-gotip/bin/go"
 ```
 
 ## Native stable-toolchain runs
@@ -86,8 +94,7 @@ native arm64 benchmark is isolated under `legacy` and does not import simdjson:
 
 ```sh
 cd legacy
-GOTOOLCHAIN=local \
-  /Users/thesyncim/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.darwin-arm64/bin/go test \
+GOTOOLCHAIN=go1.26.4 go test \
   -run='^$' \
   -bench='BenchmarkSonicNativeParseTyped(Fastest|Std)$|BenchmarkSonicNativeParseTypedReused(Fastest|Std)$' \
   -benchmem -benchtime=1s -count=5 .

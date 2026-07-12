@@ -8,9 +8,8 @@ import (
 	"unsafe"
 )
 
-// interfaceAt builds *T as an interface without letting dst escape: reflect
-// only ever sees the laundered pointer, and the caller's frame keeps the
-// memory alive for the duration of the call.
+// interfaceAt builds *T as an interface without contaminating the allocation
+// behavior of compiled plans that never execute a custom-method operation.
 func interfaceAt(typ reflect.Type, p unsafe.Pointer) any {
 	return reflect.NewAt(typ, noescape(p)).Interface()
 }
@@ -97,6 +96,10 @@ func decodeViaTextUnmarshaler(cursor *decoderCursor, node *typedNode, dst unsafe
 // encodeMarshaler dispatches MarshalJSON or MarshalText, compacting and
 // re-escaping custom JSON exactly like encoding/json.
 func (e *encodeState) encodeMarshaler(node *typedNode, src unsafe.Pointer) error {
+	return e.encodeMarshalerKind(node, src, node.encKind)
+}
+
+func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, kind typedKind) error {
 	var boxed any
 	if node.typ.Kind() == reflect.Pointer {
 		pointer := *(*unsafe.Pointer)(src)
@@ -109,7 +112,7 @@ func (e *encodeState) encodeMarshaler(node *typedNode, src unsafe.Pointer) error
 		boxed = interfaceAt(node.typ, src)
 	}
 
-	if node.encKind == typedMarshalerJSON {
+	if kind == typedMarshalerJSON {
 		marshaler, ok := boxed.(json.Marshaler)
 		if !ok {
 			return &EncodeError{Reason: "invalid compiled operation"}

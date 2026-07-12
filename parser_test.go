@@ -628,8 +628,8 @@ func TestValidateMatchesStdlibGrammarCorpus(t *testing.T) {
 			if _, err := Parse(src); err != nil {
 				t.Fatalf("Parse(%q) = %v", src, err)
 			}
-			if _, err := parseMinAllocForTest(src); err != nil {
-				t.Fatalf("parseMinAllocForTest(%q) = %v", src, err)
+			if _, err := parseOptionsZeroCopyForTest(src); err != nil {
+				t.Fatalf("ParseOptions(ZeroCopy, %q) = %v", src, err)
 			}
 			if out, err := AppendCompact(nil, src); err != nil || !json.Valid(out) {
 				t.Fatalf("AppendCompact(%q) = %q, %v", src, out, err)
@@ -1673,7 +1673,7 @@ func assertParseAnyFloatBits(t testing.TB, text string) {
 	}
 }
 
-func TestParseAnyZeroCopyAliasesStrings(t *testing.T) {
+func TestParseAnyOptionsZeroCopyAliasesStrings(t *testing.T) {
 	src := []byte(`["abc"]`)
 	zeroCopy, err := parseAnyZeroCopyForTest(src)
 	if err != nil {
@@ -1886,11 +1886,11 @@ func BenchmarkStdlibUnmarshal(b *testing.B) {
 	}
 }
 
-func BenchmarkParseZeroCopy(b *testing.B) {
+func BenchmarkParseOptionsZeroCopy(b *testing.B) {
 	src := benchmarkJSON()
 	b.SetBytes(int64(len(src)))
 	for i := 0; i < b.N; i++ {
-		if _, err := parseZeroCopyForTest(src); err != nil {
+		if _, err := parseOptionsZeroCopyForTest(src); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -2222,11 +2222,11 @@ func BenchmarkIndexFlatObjectCursor1024(b *testing.B) {
 	}
 }
 
-func BenchmarkParseZeroCopySmall(b *testing.B) {
+func BenchmarkParseOptionsZeroCopySmall(b *testing.B) {
 	src := smallJSON()
 	b.SetBytes(int64(len(src)))
 	for i := 0; i < b.N; i++ {
-		if _, err := parseZeroCopyForTest(src); err != nil {
+		if _, err := parseOptionsZeroCopyForTest(src); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -2241,16 +2241,6 @@ func BenchmarkStdlibUnmarshalSmall(b *testing.B) {
 			b.Fatal(err)
 		}
 		benchmarkSink = v
-	}
-}
-
-func BenchmarkParseMinAlloc(b *testing.B) {
-	src := benchmarkJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if _, err := parseMinAllocForTest(src); err != nil {
-			b.Fatal(err)
-		}
 	}
 }
 
@@ -2520,11 +2510,7 @@ func rawObjectJSON() []byte {
 	}`)
 }
 
-func parseZeroCopyForTest(src []byte) (Value, error) {
-	return ParseOptions(src, Options{ZeroCopy: true})
-}
-
-func parseMinAllocForTest(src []byte) (Value, error) {
+func parseOptionsZeroCopyForTest(src []byte) (Value, error) {
 	return ParseOptions(src, Options{ZeroCopy: true})
 }
 

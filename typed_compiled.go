@@ -617,7 +617,7 @@ func decodeCompiledMap(cursor *decoderCursor, node *typedNode, dst unsafe.Pointe
 		return err
 	}
 	if null {
-		*(*unsafe.Pointer)(dst) = nil
+		reflect.NewAt(node.typ, noescape(dst)).Elem().SetZero()
 		return nil
 	}
 	if err := cursor.BeginObject(node.name); err != nil {
@@ -626,17 +626,9 @@ func decodeCompiledMap(cursor *decoderCursor, node *typedNode, dst unsafe.Pointe
 	// Map keys are retained by the result, so switch owned decodes to the
 	// private input copy before the first key string is sliced.
 	cursor.ownSource()
-	// dst itself must stay out of reflect: reflect.NewAt would mark every
-	// Decode destination as escaping. A map value is one pointer word, so
-	// reflect works on a local copy of it and the created map is written
-	// back through a pointer store, which carries a write barrier.
-	existing := *(*unsafe.Pointer)(dst)
-	var mapValue reflect.Value
-	if existing == nil {
-		mapValue = reflect.MakeMap(node.typ)
-		*(*unsafe.Pointer)(dst) = mapValue.UnsafePointer()
-	} else {
-		mapValue = reflect.NewAt(node.typ, unsafe.Pointer(&existing)).Elem()
+	mapValue := reflect.NewAt(node.typ, noescape(dst)).Elem()
+	if mapValue.IsNil() {
+		mapValue.Set(reflect.MakeMap(node.typ))
 	}
 	keyType := node.typ.Key()
 	element := reflect.New(node.elem.typ)
@@ -791,7 +783,7 @@ func decodeCompiledIface(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 		return err
 	}
 	if null {
-		*(*any)(dst) = nil
+		reflect.NewAt(node.typ, noescape(dst)).Elem().SetZero()
 		return nil
 	}
 	value := reflect.NewAt(node.typ, noescape(dst)).Elem()

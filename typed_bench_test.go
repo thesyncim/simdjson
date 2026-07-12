@@ -74,6 +74,23 @@ func BenchmarkDecodeSmall(b *testing.B) {
 	}
 }
 
+func BenchmarkDecodeMapReused(b *testing.B) {
+	decoder, err := CompileDecoder[map[string]int](DecoderOptions{CaseSensitive: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	src := []byte(`{"alpha":1,"bravo":2,"charlie":3,"delta":4,"echo":5,"foxtrot":6,"golf":7,"hotel":8}`)
+	dst := make(map[string]int, 8)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := decoder.Decode(src, &dst); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkDecodeMedium(b *testing.B) {
 	src := benchRecordsJSON(32)
 	decoder, err := CompileDecoder[benchDocument](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
@@ -300,6 +317,30 @@ func BenchmarkEncodeLarge(b *testing.B) {
 		out, encodeErr = encoder.AppendJSON(out[:0], &doc)
 		if encodeErr != nil {
 			b.Fatal(encodeErr)
+		}
+	}
+}
+
+func BenchmarkEncodeMap(b *testing.B) {
+	value := map[string]int{
+		"alpha": 1, "bravo": 2, "charlie": 3, "delta": 4,
+		"echo": 5, "foxtrot": 6, "golf": 7, "hotel": 8,
+	}
+	encoder, err := CompileEncoder[map[string]int](EncoderOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	buffer, err := encoder.AppendJSON(nil, &value)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(buffer)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		buffer, err = encoder.AppendJSON(buffer[:0], &value)
+		if err != nil {
+			b.Fatal(err)
 		}
 	}
 }

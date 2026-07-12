@@ -74,8 +74,13 @@ func CompileDecoder[T any](opts DecoderOptions) (Decoder[T], error) {
 	}, nil
 }
 
-// Decode replaces dst with one JSON value. Slice capacities already reachable
-// through dst are retained where their fields are decoded again.
+// Decode decodes one JSON value into dst. By default it merges like
+// encoding/json; DecoderOptions.Replace resets state absent from the document.
+// Slice capacities already reachable through dst are retained where possible.
+//
+// Decode avoids forcing dst onto the heap. A custom unmarshal method reached
+// through this compiled path must not retain a stack-backed receiver after it
+// returns. The same restriction applies to Unmarshal.
 func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 	if plan.root == nil {
 		return fmt.Errorf("simdjson: zero Decoder")
@@ -249,6 +254,7 @@ const (
 type typedNode struct {
 	kind             typedKind // decode dispatch
 	encKind          typedKind // encode dispatch
+	encNonAddrKind   typedKind // encode dispatch for map/interface values
 	baseKind         typedKind // structural layout, for resets and emptiness
 	op               typedOp
 	encOp            typedOp
@@ -325,6 +331,7 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 	node.baseKind = node.kind
 	node.encKind = node.kind
 	node.encOp = node.op
+	node.encNonAddrKind = node.encKind
 	c.applyInterfaceKinds(node, typ)
 	return node, nil
 }
@@ -574,11 +581,26 @@ func (c *typedCompiler) applyInterfaceKinds(node *typedNode, typ reflect.Type) b
 		node.op = typedOpUnmarshaler
 		applied = true
 	}
-	if typ.Implements(jsonMarshalerReflectType) || pointerType.Implements(jsonMarshalerReflectType) {
+	if typ.Implements(jsonMarshalerReflectType) {
+		node.encNonAddrKind = typedMarshalerJSON
+		applied = true
+	} else if typ.Implements(textMarshalerReflectType) {
+		node.encNonAddrKind = typedMarshalerText
+		applied = true
+	}
+	if pointerType.Implements(jsonMarshalerReflectType) {
 		node.encKind = typedMarshalerJSON
 		node.encOp = typedOpMarshaler
 		applied = true
-	} else if typ.Implements(textMarshalerReflectType) || pointerType.Implements(textMarshalerReflectType) {
+	} else if typ.Implements(jsonMarshalerReflectType) {
+		node.encKind = typedMarshalerJSON
+		node.encOp = typedOpMarshaler
+		applied = true
+	} else if pointerType.Implements(textMarshalerReflectType) {
+		node.encKind = typedMarshalerText
+		node.encOp = typedOpMarshaler
+		applied = true
+	} else if typ.Implements(textMarshalerReflectType) {
 		node.encKind = typedMarshalerText
 		node.encOp = typedOpMarshaler
 		applied = true
@@ -724,9 +746,11 @@ func resetTyped(node *typedNode, dst unsafe.Pointer) {
 		for i := 0; i < node.length; i++ {
 			resetTyped(node.elem, unsafe.Add(dst, uintptr(i)*node.elem.size))
 		}
-	case typedPointer, typedMap:
+	case typedPointer:
 		*(*unsafe.Pointer)(dst) = nil
-	case typedAny, typedIface:
+	case typedMap, typedIface:
+		reflect.NewAt(node.typ, noescape(dst)).Elem().SetZero()
+	case typedAny:
 		*(*any)(dst) = nil
 	}
 }

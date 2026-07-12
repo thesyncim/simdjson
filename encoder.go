@@ -46,7 +46,9 @@ func CompileEncoder[T any](opts EncoderOptions) (Encoder[T], error) {
 	return Encoder[T]{root: root, escapeHTML: !opts.DisableHTMLEscaping}, nil
 }
 
-// AppendJSON appends src encoded as compact JSON to dst.
+// AppendJSON appends src encoded as compact JSON to dst. It does not force src
+// onto the heap, so a custom marshal method must not retain a stack-backed
+// receiver after it returns. The same restriction applies to Marshal.
 func (plan Encoder[T]) AppendJSON(dst []byte, src *T) ([]byte, error) {
 	if plan.root == nil {
 		return dst, fmt.Errorf("simdjson: zero Encoder")
@@ -70,7 +72,7 @@ type cachedEncoder[T any] struct {
 	sizeHint atomic.Uint64
 }
 
-// Marshal encodes src like encoding/json.Marshal with HTML escaping disabled.
+// Marshal encodes src like encoding/json.Marshal, including HTML escaping.
 // The encoder for each source type is compiled once and cached for the
 // process lifetime, along with a running output-size hint that presizes the
 // result buffer. Hot paths that encode one type repeatedly should call
@@ -157,7 +159,11 @@ type encodeState struct {
 }
 
 func (e *encodeState) encode(node *typedNode, src unsafe.Pointer) error {
-	switch node.encKind {
+	return e.encodeKind(node, src, node.encKind)
+}
+
+func (e *encodeState) encodeKind(node *typedNode, src unsafe.Pointer, kind typedKind) error {
+	switch kind {
 	case typedBool:
 		if *(*bool)(src) {
 			e.dst = append(e.dst, "true"...)
@@ -206,7 +212,7 @@ func (e *encodeState) encode(node *typedNode, src unsafe.Pointer) error {
 	case typedAny:
 		return e.encodeAny(src)
 	case typedMarshalerJSON, typedMarshalerText:
-		return e.encodeMarshaler(node, src)
+		return e.encodeMarshalerKind(node, src, kind)
 	case typedIface:
 		value := reflect.NewAt(node.typ, noescape(src)).Elem()
 		if value.IsNil() {
@@ -422,16 +428,21 @@ func (e *encodeState) encodeDynamicValue(value reflect.Value) error {
 	box := reflect.New(value.Type())
 	box.Elem().Set(value)
 	e.depth++
-	encodeErr := e.encode(node, box.UnsafePointer())
+	encodeErr := e.encodeNonAddressable(node, box.UnsafePointer())
 	e.depth--
 	return encodeErr
+}
+
+func (e *encodeState) encodeNonAddressable(node *typedNode, src unsafe.Pointer) error {
+	return e.encodeKind(node, src, node.encNonAddrKind)
 }
 
 // encodeMap writes a map with string keys as an object with byte-sorted
 // members, matching encoding/json. Values are copied into one reusable
 // addressable element before encoding.
 func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
-	if *(*unsafe.Pointer)(src) == nil {
+	mapValue := reflect.NewAt(node.typ, noescape(src)).Elem()
+	if mapValue.IsNil() {
 		e.dst = append(e.dst, "null"...)
 		return nil
 	}
@@ -439,10 +450,6 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		return &EncodeError{Reason: "maximum nesting depth exceeded"}
 	}
 	e.depth++
-	// Keep src out of reflect so encode sources never escape; the map value
-	// is one pointer word.
-	local := *(*unsafe.Pointer)(src)
-	mapValue := reflect.NewAt(node.typ, unsafe.Pointer(&local)).Elem()
 	entries := make([]mapEncodeEntry, 0, mapValue.Len())
 	iterator := mapValue.MapRange()
 	for iterator.Next() {
@@ -465,7 +472,7 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		e.dst = appendEncodedJSONString(e.dst, entries[i].name, e.escapeHTML)
 		e.dst = append(e.dst, ':')
 		elementValue.Set(mapValue.MapIndex(entries[i].key))
-		if err := e.encode(node.elem, elementPtr); err != nil {
+		if err := e.encodeNonAddressable(node.elem, elementPtr); err != nil {
 			e.depth--
 			return prependEncodePathField(err, entries[i].name)
 		}
@@ -672,13 +679,9 @@ func typedValueIsEmpty(node *typedNode, src unsafe.Pointer) bool {
 	case typedPointer:
 		return *(*unsafe.Pointer)(src) == nil
 	case typedMap:
-		if *(*unsafe.Pointer)(src) == nil {
-			return true
-		}
-		local := *(*unsafe.Pointer)(src)
-		return reflect.NewAt(node.typ, unsafe.Pointer(&local)).Elem().Len() == 0
+		return reflect.NewAt(node.typ, noescape(src)).Elem().Len() == 0
 	case typedAny, typedIface:
-		return *(*unsafe.Pointer)(src) == nil && *(*any)(src) == nil
+		return reflect.NewAt(node.typ, noescape(src)).Elem().IsNil()
 	default:
 		return false
 	}

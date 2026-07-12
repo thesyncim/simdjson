@@ -2,18 +2,20 @@
 
 [![ci](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml/badge.svg)](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml)
 
-Fast, strict JSON for Go tip, written entirely in Go: a drop-in
-`encoding/json` replacement that leads every measured category — typed
-decoding, encoding, validation, and dynamic parsing — by significant margins.
+Fast, strict JSON for Go tip, written entirely in Go. The measured fixtures
+lead the compared libraries in typed decoding, encoding, validation, and
+dynamic parsing.
 
 simdjson combines compiled typed decoders and encoders, source-backed
 selectors, caller-owned structural indexes, and runtime-selected SIMD. The
 root module has no third-party dependencies, assembly, C, `go:linkname`, or
-runtime map-layout tricks. Behavior matches `encoding/json` and is enforced
-by differential tests and fuzzers: field resolution, custom marshalers,
-merge semantics, escape rules, and byte-identical Marshal output.
+runtime map-layout tricks. `Marshal` and `Unmarshal` target `encoding/json`
+semantics for supported types, enforced by differential tests and fuzzers:
+field resolution, custom marshalers, merge behavior, and escape rules.
+The documented exception is that custom methods may not retain a stack-backed
+receiver; this preserves zero-allocation ordinary calls.
 
-> **Toolchain status:** simdjson currently requires a pinned **Go 1.27 development
+> **Toolchain status:** simdjson currently requires a **Go 1.27 development
 > toolchain**. Typed decoding uses generic methods, and SIMD builds use the
 > experimental `simd/archsimd` package. The scalar build works without
 > `GOEXPERIMENT=simd`, but it still requires Go tip today.
@@ -42,7 +44,7 @@ exact compiler, ownership rules, fixtures, competitor versions, and commands.
 
 ## Quick Start
 
-Install and pin a Go tip toolchain:
+Install the current Go tip toolchain:
 
 ```sh
 go install golang.org/dl/gotip@latest
@@ -63,7 +65,7 @@ type Event struct {
 }
 ```
 
-`Unmarshal` is a drop-in replacement for `encoding/json.Unmarshal`. It compiles
+`Unmarshal` is the stdlib-compatible convenience API. It compiles
 a decoder for each destination type once, caches it for the process lifetime,
 and matches stdlib semantics: owned strings, case-insensitive field fallback,
 and merge behavior (absent members leave existing values untouched; null
@@ -99,9 +101,9 @@ if err := decoder.Decode(payload, &event); err != nil {
 Leave `ZeroCopy` false when decoded strings must own their storage. `DecodeArray`
 decodes a top-level array and reuses caller-provided slice capacity.
 
-Encoding mirrors decoding. `Marshal` is byte-identical to
-`encoding/json.Marshal` — float formats, `omitempty`, the `string` tag
-option, HTML escaping, and escape rules included.
+Encoding mirrors decoding. For supported values, `Marshal` matches
+`encoding/json.Marshal` byte for byte: float formats, `omitempty`, the `string`
+tag option, HTML escaping, and escape rules included.
 `EncoderOptions.DisableHTMLEscaping` matches `SetEscapeHTML(false)` instead.
 A compiled `Encoder` reused with `AppendJSON` encodes with zero allocations:
 
@@ -112,6 +114,10 @@ if err != nil {
 }
 buf, err = encoder.AppendJSON(buf[:0], &event)
 ```
+
+To preserve allocation-free stack values, simdjson does not force custom-method
+receivers onto the heap. Custom methods must not retain a stack-backed receiver
+after returning; heap-backed receivers may be retained normally.
 
 Encoding the 1,024-record fixture:
 
@@ -145,9 +151,9 @@ nothing for it.
 
 | Job | API | Data model |
 |---|---|---|
-| Drop-in `json.Unmarshal` | `Unmarshal[T]` | Cached compiled decoder per type |
+| Stdlib-style unmarshal | `Unmarshal[T]` | Cached compiled decoder per type |
 | Fast concrete structs | `CompileDecoder[T]` | Compiled fields and scalar operations |
-| Drop-in `json.Marshal` | `Marshal[T]` | Cached compiled encoder per type |
+| Stdlib-style marshal | `Marshal[T]` | Cached compiled encoder per type |
 | Zero-allocation encoding | `CompileEncoder[T]`, `AppendJSON` | Caller-owned output buffer |
 | Repeated zero-allocation traversal | `BuildIndex`, `Index`, `Node` | Source and caller workspace backed |
 | Strict JSON Pointer lookup | `GetRaw`, `CompilePointer` | Validates the complete document |
@@ -248,6 +254,14 @@ The numbers above were measured on `darwin/arm64`, Apple M4 Max, using:
 
 ```text
 go version go1.27-devel_d468ad36 Tue Jul 7 05:58:00 2026 -0700 darwin/arm64
+commit d468ad3648be469ffc4090e4586c29709182d6b6
+```
+
+Build that exact compiler with the repository helper:
+
+```sh
+./scripts/bootstrap-gotip.sh "$HOME/sdk/simdjson-gotip"
+TIP_GO="$HOME/sdk/simdjson-gotip/bin/go" benchmarks/run-comparison.sh
 ```
 
 Every decoder receives the same bytes and equivalent field layout. The suite
@@ -298,7 +312,7 @@ Run the primary comparison:
 
 ```sh
 cd benchmarks
-GOEXPERIMENT=simd gotip test -run='^$' \
+GOEXPERIMENT=simd "$TIP_GO" test -run='^$' \
   -bench='^BenchmarkParseTyped$' \
   -benchmem -benchtime=1s -count=5 .
 ```
@@ -323,13 +337,13 @@ simdjson validates UTF-8, escapes, surrogate pairs, number grammar, integer over
 depth, and trailing data. The suite includes all 318 Nicolas Seriot
 JSONTestSuite cases, simdjson-derived edge cases, compiled numeric boundaries,
 allocation contracts, differential tests and fuzzers against encoding/json
-for every stdlib behavior claimed above, and Linux cross-compiles for arm64
-and amd64. Memory-safety runs use race and `checkptr=2` instrumentation with
+for every stdlib behavior claimed above, and native CI execution on Linux
+arm64 and amd64. Memory-safety runs use race and `checkptr=2` instrumentation with
 the allocation-contract tests skipped, since instrumentation itself
 allocates:
 
 ```sh
-GOEXPERIMENT=simd gotip test -gcflags='all=-d=checkptr=2' \
+GOEXPERIMENT=simd "$TIP_GO" test -gcflags='all=-d=checkptr=2' \
   -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
 ```
 
@@ -343,17 +357,19 @@ json.Marshaler/Unmarshaler and TextMarshaler/TextUnmarshaler dispatch
 types, every integer width, floats, and json.Number. Decoding merges into
 existing values like encoding/json unless DecoderOptions.Replace is set.
 Types stdlib rejects (channels, functions, complex numbers) are rejected at
-compile time. One rule is stricter than stdlib: custom un/marshalers must
-not retain their receiver after returning.
+compile time. One deliberate difference from stdlib is receiver lifetime:
+simdjson does not force custom-method receivers onto the heap, so a custom
+method must not retain a stack-backed receiver after returning.
 
 Run scalar and SIMD verification against the pinned compiler:
 
 ```sh
-gotip test ./...
-GOEXPERIMENT=simd gotip test ./...
-gotip vet -unsafeptr=false ./...
+"$TIP_GO" test ./...
+GOEXPERIMENT=simd "$TIP_GO" test ./...
+"$TIP_GO" vet -unsafeptr=false ./...
 ```
 
 The vet flag is required because noescape.go deliberately uses the runtime's
-pointer-hiding idiom, documented in that file, to keep decode destinations
-off the heap while supporting custom un/marshalers.
+pointer-hiding idiom to keep ordinary compiled sources and destinations off the
+heap. Map reflection uses public `reflect` APIs and does not assume the runtime's
+map representation.

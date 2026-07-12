@@ -22,8 +22,8 @@
 //
 // # Encoding structs
 //
-// [Marshal] produces byte-identical output to encoding/json.Marshal and
-// caches one compiled encoder per source type:
+// [Marshal] produces encoding/json.Marshal-compatible output for supported
+// values and caches one compiled encoder per source type:
 //
 //	data, err := simdjson.Marshal(&event)
 //
@@ -37,10 +37,9 @@
 //
 // Types implementing json.Marshaler, json.Unmarshaler,
 // encoding.TextMarshaler, or encoding.TextUnmarshaler — including time.Time —
-// are dispatched through those interfaces like encoding/json. One rule is
-// stricter than stdlib: implementations must not retain their receiver after
-// the call returns, mirroring the existing rule that UnmarshalJSON must not
-// retain its input slice.
+// are dispatched through those interfaces like encoding/json. To keep ordinary
+// calls allocation-free, the package does not force caller values onto the
+// heap. Custom methods must not retain a stack-backed receiver after returning.
 //
 // # Validation and selection
 //
