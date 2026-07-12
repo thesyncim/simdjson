@@ -53,6 +53,15 @@ func BenchmarkHighLevelCorpus(b *testing.B) {
 					}
 				}
 			})
+			b.Run("decode-any/simdjson-zero-copy", func(b *testing.B) {
+				b.ReportAllocs()
+				b.SetBytes(int64(len(src)))
+				for b.Loop() {
+					if _, err := simdjson.ParseAnyOptions(src, simdjson.AnyOptions{ZeroCopy: true}); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
 			benchmarkTypedCorpus(b, name, src)
 		})
 	}
@@ -111,6 +120,21 @@ func benchmarkTyped[T any](b *testing.B, src []byte) {
 		var dst T
 		for b.Loop() {
 			if err := decoder.Decode(src, &dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	zeroCopyDecoder, err := simdjson.CompileDecoder[T](simdjson.DecoderOptions{ZeroCopy: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Run("decode-typed/simdjson-compiled-zero-copy", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(src)))
+		var dst T
+		for b.Loop() {
+			if err := zeroCopyDecoder.Decode(src, &dst); err != nil {
 				b.Fatal(err)
 			}
 		}

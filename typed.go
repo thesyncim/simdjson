@@ -78,9 +78,9 @@ func CompileDecoder[T any](opts DecoderOptions) (Decoder[T], error) {
 // encoding/json; DecoderOptions.Replace resets state absent from the document.
 // Slice capacities already reachable through dst are retained where possible.
 //
-// Decode avoids forcing dst onto the heap. A custom unmarshal method reached
-// through this compiled path must not retain a stack-backed receiver after it
-// returns. The same restriction applies to Unmarshal.
+// Decode keeps ordinary compiled destinations stack eligible. Pointer-receiver
+// custom methods use a heap-backed receiver copied back before Decode returns,
+// so retaining that receiver cannot retain an internal stack address.
 func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 	if plan.root == nil {
 		return fmt.Errorf("simdjson: zero Decoder")

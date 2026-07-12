@@ -2,86 +2,131 @@
 
 [![ci](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml/badge.svg)](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml)
 
-Fast, strict JSON for Go tip, written entirely in Go. The measured fixtures
-lead the compared libraries in typed decoding, encoding, validation, and
-dynamic parsing.
+Strict, high-performance JSON for Go tip, written entirely in Go.
 
-simdjson combines compiled typed decoders and encoders, source-backed
-selectors, caller-owned structural indexes, and runtime-selected SIMD. The
-root module has no third-party dependencies, assembly, C, `go:linkname`, or
-runtime map-layout tricks. `Marshal` and `Unmarshal` target `encoding/json`
-semantics for supported types, enforced by differential tests and fuzzers:
-field resolution, custom marshalers, merge behavior, and escape rules.
-The documented exception is that custom methods may not retain a stack-backed
-receiver; this preserves zero-allocation ordinary calls.
+simdjson provides compiled typed decoders and encoders, dynamic decoding,
+zero-allocation structural indexes, JSON Pointer lookup, transforms, and
+runtime-selected SIMD. The root module has no third-party dependencies,
+assembly, C, `go:linkname`, or runtime map-layout assumptions.
 
-> **Toolchain status:** simdjson currently requires a **Go 1.27 development
-> toolchain**. Typed decoding uses generic methods, and SIMD builds use the
-> experimental `simd/archsimd` package. The scalar build works without
-> `GOEXPERIMENT=simd`, but it still requires Go tip today.
+`Marshal` and `Unmarshal` target `encoding/json` behavior for supported types,
+including field dominance, tags, custom methods, merge semantics, numeric
+boundaries, and escaping. Compatibility is checked against the pinned Go
+standard library rather than inferred from matching API names.
 
-## Results
+> **Toolchain status:** simdjson currently requires a Go 1.27 development
+> toolchain. SIMD builds additionally require `GOEXPERIMENT=simd` and Go tip's
+> experimental `simd/archsimd` package. The API and toolchain are pre-release.
 
-On an Apple M4 Max, `CompileDecoder[T]` parsed the benchmark fixtures in:
+## Performance
 
-| Mode | 31 B object | 4.2 KB / 32 records | 136.6 KB / 1,024 records |
+The primary benchmark is Go tip's complete seven-file
+`encoding/json/internal/jsontest` corpus: 6.33 MiB of real JSON covering
+geospatial data, catalogs, Go source statistics, escaped and Unicode strings,
+FHIR, and Twitter data. The same payloads and exact upstream concrete models
+are also correctness tests.
+
+Results below are medians of six 500 ms samples on an Apple M4 Max
+(`darwin/arm64`). The compiler is pinned to Go commit
+`d468ad3648be469ffc4090e4586c29709182d6b6`. Compilation is outside the timer;
+typed decode reuses its destination, matching a normal hot loop. The reported
+95% confidence intervals were at most 4%.
+
+### Typed Decode
+
+These rows use owned strings. Both libraries return data independent of the
+input. simdjson owns strings by making at most one private source-sized copy;
+the standard library allocates strings individually, so `B/op` can differ
+substantially even when semantics match.
+
+| Corpus | Size | `encoding/json` | simdjson pure Go | simdjson SIMD | SIMD speedup |
+|---|---:|---:|---:|---:|---:|
+| Canada geometry | 264 KiB | 1.270 ms | 1.148 ms | 1.154 ms | 1.10x |
+| CITM catalog | 1.65 MiB | 2.581 ms | 1.190 ms | 1.205 ms | 2.14x |
+| Go source | 1.85 MiB | 6.285 ms | 2.138 ms | 2.135 ms | 2.94x |
+| Escaped strings | 41.1 KiB | 193.7 us | 125.8 us | 123.1 us | 1.57x |
+| Unicode strings | 17.7 KiB | 40.72 us | 13.33 us | 11.90 us | 3.42x |
+| Synthea FHIR | 1.92 MiB | 3.815 ms | 1.784 ms | 1.788 ms | 2.13x |
+| Twitter status | 617 KiB | 1.344 ms | 602.8 us | 603.8 us | 2.23x |
+
+SIMD and pure Go are close on structure-heavy typed decoding because field and
+container work dominates string scanning. The Unicode corpus benefits most
+from SIMD. No result is hidden when pure Go happens to be slightly faster.
+
+### Source-Backed Decode
+
+`ZeroCopy: true` aliases unescaped strings into the immutable input. It avoids
+the source-sized ownership copy but is a different lifetime contract and is
+therefore reported separately.
+
+| Corpus | SIMD typed decode | Bytes/op | Allocs/op |
 |---|---:|---:|---:|
-| **SIMD, source-backed** | **28.2 ns / 0 allocs** | **2.60 us / 2 allocs** | **70.1 us / 2 allocs** |
-| **SIMD, owned strings** | **42.5 ns / 1 alloc** | **2.57 us / 3 allocs** | **75.3 us / 3 allocs** |
+| Canada geometry | 1.071 ms | 751 B | 2 |
+| CITM catalog | 1.070 ms | 28.2 KiB | 1,212 |
+| Go source | 1.951 ms | 10.5 KiB | 48 |
+| Escaped strings | 114.6 us | 54.8 KiB | 531 |
+| Unicode strings | 10.54 us | 864 B | 5 |
+| Synthea FHIR | 1.622 ms | 70.3 KiB | 2,539 |
+| Twitter status | 539.0 us | 104 KiB | 1,278 |
 
-The large source-backed fixture decodes at 1.9 GB/s. Reusing the destination
-removes the remaining container allocation in source-backed mode:
-`2.20 us / 0 allocs` for 32 records and `68.5 us / 0 allocs` for 1,024
-records. Robustness of the fast path, measured on the same large document:
-two-space indentation (222 KB) decodes at 2.0 GB/s, rotating every record's
-member order costs 7%, and untagged Go field names matching lowercase keys
-case-insensitively cost 2%.
+Zero-copy does not mean zero allocation: slices, maps, pointers, custom method
+receivers, and decoded escape sequences still require storage.
 
-Every number in this README comes from one measurement session on one
-machine, as medians of five one-second samples; they are not claims about
-every schema. The [benchmark methodology](#benchmark-methodology) records the
-exact compiler, ownership rules, fixtures, competitor versions, and commands.
+### Dynamic Decode And Validation
+
+Across the seven payloads, SIMD `ParseAny` with owned strings is 1.67x to 4.22x
+faster than `encoding/json`, with a 2.93x geometric-mean speedup. `Valid` wins
+six of seven payloads, with a 1.28x geometric-mean speedup. The exception is the
+escape-dense string corpus, where simdjson validation is 1.19x slower.
+
+### Typed Encode
+
+Owned-output rows compare `Marshal` with `Marshal`. The compiled rows reuse a
+caller-owned output buffer and are labeled separately because that allocation
+contract has no direct `encoding/json.Marshal` equivalent.
+
+| Corpus | `encoding/json.Marshal` | simdjson `Marshal` | compiled `AppendJSON` |
+|---|---:|---:|---:|
+| Canada geometry | 602.6 us | 523.4 us | 506.1 us |
+| CITM catalog | 804.8 us | 367.2 us | 341.0 us |
+| Go source | 2.663 ms | 1.416 ms | 1.344 ms |
+| Escaped strings | **17.67 us** | 39.68 us | 38.32 us |
+| Unicode strings | **18.19 us** | 40.20 us | 39.08 us |
+| Synthea FHIR | **5.267 ms** | 5.719 ms | 5.631 ms |
+| Twitter status | 589.4 us | 444.5 us | 418.8 us |
+
+Encoding wins four payloads. The string-only encoder and custom-method-heavy
+FHIR encoder remain explicit optimization targets; this README does not claim
+simdjson wins every schema.
 
 ## Quick Start
 
-Install the current Go tip toolchain:
+Install Go tip, then add simdjson to a module using that toolchain:
 
 ```sh
 go install golang.org/dl/gotip@latest
 gotip download
-gotip get github.com/thesyncim/simdjson
+gotip get github.com/thesyncim/simdjson@latest
 ```
 
-Define a model:
+Define a model and use the cached convenience API:
 
 ```go
-package events
-
 type Event struct {
 	ID      int       `json:"id"`
 	Name    string    `json:"name"`
 	Scores  []float64 `json:"scores"`
 	Enabled bool      `json:"enabled"`
 }
-```
 
-`Unmarshal` is the stdlib-compatible convenience API. It compiles
-a decoder for each destination type once, caches it for the process lifetime,
-and matches stdlib semantics: owned strings, case-insensitive field fallback,
-and merge behavior (absent members leave existing values untouched; null
-clears pointers, maps, slices, and interfaces but not scalars). Destinations
-reused across decodes usually want `DecoderOptions{Replace: true}`, which
-resets everything the document does not mention:
-
-```go
 var event Event
 if err := simdjson.Unmarshal(payload, &event); err != nil {
 	return err
 }
 ```
 
-Hot paths should compile the decoder once and reuse it concurrently; that also
-unlocks zero-copy strings and the other options:
+Compile once on hot paths. Plans are immutable and safe for concurrent use;
+destinations are caller-owned and must not be shared concurrently:
 
 ```go
 decoder, err := simdjson.CompileDecoder[Event](simdjson.DecoderOptions{
@@ -98,14 +143,7 @@ if err := decoder.Decode(payload, &event); err != nil {
 }
 ```
 
-Leave `ZeroCopy` false when decoded strings must own their storage. `DecodeArray`
-decodes a top-level array and reuses caller-provided slice capacity.
-
-Encoding mirrors decoding. For supported values, `Marshal` matches
-`encoding/json.Marshal` byte for byte: float formats, `omitempty`, the `string`
-tag option, HTML escaping, and escape rules included.
-`EncoderOptions.DisableHTMLEscaping` matches `SetEscapeHTML(false)` instead.
-A compiled `Encoder` reused with `AppendJSON` encodes with zero allocations:
+Encoding mirrors decoding:
 
 ```go
 encoder, err := simdjson.CompileEncoder[Event](simdjson.EncoderOptions{})
@@ -115,273 +153,152 @@ if err != nil {
 buf, err = encoder.AppendJSON(buf[:0], &event)
 ```
 
-To preserve allocation-free stack values, simdjson does not force custom-method
-receivers onto the heap. Custom methods must not retain a stack-backed receiver
-after returning; heap-backed receivers may be retained normally.
-
-Encoding the 1,024-record fixture:
-
-| Encoder | Time | Allocations |
-|---|---:|---:|
-| **simdjson `AppendJSON`, reused buffer** | **80.0 us** | **0** |
-| simdjson `Marshal` | 84.7 us | 1 |
-| Segment encoding v0.5.4 | 125.6 us | 1 |
-| go-json v0.10.6 | 141.7 us | 1 |
-| `encoding/json`, Go tip | 257.2 us | 1 |
-| jsoniter v1.1.12 | 316.5 us | 2 |
-
-## Decode Errors Carry Paths
-
-When valid JSON cannot be stored in the destination type, the returned
-`*DecodeError` reports the byte offset and the path of the offending value:
-
-```go
-err := simdjson.Unmarshal(payload, &doc)
-var decodeErr *simdjson.DecodeError
-if errors.As(err, &decodeErr) {
-	fmt.Println(decodeErr.Path) // items[3].scores[1]
-}
-// simdjson: cannot decode JSON at byte 57 into float64 at items[3].scores[1]: expected number
-```
-
-The path is assembled only while an error unwinds, so successful decodes pay
-nothing for it.
+`DecoderOptions.Replace` resets destination state not mentioned by the next
+document. The default merges like `encoding/json`: absent members retain their
+current values, while null clears pointers, maps, slices, and interfaces.
 
 ## Choose An API
 
-| Job | API | Data model |
+| Job | API | Ownership |
 |---|---|---|
-| Stdlib-style unmarshal | `Unmarshal[T]` | Cached compiled decoder per type |
-| Fast concrete structs | `CompileDecoder[T]` | Compiled fields and scalar operations |
-| Stdlib-style marshal | `Marshal[T]` | Cached compiled encoder per type |
-| Zero-allocation encoding | `CompileEncoder[T]`, `AppendJSON` | Caller-owned output buffer |
-| Repeated zero-allocation traversal | `BuildIndex`, `Index`, `Node` | Source and caller workspace backed |
-| Strict JSON Pointer lookup | `GetRaw`, `CompilePointer` | Validates the complete document |
-| Early-exit JSON Pointer scan | `ScanRaw`, `CompilePointer` | Stops after validating the target |
-| Ordered syntax tree | `Parse`, `Value` | Owned strings and ordered members |
-| Standard maps and slices | `ParseAny` | Normal Go dynamic values |
-| Validation only | `Valid`, `Validate` | No result allocation |
-| Transforms | `AppendCompact`, `AppendIndent`, `AppendCanonicalize` | Caller-owned destination |
+| Stdlib-style typed decode | `Unmarshal[T]` | Owned strings; cached plan |
+| Repeated typed decode | `CompileDecoder[T]` | Owned or source-backed strings |
+| Stdlib-style typed encode | `Marshal[T]` | Owned output; cached plan |
+| Reused-buffer encode | `CompileEncoder[T]`, `AppendJSON` | Caller-owned output |
+| Ordered syntax tree | `Parse`, `Value` | Owned by default |
+| Maps and slices | `ParseAny` | Owned by default |
+| Structural traversal | `BuildIndex`, `Index`, `Node` | Aliases source and workspace |
+| Strict JSON Pointer | `GetRaw`, `CompilePointer` | Aliases source |
+| Early-exit pointer scan | `ScanRaw`, `CompilePointer` | Aliases source |
+| Validation | `Valid`, `Validate` | No result allocation |
+| Transforms | `AppendCompact`, `AppendIndent`, `AppendCanonicalize` | Caller-owned output |
 
-The compiled plan is immutable and safe for concurrent use. Compilation is
-excluded from the benchmark timer. The plan uses packed expected-key matching,
-exact scalar operations, lazy replacement resets, and specialized fixed-float
-arrays.
+`DecodeArray` decodes a top-level array while reusing caller-provided slice
+capacity. Decode errors use `*DecodeError` with byte offset and destination
+path, assembled only on error.
 
-The root module's own benchmarks compare the SIMD and scalar builds of the
-same decode:
+## Ownership Rules
 
-| Workload | SIMD | Pure Go |
-|---|---:|---:|
-| 31 B, fresh | **27.8 ns / 0 allocs** | 28.1 ns / 0 allocs |
-| 4.2 KB, fresh | **2.31 us / 2 allocs** | 2.41 us / 2 allocs |
-| 136.6 KB, fresh | **69.3 us / 2 allocs** | 72.6 us / 2 allocs |
-| 136.6 KB, reused | **67.1 us / 0 allocs** | 70.3 us / 0 allocs |
-
-## Zero-Allocation Traversal
-
-`BuildIndex` creates a validated, navigable view in caller-provided storage:
-
-```go
-var entries [128]simdjson.IndexEntry
-idPointer := simdjson.MustCompilePointer("/items/0/id")
-
-index, err := simdjson.BuildIndex(payload, entries[:])
-if err != nil {
-	return err
-}
-
-id, ok, err := index.PointerCompiled(idPointer)
-if err != nil {
-	return err
-}
-if !ok {
-	return fmt.Errorf("missing item id")
-}
-rawID := id.Raw().Bytes()
-```
-
-`BuildIndex` processes the 136.6 KB fixture in 74.1 us (1.8 GB/s) with zero
-allocations, and `Parse` builds the full ordered syntax tree from the same
-document in 238 us.
-
-Use `RequiredIndexEntries` when the workspace size is not known. `Index` and
-`Node` alias both the input and the entry storage, so both must remain alive and
-unchanged while nodes are in use. With sufficient reused storage, valid input
-does not allocate.
-
-`ArrayIter`, `ObjectIter`, and their flat fixed-stride variants support
-allocation-free iteration. `NextRaw` avoids constructing a node when only the
-source range is needed.
-
-## String Ownership
-
-Ownership is explicit because it changes both speed and lifetime:
-
-| Decoder mode | Unescaped strings | Cost |
+| Mode | Unescaped strings | Caller obligation |
 |---|---|---|
-| Default | Alias one private copy of the input | One source-sized allocation |
-| `ZeroCopy: true` | Alias caller `src` | No string copy |
-| Either mode, escaped string | Decode into owned storage | Allocation only when needed |
+| Default | Alias one private copy of the input | None; result is independent of `src` |
+| `ZeroCopy: true` | Alias caller `src` | Keep `src` alive and immutable |
+| Escaped string | Decoded into owned storage | None |
 
-In zero-copy mode, keep `src` alive and immutable. In default mode, retaining
-one decoded string can retain the private input copy. Source-backed APIs such as
-`RawValue`, `Index`, and `Node` always alias their input.
+`RawValue`, `Index`, and `Node` always alias their input. `Index` and `Node`
+also alias the caller-provided `IndexEntry` workspace. Do not mutate either
+while handles are in use.
+
+## Safety Model
+
+simdjson uses `unsafe` in measured internal paths, but keeps the allowed uses
+narrow and testable:
+
+- SIMD loads execute only when a complete vector remains; scalar code handles
+  every tail. Tests sweep lengths, start offsets, alignments, every byte value,
+  and guard bytes immediately beyond the slice.
+- Typed field offsets and element strides come from public `reflect` metadata.
+  Maps use public reflection APIs and never assume a runtime map layout.
+- The runtime-style `noescape` helper is limited to synchronous internal
+  reflection that cannot invoke user code or retain a `reflect.Value`.
+- Pointer-receiver custom methods run on a heap-backed shadow that is copied
+  back before return. A retained receiver remains valid across stack growth and
+  GC. This is a deliberate receiver-identity difference from `encoding/json`:
+  direct field writes through the retained shadow after return do not update
+  the original value. The shadow is a normal shallow Go copy, so referenced
+  maps, slices, and pointers retain their ordinary aliasing behavior. Types
+  whose custom methods require stable receiver identity should use
+  `encoding/json` for that boundary.
+- Zero-copy APIs are opt-in and explicitly require immutable input. Owned APIs
+  are tested by mutating the original source after decoding.
+- Native CI runs pure Go and SIMD tests, race detection, `checkptr=2`, scalar
+  versus SIMD differential tests, fuzz smoke, and cross-architecture builds on
+  amd64 and native arm64.
+
+The project deliberately avoids `go:linkname`, hand-written assembly, C,
+runtime object-layout assumptions, and unguarded vector reads. Performance
+changes are kept only when correctness remains byte-for-byte identical.
 
 ## SIMD Dispatch
 
-`GOEXPERIMENT=simd` enables Go-native vector kernels and binds the best available
-implementation once during package initialization:
+`GOEXPERIMENT=simd` enables Go-native vector kernels and chooses the best
+available implementation once during package initialization:
 
-| Runtime | String scanning | 16-digit reduction |
+| Runtime | String scanner | 16-digit reduction |
 |---|---|---|
 | arm64 | NEON | NEON pairwise reduction |
 | amd64 with AVX-512 | 64-byte AVX-512 | AVX reduction |
 | amd64 with AVX2 | 32-byte AVX2 | AVX reduction |
 | Other build or CPU | Scalar Go | Scalar Go |
 
-Tiny inputs stay on scalar or SWAR paths when vector setup would cost more.
-`CurrentSIMD()` reports the selected backend, threshold, vector width, number
-backend, and detected CPU features.
-
-The number path combines SIMD digit reduction with a correctly rounded fallback,
-following the broad design in Daniel Lemire's
-[Number Parsing at a Gigabyte per Second](https://arxiv.org/abs/2101.11408).
-
-## Benchmark Methodology
-
-The numbers above were measured on `darwin/arm64`, Apple M4 Max, using:
-
-```text
-go version go1.27-devel_d468ad36 Tue Jul 7 05:58:00 2026 -0700 darwin/arm64
-commit d468ad3648be469ffc4090e4586c29709182d6b6
-```
-
-Build that exact compiler with the repository helper:
-
-```sh
-./scripts/bootstrap-gotip.sh "$HOME/sdk/simdjson-gotip"
-TIP_GO="$HOME/sdk/simdjson-gotip/bin/go" benchmarks/run-comparison.sh
-```
-
-Every decoder receives the same bytes and equivalent field layout. The suite
-keeps comparisons honest by separating:
-
-- source-backed strings from owned strings;
-- fresh destinations from reused destinations;
-- direct `encoding/json/v2` under `GOEXPERIMENT=simd,jsonv2`;
-- easyjson's generated model from shared models, so its `UnmarshalJSON` method
-  cannot intercept another library's benchmark;
-- Sonic v1.15.2 in an isolated Go 1.26.4 module, because it falls back to
-  `encoding/json` on Go 1.27 tip;
-- all comparison dependencies from simdjson's dependency-free root `go.mod`.
-
-Source-backed comparison (the Sonic rows come from its isolated Go 1.26.4
-module, measured on the same machine and fixtures):
-
-| Decoder | 31 B | 4.2 KB | 136.6 KB |
-|---|---:|---:|---:|
-| **simdjson compiled, SIMD** | **28.2 ns / 0** | **2.60 us / 2** | **70.1 us / 2** |
-| Sonic v1.15.2 Fastest, Go 1.26.4 | 187.9 ns / 4 | 5.74 us / 6 | 170.5 us / 6 |
-
-Owned-string comparison:
-
-| Decoder | 31 B | 4.2 KB | 136.6 KB |
-|---|---:|---:|---:|
-| **simdjson compiled, SIMD** | **42.5 ns / 1** | **2.57 us / 3** | **75.3 us / 3** |
-| go-json v0.10.6 | 52.3 ns / 2 | 5.45 us / 35 | 167.8 us / 1,027 |
-| Segment encoding v0.5.4 | 60.9 ns / 2 | 5.47 us / 69 | 168.0 us / 2,058 |
-| jsoniter v1.1.12 | 86.8 ns / 2 | 6.39 us / 104 | 195.9 us / 3,085 |
-| easyjson v0.9.2 generated | 86.3 ns / 1 | 8.40 us / 71 | 256.4 us / 2,060 |
-| `encoding/json/v2`, Go tip | 163.5 ns / 1 | 12.01 us / 39 | 366.1 us / 1,037 |
-| `encoding/json`, Go tip | 196.8 ns / 1 | 14.66 us / 39 | 451.4 us / 1,037 |
-| Sonic v1.15.2 Std, Go 1.26.4 | 233.0 ns / 5 | 7.82 us / 71 | 227.9 us / 2,055 |
-
-Dynamic decoding into `any`:
-
-| Decoder | 31 B | 4.2 KB | 136.6 KB |
-|---|---:|---:|---:|
-| **simdjson `ParseAny`, zero copy** | **109.3 ns / 4** | **6.32 us / 297** | **187.7 us / 9,225** |
-| simdjson `ParseAny`, owned | 111.9 ns / 5 | 6.43 us / 298 | 196.6 us / 9,226 |
-| Segment encoding v0.5.4 | 205.7 ns / 9 | 22.57 us / 559 | 681.8 us / 17,428 |
-| go-json v0.10.6 | 214.6 ns / 12 | 15.51 us / 818 | 494.5 us / 25,619 |
-| jsoniter v1.1.12 | 219.8 ns / 12 | 16.15 us / 950 | 509.7 us / 29,724 |
-| `encoding/json`, Go tip | 562.8 ns / 12 | 38.42 us / 823 | 1,129.0 us / 25,651 |
-
-Run the primary comparison:
-
-```sh
-cd benchmarks
-GOEXPERIMENT=simd "$TIP_GO" test -run='^$' \
-  -bench='^BenchmarkParseTyped$' \
-  -benchmem -benchtime=1s -count=5 .
-```
-
-See [`benchmarks/README.md`](benchmarks/README.md) for pure-Go, json/v2, native
-Sonic, environment capture, and result comparison commands.
-
-## Validation
-
-`Valid` is a recursive descent validator with SWAR and SIMD string scanning:
-
-| Validator | 31 B | 4.2 KB | 136.6 KB |
-|---|---:|---:|---:|
-| **simdjson** | **22.0 ns** | **1.84 us** | **59.0 us** |
-| Segment encoding v0.5.4 | 29.5 ns | 2.50 us | 78.8 us |
-| `encoding/json`, Go tip | 49.0 ns | 2.95 us | 92.9 us |
-| fastjson v1.6.4 | 35.1 ns | 3.71 us | 116.5 us |
+Tiny inputs remain on scalar or SWAR paths when vector setup costs more.
+`CurrentSIMD()` reports the selected backend, threshold, width, number backend,
+and detected CPU features.
 
 ## Correctness
 
-simdjson validates UTF-8, escapes, surrogate pairs, number grammar, integer overflow,
-depth, and trailing data. The suite includes all 318 Nicolas Seriot
-JSONTestSuite cases plus all seven payloads (6.33 MiB uncompressed) from the
-pinned Go tip `encoding/json/internal/jsontest` high-level corpus. Every Go
-payload is checked through validation, indexed parsing, dynamic decoding,
-`UseNumber`, dynamic encoding, and its exact concrete stdlib model. The suite
-also includes simdjson-derived edge cases, compiled numeric boundaries,
-allocation contracts, differential tests and fuzzers against encoding/json
-for every stdlib behavior claimed above, and native CI execution on Linux
-arm64 and amd64. Memory-safety runs use race and `checkptr=2` instrumentation
-with the allocation-contract tests skipped, since instrumentation itself
-allocates:
+The suite includes:
+
+- all 318 Nicolas Seriot JSONTestSuite parsing cases;
+- all seven pinned Go tip high-level corpus payloads and exact concrete models;
+- typed and dynamic differentials against `encoding/json` in owned and
+  zero-copy modes;
+- custom marshal/text method, map key, merge, duplicate-name, numeric boundary,
+  UTF-8, escape, depth, and error-path cases;
+- retained custom receiver tests across forced stack growth and GC;
+- fuzzers for validators, transforms, typed decode, encode, numbers, and SIMD
+  scanner parity.
+
+Run the complete local gate with the pinned compiler:
 
 ```sh
-GOEXPERIMENT=simd "$TIP_GO" test -gcflags='all=-d=checkptr=2' \
-  -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
-```
+TIP_GO="$HOME/sdk/simdjson-gotip/bin/go"
+./scripts/bootstrap-gotip.sh "$HOME/sdk/simdjson-gotip"
 
-The high-level corpus is an isolated test module, so its Zstandard reader does
-not add a dependency to the library. The check also runs the pinned stdlib
-oracle and verifies every compressed payload byte-for-byte against GOROOT:
-
-```sh
-./scripts/check-stdlib-corpus.sh "$TIP_GO"
-```
-
-The compiled decoder and encoder cover encoding/json's supported type
-universe: structs with flattened anonymous embedding and stdlib's exact
-dominance rules, pointers, slices, fixed arrays, maps with string, integer,
-and text-marshaling keys, empty and non-empty interfaces with stdlib's
-pointer-indirection rules, byte slices as base64, custom
-json.Marshaler/Unmarshaler and TextMarshaler/TextUnmarshaler dispatch
-(including time.Time), the omitempty and string tag options, named scalar
-types, every integer width, floats, and json.Number. Decoding merges into
-existing values like encoding/json unless DecoderOptions.Replace is set.
-Types stdlib rejects (channels, functions, complex numbers) are rejected at
-compile time. One deliberate difference from stdlib is receiver lifetime:
-simdjson does not force custom-method receivers onto the heap, so a custom
-method must not retain a stack-backed receiver after returning.
-
-Run scalar and SIMD verification against the pinned compiler:
-
-```sh
 "$TIP_GO" test ./...
 GOEXPERIMENT=simd "$TIP_GO" test ./...
 "$TIP_GO" vet -unsafeptr=false ./...
+GOEXPERIMENT=simd "$TIP_GO" test -race \
+  -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
+GOEXPERIMENT=simd "$TIP_GO" test -gcflags='all=-d=checkptr=2' \
+  -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
+./scripts/check-stdlib-corpus.sh "$TIP_GO"
 ```
 
-The vet flag is required because noescape.go deliberately uses the runtime's
-pointer-hiding idiom to keep ordinary compiled sources and destinations off the
-heap. Map reflection uses public `reflect` APIs and does not assume the runtime's
-map representation.
+Vet's `unsafeptr` analyzer is disabled only because `noescape.go` contains the
+runtime pointer-hiding idiom described above; the rest of vet still runs.
+
+## Reproduce The Benchmarks
+
+Build the exact compiler and run both modes against the same corpus:
+
+```sh
+./scripts/bootstrap-gotip.sh "$HOME/sdk/simdjson-gotip"
+TIP_GO="$HOME/sdk/simdjson-gotip/bin/go"
+
+cd tests/stdlib
+"$TIP_GO" test -run '^$' -bench HighLevelCorpus -benchmem \
+  -benchtime=500ms -count=6 > corpus-pure.txt
+GOEXPERIMENT=simd "$TIP_GO" test -run '^$' -bench HighLevelCorpus -benchmem \
+  -benchtime=500ms -count=6 > corpus-simd.txt
+
+"$TIP_GO" run golang.org/x/perf/cmd/benchstat@v0.0.0-20260615155930-9e4b9ddef5b6 \
+  corpus-pure.txt corpus-simd.txt
+```
+
+The nested corpus module contains the test-only Zstandard dependency; the root
+library module remains dependency-free. `scripts/check-stdlib-corpus.sh`
+verifies payloads and generated models byte-for-byte against the pinned GOROOT.
+
+Third-party library comparisons remain isolated in `benchmarks/` so their
+dependencies cannot leak into the library module:
+
+From the repository root:
+
+```sh
+TIP_GO="$TIP_GO" ./benchmarks/run-comparison.sh
+```
+
+Those comparison results are intentionally not copied into this README unless
+they are rerun on the documented compiler, machine, fixtures, and ownership
+contract.

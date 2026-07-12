@@ -137,6 +137,49 @@ func TestSIMDScanMatchesScalarAllByteValues(t *testing.T) {
 	}
 }
 
+func TestSIMDScannersRespectSliceBoundsAndAlignment(t *testing.T) {
+	for alignment := 0; alignment < 32; alignment++ {
+		for length := 0; length <= 192; length++ {
+			backing := make([]byte, alignment+length+64)
+			for i := range backing {
+				backing[i] = 'a'
+			}
+			src := backing[alignment : alignment+length : alignment+length]
+			for i := alignment + length; i < len(backing); i++ {
+				// A vector load past len(src) would observe this immediately.
+				backing[i] = '"'
+			}
+
+			positions := [...]int{-1, 0, length / 2, length - 1}
+			for _, position := range positions {
+				if position >= 0 && position < length {
+					src[position] = '\\'
+				}
+				for start := 0; start <= length; start++ {
+					wantSpecial := scanStringSpecialScalar(src, start)
+					if got := scanStringSpecial(src, start); got != wantSpecial {
+						t.Fatalf("special alignment=%d length=%d position=%d start=%d: got %d, want %d", alignment, length, position, start, got, wantSpecial)
+					}
+					if got := scanStringSpecialSIMD(src, start); got != wantSpecial {
+						t.Fatalf("direct special alignment=%d length=%d position=%d start=%d: got %d, want %d", alignment, length, position, start, got, wantSpecial)
+					}
+
+					wantSyntax := scanStringSyntaxScalar(src, start)
+					if got := scanStringSyntax(src, start); got != wantSyntax {
+						t.Fatalf("syntax alignment=%d length=%d position=%d start=%d: got %d, want %d", alignment, length, position, start, got, wantSyntax)
+					}
+					if got := scanStringSyntaxSIMD(src, start); got != wantSyntax {
+						t.Fatalf("direct syntax alignment=%d length=%d position=%d start=%d: got %d, want %d", alignment, length, position, start, got, wantSyntax)
+					}
+				}
+				if position >= 0 && position < length {
+					src[position] = 'a'
+				}
+			}
+		}
+	}
+}
+
 func FuzzSIMDScannersMatchScalar(f *testing.F) {
 	for _, seed := range [][]byte{
 		nil,

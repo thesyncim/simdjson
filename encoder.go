@@ -46,9 +46,9 @@ func CompileEncoder[T any](opts EncoderOptions) (Encoder[T], error) {
 	return Encoder[T]{root: root, escapeHTML: !opts.DisableHTMLEscaping}, nil
 }
 
-// AppendJSON appends src encoded as compact JSON to dst. It does not force src
-// onto the heap, so a custom marshal method must not retain a stack-backed
-// receiver after it returns. The same restriction applies to Marshal.
+// AppendJSON appends src encoded as compact JSON to dst. Ordinary compiled
+// sources remain stack eligible. Pointer-receiver custom methods use a
+// heap-backed receiver copied back before AppendJSON returns.
 func (plan Encoder[T]) AppendJSON(dst []byte, src *T) ([]byte, error) {
 	if plan.root == nil {
 		return dst, fmt.Errorf("simdjson: zero Encoder")

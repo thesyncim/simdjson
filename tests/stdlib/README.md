@@ -15,7 +15,8 @@ The payloads are copied byte-for-byte from the exact Go revision pinned by
 
 The suite differentially checks validation, dynamic decoding, `UseNumber`,
 dynamic encoding, indexed parsing, JSON reconstruction, and decoding/encoding
-through the corpus's exact concrete Go models against `encoding/json`.
+through the corpus's exact concrete Go models against `encoding/json`. Owned
+and zero-copy decoding are checked and benchmarked as separate contracts.
 
 Run the corresponding real-payload benchmarks with:
 

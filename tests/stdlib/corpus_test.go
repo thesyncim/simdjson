@@ -82,6 +82,17 @@ func checkTyped[T any](t *testing.T, src []byte) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatal("simdjson typed decode result differs from encoding/json")
 	}
+	zeroCopyDecoder, err := simdjson.CompileDecoder[T](simdjson.DecoderOptions{ZeroCopy: true})
+	if err != nil {
+		t.Fatalf("simdjson.CompileDecoder zero copy: %v", err)
+	}
+	var zeroCopy T
+	if err := zeroCopyDecoder.Decode(src, &zeroCopy); err != nil {
+		t.Fatalf("simdjson typed zero-copy decode: %v", err)
+	}
+	if !reflect.DeepEqual(zeroCopy, want) {
+		t.Fatal("simdjson typed zero-copy decode result differs from encoding/json")
+	}
 
 	wantJSON, err := json.Marshal(&want)
 	if err != nil {
@@ -138,6 +149,13 @@ func checkDynamicDecode(t *testing.T, src []byte) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatal("simdjson.ParseAny result differs from encoding/json")
+	}
+	zeroCopy, err := simdjson.ParseAnyOptions(src, simdjson.AnyOptions{ZeroCopy: true})
+	if err != nil {
+		t.Fatalf("simdjson.ParseAnyOptions zero copy: %v", err)
+	}
+	if !reflect.DeepEqual(zeroCopy, want) {
+		t.Fatal("simdjson ParseAny zero-copy result differs from encoding/json")
 	}
 
 	wantJSON, err := json.Marshal(want)

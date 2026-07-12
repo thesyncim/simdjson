@@ -37,9 +37,11 @@
 //
 // Types implementing json.Marshaler, json.Unmarshaler,
 // encoding.TextMarshaler, or encoding.TextUnmarshaler — including time.Time —
-// are dispatched through those interfaces like encoding/json. To keep ordinary
-// calls allocation-free, the package does not force caller values onto the
-// heap. Custom methods must not retain a stack-backed receiver after returning.
+// are dispatched through those interfaces like encoding/json. Ordinary plans
+// remain stack eligible. Pointer-receiver methods use a heap-backed shadow that
+// is copied back before return, so a retained receiver cannot become a stale
+// stack pointer. The shadow is a shallow Go copy and does not preserve receiver
+// pointer identity after the method returns.
 //
 // # Validation and selection
 //

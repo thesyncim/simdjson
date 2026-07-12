@@ -6,10 +6,164 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+var retainedCustomReceiver *retainingCustomReceiver
+
+type retainingCustomReceiver struct {
+	Value int
+}
+
+func (v *retainingCustomReceiver) MarshalJSON() ([]byte, error) {
+	retainedCustomReceiver = v
+	encodedValue := v.Value
+	v.Value++
+	return fmt.Appendf(nil, `{"value":%d}`, encodedValue), nil
+}
+
+func (v *retainingCustomReceiver) UnmarshalJSON(data []byte) error {
+	retainedCustomReceiver = v
+	var wire struct {
+		Value int `json:"value"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	v.Value = wire.Value
+	return nil
+}
+
+//go:noinline
+func encodeRetainingCustomReceiver() ([]byte, int, error) {
+	value := retainingCustomReceiver{Value: 41}
+	encoded, err := Marshal(&value)
+	return encoded, value.Value, err
+}
+
+//go:noinline
+func decodeRetainingCustomReceiver() (int, error) {
+	var value retainingCustomReceiver
+	err := Unmarshal([]byte(`{"value":42}`), &value)
+	return value.Value, err
+}
+
+//go:noinline
+func encodeRetainingCustomPointerReceiver() ([]byte, int, error) {
+	value := retainingCustomReceiver{Value: 45}
+	pointer := &value
+	encoded, err := Marshal(&pointer)
+	return encoded, value.Value, err
+}
+
+//go:noinline
+func decodeRetainingCustomPointerReceiver() (int, error) {
+	value := retainingCustomReceiver{Value: -1}
+	pointer := &value
+	err := Unmarshal([]byte(`{"value":46}`), &pointer)
+	return value.Value, err
+}
+
+//go:noinline
+func decodeNilRetainingCustomPointerReceiver() (*retainingCustomReceiver, error) {
+	var pointer *retainingCustomReceiver
+	err := Unmarshal([]byte(`{"value":47}`), &pointer)
+	return pointer, err
+}
+
+//go:noinline
+func growRetentionTestStack(depth int) int {
+	var scratch [2048]byte
+	scratch[depth%len(scratch)] = byte(depth)
+	if depth == 0 {
+		return int(scratch[0])
+	}
+	return int(scratch[depth%len(scratch)]) + growRetentionTestStack(depth-1)
+}
+
+func TestCustomMethodReceiversMayBeRetained(t *testing.T) {
+	retainedCustomReceiver = nil
+	encoded, copiedBack, err := encodeRetainingCustomReceiver()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != `{"value":41}` || copiedBack != 42 || retainedCustomReceiver == nil {
+		t.Fatalf("encoded = %s, retained = %p", encoded, retainedCustomReceiver)
+	}
+	encodedReceiver := retainedCustomReceiver
+	_ = growRetentionTestStack(128)
+	runtime.GC()
+	if encodedReceiver.Value != 42 {
+		t.Fatalf("retained marshal receiver value = %d, want 42", encodedReceiver.Value)
+	}
+	encodedReceiver.Value = 43
+
+	retainedCustomReceiver = nil
+	decodedValue, err := decodeRetainingCustomReceiver()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decodedValue != 42 {
+		t.Fatalf("copied-back unmarshal value = %d, want 42", decodedValue)
+	}
+	decodedReceiver := retainedCustomReceiver
+	if decodedReceiver == nil {
+		t.Fatal("custom unmarshal receiver was not retained")
+	}
+	_ = growRetentionTestStack(128)
+	runtime.GC()
+	if decodedReceiver.Value != 42 {
+		t.Fatalf("retained unmarshal receiver value = %d, want 42", decodedReceiver.Value)
+	}
+	decodedReceiver.Value = 44
+
+	retainedCustomReceiver = nil
+	encoded, copiedBack, err = encodeRetainingCustomPointerReceiver()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != `{"value":45}` || copiedBack != 46 || retainedCustomReceiver == nil {
+		t.Fatalf("pointer encoded = %s, copied back = %d, retained = %p", encoded, copiedBack, retainedCustomReceiver)
+	}
+	_ = growRetentionTestStack(128)
+	runtime.GC()
+	if retainedCustomReceiver.Value != 46 {
+		t.Fatalf("retained pointer marshal receiver value = %d, want 46", retainedCustomReceiver.Value)
+	}
+
+	retainedCustomReceiver = nil
+	decodedValue, err = decodeRetainingCustomPointerReceiver()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decodedValue != 46 || retainedCustomReceiver == nil {
+		t.Fatalf("pointer decoded = %d, retained = %p", decodedValue, retainedCustomReceiver)
+	}
+	_ = growRetentionTestStack(128)
+	runtime.GC()
+	if retainedCustomReceiver.Value != 46 {
+		t.Fatalf("retained pointer unmarshal receiver value = %d, want 46", retainedCustomReceiver.Value)
+	}
+
+	retainedCustomReceiver = nil
+	decodedPointer, err := decodeNilRetainingCustomPointerReceiver()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decodedPointer == nil || decodedPointer.Value != 47 || retainedCustomReceiver == nil {
+		t.Fatalf("nil pointer decoded = %p, retained = %p", decodedPointer, retainedCustomReceiver)
+	}
+	if decodedPointer == retainedCustomReceiver {
+		t.Fatal("custom method received the destination pointer instead of a safe shadow")
+	}
+	retainedCustomReceiver.Value = 48
+	if decodedPointer.Value != 47 {
+		t.Fatalf("post-return receiver mutation changed destination to %d", decodedPointer.Value)
+	}
+}
 
 type textPoint struct{ X, Y int }
 

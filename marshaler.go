@@ -8,10 +8,40 @@ import (
 	"unsafe"
 )
 
-// interfaceAt builds *T as an interface without contaminating the allocation
-// behavior of compiled plans that never execute a custom-method operation.
-func interfaceAt(typ reflect.Type, p unsafe.Pointer) any {
-	return reflect.NewAt(typ, noescape(p)).Interface()
+// valueInterfaceAt copies T into an interface. Calling a value-receiver method
+// on that interface cannot expose p to user code.
+func valueInterfaceAt(typ reflect.Type, p unsafe.Pointer) any {
+	return reflect.NewAt(typ, noescape(p)).Elem().Interface()
+}
+
+// copiedPointerReceiverAt creates a shallow, heap-backed *T for a call into
+// user code. Pointer-receiver methods may legally retain their receiver;
+// passing p through noescape would leave them holding a stale stack pointer
+// after stack growth.
+func copiedPointerReceiverAt(typ reflect.Type, p unsafe.Pointer) (any, reflect.Value) {
+	shadow := reflect.New(typ)
+	shadow.Elem().Set(reflect.NewAt(typ, noescape(p)).Elem())
+	return shadow.Interface(), shadow
+}
+
+func copiedLoadedPointerReceiverAt(typ reflect.Type, p unsafe.Pointer) (any, reflect.Value) {
+	shadow := reflect.New(typ.Elem())
+	shadow.Elem().Set(reflect.NewAt(typ.Elem(), noescape(p)).Elem())
+	return shadow.Interface(), shadow
+}
+
+func copyMethodReceiverBack(typ reflect.Type, dst unsafe.Pointer, shadow reflect.Value) {
+	if !shadow.IsValid() {
+		return
+	}
+	if typ.Kind() == reflect.Pointer {
+		pointer := *(*unsafe.Pointer)(dst)
+		if pointer != nil {
+			reflect.NewAt(typ.Elem(), noescape(pointer)).Elem().Set(shadow.Elem())
+		}
+		return
+	}
+	reflect.NewAt(typ, noescape(dst)).Elem().Set(shadow.Elem())
 }
 
 // decodeViaUnmarshaler feeds the raw bytes of the next JSON value to the
@@ -28,36 +58,35 @@ func decodeViaUnmarshaler(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 		*(*unsafe.Pointer)(dst) = nil
 		return nil
 	}
-	unmarshaler, ok := receiverAt(node.typ, dst).(json.Unmarshaler)
+	receiver, shadow := receiverAt(node.typ, dst)
+	unmarshaler, ok := receiver.(json.Unmarshaler)
 	if !ok {
 		return &DecodeError{Offset: start, Type: node.typ, Reason: "invalid compiled operation"}
 	}
-	if err := unmarshaler.UnmarshalJSON(raw); err != nil {
+	err := unmarshaler.UnmarshalJSON(raw)
+	copyMethodReceiverBack(node.typ, dst, shadow)
+	if err != nil {
 		return &DecodeError{Offset: start, Type: node.typ, Reason: err.Error()}
 	}
 	return nil
 }
 
-// interfaceAtPointer boxes an already-loaded pointer value of type typ.
-func interfaceAtPointer(typ reflect.Type, pointer unsafe.Pointer) any {
-	local := pointer
-	return reflect.NewAt(typ, unsafe.Pointer(&local)).Elem().Interface()
-}
-
 // receiverAt boxes the un/marshaler receiver for the value at dst: pointer
 // kinds are loaded and allocated on demand, other kinds pass their address.
-func receiverAt(typ reflect.Type, dst unsafe.Pointer) any {
+func receiverAt(typ reflect.Type, dst unsafe.Pointer) (any, reflect.Value) {
 	if typ.Kind() != reflect.Pointer {
-		return interfaceAt(typ, dst)
+		return copiedPointerReceiverAt(typ, dst)
 	}
 	pointer := *(*unsafe.Pointer)(dst)
 	if pointer == nil {
 		value := reflect.New(typ.Elem())
 		pointer = value.UnsafePointer()
 		*(*unsafe.Pointer)(dst) = pointer
+		boxed, shadow := copiedLoadedPointerReceiverAt(typ, pointer)
 		runtime.KeepAlive(value)
+		return boxed, shadow
 	}
-	return interfaceAtPointer(typ, pointer)
+	return copiedLoadedPointerReceiverAt(typ, pointer)
 }
 
 // decodeViaTextUnmarshaler decodes a JSON string through UnmarshalText.
@@ -83,11 +112,14 @@ func decodeViaTextUnmarshaler(cursor *decoderCursor, node *typedNode, dst unsafe
 		return err
 	}
 
-	unmarshaler, ok := receiverAt(node.typ, dst).(encoding.TextUnmarshaler)
+	receiver, shadow := receiverAt(node.typ, dst)
+	unmarshaler, ok := receiver.(encoding.TextUnmarshaler)
 	if !ok {
 		return &DecodeError{Offset: start, Type: node.typ, Reason: "invalid compiled operation"}
 	}
-	if err := unmarshaler.UnmarshalText(text); err != nil {
+	err = unmarshaler.UnmarshalText(text)
+	copyMethodReceiverBack(node.typ, dst, shadow)
+	if err != nil {
 		return &DecodeError{Offset: start, Type: node.typ, Reason: err.Error()}
 	}
 	return nil
@@ -101,15 +133,20 @@ func (e *encodeState) encodeMarshaler(node *typedNode, src unsafe.Pointer) error
 
 func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, kind typedKind) error {
 	var boxed any
+	var shadow reflect.Value
 	if node.typ.Kind() == reflect.Pointer {
 		pointer := *(*unsafe.Pointer)(src)
 		if pointer == nil {
 			e.dst = append(e.dst, "null"...)
 			return nil
 		}
-		boxed = interfaceAtPointer(node.typ, pointer)
+		boxed, shadow = copiedLoadedPointerReceiverAt(node.typ, pointer)
+	} else if kind == typedMarshalerJSON && node.typ.Implements(jsonMarshalerReflectType) {
+		boxed = valueInterfaceAt(node.typ, src)
+	} else if kind == typedMarshalerText && node.typ.Implements(textMarshalerReflectType) {
+		boxed = valueInterfaceAt(node.typ, src)
 	} else {
-		boxed = interfaceAt(node.typ, src)
+		boxed, shadow = copiedPointerReceiverAt(node.typ, src)
 	}
 
 	if kind == typedMarshalerJSON {
@@ -118,6 +155,7 @@ func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, k
 			return &EncodeError{Reason: "invalid compiled operation"}
 		}
 		data, err := marshaler.MarshalJSON()
+		copyMethodReceiverBack(node.typ, src, shadow)
 		if err != nil {
 			return &EncodeError{Reason: "MarshalJSON: " + err.Error()}
 		}
@@ -136,6 +174,7 @@ func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, k
 		return &EncodeError{Reason: "invalid compiled operation"}
 	}
 	text, err := marshaler.MarshalText()
+	copyMethodReceiverBack(node.typ, src, shadow)
 	if err != nil {
 		return &EncodeError{Reason: "MarshalText: " + err.Error()}
 	}
