@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"unsafe"
 )
@@ -266,12 +267,21 @@ func (cursor *decoderCursor) nextObjectFieldExpected(first bool, expected *typed
 		// the exact compare misses and folding applies, retry with the ASCII
 		// case bits of the key's letters masked out.
 		diff := (word ^ expected.key) & mask
+		foldedHead := diff != 0
 		if diff != 0 && diff&^expected.keyFold == 0 && cursor.flags&decoderCaseSensitive == 0 {
 			diff = 0
 		}
 		if diff == 0 {
 			keyEnd := keyStart + int(expected.keyLen)
-			if keyEnd+1 < len(cursor.src) && cursor.src[keyEnd+1] == ':' {
+			matchedName := expected.keyLen <= 7
+			if !matchedName && keyEnd+1 < len(cursor.src) && cursor.src[keyEnd] == '"' {
+				matchedName = !foldedHead && matchStringAt(cursor.src, keyStart+8, expected.name[8:])
+				if !matchedName && cursor.flags&decoderCaseSensitive == 0 {
+					actual := unsafe.String(unsafe.SliceData(cursor.src[keyStart:keyEnd]), keyEnd-keyStart)
+					matchedName = strings.EqualFold(actual, expected.name)
+				}
+			}
+			if matchedName && keyEnd+1 < len(cursor.src) && cursor.src[keyEnd+1] == ':' {
 				cursor.i = keyEnd + 2
 				if cursor.i < len(cursor.src) && cursor.src[cursor.i] <= ' ' {
 					cursor.skipSpace()
@@ -281,13 +291,13 @@ func (cursor *decoderCursor) nextObjectFieldExpected(first bool, expected *typed
 		}
 	}
 	special := stringSpecialMask(word)
-	if special == 0 {
-		key, ok, err = cursor.NextObjectField(first)
-		return key, false, ok, err
+	keyEnd := keyStart
+	if special != 0 {
+		keyEnd += bits.TrailingZeros64(special) / 8
+	} else {
+		keyEnd = scanStringSpecial(cursor.src, keyStart+8)
 	}
-	keyLen := bits.TrailingZeros64(special) / 8
-	keyEnd := keyStart + keyLen
-	if cursor.src[keyEnd] != '"' || keyEnd+1 >= len(cursor.src) || cursor.src[keyEnd+1] != ':' {
+	if keyEnd >= len(cursor.src) || cursor.src[keyEnd] != '"' || keyEnd+1 >= len(cursor.src) || cursor.src[keyEnd+1] != ':' {
 		key, ok, err = cursor.NextObjectField(first)
 		return key, false, ok, err
 	}
@@ -295,6 +305,7 @@ func (cursor *decoderCursor) nextObjectFieldExpected(first bool, expected *typed
 	if cursor.i < len(cursor.src) && cursor.src[cursor.i] <= ' ' {
 		cursor.skipSpace()
 	}
+	keyLen := keyEnd - keyStart
 	key = unsafe.String(unsafe.SliceData(cursor.src[keyStart:keyEnd]), keyLen)
 	return key, false, true, nil
 }
@@ -544,6 +555,15 @@ func decodeCompiledFloatArray[T floatValue](cursor *decoderCursor, node *typedNo
 					*(*T)(unsafe.Add(dst, uintptr(index)*node.elem.size)) = T(value)
 					cursor.i = end
 					continue
+				}
+				if unsafe.Sizeof(T(0)) == 8 {
+					base := unsafe.Pointer(unsafe.SliceData(src))
+					end, value, exact, ok := scanTypedFloat64(base, len(src), i)
+					if ok && exact {
+						*(*T)(unsafe.Add(dst, uintptr(index)*node.elem.size)) = T(value)
+						cursor.i = end
+						continue
+					}
 				}
 			}
 		}

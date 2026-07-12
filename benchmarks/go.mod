@@ -10,6 +10,7 @@ require (
 	github.com/minio/simdjson-go v0.4.5
 	github.com/segmentio/encoding v0.5.4
 	github.com/thesyncim/simdjson v0.0.0
+	github.com/thesyncim/simdjson/tests/stdlib v0.0.0
 	github.com/valyala/fastjson v1.6.10
 )
 
@@ -18,7 +19,7 @@ require (
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
-	github.com/klauspost/compress v1.15.15 // indirect
+	github.com/klauspost/compress v1.19.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.9 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421 // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
@@ -29,3 +30,5 @@ require (
 )
 
 replace github.com/thesyncim/simdjson => ..
+
+replace github.com/thesyncim/simdjson/tests/stdlib => ../tests/stdlib

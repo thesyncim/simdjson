@@ -21,6 +21,9 @@ func firstMaskLane(m archsimd.Mask8x16) int {
 }
 
 func maskHasAnyLane(m archsimd.Mask8x16) bool {
-	x := m.ToInt8x16().ToBits().ReshapeToUint64s()
-	return x.GetElem(0)|x.GetElem(1) != 0
+	return m.ToInt8x16().ToBits().ReduceMax() != 0
+}
+
+func maskNot(m archsimd.Mask8x16) archsimd.Mask8x16 {
+	return m.Not()
 }

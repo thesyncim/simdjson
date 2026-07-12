@@ -1,5 +1,7 @@
 package simdjson
 
+import "encoding/binary"
+
 func skipSpace(src []byte, i int) int {
 	for i < len(src) {
 		c := src[i]
@@ -10,6 +12,9 @@ func skipSpace(src []byte, i int) int {
 			return i
 		}
 		i++
+		for i+8 <= len(src) && binary.LittleEndian.Uint64(src[i:]) == 0x2020202020202020 {
+			i += 8
+		}
 	}
 	return i
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"sync"
 	"unicode/utf16"
-	"unicode/utf8"
 	"unsafe"
 )
 
@@ -179,6 +178,7 @@ type parser struct {
 	maxDepth int
 	zeroCopy bool
 	ownedSrc []byte
+	strings  []byte
 	anyArena *anyValueArena
 }
 
@@ -195,9 +195,49 @@ func (p *parser) parseString() (string, error) {
 	start := p.i
 	chunkStart := start
 	var out []byte
+	outStart := -1
 
 	for {
-		j := scanStringSpecial(p.src, p.i)
+		if p.i+6 <= len(p.src) && p.src[p.i] == '\\' && p.src[p.i+1] == 'u' {
+			if outStart < 0 {
+				if p.strings == nil {
+					p.strings = make([]byte, 0, len(p.src))
+				}
+				outStart = len(p.strings)
+				out = p.strings
+			}
+			out = append(out, p.src[chunkStart:p.i]...)
+			for p.i+6 <= len(p.src) && p.src[p.i] == '\\' && p.src[p.i+1] == 'u' {
+				escapeStart := p.i
+				u, ok := hex4(p.src, p.i+2)
+				if !ok {
+					return "", p.err(escapeStart, "invalid unicode escape")
+				}
+				p.i += 6
+				r := rune(u)
+				switch {
+				case 0xD800 <= r && r <= 0xDBFF:
+					if p.i+6 > len(p.src) || p.src[p.i] != '\\' || p.src[p.i+1] != 'u' {
+						return "", p.err(escapeStart, "missing low surrogate")
+					}
+					lo, ok := hex4(p.src, p.i+2)
+					if !ok || lo < 0xDC00 || lo > 0xDFFF {
+						return "", p.err(escapeStart, "invalid low surrogate")
+					}
+					p.i += 6
+					r = utf16.DecodeRune(r, rune(lo))
+				case 0xDC00 <= r && r <= 0xDFFF:
+					return "", p.err(escapeStart, "unexpected low surrogate")
+				}
+				out = appendEscapedRune(out, r)
+			}
+			chunkStart = p.i
+			continue
+		}
+		j := p.i
+		if j >= len(p.src) || p.src[j] != '\\' {
+			j = scanStringSpecial(p.src, j)
+		}
 		if j >= len(p.src) {
 			return "", p.err(len(p.src), "unterminated string")
 		}
@@ -205,17 +245,22 @@ func (p *parser) parseString() (string, error) {
 		c := p.src[p.i]
 		switch {
 		case c == '"':
-			if out == nil {
+			if outStart < 0 {
 				s := p.string(p.src[start:p.i])
 				p.i++
 				return s, nil
 			}
 			out = append(out, p.src[chunkStart:p.i]...)
+			p.strings = out
 			p.i++
-			return ownedBytesString(out), nil
+			return ownedBytesString(out[outStart:]), nil
 		case c == '\\':
-			if out == nil {
-				out = make([]byte, 0, len(p.src[start:p.i]))
+			if outStart < 0 {
+				if p.strings == nil {
+					p.strings = make([]byte, 0, len(p.src))
+				}
+				outStart = len(p.strings)
+				out = p.strings
 			}
 			out = append(out, p.src[chunkStart:p.i]...)
 			p.i++
@@ -294,7 +339,7 @@ func (p *parser) appendEscape(out *[]byte) error {
 		if err != nil {
 			return err
 		}
-		*out = utf8.AppendRune(*out, r)
+		*out = appendEscapedRune(*out, r)
 		return nil
 	default:
 		return p.err(p.i-1, "invalid escape sequence")
@@ -336,27 +381,38 @@ func hex4(src []byte, i int) (uint16, bool) {
 	if i+4 > len(src) {
 		return 0, false
 	}
-	var v uint16
-	for j := 0; j < 4; j++ {
-		h, ok := fromHex(src[i+j])
-		if !ok {
-			return 0, false
-		}
-		v = v<<4 | uint16(h)
-	}
-	return v, true
+	a := hexNibbleTable[src[i]]
+	b := hexNibbleTable[src[i+1]]
+	c := hexNibbleTable[src[i+2]]
+	d := hexNibbleTable[src[i+3]]
+	return uint16(a)<<12 | uint16(b)<<8 | uint16(c)<<4 | uint16(d), a|b|c|d < 0x10
 }
 
-func fromHex(c byte) (byte, bool) {
+var hexNibbleTable = func() [256]byte {
+	var table [256]byte
+	for i := range table {
+		table[i] = 0xff
+	}
+	for c := byte('0'); c <= '9'; c++ {
+		table[c] = c - '0'
+	}
+	for c := byte('a'); c <= 'f'; c++ {
+		table[c] = c - 'a' + 10
+		table[c-'a'+'A'] = c - 'a' + 10
+	}
+	return table
+}()
+
+func appendEscapedRune(dst []byte, r rune) []byte {
 	switch {
-	case '0' <= c && c <= '9':
-		return c - '0', true
-	case 'a' <= c && c <= 'f':
-		return c - 'a' + 10, true
-	case 'A' <= c && c <= 'F':
-		return c - 'A' + 10, true
+	case r <= 0x7f:
+		return append(dst, byte(r))
+	case r <= 0x7ff:
+		return append(dst, 0xc0|byte(r>>6), 0x80|byte(r)&0x3f)
+	case r <= 0xffff:
+		return append(dst, 0xe0|byte(r>>12), 0x80|byte(r>>6)&0x3f, 0x80|byte(r)&0x3f)
 	default:
-		return 0, false
+		return append(dst, 0xf0|byte(r>>18), 0x80|byte(r>>12)&0x3f, 0x80|byte(r>>6)&0x3f, 0x80|byte(r)&0x3f)
 	}
 }
 

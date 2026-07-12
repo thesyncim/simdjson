@@ -1609,6 +1609,30 @@ func TestParseAnyFloat64MatchesStrconv(t *testing.T) {
 	}
 }
 
+func TestScaledJSONFloat64MatchesStrconv(t *testing.T) {
+	state := uint64(0x6a09e667f3bcc909)
+	for range 100000 {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		mantissa := state%9999999999999999999 + 1
+		exponent := -1 - int(state>>59)%22
+		text := strconv.FormatUint(mantissa, 10) + "e" + strconv.Itoa(exponent)
+		want, err := strconv.ParseFloat(text, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := ParseFloat64([]byte(text))
+		if err != nil {
+			t.Fatalf("ParseFloat64(%q): %v", text, err)
+		}
+		if math.Float64bits(got) != math.Float64bits(want) {
+			t.Fatalf("ParseFloat64(%q) = %.17g (%#x), want %.17g (%#x)",
+				text, got, math.Float64bits(got), want, math.Float64bits(want))
+		}
+	}
+}
+
 func TestParseFloat64(t *testing.T) {
 	for _, text := range []string{
 		"0",

@@ -559,7 +559,11 @@ func scanAnyNumberFast(base unsafe.Pointer, n, i int) (end int, integer uint64, 
 	return i, integer, negative, isInteger, true
 }
 
-var anyPow10 = [...]float64{1, 10, 100, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15}
+var anyPow10 = [...]float64{
+	1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10,
+	1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20,
+	1e21, 1e22,
+}
 
 // anyValueArena uses ordinary Go backing arrays to amortize storage for small
 // nested arrays. It deliberately does not construct map or interface headers.

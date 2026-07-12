@@ -70,7 +70,7 @@ func scanStringSyntaxScalar(src []byte, i int) int {
 }
 
 func invalidUTF8Index(src []byte, start, end int) int {
-	if utf8.Valid(src[start:end]) {
+	if validUTF8Fast(src[start:end]) {
 		return -1
 	}
 	for start < end {

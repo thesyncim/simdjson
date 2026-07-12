@@ -168,44 +168,38 @@ func (n jsonNumber) exactFloat64() (float64, bool) {
 		}
 		return 0, true
 	}
-	if n.exponent >= 0 {
-		if n.exponent > 15 {
-			return 0, false
+	// This is the same exact-rounding envelope used by strconv: a mantissa
+	// below 2^52 combined with a power of ten no larger than 1e22 can be
+	// converted with one floating-point multiply or divide. Moving up to 15
+	// decimal zeros into the mantissa extends the positive exponent range.
+	if mantissa >= uint64(1)<<52 {
+		if n.exponent < 0 {
+			return scaleJSONFloat64(mantissa, n.exponent, n.negative)
 		}
-		for range n.exponent {
-			if mantissa > (uint64(1)<<53)/10 {
-				return 0, false
-			}
-			mantissa *= 10
-		}
-	} else {
-		denominatorPower := -n.exponent
-		if denominatorPower > 22 {
-			return 0, false
-		}
-		for range denominatorPower {
-			if mantissa%5 != 0 {
-				return 0, false
-			}
-			mantissa /= 5
-		}
-		if mantissa > uint64(1)<<53 {
-			return 0, false
-		}
-		value := math.Ldexp(float64(mantissa), -denominatorPower)
-		if n.negative {
-			value = -value
-		}
-		return value, true
-	}
-	if mantissa > uint64(1)<<53 {
 		return 0, false
 	}
 	value := float64(mantissa)
 	if n.negative {
 		value = -value
 	}
-	return value, true
+	switch {
+	case n.exponent == 0:
+		return value, true
+	case n.exponent > 0 && n.exponent <= 37:
+		exponent := n.exponent
+		if exponent > 22 {
+			value *= anyPow10[exponent-22]
+			exponent = 22
+		}
+		if value > 1e15 || value < -1e15 {
+			return 0, false
+		}
+		return value * anyPow10[exponent], true
+	case n.exponent < 0 && n.exponent >= -22:
+		return value / anyPow10[-n.exponent], true
+	default:
+		return 0, false
+	}
 }
 
 func exactJSONFloat64(base unsafe.Pointer, start, end int) (float64, bool) {
@@ -273,6 +267,90 @@ func exactJSONFloat64(base unsafe.Pointer, start, end int) (float64, bool) {
 		exponent: exponent - fractionDigits,
 		negative: negative,
 	}).exactFloat64()
+}
+
+func scanTypedFloat64(base unsafe.Pointer, n, start int) (end int, value float64, exact, ok bool) {
+	i := start
+	negative := false
+	if fastByteAt(base, i) == '-' {
+		negative = true
+		i++
+		if i >= n {
+			return i, 0, false, false
+		}
+	}
+
+	var mantissa uint64
+	digits := 0
+	if fastByteAt(base, i) == '0' {
+		digits = 1
+		i++
+		if i < n && isDigit(fastByteAt(base, i)) {
+			return i, 0, false, false
+		}
+	} else if isOneNine(fastByteAt(base, i)) {
+		for i < n && isDigit(fastByteAt(base, i)) {
+			digits++
+			if digits <= 18 {
+				mantissa = mantissa*10 + uint64(fastByteAt(base, i)-'0')
+			}
+			i++
+		}
+	} else {
+		return i, 0, false, false
+	}
+
+	fractionDigits := 0
+	if i < n && fastByteAt(base, i) == '.' {
+		i++
+		if i >= n || !isDigit(fastByteAt(base, i)) {
+			return i, 0, false, false
+		}
+		for i < n && isDigit(fastByteAt(base, i)) {
+			digits++
+			fractionDigits++
+			if digits <= 18 {
+				mantissa = mantissa*10 + uint64(fastByteAt(base, i)-'0')
+			}
+			i++
+		}
+	}
+
+	exponent := 0
+	if i < n && (fastByteAt(base, i) == 'e' || fastByteAt(base, i) == 'E') {
+		i++
+		exponentNegative := false
+		if i < n && (fastByteAt(base, i) == '+' || fastByteAt(base, i) == '-') {
+			exponentNegative = fastByteAt(base, i) == '-'
+			i++
+		}
+		if i >= n || !isDigit(fastByteAt(base, i)) {
+			return i, 0, false, false
+		}
+		for i < n && isDigit(fastByteAt(base, i)) {
+			if exponent <= 1000 {
+				exponent = exponent*10 + int(fastByteAt(base, i)-'0')
+			}
+			i++
+		}
+		if exponentNegative {
+			exponent = -exponent
+		}
+	}
+
+	if digits <= 18 {
+		decimalExponent := exponent - fractionDigits
+		if mantissa >= uint64(1)<<52 && decimalExponent >= -22 && decimalExponent < 0 {
+			value, exact = scaleJSONFloat64(mantissa, decimalExponent, negative)
+		} else {
+			value, exact = (jsonNumber{
+				mantissa: mantissa,
+				exponent: decimalExponent,
+				negative: negative,
+			}).exactFloat64()
+		}
+	}
+	return i, value, exact, true
 }
 
 var pow10Uint64 = [...]uint64{

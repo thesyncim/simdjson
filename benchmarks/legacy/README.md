@@ -4,14 +4,22 @@ This nested module benchmarks native implementations that do not build under
 the Go tip toolchain required by simdjson. It deliberately does not import simdjson.
 
 Sonic v1.15.2 supports Go 1.26 but selects an `encoding/json` fallback on Go
-1.27 tip. The published native run used Go 1.26.4 on Apple M4 Max:
+1.27 tip. The module therefore contains a mechanical copy of the pinned Go-tip
+corpus models and reads the same compressed payloads as the main comparison
+module. `scripts/check-stdlib-corpus.sh` verifies both model copies.
+
+The published exact-corpus run used Go 1.26.4 on Apple M4 Max:
 
 ```sh
-GOTOOLCHAIN=go1.26.4 go test \
-  -run='^$' \
-  -bench='BenchmarkSonicNativeParseTyped(Fastest|Std)$|BenchmarkSonicNativeParseTypedReused(Fastest|Std)$' \
-  -benchmem -benchtime=1s -count=5 .
+GOTOOLCHAIN=go1.26.4 go test -run='^$' \
+  -bench='^BenchmarkStdlibCorpusNativeSonic$' \
+  -benchmem -benchtime=300ms -count=6 .
 ```
+
+It benchmarks native validation, owned dynamic decode, typed reused decode in
+`ConfigStd` and `ConfigFastest`, and encode. Go 1.26 and Go tip timings are
+reported in separate columns because compiler and standard-library revisions
+differ.
 
 Medians of five samples, shown as `time / allocs-op`:
 

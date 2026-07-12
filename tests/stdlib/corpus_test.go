@@ -1,40 +1,24 @@
-package stdlib_test
+package stdlibcorpus
 
 import (
 	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
-	"os"
-	"path/filepath"
 	"reflect"
 	"testing"
 
-	"github.com/klauspost/compress/zstd"
 	"github.com/thesyncim/simdjson"
 )
 
-var stdlibCorpora = []string{
-	"canada_geometry.json.zst",
-	"citm_catalog.json.zst",
-	"golang_source.json.zst",
-	"string_escaped.json.zst",
-	"string_unicode.json.zst",
-	"synthea_fhir.json.zst",
-	"twitter_status.json.zst",
-}
-
 func TestHighLevelCorpus(t *testing.T) {
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer decoder.Close()
-
-	for _, name := range stdlibCorpora {
+	for _, name := range Names {
 		name := name
 		t.Run(name, func(t *testing.T) {
-			src := readCorpus(t, decoder, name)
+			src, err := Read(name)
+			if err != nil {
+				t.Fatal(err)
+			}
 			checkValidation(t, src)
 			checkDynamicDecode(t, src)
 			checkNumberDecode(t, src)
@@ -109,19 +93,6 @@ func checkTyped[T any](t *testing.T, src []byte) {
 	if !bytes.Equal(gotJSON, wantJSON) {
 		t.Fatalf("simdjson typed encode differs from encoding/json: got %d bytes, want %d", len(gotJSON), len(wantJSON))
 	}
-}
-
-func readCorpus(t testing.TB, decoder *zstd.Decoder, name string) []byte {
-	t.Helper()
-	compressed, err := os.ReadFile(filepath.Join("testdata", name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	src, err := decoder.DecodeAll(compressed, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return src
 }
 
 func checkValidation(t *testing.T, src []byte) {

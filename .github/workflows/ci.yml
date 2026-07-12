@@ -81,3 +81,8 @@ jobs:
         if: ${{ matrix.primary }}
         run: $RUNNER_TEMP/gotip/bin/go test -run 'TestValidatorsAcceptFixtures' .
         working-directory: benchmarks
+
+      - name: Stable comparison module builds
+        if: ${{ matrix.primary }}
+        run: go test ./...
+        working-directory: benchmarks/legacy

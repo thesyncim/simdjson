@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unsafe"
 )
@@ -219,6 +220,7 @@ const (
 	typedMarshalerJSON
 	typedMarshalerText
 	typedIface
+	typedTime
 )
 
 type typedOp uint8
@@ -268,6 +270,7 @@ type typedNode struct {
 	mapKeyTextDecode bool
 	mapKeyTextEncode bool
 	fields           []typedField
+	fieldIndex       map[string]int16
 	encFields        []typedEncField
 	fieldHops        [][]typedFieldHop
 	hopResets        []uintptr
@@ -304,6 +307,7 @@ type typedCompiler struct {
 }
 
 var jsonNumberReflectType = reflect.TypeFor[json.Number]()
+var timeReflectType = reflect.TypeFor[time.Time]()
 
 func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, error) {
 	if node := c.nodes[typ]; node != nil {
@@ -500,6 +504,16 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 				compiledField.key |= uint64('"') << (len(name) * 8)
 				compiledField.keyMask = ^uint64(0) >> ((7 - len(name)) * 8)
 				compiledField.keyLen = uint8(len(name))
+			} else if len(name) <= 255 {
+				for byteIndex := range 8 {
+					c := name[byteIndex]
+					compiledField.key |= uint64(c) << (byteIndex * 8)
+					if lower := c | 0x20; 'a' <= lower && lower <= 'z' {
+						compiledField.keyFold |= 0x20 << (byteIndex * 8)
+					}
+				}
+				compiledField.keyMask = ^uint64(0)
+				compiledField.keyLen = uint8(len(name))
 			}
 			node.fields = append(node.fields, compiledField)
 		}
@@ -517,6 +531,12 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 				if i != j && strings.EqualFold(node.fields[i].name, node.fields[j].name) {
 					node.fields[i].keyFold = 0
 				}
+			}
+		}
+		if len(node.fields) >= 8 {
+			node.fieldIndex = make(map[string]int16, len(node.fields))
+			for i := range node.fields {
+				node.fieldIndex[node.fields[i].name] = int16(i)
 			}
 		}
 	default:
@@ -580,6 +600,12 @@ func (c *typedCompiler) applyInterfaceKinds(node *typedNode, typ reflect.Type) b
 		node.kind = typedUnmarshalerText
 		node.op = typedOpUnmarshaler
 		applied = true
+	}
+	if typ == timeReflectType {
+		node.encKind = typedTime
+		node.encNonAddrKind = typedTime
+		node.encOp = typedOpMarshaler
+		return true
 	}
 	if typ.Implements(jsonMarshalerReflectType) {
 		node.encNonAddrKind = typedMarshalerJSON
@@ -687,9 +713,15 @@ func (p *parser) skipTypedValue(depth int) error {
 }
 
 func (node *typedNode) findFieldSlow(key string, fold bool) *typedField {
-	for i := range node.fields {
-		if node.fields[i].name == key {
-			return &node.fields[i]
+	if node.fieldIndex != nil {
+		if index, ok := node.fieldIndex[key]; ok {
+			return &node.fields[index]
+		}
+	} else {
+		for i := range node.fields {
+			if node.fields[i].name == key {
+				return &node.fields[i]
+			}
 		}
 	}
 	if fold {

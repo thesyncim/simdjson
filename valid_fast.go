@@ -199,7 +199,37 @@ func scanJSONStringFastLong(src []byte, base unsafe.Pointer, i int) (int, bool, 
 	escaped := false
 	i++
 	for {
-		j := scanStringSpecial(src, i)
+		if end, ok := scanUnicodeEscapeRun(src, i); !ok {
+			return i, escaped, false
+		} else if end != i {
+			escaped = true
+			i = end
+		}
+		for i+6 <= len(src) && fastByteAt(base, i) == '\\' && fastByteAt(base, i+1) == 'u' {
+			escaped = true
+			u, ok := hex4(src, i+2)
+			if !ok {
+				return i, escaped, false
+			}
+			i += 6
+			switch {
+			case u >= 0xD800 && u <= 0xDBFF:
+				if i+6 > len(src) || fastByteAt(base, i) != '\\' || fastByteAt(base, i+1) != 'u' {
+					return i, escaped, false
+				}
+				lo, ok := hex4(src, i+2)
+				if !ok || lo < 0xDC00 || lo > 0xDFFF {
+					return i, escaped, false
+				}
+				i += 6
+			case u >= 0xDC00 && u <= 0xDFFF:
+				return i, escaped, false
+			}
+		}
+		j := i
+		if j >= len(src) || fastByteAt(base, j) != '\\' {
+			j = scanStringSpecial(src, j)
+		}
 		if j >= len(src) {
 			return len(src), escaped, false
 		}

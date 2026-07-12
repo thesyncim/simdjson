@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"math/bits"
 	"simd/archsimd"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -16,6 +17,24 @@ var (
 	scanStringVectorBytes      int
 	scanCPUFeatures            CPUFeatures
 )
+
+var unicodeEscapeExpected = [...][16]uint8{
+	{'\\', 'u', 0, 0, 0, 0, '\\', 'u', 0, 0, 0, 0, '\\', 'u', 0, 0},
+	{0, 0, '\\', 'u', 0, 0, 0, 0, '\\', 'u', 0, 0, 0, 0, '\\', 'u'},
+	{0, 0, 0, 0, '\\', 'u', 0, 0, 0, 0, '\\', 'u', 0, 0, 0, 0},
+}
+
+var unicodeEscapeHexMasks = [...][16]int8{
+	{0, 0, -1, -1, -1, -1, 0, 0, -1, -1, -1, -1, 0, 0, -1, -1},
+	{-1, -1, 0, 0, -1, -1, -1, -1, 0, 0, -1, -1, -1, -1, 0, 0},
+	{-1, -1, -1, -1, 0, 0, -1, -1, -1, -1, 0, 0, -1, -1, -1, -1},
+}
+
+var unicodeEscapeFirstMasks = [...][16]int8{
+	{0, 0, -1, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, -1, 0},
+	{0, 0, 0, 0, -1, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0},
+	{-1, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, -1, 0, 0, 0},
+}
 
 func init() {
 	initStringScanner()
@@ -202,4 +221,167 @@ func scanStringSyntaxSIMD(src []byte, i int) int {
 		i += 16
 	}
 	return scanStringSyntaxScalar(src, i)
+}
+
+// scanUnicodeEscapeRun validates complete groups of eight contiguous
+// \uXXXX escapes. It stops before a partial block or a surrogate so the
+// scalar path can preserve precise pair semantics.
+func scanUnicodeEscapeRun(src []byte, i int) (int, bool) {
+	if len(src)-i < 48 || src[i] != '\\' || src[i+1] != 'u' {
+		return i, true
+	}
+	base := unsafe.Pointer(unsafe.SliceData(src))
+	zero := archsimd.BroadcastUint8x16('0')
+	ten := archsimd.BroadcastUint8x16(10)
+	lower := archsimd.BroadcastUint8x16(0x20)
+	a := archsimd.BroadcastUint8x16('a')
+	six := archsimd.BroadcastUint8x16(6)
+	d := archsimd.BroadcastUint8x16('d')
+	expected0 := archsimd.LoadUint8x16Array(&unicodeEscapeExpected[0])
+	expected1 := archsimd.LoadUint8x16Array(&unicodeEscapeExpected[1])
+	expected2 := archsimd.LoadUint8x16Array(&unicodeEscapeExpected[2])
+	hexMask0 := archsimd.LoadInt8x16Array(&unicodeEscapeHexMasks[0]).ToMask()
+	hexMask1 := archsimd.LoadInt8x16Array(&unicodeEscapeHexMasks[1]).ToMask()
+	hexMask2 := archsimd.LoadInt8x16Array(&unicodeEscapeHexMasks[2]).ToMask()
+	firstMask0 := archsimd.LoadInt8x16Array(&unicodeEscapeFirstMasks[0]).ToMask()
+	firstMask1 := archsimd.LoadInt8x16Array(&unicodeEscapeFirstMasks[1]).ToMask()
+	firstMask2 := archsimd.LoadInt8x16Array(&unicodeEscapeFirstMasks[2]).ToMask()
+
+	for i+48 <= len(src) {
+		v0 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
+		v1 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i+16)))
+		v2 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i+32)))
+		prefix0, invalid0, surrogate0 := unicodeEscapeVectorMasks(v0, expected0, hexMask0, firstMask0, zero, ten, lower, a, six, d)
+		prefix1, invalid1, surrogate1 := unicodeEscapeVectorMasks(v1, expected1, hexMask1, firstMask1, zero, ten, lower, a, six, d)
+		prefix2, invalid2, surrogate2 := unicodeEscapeVectorMasks(v2, expected2, hexMask2, firstMask2, zero, ten, lower, a, six, d)
+		if maskHasAnyLane(prefix0.Or(prefix1).Or(prefix2)) {
+			return i, true
+		}
+		if maskHasAnyLane(invalid0.Or(invalid1).Or(invalid2).
+			Or(surrogate0).Or(surrogate1).Or(surrogate2)) {
+			return i, true
+		}
+		i += 48
+	}
+	return i, true
+}
+
+func unicodeEscapeVectorMasks(v, expected archsimd.Uint8x16, hexMask, firstMask archsimd.Mask8x16, zero, ten, lower, a, six, d archsimd.Uint8x16) (prefix, invalid, surrogate archsimd.Mask8x16) {
+	prefix = maskNot(v.Equal(expected).Or(hexMask))
+	hex := v.Sub(zero).Less(ten).Or(v.Or(lower).Sub(a).Less(six))
+	invalid = maskNot(hex).And(hexMask)
+	surrogate = v.Or(lower).Equal(d).And(firstMask)
+	return prefix, invalid, surrogate
+}
+
+func validUTF8Fast(src []byte) bool {
+	if len(src) < 16 {
+		return utf8.Valid(src)
+	}
+	base := unsafe.Pointer(unsafe.SliceData(src))
+	b80 := archsimd.BroadcastUint8x16(0x80)
+	b90 := archsimd.BroadcastUint8x16(0x90)
+	ba0 := archsimd.BroadcastUint8x16(0xa0)
+	bc0 := archsimd.BroadcastUint8x16(0xc0)
+	bc2 := archsimd.BroadcastUint8x16(0xc2)
+	be0 := archsimd.BroadcastUint8x16(0xe0)
+	bed := archsimd.BroadcastUint8x16(0xed)
+	bf0 := archsimd.BroadcastUint8x16(0xf0)
+	bf4 := archsimd.BroadcastUint8x16(0xf4)
+	bf5 := archsimd.BroadcastUint8x16(0xf5)
+	zero := archsimd.BroadcastUint8x16(0)
+	prevLead := zero
+	prevLead34 := zero
+	prevLead4 := zero
+	prevE0 := zero
+	prevED := zero
+	prevF0 := zero
+	prevF4 := zero
+
+	i := 0
+	for i+16 <= len(src) {
+		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
+		ascii := v.Less(b80)
+		continuation := v.GreaterEqual(b80).And(v.Less(bc0))
+		lead2 := v.GreaterEqual(bc2).And(v.Less(be0))
+		lead3 := v.GreaterEqual(be0).And(v.Less(bf0))
+		lead4 := v.GreaterEqual(bf0).And(v.Less(bf5))
+		if maskHasAnyLane(maskNot(ascii.Or(continuation).Or(lead2).Or(lead3).Or(lead4))) {
+			return false
+		}
+
+		lead := lead2.Or(lead3).Or(lead4).ToInt8x16().ToBits()
+		lead34 := lead3.Or(lead4).ToInt8x16().ToBits()
+		lead4Bytes := lead4.ToInt8x16().ToBits()
+		expected := lead.ConcatShiftBytesRight(prevLead, 15).
+			Or(lead34.ConcatShiftBytesRight(prevLead34, 14)).
+			Or(lead4Bytes.ConcatShiftBytesRight(prevLead4, 13))
+		actual := continuation.ToInt8x16().ToBits()
+		if maskHasAnyLane(actual.NotEqual(expected)) {
+			return false
+		}
+
+		afterE0 := v.Equal(be0).ToInt8x16().ToBits().ConcatShiftBytesRight(prevE0, 15).BitsToInt8().ToMask()
+		afterED := v.Equal(bed).ToInt8x16().ToBits().ConcatShiftBytesRight(prevED, 15).BitsToInt8().ToMask()
+		afterF0 := v.Equal(bf0).ToInt8x16().ToBits().ConcatShiftBytesRight(prevF0, 15).BitsToInt8().ToMask()
+		afterF4 := v.Equal(bf4).ToInt8x16().ToBits().ConcatShiftBytesRight(prevF4, 15).BitsToInt8().ToMask()
+		if maskHasAnyLane(afterE0.And(v.Less(ba0)).
+			Or(afterED.And(v.GreaterEqual(ba0))).
+			Or(afterF0.And(v.Less(b90))).
+			Or(afterF4.And(v.GreaterEqual(b90)))) {
+			return false
+		}
+
+		prevLead = lead
+		prevLead34 = lead34
+		prevLead4 = lead4Bytes
+		prevE0 = v.Equal(be0).ToInt8x16().ToBits()
+		prevED = v.Equal(bed).ToInt8x16().ToBits()
+		prevF0 = v.Equal(bf0).ToInt8x16().ToBits()
+		prevF4 = v.Equal(bf4).ToInt8x16().ToBits()
+		i += 16
+	}
+
+	tail := i
+	for tail > 0 && i-tail < 3 && src[tail-1]&0xc0 == 0x80 {
+		tail--
+	}
+	if tail > 0 {
+		tail--
+	}
+	return utf8.Valid(src[tail:])
+}
+
+func hasJSONLineSeparatorFast(src []byte, start int) bool {
+	if len(src)-start < 16 {
+		return hasJSONLineSeparatorScalar(src, start)
+	}
+	base := unsafe.Pointer(unsafe.SliceData(src))
+	e2 := archsimd.BroadcastUint8x16(0xe2)
+	b80 := archsimd.BroadcastUint8x16(0x80)
+	a8 := archsimd.BroadcastUint8x16(0xa8)
+	a9 := archsimd.BroadcastUint8x16(0xa9)
+	zero := archsimd.BroadcastUint8x16(0)
+	prevE2 := zero
+	prev80 := zero
+	i := start
+	for i+16 <= len(src) {
+		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
+		e2Bits := v.Equal(e2).ToInt8x16().ToBits()
+		b80Bits := v.Equal(b80).ToInt8x16().ToBits()
+		precededByE280 := e2Bits.ConcatShiftBytesRight(prevE2, 14).
+			And(b80Bits.ConcatShiftBytesRight(prev80, 15))
+		last := v.Equal(a8).Or(v.Equal(a9)).ToInt8x16().ToBits()
+		if maskHasAnyLane(last.And(precededByE280).BitsToInt8().ToMask()) {
+			return true
+		}
+		prevE2 = e2Bits
+		prev80 = b80Bits
+		i += 16
+	}
+	tail := i - 2
+	if tail < start {
+		tail = start
+	}
+	return hasJSONLineSeparatorScalar(src, tail)
 }

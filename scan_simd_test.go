@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
+	"unicode/utf8"
 )
 
 var scanSink int
@@ -53,6 +54,63 @@ func TestSIMDStringSyntaxMatchesScalarAllByteValues(t *testing.T) {
 			got = scanStringSyntaxSIMD(src, start)
 			if got != want {
 				t.Fatalf("scanStringSyntaxSIMD(byte=0x%02x start=%d) = %d, want %d", b, start, got, want)
+			}
+		}
+	}
+}
+
+func TestSIMDUTF8MatchesStdlib(t *testing.T) {
+	state := uint64(0x243f6a8885a308d3)
+	storage := make([]byte, 32+512)
+	for length := 0; length <= 512; length++ {
+		for offset := 0; offset < 32; offset++ {
+			src := storage[offset : offset+length]
+			for i := range src {
+				state ^= state << 13
+				state ^= state >> 7
+				state ^= state << 17
+				src[i] = byte(state)
+			}
+			if got, want := validUTF8Fast(src), utf8.Valid(src); got != want {
+				t.Fatalf("validUTF8Fast(length=%d offset=%d data=%x) = %v, want %v", length, offset, src, got, want)
+			}
+		}
+	}
+
+	valid := []byte("ASCII-العربية-Հայերեն-বাংলা-日本語-🙂")
+	for repeats := 1; repeats <= 32; repeats++ {
+		src := make([]byte, 0, repeats*len(valid))
+		for range repeats {
+			src = append(src, valid...)
+		}
+		if !validUTF8Fast(src) {
+			t.Fatalf("validUTF8Fast rejected %d-byte multilingual input", len(src))
+		}
+	}
+}
+
+func TestSIMDJSONLineSeparatorMatchesScalar(t *testing.T) {
+	state := uint64(0x13198a2e03707344)
+	storage := make([]byte, 32+512)
+	for length := 0; length <= 512; length++ {
+		for offset := 0; offset < 32; offset++ {
+			src := storage[offset : offset+length]
+			for i := range src {
+				state ^= state << 13
+				state ^= state >> 7
+				state ^= state << 17
+				src[i] = byte(state)
+			}
+			if length >= 3 && (length+offset)%5 == 0 {
+				at := (length*17 + offset) % (length - 2)
+				src[at], src[at+1], src[at+2] = 0xe2, 0x80, 0xa8+byte((length+offset)&1)
+			}
+			for start := 0; start <= length; start++ {
+				got := hasJSONLineSeparatorFast(src, start)
+				want := hasJSONLineSeparatorScalar(src, start)
+				if got != want {
+					t.Fatalf("line separator(length=%d offset=%d start=%d data=%x) = %v, want %v", length, offset, start, src, got, want)
+				}
 			}
 		}
 	}

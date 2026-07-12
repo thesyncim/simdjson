@@ -5,6 +5,9 @@ enter simdjson's root module graph.
 
 ## Fairness rules
 
+- `BenchmarkStdlibCorpus` uses the seven exact payloads and concrete models
+  pinned from Go tip. Every result is checked against `encoding/json` before
+  timing; encode accepts byte differences only when decoded values are equal.
 - Go-tip typed decoders consume the same byte slices and decode equivalent
   `TypedSmall` or `TypedDocument` schemas.
 - easyjson types live in `easyjsonmodel`. Attaching easyjson's generated
@@ -18,8 +21,22 @@ enter simdjson's root module graph.
 - `encoding/json/v2` is imported directly and built only with the
   `goexperiment.jsonv2` tag.
 
-Fixtures are 31 bytes, 4,240 bytes (32 records), and 136,586 bytes (1,024
-records). Published results use the median of five one-second samples.
+The synthetic fixtures are 31 bytes, 4,240 bytes (32 records), and 136,586
+bytes (1,024 records). Exact-corpus results use six 200 ms samples; synthetic
+published results use five one-second samples.
+
+## Exact standard-library corpus
+
+```sh
+GOEXPERIMENT=simd "$TIP_GO" test -run='^$' \
+  -bench='^BenchmarkStdlibCorpus$' \
+  -benchmem -benchtime=200ms -count=6 .
+```
+
+The benchmark exposes `valid`, `dynamic-owned`, `typed-reused`, and `encode`
+groups. Owned and source-backed rows are distinct. Sonic is omitted when its
+API reports stdlib fallback; run `BenchmarkStdlibCorpusNativeSonic` in
+`legacy/` with Go 1.26.4 for native numbers.
 
 ## Compiled decoder
 
@@ -106,6 +123,8 @@ another pinned environment.
 
 ## Benchmark groups
 
+- `BenchmarkStdlibCorpus`: exact Go-tip corpus validation, dynamic decode,
+  typed reused decode, and encode across conventional libraries.
 - `BenchmarkParseTyped`: typed fresh and reused decoding across conventional,
   compiled zero-copy, compiled owned, and competitor modes.
 - `BenchmarkParseTypedJSONV2`: direct `encoding/json/v2` typed decoding.

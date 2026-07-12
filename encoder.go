@@ -9,10 +9,12 @@ import (
 	"math"
 	"math/bits"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 	"unsafe"
 )
@@ -213,6 +215,8 @@ func (e *encodeState) encodeKind(node *typedNode, src unsafe.Pointer, kind typed
 		return e.encodeAny(src)
 	case typedMarshalerJSON, typedMarshalerText:
 		return e.encodeMarshalerKind(node, src, kind)
+	case typedTime:
+		return e.encodeTime(src)
 	case typedIface:
 		value := reflect.NewAt(node.typ, noescape(src)).Elem()
 		if value.IsNil() {
@@ -247,6 +251,17 @@ func (e *encodeState) encodeKind(node *typedNode, src unsafe.Pointer, kind typed
 	default:
 		return &EncodeError{Reason: "invalid compiled operation"}
 	}
+	return nil
+}
+
+func (e *encodeState) encodeTime(src unsafe.Pointer) error {
+	e.dst = append(e.dst, '"')
+	var err error
+	e.dst, err = (*time.Time)(src).AppendText(e.dst)
+	if err != nil {
+		return &EncodeError{Reason: "MarshalJSON: Time.MarshalJSON: " + strings.TrimPrefix(err.Error(), "Time.AppendText: ")}
+	}
+	e.dst = append(e.dst, '"')
 	return nil
 }
 
@@ -291,12 +306,38 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 			}
 		case typedOpString:
 			e.dst = appendEncodedJSONString(e.dst, *(*string)(fieldSrc), e.escapeHTML)
+		case typedOpNumber:
+			err = e.encodeNumberLiteral(*(*string)(fieldSrc))
+		case typedOpInt8:
+			e.dst = appendCompactInt(e.dst, int64(*(*int8)(fieldSrc)))
+		case typedOpInt16:
+			e.dst = appendCompactInt(e.dst, int64(*(*int16)(fieldSrc)))
+		case typedOpInt32:
+			e.dst = appendCompactInt(e.dst, int64(*(*int32)(fieldSrc)))
 		case typedOpInt64:
 			e.dst = appendCompactInt(e.dst, *(*int64)(fieldSrc))
+		case typedOpUint8:
+			e.dst = appendCompactUint(e.dst, uint64(*(*uint8)(fieldSrc)))
+		case typedOpUint16:
+			e.dst = appendCompactUint(e.dst, uint64(*(*uint16)(fieldSrc)))
+		case typedOpUint32:
+			e.dst = appendCompactUint(e.dst, uint64(*(*uint32)(fieldSrc)))
 		case typedOpUint64:
 			e.dst = appendCompactUint(e.dst, *(*uint64)(fieldSrc))
+		case typedOpFloat32:
+			err = e.encodeFloat(float64(*(*float32)(fieldSrc)), 32)
 		case typedOpFloat64:
 			err = e.encodeFloat(*(*float64)(fieldSrc), 64)
+		case typedOpStruct:
+			err = e.encodeStruct(field.node, fieldSrc)
+		case typedOpSlice:
+			err = e.encodeSlice(field.node, fieldSrc)
+		case typedOpArray:
+			err = e.encodeArray(field.node, fieldSrc)
+		case typedOpMap:
+			err = e.encodeMap(field.node, fieldSrc)
+		case typedOpAny:
+			err = e.encodeAny(fieldSrc)
 		case typedOpQuoted:
 			err = e.encodeQuoted(field.node, fieldSrc)
 		case typedOpMarshaler:
@@ -330,7 +371,26 @@ func (e *encodeState) encodeSlice(node *typedNode, src unsafe.Pointer) error {
 			e.dst = append(e.dst, ',')
 		}
 		element := unsafe.Add(header.data, uintptr(index)*node.elem.size)
-		if err := e.encode(node.elem, element); err != nil {
+		var err error
+		switch node.elem.encOp {
+		case typedOpStruct:
+			err = e.encodeStruct(node.elem, element)
+		case typedOpSlice:
+			err = e.encodeSlice(node.elem, element)
+		case typedOpArray:
+			err = e.encodeArray(node.elem, element)
+		case typedOpString:
+			e.dst = appendEncodedJSONString(e.dst, *(*string)(element), e.escapeHTML)
+		case typedOpInt64:
+			e.dst = appendCompactInt(e.dst, *(*int64)(element))
+		case typedOpUint64:
+			e.dst = appendCompactUint(e.dst, *(*uint64)(element))
+		case typedOpFloat64:
+			err = e.encodeFloat(*(*float64)(element), 64)
+		default:
+			err = e.encode(node.elem, element)
+		}
+		if err != nil {
 			e.depth--
 			return prependEncodePathIndex(err, index)
 		}
@@ -460,7 +520,7 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		}
 		entries = append(entries, mapEncodeEntry{name: name, key: iterator.Key()})
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+	slices.SortFunc(entries, func(a, b mapEncodeEntry) int { return strings.Compare(a.name, b.name) })
 	element := reflect.New(node.elem.typ)
 	elementPtr := element.UnsafePointer()
 	elementValue := element.Elem()
@@ -568,13 +628,8 @@ func (e *encodeState) encodeFloat(value float64, bits int) error {
 			return nil
 		}
 		if bits == 64 && positive < 1e9 {
-			if scaled := value * 10; math.Trunc(scaled) == scaled && scaled/10 == value {
-				e.dst = appendScaledDecimal(e.dst, value, scaled, 1)
-				return nil
-			}
-			if scaled := value * 100; math.Trunc(scaled) == scaled && scaled/100 == value &&
-				uint64(math.Abs(scaled))%10 != 0 {
-				e.dst = appendScaledDecimal(e.dst, value, scaled, 2)
+			if scaled := value * 1e6; math.Trunc(scaled) == scaled && scaled/1e6 == value {
+				e.dst = appendScaledDecimal6(e.dst, value, scaled)
 				return nil
 			}
 		}
@@ -597,32 +652,29 @@ func (e *encodeState) encodeFloat(value float64, bits int) error {
 	return nil
 }
 
-// appendScaledDecimal writes value as a fixed decimal with digits fractional
-// digits, where scaled is value*10^digits and is integer valued. Trailing
-// fractional zeros never reach here: a value with an exact shorter form is
-// caught by the coarser fast path first.
-func appendScaledDecimal(dst []byte, value, scaled float64, digits int) []byte {
+// appendScaledDecimal6 writes an exactly recoverable fixed decimal with up to
+// six fractional digits. encodeFloat only calls it below 1e9, where adjacent
+// 1e-6 grid points are wider than a float64 rounding interval.
+func appendScaledDecimal6(dst []byte, value, scaled float64) []byte {
 	if math.Signbit(value) {
 		dst = append(dst, '-')
 		scaled = -scaled
 	}
 	units := uint64(scaled)
-	var fraction uint64
-	switch digits {
-	case 1:
-		fraction = units % 10
-		units /= 10
-	default:
-		fraction = units % 100
-		units /= 100
-	}
+	fraction := units % 1e6
+	units /= 1e6
 	dst = appendCompactUint(dst, units)
 	dst = append(dst, '.')
-	if digits == 2 {
-		dst = append(dst, encodeDigitPairs[fraction*2], encodeDigitPairs[fraction*2+1])
-		return dst
+	var digits [6]byte
+	for i := 5; i >= 0; i-- {
+		digits[i] = byte('0' + fraction%10)
+		fraction /= 10
 	}
-	return append(dst, byte('0'+fraction))
+	end := len(digits)
+	for digits[end-1] == '0' {
+		end--
+	}
+	return append(dst, digits[:end]...)
 }
 
 // encodeNumberLiteral emits a json.Number after validating its spelling,
@@ -704,6 +756,15 @@ const encodeDigitPairs = "" +
 // appendCompactUint formats v with two digits per store. It beats the
 // general strconv path on the short integers that dominate JSON documents.
 func appendCompactUint(dst []byte, v uint64) []byte {
+	if v < 10 {
+		return append(dst, byte('0'+v))
+	}
+	if v < 100 {
+		return append(dst, encodeDigitPairs[v*2], encodeDigitPairs[v*2+1])
+	}
+	if v >= 1e10 {
+		return strconv.AppendUint(dst, v, 10)
+	}
 	var buffer [20]byte
 	i := len(buffer)
 	for v >= 100 {
@@ -738,12 +799,30 @@ func appendCompactInt(dst []byte, v int64) []byte {
 func appendEncodedJSONString(dst []byte, s string, escapeHTML bool) []byte {
 	dst = append(dst, '"')
 	src := unsafe.Slice(unsafe.StringData(s), len(s))
+	first := 0
+	if escapeHTML {
+		first = scanEncodedHTMLSpecial(src, 0)
+	} else {
+		first = scanStringSpecial(src, 0)
+	}
+	if first == len(src) {
+		dst = append(dst, s...)
+		return append(dst, '"')
+	}
+	unicodeClean := false
+	if src[first] >= 0x80 {
+		unicodeClean = validUTF8Fast(src) && !hasJSONLineSeparatorFast(src, first)
+	}
 	start := 0
-	for i := 0; i < len(s); {
+	for i := first; i < len(s); {
 		// The scanners stop at exactly the escape-relevant set: quotes,
 		// backslashes, control bytes, non-ASCII, and in HTML mode the
 		// angle brackets and ampersand encoding/json escapes by default.
-		if escapeHTML {
+		if unicodeClean && escapeHTML {
+			i = scanEncodedHTMLSyntax(src, i)
+		} else if unicodeClean {
+			i = scanStringSyntax(src, i)
+		} else if escapeHTML {
 			i = scanEncodedHTMLSpecial(src, i)
 		} else {
 			i = scanStringSpecial(src, i)
@@ -795,6 +874,34 @@ func appendEncodedJSONString(dst []byte, s string, escapeHTML bool) []byte {
 	}
 	dst = append(dst, s[start:]...)
 	return append(dst, '"')
+}
+
+func hasJSONLineSeparatorScalar(src []byte, start int) bool {
+	for i := start; i+2 < len(src); i++ {
+		if src[i] == 0xe2 && src[i+1] == 0x80 && (src[i+2] == 0xa8 || src[i+2] == 0xa9) {
+			return true
+		}
+	}
+	return false
+}
+
+func scanEncodedHTMLSyntax(src []byte, i int) int {
+	for i+8 <= len(src) {
+		x := binary.LittleEndian.Uint64(src[i:])
+		m := stringSyntaxMask(x) | byteEqMask(x, '<') | byteEqMask(x, '>') | byteEqMask(x, '&')
+		if m != 0 {
+			return i + bits.TrailingZeros64(m)/8
+		}
+		i += 8
+	}
+	for i < len(src) {
+		c := src[i]
+		if c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' || c < 0x20 {
+			return i
+		}
+		i++
+	}
+	return len(src)
 }
 
 func scanEncodedHTMLSpecial(src []byte, i int) int {

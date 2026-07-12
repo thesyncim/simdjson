@@ -4,7 +4,7 @@
 
 // Derived from encoding/json/internal/jsontest/testdata.go at the Go revision
 // recorded in testdata/UPSTREAM.md.
-package stdlib_test
+package stdlibcorpus
 
 import (
 	"errors"

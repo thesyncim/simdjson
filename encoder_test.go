@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -107,6 +108,55 @@ func TestEncoderFloatFormats(t *testing.T) {
 		if gotErr == nil && !bytes.Equal(got, want) {
 			t.Fatalf("float %g: simdjson %s, stdlib %s", f, got, want)
 		}
+	}
+}
+
+func TestEncoderFloatFormatsDifferential(t *testing.T) {
+	type wrapper struct {
+		F float64 `json:"f"`
+	}
+	encoder, err := CompileEncoder[wrapper](EncoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := uint64(0x9e3779b97f4a7c15)
+	for i := 0; i < 100000; i++ {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		var value float64
+		if i&1 == 0 {
+			scaled := int64(state%1999999999999999) - 999999999999999
+			value = float64(scaled) / 1e6
+		} else {
+			value = math.Float64frombits(state)
+		}
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			continue
+		}
+		input := wrapper{F: value}
+		got, gotErr := encoder.AppendJSON(nil, &input)
+		want, wantErr := json.Marshal(&input)
+		if (gotErr == nil) != (wantErr == nil) || !bytes.Equal(got, want) {
+			t.Fatalf("float %.17g (%#x): simdjson=%s err=%v, stdlib=%s err=%v", value, math.Float64bits(value), got, gotErr, want, wantErr)
+		}
+	}
+}
+
+func BenchmarkAppendCompactUint(b *testing.B) {
+	for _, value := range []uint64{7, 42, 9999, 12345678, 1234567890123, math.MaxUint64} {
+		b.Run(fmt.Sprintf("%d/compact", value), func(b *testing.B) {
+			var dst []byte
+			for range b.N {
+				dst = appendCompactUint(dst[:0], value)
+			}
+		})
+		b.Run(fmt.Sprintf("%d/strconv", value), func(b *testing.B) {
+			var dst []byte
+			for range b.N {
+				dst = strconv.AppendUint(dst[:0], value, 10)
+			}
+		})
 	}
 }
 

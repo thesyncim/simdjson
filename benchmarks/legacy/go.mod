@@ -2,7 +2,10 @@ module github.com/thesyncim/simdjson/benchmarks/legacy
 
 go 1.26
 
-require github.com/bytedance/sonic v1.15.2
+require (
+	github.com/bytedance/sonic v1.15.2
+	github.com/klauspost/compress v1.19.0
+)
 
 require (
 	github.com/bytedance/gopkg v0.1.3 // indirect

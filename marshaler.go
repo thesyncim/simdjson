@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"runtime"
+	"time"
 	"unsafe"
 )
 
@@ -52,6 +53,12 @@ func decodeViaUnmarshaler(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 		return err
 	}
 	raw := cursor.src[start:cursor.i]
+	if node.typ == timeReflectType {
+		if err := (*time.Time)(dst).UnmarshalJSON(raw); err != nil {
+			return &DecodeError{Offset: start, Type: node.typ, Reason: err.Error()}
+		}
+		return nil
+	}
 
 	// A pointer-kind receiver treats null as assignment like encoding/json.
 	if node.typ.Kind() == reflect.Pointer && len(raw) > 0 && raw[0] == 'n' {
@@ -128,6 +135,9 @@ func decodeViaTextUnmarshaler(cursor *decoderCursor, node *typedNode, dst unsafe
 // encodeMarshaler dispatches MarshalJSON or MarshalText, compacting and
 // re-escaping custom JSON exactly like encoding/json.
 func (e *encodeState) encodeMarshaler(node *typedNode, src unsafe.Pointer) error {
+	if node.encKind == typedTime {
+		return e.encodeTime(src)
+	}
 	return e.encodeMarshalerKind(node, src, node.encKind)
 }
 

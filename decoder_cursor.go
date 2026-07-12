@@ -52,6 +52,7 @@ type decoderCursor struct {
 	maxDepth int
 	depth    int
 	flags    decoderFlags
+	strings  unsafe.Pointer
 }
 
 // newDecoderCursor starts decoding src with opts.
@@ -453,9 +454,11 @@ func (c *decoderCursor) stringSlow[T stringValue](dst *T) error {
 		return nil
 	}
 	c.ownSource()
+	c.ensureStringArena()
 	p := c.slowParser()
 	text, err := p.parseString()
 	c.i = p.i
+	c.setStringArenaLen(len(p.strings))
 	if err != nil {
 		return err
 	}
@@ -489,7 +492,8 @@ func (c *decoderCursor) Number[T stringValue](dst *T) error {
 
 // Int decodes directly into any defined signed integer type.
 func (c *decoderCursor) Int[T signedInteger](dst *T) error {
-	if c.i < len(c.src) && c.src[c.i] == 'n' {
+	n := len(c.src)
+	if c.i < n && c.src[c.i] == 'n' {
 		if !matchStringAt(c.src, c.i, "null") {
 			return c.err(c.i, "invalid literal")
 		}
@@ -500,19 +504,20 @@ func (c *decoderCursor) Int[T signedInteger](dst *T) error {
 		return nil
 	}
 	start := c.i
-	if start >= len(c.src) {
+	if start >= n {
 		return c.genericExpected[T]("number")
 	}
+	base := unsafe.Pointer(unsafe.SliceData(c.src))
 	i := start
 	negative := false
-	if c.src[i] == '-' {
+	if fastByteAt(base, i) == '-' {
 		negative = true
 		i++
-		if i == len(c.src) {
+		if i == n {
 			return c.err(start, "invalid number")
 		}
 	}
-	if !isDigit(c.src[i]) {
+	if !isDigit(fastByteAt(base, i)) {
 		return c.genericExpected[T]("number")
 	}
 	bits := int(unsafe.Sizeof(*dst)) * 8
@@ -520,24 +525,37 @@ func (c *decoderCursor) Int[T signedInteger](dst *T) error {
 	if !negative {
 		limit--
 	}
+	cutoff, cutlim := limit/10, limit%10
 	value := uint64(0)
-	if c.src[i] == '0' {
+	if fastByteAt(base, i) == '0' {
 		i++
-		if i < len(c.src) && isDigit(c.src[i]) {
+		if i < n && isDigit(fastByteAt(base, i)) {
 			return c.err(start, "invalid leading zero in number")
 		}
 	} else {
-		for i < len(c.src) && isDigit(c.src[i]) {
-			digit := uint64(c.src[i] - '0')
-			if value > (limit-digit)/10 {
+		if i+8 <= n {
+			digits := unsafe.Add(base, i)
+			if i+16 <= n && all16Digits(digits) {
+				value = parse16Digits(digits)
+				i += 16
+				if value > limit {
+					return c.genericError[T](start, "integer overflow")
+				}
+			} else if all8Digits(digits) {
+				value = parse8Digits(digits)
+				i += 8
+			}
+		}
+		for i < n && isDigit(fastByteAt(base, i)) {
+			digit := uint64(fastByteAt(base, i) - '0')
+			if value > cutoff || value == cutoff && digit > cutlim {
 				return c.genericError[T](start, "integer overflow")
 			}
 			value = value*10 + digit
 			i++
 		}
 	}
-	if i < len(c.src) && (c.src[i] == '.' || c.src[i] == 'e' || c.src[i] == 'E') {
-		base := unsafe.Pointer(unsafe.SliceData(c.src))
+	if i < n && (fastByteAt(base, i) == '.' || fastByteAt(base, i) == 'e' || fastByteAt(base, i) == 'E') {
 		if _, ok := scanNumberFast(base, len(c.src), start); !ok {
 			_, message := scanNumber(c.src, start)
 			return c.err(start, message)
@@ -555,7 +573,8 @@ func (c *decoderCursor) Int[T signedInteger](dst *T) error {
 
 // Uint decodes directly into any defined unsigned integer type.
 func (c *decoderCursor) Uint[T unsignedInteger](dst *T) error {
-	if c.i < len(c.src) && c.src[c.i] == 'n' {
+	n := len(c.src)
+	if c.i < n && c.src[c.i] == 'n' {
 		if !matchStringAt(c.src, c.i, "null") {
 			return c.err(c.i, "invalid literal")
 		}
@@ -566,7 +585,11 @@ func (c *decoderCursor) Uint[T unsignedInteger](dst *T) error {
 		return nil
 	}
 	start := c.i
-	if start >= len(c.src) || !isDigit(c.src[start]) {
+	if start >= n {
+		return c.genericExpected[T]("number")
+	}
+	base := unsafe.Pointer(unsafe.SliceData(c.src))
+	if !isDigit(fastByteAt(base, start)) {
 		return c.genericExpected[T]("number")
 	}
 	bits := int(unsafe.Sizeof(*dst)) * 8
@@ -574,25 +597,38 @@ func (c *decoderCursor) Uint[T unsignedInteger](dst *T) error {
 	if bits < 64 {
 		limit = uint64(1)<<bits - 1
 	}
+	cutoff, cutlim := limit/10, limit%10
 	i := start
 	value := uint64(0)
-	if c.src[i] == '0' {
+	if fastByteAt(base, i) == '0' {
 		i++
-		if i < len(c.src) && isDigit(c.src[i]) {
+		if i < n && isDigit(fastByteAt(base, i)) {
 			return c.err(start, "invalid leading zero in number")
 		}
 	} else {
-		for i < len(c.src) && isDigit(c.src[i]) {
-			digit := uint64(c.src[i] - '0')
-			if value > (limit-digit)/10 {
+		if i+8 <= n {
+			digits := unsafe.Add(base, i)
+			if i+16 <= n && all16Digits(digits) {
+				value = parse16Digits(digits)
+				i += 16
+				if value > limit {
+					return c.genericError[T](start, "unsigned integer overflow")
+				}
+			} else if all8Digits(digits) {
+				value = parse8Digits(digits)
+				i += 8
+			}
+		}
+		for i < n && isDigit(fastByteAt(base, i)) {
+			digit := uint64(fastByteAt(base, i) - '0')
+			if value > cutoff || value == cutoff && digit > cutlim {
 				return c.genericError[T](start, "unsigned integer overflow")
 			}
 			value = value*10 + digit
 			i++
 		}
 	}
-	if i < len(c.src) && (c.src[i] == '.' || c.src[i] == 'e' || c.src[i] == 'E') {
-		base := unsafe.Pointer(unsafe.SliceData(c.src))
+	if i < n && (fastByteAt(base, i) == '.' || fastByteAt(base, i) == 'e' || fastByteAt(base, i) == 'E') {
 		if _, ok := scanNumberFast(base, len(c.src), start); !ok {
 			_, message := scanNumber(c.src, start)
 			return c.err(start, message)
@@ -634,25 +670,37 @@ func (c *decoderCursor) floatSlow[T floatValue](dst *T) error {
 	}
 	start := c.i
 	base := unsafe.Pointer(unsafe.SliceData(c.src))
+	bits := int(unsafe.Sizeof(*dst)) * 8
+	if bits == 64 {
+		end, value, exact, ok := scanTypedFloat64(base, len(c.src), start)
+		if !ok {
+			_, message := scanNumber(c.src, start)
+			return c.err(start, message)
+		}
+		if !exact {
+			text := unsafe.String((*byte)(unsafe.Add(base, start)), end-start)
+			var err error
+			value, err = strconv.ParseFloat(text, 64)
+			if err != nil {
+				return c.genericError[T](start, "number out of range")
+			}
+		}
+		*dst = T(value)
+		c.i = end
+		return nil
+	}
 	end, integer, negative, isInteger, ok := scanAnyNumberFast(base, len(c.src), start)
 	if !ok {
 		_, message := scanNumber(c.src, start)
 		return c.err(start, message)
 	}
 	text := unsafe.String((*byte)(unsafe.Add(base, start)), end-start)
-	bits := int(unsafe.Sizeof(*dst)) * 8
 	var value float64
 	var err error
 	if isInteger && integer <= uint64(1)<<53 {
 		value = float64(integer)
 		if negative {
 			value = -value
-		}
-	} else if bits == 64 {
-		if exact, ok := exactJSONFloat64(base, start, end); ok {
-			value = exact
-		} else {
-			value, err = strconv.ParseFloat(text, 64)
 		}
 	} else {
 		value, err = strconv.ParseFloat(text, 32)
@@ -768,14 +816,52 @@ func (c *decoderCursor) err(offset int, reason string) error {
 }
 
 func (c *decoderCursor) slowParser() parser {
-	return parser{src: c.src, i: c.i, maxDepth: c.maxDepth, zeroCopy: true}
+	return parser{src: c.src, i: c.i, maxDepth: c.maxDepth, zeroCopy: true, strings: c.stringArena()}
 }
 
 func (c *decoderCursor) typedKey() (string, error) {
+	start := c.i + 1
+	special := scanStringSpecial(c.src, start)
+	if special < len(c.src) {
+		switch c.src[special] {
+		case '"':
+			c.i = special + 1
+			return unsafe.String(unsafe.SliceData(c.src[start:special]), special-start), nil
+		case '\\':
+			c.ensureStringArena()
+		}
+	}
 	p := c.slowParser()
 	key, err := p.typedKey()
 	c.i = p.i
+	c.setStringArenaLen(len(p.strings))
 	return key, err
+}
+
+func (c *decoderCursor) ensureStringArena() {
+	if c.strings != nil {
+		return
+	}
+	const headerSize = 8
+	storage := make([]byte, headerSize+len(c.src))
+	c.strings = unsafe.Pointer(unsafe.SliceData(storage))
+}
+
+func (c *decoderCursor) stringArena() []byte {
+	if c.strings == nil {
+		return nil
+	}
+	const headerSize = 8
+	header := unsafe.Slice((*byte)(c.strings), headerSize)
+	used := int(binary.LittleEndian.Uint64(header))
+	return unsafe.Slice((*byte)(unsafe.Add(c.strings, headerSize)), len(c.src))[:used]
+}
+
+func (c *decoderCursor) setStringArenaLen(used int) {
+	if c.strings != nil {
+		header := unsafe.Slice((*byte)(c.strings), 8)
+		binary.LittleEndian.PutUint64(header, uint64(used))
+	}
 }
 
 func (c *decoderCursor) genericExpected[T any](jsonType string) error {

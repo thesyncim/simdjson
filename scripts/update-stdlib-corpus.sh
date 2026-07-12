@@ -10,7 +10,8 @@ goroot=$("$go_bin" env GOROOT)
 source_dir=$goroot/src/encoding/json/internal/jsontest/_embed
 models_source=$goroot/src/encoding/json/internal/jsontest/testdata.go
 destination=$repo_root/tests/stdlib/testdata
-models_destination=$repo_root/tests/stdlib/models_test.go
+models_destination=$repo_root/tests/stdlib/models.go
+legacy_models_destination=$repo_root/benchmarks/legacy/stdlib_models_test.go
 
 if [ ! -d "$source_dir" ] || [ ! -f "$models_source" ]; then
 	printf '%s\n' "encoding/json high-level corpus not found: $source_dir" >&2
@@ -24,10 +25,17 @@ cp "$goroot/LICENSE" "$destination/LICENSE"
 
 {
 	sed -n '1,4p' "$models_source"
-	printf '%s\n' '' '// Derived from encoding/json/internal/jsontest/testdata.go at the Go revision' '// recorded in testdata/UPSTREAM.md.' 'package stdlib_test' '' 'import (' '    "errors"' '    "time"' ')' ''
+	printf '%s\n' '' '// Derived from encoding/json/internal/jsontest/testdata.go at the Go revision' '// recorded in testdata/UPSTREAM.md.' 'package stdlibcorpus' '' 'import (' '    "errors"' '    "time"' ')' ''
 	sed -n '/^type (/,$p' "$models_source"
 } >"$models_destination"
 "$goroot/bin/gofmt" -w "$models_destination"
+
+{
+	sed -n '1,4p' "$models_source"
+	printf '%s\n' '' '// Derived from encoding/json/internal/jsontest/testdata.go at the Go revision' '// recorded in tests/stdlib/testdata/UPSTREAM.md.' 'package legacy' '' 'import (' '    "errors"' '    "time"' ')' ''
+	sed -n '/^type (/,$p' "$models_source"
+} >"$legacy_models_destination"
+"$goroot/bin/gofmt" -w "$legacy_models_destination"
 
 commit=$(git -C "$goroot" rev-parse HEAD)
 cat >"$destination/UPSTREAM.md" <<EOF

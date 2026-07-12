@@ -2,6 +2,7 @@ package simdjson
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"testing"
 	"unsafe"
@@ -9,6 +10,30 @@ import (
 
 var parsedDigitsSink uint64
 var benchmarkFloatSink float64
+
+func TestParse8Digits(t *testing.T) {
+	for value := uint64(0); value < 100000000; value += 7919 {
+		text := []byte(fmt.Sprintf("%08d", value))
+		base := unsafe.Pointer(unsafe.SliceData(text))
+		if !all8Digits(base) {
+			t.Fatalf("all8Digits rejected %q", text)
+		}
+		if got := parse8Digits(base); got != value {
+			t.Fatalf("parse8Digits(%q) = %d, want %d", text, got, value)
+		}
+	}
+	text := []byte("00000000")
+	for i := range text {
+		for value := 0; value < 256; value++ {
+			text[i] = byte(value)
+			want := value >= '0' && value <= '9'
+			if got := all8Digits(unsafe.Pointer(unsafe.SliceData(text))); got != want {
+				t.Fatalf("position %d byte %#02x: all8Digits = %v, want %v", i, value, got, want)
+			}
+		}
+		text[i] = '0'
+	}
+}
 
 func TestAll16DigitsEveryBytePosition(t *testing.T) {
 	var digits [16]byte

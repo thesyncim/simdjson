@@ -1,22 +1,18 @@
-package stdlib_test
+package stdlibcorpus
 
 import (
 	"encoding/json"
 	"testing"
 
-	"github.com/klauspost/compress/zstd"
 	"github.com/thesyncim/simdjson"
 )
 
 func BenchmarkHighLevelCorpus(b *testing.B) {
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer decoder.Close()
-
-	for _, name := range stdlibCorpora {
-		src := readCorpus(b, decoder, name)
+	for _, name := range Names {
+		src, err := Read(name)
+		if err != nil {
+			b.Fatal(err)
+		}
 		b.Run(name, func(b *testing.B) {
 			b.Run("valid/encoding-json", func(b *testing.B) {
 				b.SetBytes(int64(len(src)))
