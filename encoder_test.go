@@ -146,7 +146,7 @@ func TestEncoderErrors(t *testing.T) {
 	}
 }
 
-func TestEncoderAppendJSONReusesBuffer(t *testing.T) {
+func TestEncoderAppendJSONReusesBufferAllocs(t *testing.T) {
 	encoder, err := CompileEncoder[typedTestRecord](EncoderOptions{})
 	if err != nil {
 		t.Fatal(err)
