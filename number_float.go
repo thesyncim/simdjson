@@ -271,6 +271,36 @@ func exactJSONFloat64(base unsafe.Pointer, start, end int) (float64, bool) {
 
 func scanTypedFloat64(base unsafe.Pointer, n, start int) (end int, value float64, exact, ok bool) {
 	i := start
+	if fastByteAt(base, i) == '-' {
+		i++
+	}
+	if i <= n-18 && fastByteAt(base, i) == '0' && fastByteAt(base, i+1) == '.' &&
+		all16Digits(unsafe.Add(base, i+2)) {
+		return scanTypedLeadingZeroFloat64(base, n, start)
+	}
+	if start <= n-8 {
+		word := loadUint64LE(unsafe.Add(base, start))
+		if byteEqMask(word, ',')|byteEqMask(word, ']')|byteEqMask(word, '}') != 0 {
+			end, number, ok := scanJSONNumber(base, n, start)
+			if !ok {
+				return end, 0, false, false
+			}
+			value, exact = number.exactFloat64()
+			return end, value, exact, true
+		}
+	} else {
+		end, number, ok := scanJSONNumber(base, n, start)
+		if !ok {
+			return end, 0, false, false
+		}
+		value, exact = number.exactFloat64()
+		return end, value, exact, true
+	}
+	return scanTypedSimpleFloat64(base, n, start)
+}
+
+func scanTypedSimpleFloat64(base unsafe.Pointer, n, start int) (end int, value float64, exact, ok bool) {
+	i := start
 	negative := false
 	if fastByteAt(base, i) == '-' {
 		negative = true
@@ -350,6 +380,71 @@ func scanTypedFloat64(base unsafe.Pointer, n, start int) (end int, value float64
 			}).exactFloat64()
 		}
 	}
+	return i, value, exact, true
+}
+
+func scanTypedLeadingZeroFloat64(base unsafe.Pointer, n, start int) (end int, value float64, exact, ok bool) {
+	i := start
+	negative := false
+	if fastByteAt(base, i) == '-' {
+		negative = true
+		i++
+	}
+	// The dispatcher proved that this is 0. followed by at least 16 digits.
+	i += 2
+	dp := 0
+	for i < n && fastByteAt(base, i) == '0' {
+		dp--
+		i++
+	}
+	var mantissa uint64
+	ndMant := 0
+	truncated := false
+	if i <= n-16 && isOneNine(fastByteAt(base, i)) && all16Digits(unsafe.Add(base, i)) {
+		mantissa = parse16Digits(unsafe.Add(base, i))
+		ndMant = 16
+		i += 16
+	}
+	for i < n && isDigit(fastByteAt(base, i)) {
+		c := fastByteAt(base, i)
+		if ndMant < maxJSONMantissaDigits {
+			mantissa = mantissa*10 + uint64(c-'0')
+			ndMant++
+		} else if c != '0' {
+			truncated = true
+		}
+		i++
+	}
+
+	if i < n && (fastByteAt(base, i) == 'e' || fastByteAt(base, i) == 'E') {
+		i++
+		exponentSign := 1
+		if i < n && (fastByteAt(base, i) == '+' || fastByteAt(base, i) == '-') {
+			if fastByteAt(base, i) == '-' {
+				exponentSign = -1
+			}
+			i++
+		}
+		if i >= n || !isDigit(fastByteAt(base, i)) {
+			return i, 0, false, false
+		}
+		exponent := 0
+		for i < n && isDigit(fastByteAt(base, i)) {
+			if exponent < 10000 {
+				exponent = exponent*10 + int(fastByteAt(base, i)-'0')
+			}
+			i++
+		}
+		dp += exponent * exponentSign
+	}
+
+	number := jsonNumber{
+		mantissa:  mantissa,
+		exponent:  dp - ndMant,
+		negative:  negative,
+		truncated: truncated,
+	}
+	value, exact = number.exactFloat64()
 	return i, value, exact, true
 }
 

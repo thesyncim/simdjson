@@ -35,7 +35,7 @@ for validation. Speedups are geometric means across all seven payloads.
 | Operation | Contract | Wins vs stdlib | Wins vs rival | vs stdlib | vs rival |
 |---|---|---:|---:|---:|---:|
 | Validate | Syntax only | **7/7** | **7/7** | **1.95x** | **1.79x** |
-| Typed decode | Owned strings, reused destination | **7/7** | **7/7** | **3.82x** | **1.54x** |
+| Typed decode | Owned strings, reused destination | **7/7** | **7/7** | **4.15x** | **1.60x** |
 | Dynamic decode | Owned `any` tree | **7/7** | **7/7** | **4.15x** | **1.89x** |
 | Encode | Owned output | **7/7** | 4/7 | **2.14x** | **1.27x** |
 | Encode | Reused output buffer | **7/7** | **5/7** | **2.32x** | **1.37x** |
@@ -52,24 +52,24 @@ contract.
 
 | Corpus | `encoding/json` | simdjson owned | simdjson source-backed | Fastest tip rival | Native Sonic owned |
 |---|---:|---:|---:|---:|---:|
-| Canada geometry | 1.248 ms | **359.2 us** | 343.9 us | go-json 756.0 us | 440.5 us |
-| CITM catalog | 2.519 ms | **760.1 us** | 667.7 us | go-json 1.047 ms | 1.423 ms |
-| Go source | 6.154 ms | **1.646 ms** | 1.572 ms | Segment 2.139 ms | 3.345 ms |
-| Escaped strings | 187.9 us | **27.45 us** | 25.01 us | go-json 63.27 us | 30.69 us |
-| Unicode strings | 38.84 us | **8.255 us** | 7.378 us | go-json 11.31 us | 11.28 us |
-| Synthea FHIR | 3.688 ms | **1.416 ms** | 1.292 ms | go-json 1.670 ms | 2.653 ms |
-| Twitter status | 1.307 ms | **398.1 us** | 353.0 us | go-json 595.1 us | 699.8 us |
+| Canada geometry | 1.197 ms | **359.7 us** | 359.5 us | go-json 698.4 us | 440.5 us |
+| CITM catalog | 2.513 ms | **697.3 us** | 632.7 us | go-json 988.9 us | 1.423 ms |
+| Go source | 5.925 ms | **1.144 ms** | 1.097 ms | Segment 2.070 ms | 3.345 ms |
+| Escaped strings | 173.8 us | **26.04 us** | 26.10 us | go-json 56.65 us | 30.69 us |
+| Unicode strings | 40.29 us | **7.586 us** | 6.881 us | go-json 10.37 us | 11.28 us |
+| Synthea FHIR | 3.617 ms | **1.312 ms** | 1.214 ms | go-json 1.556 ms | 2.653 ms |
+| Twitter status | 1.297 ms | **368.6 us** | 332.2 us | go-json 562.4 us | 699.8 us |
 
 Source-backed allocation counts are not zero for container-heavy models:
 
 | Corpus | Bytes/op | Allocs/op |
 |---|---:|---:|
-| Canada geometry | 601 B | 2 |
-| CITM catalog | 1.68 MiB | 1,227 |
-| Go source | 21.1 KiB | 98 |
+| Canada geometry | 629 B | 2 |
+| CITM catalog | 1.68 MiB | 1,224 |
+| Go source | 14.6 KiB | 68 |
 | Escaped strings | 48.0 KiB | 1 |
 | Unicode strings | 18.0 KiB | 1 |
-| Synthea FHIR | 1.95 MiB | 355 |
+| Synthea FHIR | 1.95 MiB | 351 |
 | Twitter status | 631 KiB | 140 |
 
 Slices, maps, pointers, escaped text, and custom method receivers still require
@@ -236,8 +236,9 @@ once, and implementation choices are fixed during package initialization.
 | Other build or CPU | Scalar Go | Scalar Go |
 
 Other vector paths include strict UTF-8 validation, contiguous `\uXXXX`
-validation, U+2028/U+2029 detection, and syntax scans used by string encoding.
-Every vector load is length-guarded. `CurrentSIMD()` reports the selected
+validation, U+2028/U+2029 detection, syntax scans used by string encoding, and
+shape-dispatched typed decimals that reduce 16 significant digits in one SIMD
+pass. Every vector load is length-guarded. `CurrentSIMD()` reports the selected
 backend, vector width, threshold, number backend, and CPU features.
 
 ## Safety Model

@@ -430,6 +430,37 @@ func TestFieldOrderPermutationsMatchStdlib(t *testing.T) {
 	permute(members, nil)
 }
 
+func TestCompiledFieldTableCollisionsMatchStdlib(t *testing.T) {
+	type collisionRecord struct {
+		Field0 int `json:"field0"`
+		Field1 int `json:"field1"`
+		Field2 int `json:"field2"`
+		Field3 int `json:"field3"`
+		Field4 int `json:"field4"`
+		Field5 int `json:"field5"`
+		Field6 int `json:"field6"`
+		Field7 int `json:"field7"`
+		Field8 int `json:"field8"`
+		Field9 int `json:"field9"`
+	}
+	// These names deliberately share the same initial table slot.
+	src := []byte(`{"field9":9,"field0":0,"unknown":[1,2],"field8":8,"field1":1,"field7":7,"field2":2,"field6":6,"field3":3,"FIELD4":4,"field5":5}`)
+	decoder, err := CompileDecoder[collisionRecord](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got, want collisionRecord
+	if err := decoder.Decode(src, &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(src, &want); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("collision decode = %#v, want %#v", got, want)
+	}
+}
+
 func TestCaseFoldedKeysMatchStdlib(t *testing.T) {
 	type untagged struct {
 		ID     int

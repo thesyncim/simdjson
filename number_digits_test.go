@@ -3,6 +3,7 @@ package simdjson
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"testing"
 	"unsafe"
@@ -10,6 +11,52 @@ import (
 
 var parsedDigitsSink uint64
 var benchmarkFloatSink float64
+
+func TestScanTypedFloat64LeadingZerosMatchesStrconv(t *testing.T) {
+	for _, text := range []string{
+		"0.0006988752666567719",
+		"-0.0011574074074074073",
+		"0.00012874983906270118",
+		"0.028647215558761104",
+	} {
+		src := []byte(text + ",")
+		end, got, exact, ok := scanTypedFloat64(unsafe.Pointer(unsafe.SliceData(src)), len(src), 0)
+		if !ok || !exact || end != len(text) {
+			t.Fatalf("scanTypedFloat64(%q) = end %d, exact %v, ok %v", text, end, exact, ok)
+		}
+		want, err := strconv.ParseFloat(text, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if math.Float64bits(got) != math.Float64bits(want) {
+			t.Fatalf("scanTypedFloat64(%q) = %.17g (%#x), want %.17g (%#x)",
+				text, got, math.Float64bits(got), want, math.Float64bits(want))
+		}
+	}
+}
+
+func TestScanTypedFloat64FormattedValues(t *testing.T) {
+	state := uint64(0x243f6a8885a308d3)
+	for range 50000 {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		want := math.Float64frombits(state)
+		if math.IsNaN(want) || math.IsInf(want, 0) {
+			continue
+		}
+		text := strconv.FormatFloat(want, 'g', -1, 64)
+		src := []byte(text + ",")
+		end, got, exact, ok := scanTypedFloat64(unsafe.Pointer(unsafe.SliceData(src)), len(src), 0)
+		if !ok || end != len(text) {
+			t.Fatalf("scanTypedFloat64(%q) = end %d, ok %v", text, end, ok)
+		}
+		if exact && math.Float64bits(got) != math.Float64bits(want) {
+			t.Fatalf("scanTypedFloat64(%q) = %.17g (%#x), want %.17g (%#x)",
+				text, got, math.Float64bits(got), want, math.Float64bits(want))
+		}
+	}
+}
 
 func TestParse8Digits(t *testing.T) {
 	for value := uint64(0); value < 100000000; value += 7919 {

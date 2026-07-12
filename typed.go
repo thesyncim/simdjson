@@ -2,6 +2,7 @@ package simdjson
 
 import (
 	"encoding"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -270,7 +271,8 @@ type typedNode struct {
 	mapKeyTextDecode bool
 	mapKeyTextEncode bool
 	fields           []typedField
-	fieldIndex       map[string]int16
+	fieldTable       []int16
+	fieldTableMask   uint32
 	encFields        []typedEncField
 	fieldHops        [][]typedFieldHop
 	hopResets        []uintptr
@@ -539,9 +541,18 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 			}
 		}
 		if len(node.fields) >= 8 {
-			node.fieldIndex = make(map[string]int16, len(node.fields))
+			tableSize := 16
+			for tableSize < len(node.fields)*2 {
+				tableSize *= 2
+			}
+			node.fieldTable = make([]int16, tableSize)
+			node.fieldTableMask = uint32(tableSize - 1)
 			for i := range node.fields {
-				node.fieldIndex[node.fields[i].name] = int16(i)
+				slot := fieldNameHash(node.fields[i].name) & node.fieldTableMask
+				for node.fieldTable[slot] != 0 {
+					slot = (slot + 1) & node.fieldTableMask
+				}
+				node.fieldTable[slot] = int16(i + 1)
 			}
 		}
 	default:
@@ -718,9 +729,18 @@ func (p *parser) skipTypedValue(depth int) error {
 }
 
 func (node *typedNode) findFieldSlow(key string, fold bool) *typedField {
-	if node.fieldIndex != nil {
-		if index, ok := node.fieldIndex[key]; ok {
-			return &node.fields[index]
+	if node.fieldTable != nil {
+		slot := fieldNameHash(key) & node.fieldTableMask
+		for {
+			entry := node.fieldTable[slot]
+			if entry == 0 {
+				break
+			}
+			field := &node.fields[entry-1]
+			if field.name == key {
+				return field
+			}
+			slot = (slot + 1) & node.fieldTableMask
 		}
 	} else {
 		for i := range node.fields {
@@ -730,13 +750,33 @@ func (node *typedNode) findFieldSlow(key string, fold bool) *typedField {
 		}
 	}
 	if fold {
-		for i := range node.fields {
-			if strings.EqualFold(node.fields[i].name, key) {
-				return &node.fields[i]
-			}
+		return node.findFieldFold(key)
+	}
+	return nil
+}
+
+//go:noinline
+func (node *typedNode) findFieldFold(key string) *typedField {
+	for i := range node.fields {
+		if strings.EqualFold(node.fields[i].name, key) {
+			return &node.fields[i]
 		}
 	}
 	return nil
+}
+
+func fieldNameHash(name string) uint32 {
+	var head uint64
+	if len(name) >= 8 {
+		head = binary.LittleEndian.Uint64(unsafe.Slice(unsafe.StringData(name), len(name)))
+	} else {
+		for i := range len(name) {
+			head |= uint64(name[i]) << (i * 8)
+		}
+	}
+	head ^= uint64(len(name)) * 0x9e3779b97f4a7c15
+	head ^= head >> 33
+	return uint32(head ^ head>>32)
 }
 
 func resetTyped(node *typedNode, dst unsafe.Pointer) {
