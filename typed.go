@@ -293,17 +293,20 @@ type typedField struct {
 	op      typedOp
 }
 
-// typedEncField holds the encoder-only view of a struct field, parallel to
-// typedNode.fields, so decoder field records stay within two cache lines.
+// typedEncField holds the complete encoder-only view of a struct field, so the
+// hot encode loop does not touch the larger decoder field record.
 type typedEncField struct {
-	encName      string
-	encNamePlain string
-	encOp        typedOp
-	omitEmpty    bool
+	encName   string
+	node      *typedNode
+	offset    uintptr
+	hop       int16
+	encOp     typedOp
+	omitEmpty bool
 }
 
 type typedCompiler struct {
-	nodes map[reflect.Type]*typedNode
+	nodes      map[reflect.Type]*typedNode
+	escapeHTML bool
 }
 
 var jsonNumberReflectType = reflect.TypeFor[json.Number]()
@@ -472,10 +475,12 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 				node.hopResets = append(node.hopResets, hops[0].offset)
 			}
 			encField := typedEncField{
-				encName:      string(appendEncodedJSONString(nil, resolved.name, true)) + ":",
-				encNamePlain: string(appendEncodedJSONString(nil, resolved.name, false)) + ":",
-				encOp:        fieldNode.encOp,
-				omitEmpty:    resolved.omitEmpty,
+				encName:   string(appendEncodedJSONString(nil, resolved.name, c.escapeHTML)) + ":",
+				node:      fieldNode,
+				offset:    offset,
+				hop:       compiledField.hop,
+				encOp:     fieldNode.encOp,
+				omitEmpty: resolved.omitEmpty,
 			}
 			if resolved.quoted {
 				quotedNode := fieldNode

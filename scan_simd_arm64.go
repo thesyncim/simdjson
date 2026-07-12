@@ -22,3 +22,11 @@ func scanStringSpecialRuntime(src []byte, i int) int {
 func scanStringSyntaxRuntime(src []byte, i int) int {
 	return scanStringSyntaxSIMD(src, i)
 }
+
+func scanEncodedHTMLSpecialRuntime(src []byte, i int) int {
+	return scanEncodedHTMLSpecialSIMD(src, i)
+}
+
+func scanEncodedHTMLSyntaxRuntime(src []byte, i int) int {
+	return scanEncodedHTMLSyntaxSIMD(src, i)
+}

@@ -24,12 +24,24 @@ func scanStringSyntax(src []byte, i int) int {
 	return scanStringSyntaxScalar(src, i)
 }
 
+func scanEncodedHTMLSpecialFast(src []byte, i int) int {
+	return scanEncodedHTMLSpecialScalar(src, i)
+}
+
+func scanEncodedHTMLSyntaxFast(src []byte, i int) int {
+	return scanEncodedHTMLSyntaxScalar(src, i)
+}
+
 func scanUnicodeEscapeRun(src []byte, i int) (int, bool) {
 	return i, true
 }
 
 func validUTF8Fast(src []byte) bool {
 	return utf8.Valid(src)
+}
+
+func validUTF8NoLineSeparatorFast(src []byte) bool {
+	return utf8.Valid(src) && !hasJSONLineSeparatorScalar(src, 0)
 }
 
 func hasJSONLineSeparatorFast(src []byte, start int) bool {

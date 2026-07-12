@@ -74,6 +74,10 @@ func TestSIMDUTF8MatchesStdlib(t *testing.T) {
 			if got, want := validUTF8Fast(src), utf8.Valid(src); got != want {
 				t.Fatalf("validUTF8Fast(length=%d offset=%d data=%x) = %v, want %v", length, offset, src, got, want)
 			}
+			wantClean := utf8.Valid(src) && !hasJSONLineSeparatorScalar(src, 0)
+			if got := validUTF8NoLineSeparatorFast(src); got != wantClean {
+				t.Fatalf("validUTF8NoLineSeparatorFast(length=%d offset=%d data=%x) = %v, want %v", length, offset, src, got, wantClean)
+			}
 		}
 	}
 
@@ -86,6 +90,22 @@ func TestSIMDUTF8MatchesStdlib(t *testing.T) {
 		if !validUTF8Fast(src) {
 			t.Fatalf("validUTF8Fast rejected %d-byte multilingual input", len(src))
 		}
+	}
+}
+
+func TestSIMDUTF8NoLineSeparatorBoundaries(t *testing.T) {
+	for position := 0; position <= 96; position++ {
+		for _, last := range []byte{0xa8, 0xa9} {
+			src := longScanCase(128, -1, 0)
+			src[position], src[position+1], src[position+2] = 0xe2, 0x80, last
+			if validUTF8NoLineSeparatorFast(src) {
+				t.Fatalf("accepted U+202%c at byte %d", '8'+rune(last-0xa8), position)
+			}
+		}
+	}
+	clean := []byte("ASCII-العربية-Հայերեն-বাংলা-日本語-🙂")
+	if !validUTF8NoLineSeparatorFast(clean) {
+		t.Fatal("rejected clean multilingual input")
 	}
 }
 
@@ -195,6 +215,56 @@ func TestSIMDScanMatchesScalarAllByteValues(t *testing.T) {
 	}
 }
 
+func TestSIMDEncodedHTMLScannersMatchScalar(t *testing.T) {
+	starts := []int{0, 1, 15, 16, 31, 63, 64, 79, 80, 81, 159, 160}
+	for b := 0; b <= 0xff; b++ {
+		src := longScanCase(192, 80, byte(b))
+		for _, start := range starts {
+			wantSpecial := scanEncodedHTMLSpecialScalar(src, start)
+			if got := scanEncodedHTMLSpecialFast(src, start); got != wantSpecial {
+				t.Fatalf("HTML special byte=0x%02x start=%d: got %d, want %d", b, start, got, wantSpecial)
+			}
+			if got := scanEncodedHTMLSpecialSIMD(src, start); got != wantSpecial {
+				t.Fatalf("direct HTML special byte=0x%02x start=%d: got %d, want %d", b, start, got, wantSpecial)
+			}
+
+			wantSyntax := scanEncodedHTMLSyntaxScalar(src, start)
+			if got := scanEncodedHTMLSyntaxFast(src, start); got != wantSyntax {
+				t.Fatalf("HTML syntax byte=0x%02x start=%d: got %d, want %d", b, start, got, wantSyntax)
+			}
+			if got := scanEncodedHTMLSyntaxSIMD(src, start); got != wantSyntax {
+				t.Fatalf("direct HTML syntax byte=0x%02x start=%d: got %d, want %d", b, start, got, wantSyntax)
+			}
+		}
+	}
+}
+
+func TestSIMDEncodedHTMLScannersRespectBounds(t *testing.T) {
+	state := uint64(0x9e3779b97f4a7c15)
+	for alignment := 0; alignment < 32; alignment++ {
+		for length := 0; length <= 256; length++ {
+			backing := make([]byte, alignment+length+64)
+			src := backing[alignment : alignment+length : alignment+length]
+			for i := range src {
+				state ^= state << 13
+				state ^= state >> 7
+				state ^= state << 17
+				src[i] = byte(state)
+			}
+			for start := 0; start <= length; start++ {
+				wantSpecial := scanEncodedHTMLSpecialScalar(src, start)
+				if got := scanEncodedHTMLSpecialFast(src, start); got != wantSpecial {
+					t.Fatalf("HTML special alignment=%d length=%d start=%d: got %d, want %d", alignment, length, start, got, wantSpecial)
+				}
+				wantSyntax := scanEncodedHTMLSyntaxScalar(src, start)
+				if got := scanEncodedHTMLSyntaxFast(src, start); got != wantSyntax {
+					t.Fatalf("HTML syntax alignment=%d length=%d start=%d: got %d, want %d", alignment, length, start, got, wantSyntax)
+				}
+			}
+		}
+	}
+}
+
 func TestSIMDScannersRespectSliceBoundsAndAlignment(t *testing.T) {
 	for alignment := 0; alignment < 32; alignment++ {
 		for length := 0; length <= 192; length++ {
@@ -275,6 +345,21 @@ func FuzzSIMDScannersMatchScalar(f *testing.F) {
 		if got := scanStringSyntaxSIMD(src, start); got != wantSyntax {
 			t.Fatalf("direct SIMD syntax scan = %d, scalar = %d", got, wantSyntax)
 		}
+
+		wantHTMLSpecial := scanEncodedHTMLSpecialScalar(src, start)
+		if got := scanEncodedHTMLSpecialFast(src, start); got != wantHTMLSpecial {
+			t.Fatalf("HTML special scan = %d, scalar = %d", got, wantHTMLSpecial)
+		}
+		if got := scanEncodedHTMLSpecialSIMD(src, start); got != wantHTMLSpecial {
+			t.Fatalf("direct SIMD HTML special scan = %d, scalar = %d", got, wantHTMLSpecial)
+		}
+		wantHTMLSyntax := scanEncodedHTMLSyntaxScalar(src, start)
+		if got := scanEncodedHTMLSyntaxFast(src, start); got != wantHTMLSyntax {
+			t.Fatalf("HTML syntax scan = %d, scalar = %d", got, wantHTMLSyntax)
+		}
+		if got := scanEncodedHTMLSyntaxSIMD(src, start); got != wantHTMLSyntax {
+			t.Fatalf("direct SIMD HTML syntax scan = %d, scalar = %d", got, wantHTMLSyntax)
+		}
 	})
 }
 
@@ -333,6 +418,28 @@ func BenchmarkStringScannerQuoteAtEnd(b *testing.B) {
 		b.Run(fmt.Sprintf("direct/%d", n), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				scanSink = scanStringSpecialSIMD(src, 0)
+			}
+		})
+	}
+}
+
+func BenchmarkEncodedHTMLScannerASCII(b *testing.B) {
+	lengths := []int{16, 32, 48, 64, 96, 128, 256, 512, 1024}
+	for _, n := range lengths {
+		src := longScanCase(n, -1, 0)
+		b.Run(fmt.Sprintf("scalar/%d", n), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				scanSink = scanEncodedHTMLSpecialScalar(src, 0)
+			}
+		})
+		b.Run(fmt.Sprintf("dispatch/%d", n), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				scanSink = scanEncodedHTMLSpecialFast(src, 0)
+			}
+		})
+		b.Run(fmt.Sprintf("direct/%d", n), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				scanSink = scanEncodedHTMLSpecialSIMD(src, 0)
 			}
 		})
 	}

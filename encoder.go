@@ -40,12 +40,13 @@ type Encoder[T any] struct {
 // CompileDecoder plus the omitempty and string tag options.
 func CompileEncoder[T any](opts EncoderOptions) (Encoder[T], error) {
 	typ := reflect.TypeFor[T]()
-	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode)}
+	escapeHTML := !opts.DisableHTMLEscaping
+	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode), escapeHTML: escapeHTML}
 	root, err := compiler.compile(typ, typ.String())
 	if err != nil {
 		return Encoder[T]{}, err
 	}
-	return Encoder[T]{root: root, escapeHTML: !opts.DisableHTMLEscaping}, nil
+	return Encoder[T]{root: root, escapeHTML: escapeHTML}, nil
 }
 
 // AppendJSON appends src encoded as compact JSON to dst. Ordinary compiled
@@ -272,30 +273,25 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 	e.depth++
 	e.dst = append(e.dst, '{')
 	first := true
-	for i := range node.fields {
-		field := &node.fields[i]
+	for i := range node.encFields {
 		encField := &node.encFields[i]
 		fieldBase := src
-		if field.hop >= 0 {
-			fieldBase = resolveResetHops(src, node.fieldHops[field.hop])
+		if encField.hop >= 0 {
+			fieldBase = resolveResetHops(src, node.fieldHops[encField.hop])
 			if fieldBase == nil {
 				// A nil embedded pointer omits its promoted fields entirely.
 				continue
 			}
 		}
-		fieldSrc := unsafe.Add(fieldBase, field.offset)
-		if encField.omitEmpty && typedValueIsEmpty(field.node, fieldSrc) {
+		fieldSrc := unsafe.Add(fieldBase, encField.offset)
+		if encField.omitEmpty && typedValueIsEmpty(encField.node, fieldSrc) {
 			continue
 		}
 		if !first {
 			e.dst = append(e.dst, ',')
 		}
 		first = false
-		if e.escapeHTML {
-			e.dst = append(e.dst, encField.encName...)
-		} else {
-			e.dst = append(e.dst, encField.encNamePlain...)
-		}
+		e.dst = append(e.dst, encField.encName...)
 		var err error
 		switch encField.encOp {
 		case typedOpBool:
@@ -329,25 +325,25 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 		case typedOpFloat64:
 			err = e.encodeFloat(*(*float64)(fieldSrc), 64)
 		case typedOpStruct:
-			err = e.encodeStruct(field.node, fieldSrc)
+			err = e.encodeStruct(encField.node, fieldSrc)
 		case typedOpSlice:
-			err = e.encodeSlice(field.node, fieldSrc)
+			err = e.encodeSlice(encField.node, fieldSrc)
 		case typedOpArray:
-			err = e.encodeArray(field.node, fieldSrc)
+			err = e.encodeArray(encField.node, fieldSrc)
 		case typedOpMap:
-			err = e.encodeMap(field.node, fieldSrc)
+			err = e.encodeMap(encField.node, fieldSrc)
 		case typedOpAny:
 			err = e.encodeAny(fieldSrc)
 		case typedOpQuoted:
-			err = e.encodeQuoted(field.node, fieldSrc)
+			err = e.encodeQuoted(encField.node, fieldSrc)
 		case typedOpMarshaler:
-			err = e.encodeMarshaler(field.node, fieldSrc)
+			err = e.encodeMarshaler(encField.node, fieldSrc)
 		default:
-			err = e.encode(field.node, fieldSrc)
+			err = e.encode(encField.node, fieldSrc)
 		}
 		if err != nil {
 			e.depth--
-			return prependEncodePathField(err, field.name)
+			return prependEncodePathField(err, node.fields[i].name)
 		}
 	}
 	e.dst = append(e.dst, '}')
@@ -363,6 +359,9 @@ func (e *encodeState) encodeSlice(node *typedNode, src unsafe.Pointer) error {
 	}
 	if e.depth >= defaultMaxDepth {
 		return &EncodeError{Reason: "maximum nesting depth exceeded"}
+	}
+	if node.elem.encOp == typedOpStruct {
+		return e.encodeStructSlice(node, header)
 	}
 	e.depth++
 	e.dst = append(e.dst, '[')
@@ -400,9 +399,30 @@ func (e *encodeState) encodeSlice(node *typedNode, src unsafe.Pointer) error {
 	return nil
 }
 
+func (e *encodeState) encodeStructSlice(node *typedNode, header *typedSliceHeader) error {
+	e.depth++
+	e.dst = append(e.dst, '[')
+	for index := 0; index < header.len; index++ {
+		if index > 0 {
+			e.dst = append(e.dst, ',')
+		}
+		element := unsafe.Add(header.data, uintptr(index)*node.elem.size)
+		if err := e.encodeStruct(node.elem, element); err != nil {
+			e.depth--
+			return prependEncodePathIndex(err, index)
+		}
+	}
+	e.dst = append(e.dst, ']')
+	e.depth--
+	return nil
+}
+
 func (e *encodeState) encodeArray(node *typedNode, src unsafe.Pointer) error {
 	if e.depth >= defaultMaxDepth {
 		return &EncodeError{Reason: "maximum nesting depth exceeded"}
+	}
+	if node.elem.encOp == typedOpFloat64 {
+		return e.encodeFloat64Array(node, src)
 	}
 	e.depth++
 	e.dst = append(e.dst, '[')
@@ -421,6 +441,28 @@ func (e *encodeState) encodeArray(node *typedNode, src unsafe.Pointer) error {
 	return nil
 }
 
+func (e *encodeState) encodeFloat64Array(node *typedNode, src unsafe.Pointer) error {
+	e.depth++
+	e.dst = append(e.dst, '[')
+	if node.length > 0 {
+		if err := e.encodeFloat(*(*float64)(src), 64); err != nil {
+			e.depth--
+			return prependEncodePathIndex(err, 0)
+		}
+		for index := 1; index < node.length; index++ {
+			e.dst = append(e.dst, ',')
+			element := unsafe.Add(src, uintptr(index)*8)
+			if err := e.encodeFloat(*(*float64)(element), 64); err != nil {
+				e.depth--
+				return prependEncodePathIndex(err, index)
+			}
+		}
+	}
+	e.dst = append(e.dst, ']')
+	e.depth--
+	return nil
+}
+
 // dynamicEncodeNodes caches one compiled encode plan per concrete type seen
 // inside an interface value.
 var dynamicEncodeNodes sync.Map
@@ -430,14 +472,20 @@ type dynamicEncodeEntry struct {
 	err  error
 }
 
-func dynamicEncodeNode(typ reflect.Type) (*typedNode, error) {
-	if entry, ok := dynamicEncodeNodes.Load(typ); ok {
+type dynamicEncodeKey struct {
+	typ        reflect.Type
+	escapeHTML bool
+}
+
+func dynamicEncodeNode(typ reflect.Type, escapeHTML bool) (*typedNode, error) {
+	key := dynamicEncodeKey{typ: typ, escapeHTML: escapeHTML}
+	if entry, ok := dynamicEncodeNodes.Load(key); ok {
 		cached := entry.(*dynamicEncodeEntry)
 		return cached.node, cached.err
 	}
-	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode)}
+	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode), escapeHTML: escapeHTML}
 	node, err := compiler.compile(typ, typ.String())
-	entry, _ := dynamicEncodeNodes.LoadOrStore(typ, &dynamicEncodeEntry{node: node, err: err})
+	entry, _ := dynamicEncodeNodes.LoadOrStore(key, &dynamicEncodeEntry{node: node, err: err})
 	cached := entry.(*dynamicEncodeEntry)
 	return cached.node, cached.err
 }
@@ -481,7 +529,7 @@ func (e *encodeState) encodeDynamicValue(value reflect.Value) error {
 	if e.depth >= defaultMaxDepth {
 		return &EncodeError{Reason: "maximum nesting depth exceeded"}
 	}
-	node, err := dynamicEncodeNode(value.Type())
+	node, err := dynamicEncodeNode(value.Type(), e.escapeHTML)
 	if err != nil {
 		return &EncodeError{Reason: err.Error()}
 	}
@@ -801,7 +849,7 @@ func appendEncodedJSONString(dst []byte, s string, escapeHTML bool) []byte {
 	src := unsafe.Slice(unsafe.StringData(s), len(s))
 	first := 0
 	if escapeHTML {
-		first = scanEncodedHTMLSpecial(src, 0)
+		first = scanEncodedHTMLSpecialFast(src, 0)
 	} else {
 		first = scanStringSpecial(src, 0)
 	}
@@ -811,7 +859,7 @@ func appendEncodedJSONString(dst []byte, s string, escapeHTML bool) []byte {
 	}
 	unicodeClean := false
 	if src[first] >= 0x80 {
-		unicodeClean = validUTF8Fast(src) && !hasJSONLineSeparatorFast(src, first)
+		unicodeClean = validUTF8NoLineSeparatorFast(src)
 	}
 	start := 0
 	for i := first; i < len(s); {
@@ -819,11 +867,11 @@ func appendEncodedJSONString(dst []byte, s string, escapeHTML bool) []byte {
 		// backslashes, control bytes, non-ASCII, and in HTML mode the
 		// angle brackets and ampersand encoding/json escapes by default.
 		if unicodeClean && escapeHTML {
-			i = scanEncodedHTMLSyntax(src, i)
+			i = scanEncodedHTMLSyntaxFast(src, i)
 		} else if unicodeClean {
 			i = scanStringSyntax(src, i)
 		} else if escapeHTML {
-			i = scanEncodedHTMLSpecial(src, i)
+			i = scanEncodedHTMLSpecialFast(src, i)
 		} else {
 			i = scanStringSpecial(src, i)
 		}
@@ -885,7 +933,7 @@ func hasJSONLineSeparatorScalar(src []byte, start int) bool {
 	return false
 }
 
-func scanEncodedHTMLSyntax(src []byte, i int) int {
+func scanEncodedHTMLSyntaxScalar(src []byte, i int) int {
 	for i+8 <= len(src) {
 		x := binary.LittleEndian.Uint64(src[i:])
 		m := stringSyntaxMask(x) | byteEqMask(x, '<') | byteEqMask(x, '>') | byteEqMask(x, '&')
@@ -904,7 +952,7 @@ func scanEncodedHTMLSyntax(src []byte, i int) int {
 	return len(src)
 }
 
-func scanEncodedHTMLSpecial(src []byte, i int) int {
+func scanEncodedHTMLSpecialScalar(src []byte, i int) int {
 	for i+8 <= len(src) {
 		x := binary.LittleEndian.Uint64(src[i:])
 		m := stringSpecialMask(x) | byteEqMask(x, '<') | byteEqMask(x, '>') | byteEqMask(x, '&')

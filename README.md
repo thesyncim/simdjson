@@ -37,8 +37,8 @@ for validation. Speedups are geometric means across all seven payloads.
 | Validate | Syntax only | **7/7** | **7/7** | **1.95x** | **1.79x** |
 | Typed decode | Owned strings, reused destination | **7/7** | **7/7** | **3.82x** | **1.54x** |
 | Dynamic decode | Owned `any` tree | **7/7** | **7/7** | **4.15x** | **1.89x** |
-| Encode | Owned output | **7/7** | 4/7 | **1.94x** | **1.15x** |
-| Encode | Reused output buffer | **7/7** | 4/7 | **2.09x** | **1.24x** |
+| Encode | Owned output | **7/7** | 4/7 | **2.14x** | **1.27x** |
+| Encode | Reused output buffer | **7/7** | **5/7** | **2.32x** | **1.37x** |
 
 The scorecard does not mix ownership contracts. Source-backed decode and reused
 output are reported separately below. Native Sonic uses a different compiler
@@ -101,18 +101,18 @@ caller-owned buffer and is shown separately.
 
 | Corpus | stdlib | simdjson owned | compiled reuse | Fastest tip rival | Native Sonic |
 |---|---:|---:|---:|---:|---:|
-| Canada geometry | 594.0 us | **465.9 us** | **453.8 us** | Segment 478.2 us | 782.8 us |
-| CITM catalog | 801.4 us | 357.9 us | 334.3 us | **Segment 316.5 us** | 836.2 us |
-| Go source | 2.795 ms | 1.371 ms | 1.297 ms | **Segment 1.220 ms** | 3.711 ms |
-| Escaped strings | 18.82 us | **10.13 us** | **9.123 us** | jsoniter 21.02 us | 19.73 us |
-| Unicode strings | 18.98 us | **10.20 us** | **9.118 us** | go-json 20.59 us | 19.76 us |
-| Synthea FHIR | 5.547 ms | 2.317 ms | 2.213 ms | **Segment 1.811 ms** | 6.834 ms |
-| Twitter status | 609.0 us | **288.0 us** | **255.7 us** | go-json 295.6 us | 552.9 us |
+| Canada geometry | 592.7 us | **451.8 us** | **440.4 us** | Segment 474.3 us | 782.8 us |
+| CITM catalog | 809.6 us | 330.8 us | **304.9 us** | Segment 313.6 us | 836.2 us |
+| Go source | 2.671 ms | 1.270 ms | 1.206 ms | **Segment 1.184 ms** | 3.711 ms |
+| Escaped strings | 18.28 us | **7.769 us** | **6.939 us** | jsoniter 17.91 us | 19.73 us |
+| Unicode strings | 17.72 us | **7.654 us** | **6.873 us** | jsoniter 20.17 us | 19.76 us |
+| Synthea FHIR | 5.366 ms | 2.169 ms | 2.041 ms | **Segment 1.790 ms** | 6.834 ms |
+| Twitter status | 590.2 us | **262.6 us** | **231.8 us** | Segment 293.0 us | 552.9 us |
 
-The remaining encode gaps are explicit: Go source is shortest-float heavy, and
-Synthea invokes value-receiver custom marshalers thousands of times. simdjson
-keeps safe public reflection there instead of using runtime interface-layout
-or map-layout tricks.
+The remaining encode gaps are explicit: Go source remains 1.9% behind Segment
+and is shortest-float heavy. Synthea invokes value-receiver custom marshalers
+thousands of times; simdjson keeps safe public reflection there instead of
+using runtime interface-layout or map-layout tricks.
 
 ### SIMD Versus Pure Go
 
@@ -126,8 +126,8 @@ selected once at initialization; short runs remain scalar or SWAR.
 | Dynamic source-backed | **7/7** | **1.09x** |
 | Typed owned | 3/7 | **1.06x** |
 | Typed source-backed | 6/7 | **1.09x** |
-| Encode owned | 5/7 | **1.24x** |
-| Encode compiled reuse | 4/7 | **1.29x** |
+| Encode owned | 5/7 | **1.35x** |
+| Encode compiled reuse | **6/7** | **1.40x** |
 
 Owned typed decode includes a source-sized copy that SIMD cannot accelerate;
 the source-backed row exposes parser uplift more directly. SIMD is not claimed
