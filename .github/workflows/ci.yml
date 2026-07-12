@@ -43,6 +43,9 @@ jobs:
         env:
           GOEXPERIMENT: simd
 
+      - name: Go stdlib high-level corpus
+        run: ./scripts/check-stdlib-corpus.sh "$RUNNER_TEMP/gotip/bin/go"
+
       - name: Vet
         run: $RUNNER_TEMP/gotip/bin/go vet -unsafeptr=false ./...
 

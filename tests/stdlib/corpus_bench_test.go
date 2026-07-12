@@ -1,0 +1,158 @@
+package stdlib_test
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/klauspost/compress/zstd"
+	"github.com/thesyncim/simdjson"
+)
+
+func BenchmarkHighLevelCorpus(b *testing.B) {
+	decoder, err := zstd.NewReader(nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer decoder.Close()
+
+	for _, name := range stdlibCorpora {
+		src := readCorpus(b, decoder, name)
+		b.Run(name, func(b *testing.B) {
+			b.Run("valid/encoding-json", func(b *testing.B) {
+				b.SetBytes(int64(len(src)))
+				for b.Loop() {
+					if !json.Valid(src) {
+						b.Fatal("invalid corpus input")
+					}
+				}
+			})
+			b.Run("valid/simdjson", func(b *testing.B) {
+				b.SetBytes(int64(len(src)))
+				for b.Loop() {
+					if !simdjson.Valid(src) {
+						b.Fatal("invalid corpus input")
+					}
+				}
+			})
+			b.Run("decode-any/encoding-json", func(b *testing.B) {
+				b.ReportAllocs()
+				b.SetBytes(int64(len(src)))
+				for b.Loop() {
+					var dst any
+					if err := json.Unmarshal(src, &dst); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			b.Run("decode-any/simdjson", func(b *testing.B) {
+				b.ReportAllocs()
+				b.SetBytes(int64(len(src)))
+				for b.Loop() {
+					if _, err := simdjson.ParseAny(src); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			benchmarkTypedCorpus(b, name, src)
+		})
+	}
+}
+
+func benchmarkTypedCorpus(b *testing.B, name string, src []byte) {
+	b.Helper()
+	switch name {
+	case "canada_geometry.json.zst":
+		benchmarkTyped[canadaRoot](b, src)
+	case "citm_catalog.json.zst":
+		benchmarkTyped[citmRoot](b, src)
+	case "golang_source.json.zst":
+		benchmarkTyped[golangRoot](b, src)
+	case "string_escaped.json.zst", "string_unicode.json.zst":
+		benchmarkTyped[stringRoot](b, src)
+	case "synthea_fhir.json.zst":
+		benchmarkTyped[syntheaRoot](b, src)
+	case "twitter_status.json.zst":
+		benchmarkTyped[twitterRoot](b, src)
+	default:
+		b.Fatalf("stdlib corpus has no concrete model: %s", name)
+	}
+}
+
+func benchmarkTyped[T any](b *testing.B, src []byte) {
+	b.Helper()
+	b.Run("decode-typed/encoding-json-unmarshal", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(src)))
+		var dst T
+		for b.Loop() {
+			if err := json.Unmarshal(src, &dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("decode-typed/simdjson-unmarshal", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(src)))
+		var dst T
+		for b.Loop() {
+			if err := simdjson.Unmarshal(src, &dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	decoder, err := simdjson.CompileDecoder[T](simdjson.DecoderOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Run("decode-typed/simdjson-compiled", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(src)))
+		var dst T
+		for b.Loop() {
+			if err := decoder.Decode(src, &dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	var value T
+	if err := json.Unmarshal(src, &value); err != nil {
+		b.Fatal(err)
+	}
+	b.Run("encode-typed/encoding-json-marshal", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(src)))
+		for b.Loop() {
+			if _, err := json.Marshal(&value); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("encode-typed/simdjson-marshal", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(src)))
+		for b.Loop() {
+			if _, err := simdjson.Marshal(&value); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	encoder, err := simdjson.CompileEncoder[T](simdjson.EncoderOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Run("encode-typed/simdjson-compiled-reuse", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(src)))
+		dst := make([]byte, 0, len(src))
+		for b.Loop() {
+			var err error
+			dst, err = encoder.AppendJSON(dst[:0], &value)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}

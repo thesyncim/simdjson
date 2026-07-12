@@ -335,16 +335,28 @@ Sonic, environment capture, and result comparison commands.
 
 simdjson validates UTF-8, escapes, surrogate pairs, number grammar, integer overflow,
 depth, and trailing data. The suite includes all 318 Nicolas Seriot
-JSONTestSuite cases, simdjson-derived edge cases, compiled numeric boundaries,
+JSONTestSuite cases plus all seven payloads (6.33 MiB uncompressed) from the
+pinned Go tip `encoding/json/internal/jsontest` high-level corpus. Every Go
+payload is checked through validation, indexed parsing, dynamic decoding,
+`UseNumber`, dynamic encoding, and its exact concrete stdlib model. The suite
+also includes simdjson-derived edge cases, compiled numeric boundaries,
 allocation contracts, differential tests and fuzzers against encoding/json
 for every stdlib behavior claimed above, and native CI execution on Linux
-arm64 and amd64. Memory-safety runs use race and `checkptr=2` instrumentation with
-the allocation-contract tests skipped, since instrumentation itself
+arm64 and amd64. Memory-safety runs use race and `checkptr=2` instrumentation
+with the allocation-contract tests skipped, since instrumentation itself
 allocates:
 
 ```sh
 GOEXPERIMENT=simd "$TIP_GO" test -gcflags='all=-d=checkptr=2' \
   -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
+```
+
+The high-level corpus is an isolated test module, so its Zstandard reader does
+not add a dependency to the library. The check also runs the pinned stdlib
+oracle and verifies every compressed payload byte-for-byte against GOROOT:
+
+```sh
+./scripts/check-stdlib-corpus.sh "$TIP_GO"
 ```
 
 The compiled decoder and encoder cover encoding/json's supported type
