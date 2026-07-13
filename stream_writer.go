@@ -1,0 +1,351 @@
+package simdjson
+
+import (
+	"errors"
+	"io"
+	"time"
+
+	simdkernels "github.com/thesyncim/simdjson/simd"
+)
+
+// Writer streams JSON to an io.Writer through one reused buffer, so encoding
+// allocates nothing once the buffer has grown to its working size.
+//
+// Two levels are available and may be mixed between top-level values.
+// Encode appends one complete value through a compiled [Encoder]. The token
+// methods (BeginObject, Key, Int, ...) build a value by hand with the same
+// byte output as Marshal; the writer tracks container state, inserts commas,
+// and turns any call that would produce malformed JSON into an error instead
+// of corrupt output.
+//
+// Errors are sticky: after a write or usage error every method is a no-op
+// and Err, Flush, and Close report the first failure. A Writer is not safe
+// for concurrent use.
+type Writer struct {
+	out        io.Writer
+	buf        []byte
+	flushAt    int
+	err        error
+	escapeHTML bool
+
+	// Container state for the token layer. Each level records the kind of
+	// open container, whether it has members, and — inside objects —
+	// whether a key is pending its value. Depth zero is the stream itself,
+	// where values are separated by nothing (callers add Newline for
+	// NDJSON).
+	stack   []streamFrame
+	started bool // the current top-level token value emitted something
+}
+
+type streamFrame struct {
+	kind     byte // '{' or '['
+	members  int
+	afterKey bool
+}
+
+// defaultWriterSize is the flush threshold: large enough to amortize the
+// io.Writer call, small enough to stay cache-friendly.
+const defaultWriterSize = 32 << 10
+
+// NewWriter returns a Writer with the default buffer threshold. Output
+// matches encoding/json, including HTML escaping; see SetEscapeHTML.
+func NewWriter(out io.Writer) *Writer {
+	return NewWriterSize(out, defaultWriterSize)
+}
+
+// NewWriterSize is NewWriter with an explicit flush threshold in bytes.
+// A single value larger than the threshold still buffers whole and flushes
+// afterwards.
+func NewWriterSize(out io.Writer, size int) *Writer {
+	if size < 512 {
+		size = 512
+	}
+	return &Writer{
+		out:        out,
+		buf:        make([]byte, 0, size),
+		flushAt:    size,
+		escapeHTML: true,
+		stack:      make([]streamFrame, 0, 16),
+	}
+}
+
+// SetEscapeHTML controls whether <, >, and & are escaped in strings, like
+// json.Encoder.SetEscapeHTML. It must not be called between tokens of an
+// unfinished value.
+func (w *Writer) SetEscapeHTML(escape bool) {
+	w.escapeHTML = escape
+}
+
+// Err returns the first error the writer encountered, if any.
+func (w *Writer) Err() error {
+	return w.err
+}
+
+// EncodeTo appends one complete top-level value to w through a compiled
+// encoder. On error the buffered output is unchanged. It is an error to
+// call EncodeTo while a token-built value is unfinished.
+func EncodeTo[T any](w *Writer, enc Encoder[T], src *T) error {
+	if w.err != nil {
+		return w.err
+	}
+	if len(w.stack) != 0 {
+		return w.fail(errors.New("simdjson: Encode inside an unfinished token value"))
+	}
+	dst, err := enc.AppendJSON(w.buf, src)
+	if err != nil {
+		return w.fail(err)
+	}
+	w.buf = dst
+	w.started = false
+	return w.maybeFlush()
+}
+
+// Newline appends a line feed, for NDJSON framing between top-level values.
+func (w *Writer) Newline() error {
+	if w.err != nil {
+		return w.err
+	}
+	if len(w.stack) != 0 {
+		return w.fail(errors.New("simdjson: Newline inside an unfinished token value"))
+	}
+	w.buf = append(w.buf, '\n')
+	w.started = false
+	return w.maybeFlush()
+}
+
+// Raw appends an already encoded JSON value verbatim, like json.RawMessage.
+// The caller is responsible for its validity.
+func (w *Writer) Raw(value []byte) error {
+	if !w.beforeValue() {
+		return w.err
+	}
+	w.buf = append(w.buf, value...)
+	return w.afterValue()
+}
+
+// BeginObject opens an object member position.
+func (w *Writer) BeginObject() error {
+	if !w.beforeValue() {
+		return w.err
+	}
+	w.buf = append(w.buf, '{')
+	w.stack = append(w.stack, streamFrame{kind: '{'})
+	return nil
+}
+
+// EndObject closes the innermost open object.
+func (w *Writer) EndObject() error {
+	if w.err != nil {
+		return w.err
+	}
+	top := len(w.stack) - 1
+	if top < 0 || w.stack[top].kind != '{' || w.stack[top].afterKey {
+		return w.fail(errors.New("simdjson: EndObject without a matching open object"))
+	}
+	w.stack = w.stack[:top]
+	w.buf = append(w.buf, '}')
+	return w.afterValue()
+}
+
+// BeginArray opens an array element position.
+func (w *Writer) BeginArray() error {
+	if !w.beforeValue() {
+		return w.err
+	}
+	w.buf = append(w.buf, '[')
+	w.stack = append(w.stack, streamFrame{kind: '['})
+	return nil
+}
+
+// EndArray closes the innermost open array.
+func (w *Writer) EndArray() error {
+	if w.err != nil {
+		return w.err
+	}
+	top := len(w.stack) - 1
+	if top < 0 || w.stack[top].kind != '[' {
+		return w.fail(errors.New("simdjson: EndArray without a matching open array"))
+	}
+	w.stack = w.stack[:top]
+	w.buf = append(w.buf, ']')
+	return w.afterValue()
+}
+
+// Key writes the next member name of the innermost open object.
+func (w *Writer) Key(name string) error {
+	if w.err != nil {
+		return w.err
+	}
+	top := len(w.stack) - 1
+	if top < 0 || w.stack[top].kind != '{' || w.stack[top].afterKey {
+		return w.fail(errors.New("simdjson: Key outside an object member position"))
+	}
+	if w.stack[top].members > 0 {
+		w.buf = append(w.buf, ',')
+	}
+	w.buf = appendEncodedJSONString(w.buf, name, w.escapeHTML)
+	w.buf = append(w.buf, ':')
+	w.stack[top].afterKey = true
+	return nil
+}
+
+// String writes a string value.
+func (w *Writer) String(s string) error {
+	if !w.beforeValue() {
+		return w.err
+	}
+	w.buf = appendEncodedJSONString(w.buf, s, w.escapeHTML)
+	return w.afterValue()
+}
+
+// Int writes an integer value.
+func (w *Writer) Int(v int64) error {
+	if !w.beforeValue() {
+		return w.err
+	}
+	w.buf = appendCompactInt(w.buf, v)
+	return w.afterValue()
+}
+
+// Uint writes an unsigned integer value.
+func (w *Writer) Uint(v uint64) error {
+	if !w.beforeValue() {
+		return w.err
+	}
+	w.buf = appendCompactUint(w.buf, v)
+	return w.afterValue()
+}
+
+// Float writes a number value spelled exactly like Marshal.
+func (w *Writer) Float(v float64) error {
+	if !w.beforeValue() {
+		return w.err
+	}
+	dst, err := appendJSONFloat(w.buf, v, 64)
+	if err != nil {
+		return w.fail(err)
+	}
+	w.buf = dst
+	return w.afterValue()
+}
+
+// Bool writes a boolean value.
+func (w *Writer) Bool(v bool) error {
+	if !w.beforeValue() {
+		return w.err
+	}
+	if v {
+		w.buf = append(w.buf, "true"...)
+	} else {
+		w.buf = append(w.buf, "false"...)
+	}
+	return w.afterValue()
+}
+
+// Null writes a null value.
+func (w *Writer) Null() error {
+	if !w.beforeValue() {
+		return w.err
+	}
+	w.buf = append(w.buf, "null"...)
+	return w.afterValue()
+}
+
+// Time writes an RFC 3339 string value, like Marshal on a time.Time.
+func (w *Writer) Time(t time.Time) error {
+	if !w.beforeValue() {
+		return w.err
+	}
+	dst, err := simdkernels.AppendTime(w.buf, t)
+	if err != nil {
+		return w.fail(err)
+	}
+	w.buf = dst
+	return w.afterValue()
+}
+
+// Flush writes all buffered output.
+func (w *Writer) Flush() error {
+	if w.err != nil {
+		return w.err
+	}
+	if len(w.stack) != 0 {
+		return w.fail(errors.New("simdjson: Flush inside an unfinished token value"))
+	}
+	return w.flush()
+}
+
+// Close flushes buffered output. It does not close the underlying writer.
+func (w *Writer) Close() error {
+	return w.Flush()
+}
+
+// beforeValue validates that a value may start here and writes the comma
+// separating it from a preceding sibling.
+func (w *Writer) beforeValue() bool {
+	if w.err != nil {
+		return false
+	}
+	top := len(w.stack) - 1
+	if top < 0 {
+		if w.started {
+			w.fail(errors.New("simdjson: second top-level token value without Newline or Flush"))
+			return false
+		}
+		w.started = true
+		return true
+	}
+	frame := &w.stack[top]
+	switch frame.kind {
+	case '{':
+		if !frame.afterKey {
+			w.fail(errors.New("simdjson: object value without a preceding Key"))
+			return false
+		}
+	default:
+		if frame.members > 0 {
+			w.buf = append(w.buf, ',')
+		}
+	}
+	return true
+}
+
+// afterValue closes out one value: bookkeeping, then the flush check when
+// the value completed a top-level token document.
+func (w *Writer) afterValue() error {
+	if top := len(w.stack) - 1; top >= 0 {
+		w.stack[top].members++
+		w.stack[top].afterKey = false
+		return nil
+	}
+	return w.maybeFlush()
+}
+
+func (w *Writer) maybeFlush() error {
+	if len(w.buf) < w.flushAt {
+		return nil
+	}
+	return w.flush()
+}
+
+func (w *Writer) flush() error {
+	if len(w.buf) == 0 {
+		return nil
+	}
+	n, err := w.out.Write(w.buf)
+	if err == nil && n < len(w.buf) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return w.fail(err)
+	}
+	w.buf = w.buf[:0]
+	return nil
+}
+
+func (w *Writer) fail(err error) error {
+	if w.err == nil {
+		w.err = err
+	}
+	return w.err
+}

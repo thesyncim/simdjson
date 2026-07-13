@@ -100,6 +100,8 @@ using its portable Go implementations.
 | JSON Pointer | `GetRaw`, `ScanRaw`, `CompilePointer` | Aliases source |
 | Strict validation | `Valid`, `Validate` | No result allocation |
 | Transforms | `AppendCompact`, `AppendIndent`, `AppendCanonicalize` | Caller-owned output |
+| Streaming write | `NewWriter`, `EncodeTo`, token methods | One reused buffer |
+| Streaming read | `NewReader`, `Next`, `DecodeTo` | Rolling buffer; values alias until `Next` |
 | Reusable byte kernels | `simd` subpackage | Caller-provided storage |
 
 ### Ownership
@@ -124,6 +126,32 @@ failure.
 `AppendJSON` requires its destination backing storage to be disjoint from
 storage reachable through the source value. On error it returns the original
 destination length, but unused capacity may contain partial output.
+
+### Streaming
+
+`Writer` streams NDJSON or concatenated values through one reused buffer,
+either from compiled encoders or through token methods that track container
+state and refuse to emit malformed JSON. `Reader` iterates top-level values
+from any `io.Reader`; each `Next` validates one complete value, values alias
+the rolling buffer only until the following `Next`, and a value split across
+reads costs one compacting copy. Steady-state streaming in both directions
+performs no per-value allocations.
+
+```go
+w := simdjson.NewWriter(out)
+for _, event := range events {
+    simdjson.EncodeTo(w, enc, &event) // enc from CompileEncoder
+    w.Newline()
+}
+w.Close()
+
+r := simdjson.NewReader(in)
+for r.Next() {
+    var event Event
+    simdjson.DecodeTo(r, dec, &event) // dec from CompileDecoder
+}
+err := r.Err()
+```
 
 ## Performance
 

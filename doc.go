@@ -59,6 +59,15 @@
 // nil. [AppendCompact], [AppendIndent], and [AppendCanonicalize] rewrite
 // documents into caller-owned buffers.
 //
+// # Streaming
+//
+// [Writer] streams NDJSON or concatenated top-level values through one
+// reused buffer, from compiled encoders via [EncodeTo] or through token
+// methods that track container state so malformed output is impossible.
+// [Reader] iterates validated top-level values from an io.Reader with a
+// rolling buffer; [DecodeTo] decodes the current value, which aliases the
+// buffer only until the next [Reader.Next].
+//
 // # Toolchain
 //
 // The module currently requires a Go 1.27 development toolchain for generic

@@ -1005,8 +1005,19 @@ func (e *encodeState) encodeQuoted(node *typedNode, src unsafe.Pointer) error {
 // encodeFloat matches encoding/json: shortest representation, with the 'e'
 // format only for large or small magnitudes, and a trimmed exponent digit.
 func (e *encodeState) encodeFloat(value float64, bits int) error {
+	dst, err := appendJSONFloat(e.dst, value, bits)
+	if err != nil {
+		return err
+	}
+	e.dst = dst
+	return nil
+}
+
+// appendJSONFloat appends value the way encoding/json spells it, shared by
+// the compiled encoder and the streaming writer.
+func appendJSONFloat(dst []byte, value float64, bits int) ([]byte, error) {
 	if math.IsInf(value, 0) || math.IsNaN(value) {
-		return &EncodeError{Reason: "unsupported float value " + strconv.FormatFloat(value, 'g', -1, bits)}
+		return dst, &EncodeError{Reason: "unsupported float value " + strconv.FormatFloat(value, 'g', -1, bits)}
 	}
 
 	// Fast paths for values whose shortest fixed form is provably the digits
@@ -1025,26 +1036,23 @@ func (e *encodeState) encodeFloat(value float64, bits int) error {
 	if positive := math.Abs(value); positive < integerLimit {
 		if truncated := math.Trunc(value); truncated == value {
 			if value == 0 && math.Signbit(value) {
-				e.dst = append(e.dst, '-', '0')
-				return nil
+				return append(dst, '-', '0'), nil
 			}
-			e.dst = appendCompactInt(e.dst, int64(value))
-			return nil
+			return appendCompactInt(dst, int64(value)), nil
 		}
 		if bits == 64 && positive < 1e9 {
 			if scaled := value * 1e6; math.Trunc(scaled) == scaled && scaled/1e6 == value {
-				e.dst = appendScaledDecimal6(e.dst, value, scaled)
-				return nil
+				return appendScaledDecimal6(dst, value, scaled), nil
 			}
 		}
 	}
 
 	if bits == 32 {
-		e.dst, _ = simdkernels.AppendFloat32(e.dst, float32(value))
+		dst, _ = simdkernels.AppendFloat32(dst, float32(value))
 	} else {
-		e.dst, _ = simdkernels.AppendFloat64(e.dst, value)
+		dst, _ = simdkernels.AppendFloat64(dst, value)
 	}
-	return nil
+	return dst, nil
 }
 
 // appendScaledDecimal6 writes an exactly recoverable fixed decimal with up to
