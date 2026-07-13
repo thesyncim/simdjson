@@ -190,11 +190,13 @@ func scanStringSpecialSIMD(src []byte, i int) int {
 			Or(v3.BitsToInt8().Less(ctrlOrNonASCII))
 
 		if maskHasAnyLane(m0.Or(m1).Or(m2).Or(m3)) {
-			if nib := maskNibbles(m0); nib != 0 {
-				return i + maskLane(nib)
-			}
-			if nib := maskNibbles(m1); nib != 0 {
-				return i + 16 + maskLane(nib)
+			// Halve first so a hit costs at most one reduce plus two
+			// extractions regardless of which vector holds it.
+			if maskHasAnyLane(m0.Or(m1)) {
+				if nib := maskNibbles(m0); nib != 0 {
+					return i + maskLane(nib)
+				}
+				return i + 16 + maskLane(maskNibbles(m1))
 			}
 			if nib := maskNibbles(m2); nib != 0 {
 				return i + 32 + maskLane(nib)
@@ -258,11 +260,13 @@ func scanStringSyntaxSIMD(src []byte, i int) int {
 		m3 := v3.Equal(quote).Or(v3.Equal(slash)).Or(v3.Less(ctrl))
 
 		if maskHasAnyLane(m0.Or(m1).Or(m2).Or(m3)) {
-			if nib := maskNibbles(m0); nib != 0 {
-				return i + maskLane(nib)
-			}
-			if nib := maskNibbles(m1); nib != 0 {
-				return i + 16 + maskLane(nib)
+			// Halve first so a hit costs at most one reduce plus two
+			// extractions regardless of which vector holds it.
+			if maskHasAnyLane(m0.Or(m1)) {
+				if nib := maskNibbles(m0); nib != 0 {
+					return i + maskLane(nib)
+				}
+				return i + 16 + maskLane(maskNibbles(m1))
 			}
 			if nib := maskNibbles(m2); nib != 0 {
 				return i + 32 + maskLane(nib)
@@ -336,11 +340,13 @@ func scanEncodedHTMLSpecialSIMD(src []byte, i int) int {
 		m2 := encodedHTMLSpecialMask(v2, slash, gt, amp, bit2, bit4, ctrlOrNonASCII)
 		m3 := encodedHTMLSpecialMask(v3, slash, gt, amp, bit2, bit4, ctrlOrNonASCII)
 		if maskHasAnyLane(m0.Or(m1).Or(m2).Or(m3)) {
-			if nib := maskNibbles(m0); nib != 0 {
-				return i + maskLane(nib)
-			}
-			if nib := maskNibbles(m1); nib != 0 {
-				return i + 16 + maskLane(nib)
+			// Halve first so a hit costs at most one reduce plus two
+			// extractions regardless of which vector holds it.
+			if maskHasAnyLane(m0.Or(m1)) {
+				if nib := maskNibbles(m0); nib != 0 {
+					return i + maskLane(nib)
+				}
+				return i + 16 + maskLane(maskNibbles(m1))
 			}
 			if nib := maskNibbles(m2); nib != 0 {
 				return i + 32 + maskLane(nib)
@@ -406,11 +412,13 @@ func scanEncodedHTMLSyntaxSIMD(src []byte, i int) int {
 		m2 := encodedHTMLSyntaxMask(v2, slash, gt, amp, bit2, bit4, ctrl)
 		m3 := encodedHTMLSyntaxMask(v3, slash, gt, amp, bit2, bit4, ctrl)
 		if maskHasAnyLane(m0.Or(m1).Or(m2).Or(m3)) {
-			if nib := maskNibbles(m0); nib != 0 {
-				return i + maskLane(nib)
-			}
-			if nib := maskNibbles(m1); nib != 0 {
-				return i + 16 + maskLane(nib)
+			// Halve first so a hit costs at most one reduce plus two
+			// extractions regardless of which vector holds it.
+			if maskHasAnyLane(m0.Or(m1)) {
+				if nib := maskNibbles(m0); nib != 0 {
+					return i + maskLane(nib)
+				}
+				return i + 16 + maskLane(maskNibbles(m1))
 			}
 			if nib := maskNibbles(m2); nib != 0 {
 				return i + 32 + maskLane(nib)
