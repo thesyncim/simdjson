@@ -7,6 +7,13 @@ import "math/bits"
 // Stage-1 structural scanning in the style of the simdjson paper: each
 // 64-byte block is classified into one-bit-per-byte masks from which the
 // caller derives string extents and structural positions.
+//
+// These kernels are verified groundwork without a production consumer. A
+// position-driven validator was built on them and measured about twice as
+// slow as the recursive-descent scanner: profiling put only a small share
+// of the time in the masks, with the rest in position extraction and
+// cursor dispatch, so that walker was removed. The economics flip only
+// with a consumer near one nanosecond per emitted position.
 
 // Stage1Enabled reports whether this build provides the stage-1 kernel.
 func Stage1Enabled() bool { return true }

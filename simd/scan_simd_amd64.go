@@ -22,6 +22,13 @@ const (
 )
 
 func initStringScanner() {
+	// Both vector levels share the dispatcher thresholds: vector entry
+	// needs 32 remaining bytes (one AVX2 block), and the 16-byte word
+	// probes run only on spans of 40 or more, so a 32-39 byte remainder
+	// enters the vector kernel directly instead of spending probes on half
+	// of it. The AVX-512 kernels hand sub-block tails to the AVX2 kernels,
+	// which finish through the 16-byte or scalar paths. Without AVX2 the
+	// thresholds keep their disabling defaults.
 	scanCPUFeatures = detectX86CPUFeatures()
 	switch {
 	case archsimd.X86.AVX512():

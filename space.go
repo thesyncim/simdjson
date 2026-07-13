@@ -2,6 +2,11 @@ package simdjson
 
 import "encoding/binary"
 
+// skipSpace returns the index of the first significant byte at or after i,
+// consuming runs of eight spaces word-at-a-time so indented documents skip
+// quickly. It must stay inlineable into every parser loop: the inlining
+// budget is 80 and one call to a non-inlineable function costs 57 by
+// itself, so almost any addition here de-inlines every call site.
 func skipSpace(src []byte, i int) int {
 	for i < len(src) {
 		c := src[i]

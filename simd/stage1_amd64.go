@@ -8,8 +8,11 @@ import (
 )
 
 // Stage1Block classifies one full 64-byte block starting at p. The nibble
-// lookups use Permute (PSHUFB indexing by the low four bits) and the high
-// nibble comes from a halfword shift because amd64 has no per-byte shift.
+// lookups use PermuteOrZero, which lowers to the AVX-baseline byte shuffle
+// where Permute would require the AVX-512 VBMI byte permute; the nibble
+// indexes never set the shuffle's zeroing bit, so the OrZero semantics are
+// a plain lookup here. The high nibble comes from a halfword shift because
+// amd64 has no per-byte shift.
 func Stage1Block(p *[64]byte, m *Stage1Masks) {
 	base := unsafe.Pointer(p)
 	v0 := archsimd.LoadUint8x16Array((*[16]uint8)(base))

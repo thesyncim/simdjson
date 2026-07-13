@@ -737,7 +737,9 @@ func (e *encodeState) encodeFloat64Array(node *typedNode, src unsafe.Pointer) er
 }
 
 // dynamicEncodeNodes caches one compiled encode plan per concrete type seen
-// inside an interface value.
+// inside an interface value. These plans run inside whichever static plan
+// encountered the interface, so they are compiled with dynamic set and must
+// never carry indexes into a plan-specific scratch; see typedCompiler.dynamic.
 var dynamicEncodeNodes sync.Map
 
 type dynamicEncodeEntry struct {

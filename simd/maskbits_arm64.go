@@ -20,7 +20,8 @@ func maskNibbles(m archsimd.Mask8x16) uint64 {
 	return m.ToInt8x16().ToBits().ReshapeToUint16s().Shift(shift).TruncToUint8().ReshapeToUint64s().GetElem(0)
 }
 
-// maskLane converts a non-zero maskNibbles value to its lane index.
+// maskLane converts a non-zero maskNibbles value to its lane index; each
+// lane owns four mask bits, so the trailing-zero count divides by four.
 func maskLane(nib uint64) int {
 	return bits.TrailingZeros64(nib) >> 2
 }

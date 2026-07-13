@@ -321,6 +321,10 @@ func scanShortJSONString(base unsafe.Pointer, n, quote int) (int, bool) {
 
 // nextSignificantFast skips insignificant whitespace and returns the first
 // significant byte, saving the reload every caller performed afterwards.
+// The c > ' ' test resolves nearly every significant byte in one compare.
+// It must stay inlineable into the validation loops: the inlining budget
+// is 80 and one call to a non-inlineable function costs 57 by itself, so
+// almost any addition here de-inlines every call site.
 func nextSignificantFast(base unsafe.Pointer, n, i int) (int, byte) {
 	for i < n {
 		c := fastByteAt(base, i)
@@ -332,6 +336,9 @@ func nextSignificantFast(base unsafe.Pointer, n, i int) (int, byte) {
 	return i, 0
 }
 
+// skipSpaceFast is nextSignificantFast for callers that only need the
+// position. The same inlining budget applies: keep the cost under 80,
+// where one non-inlined call alone counts 57.
 func skipSpaceFast(base unsafe.Pointer, n, i int) int {
 	for i < n {
 		c := fastByteAt(base, i)

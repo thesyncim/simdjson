@@ -10,6 +10,9 @@ import (
 	"unsafe"
 )
 
+// The dispatch thresholds start at max int, which disables the probe and
+// vector stages until initStringScanner installs the measured values for a
+// detected backend; without one the dispatchers run only their word loops.
 var (
 	scanStringSpecialBackend   = "scalar"
 	scanStringSelectedMinBytes = int(^uint(0) >> 1)
@@ -18,8 +21,16 @@ var (
 	scanCPUFeatures            CPUFeatures
 )
 
+// scanEncodedHTMLMinBytes gates the HTML scanners straight into the vector
+// kernels at one full block. They have no SWAR probe stage: each word mask
+// must test three extra characters, roughly doubling its cost.
 const scanEncodedHTMLMinBytes = 16
 
+// A \uXXXX escape is six bytes, so escape structure repeats every
+// lcm(6, 16) = 48 bytes. The three phase-shifted rows of each table below
+// describe one 16-byte vector of that period: where the literal "\u" bytes
+// fall, which lanes must hold hex digits, and which lane is the first hex
+// digit of an escape (the surrogate probe position).
 var unicodeEscapeExpected = [...][16]uint8{
 	{'\\', 'u', 0, 0, 0, 0, '\\', 'u', 0, 0, 0, 0, '\\', 'u', 0, 0},
 	{0, 0, '\\', 'u', 0, 0, 0, 0, '\\', 'u', 0, 0, 0, 0, '\\', 'u'},
@@ -58,6 +69,17 @@ func simdInfo() SIMDInfo {
 	}
 }
 
+// scanStringSpecial returns the index of the first byte at or after i that
+// needs individual handling in a JSON string: quote, backslash, control, or
+// non-ASCII.
+// The span from i is the remaining document, not the string being scanned —
+// the string's end is precisely what the caller is looking for — so a long
+// remainder does not imply a long string, and the terminating byte usually
+// sits within the first words. Dispatch is staged accordingly: two SWAR word
+// probes catch near matches, the arch vector kernel takes over when enough
+// bytes remain to amortize its setup, and shorter remainders run
+// word-at-a-time with one overlapped final word, so nothing degrades to the
+// byte loop unless the whole span holds fewer than eight bytes.
 func scanStringSpecial(src []byte, i int) int {
 	start := i
 	remaining := len(src) - i
@@ -85,7 +107,9 @@ func scanStringSpecial(src []byte, i int) int {
 	}
 	if tail := len(src) - 8; tail >= start {
 		// The bytes of the final word that precede i were already cleared,
-		// so a match found here is at or after i.
+		// so a match found here is at or after i. Guarding on start rather
+		// than zero keeps the overlap inside this call's span: bytes before
+		// start were never cleared and could yield a stale match.
 		if m := stringSpecialMask(binary.LittleEndian.Uint64(src[tail:])); m != 0 {
 			return tail + bits.TrailingZeros64(m)/8
 		}
@@ -105,6 +129,10 @@ func scanStringSpecialLong(src []byte, i int) int {
 	return scanStringSpecialRuntime(src, i)
 }
 
+// scanStringSyntax is scanStringSpecial without the non-ASCII stop class,
+// staged the same way. Callers use it when multi-byte runes need no
+// individual inspection: either the string is already known to be clean
+// UTF-8, or the caller validates the skipped run afterwards.
 func scanStringSyntax(src []byte, i int) int {
 	start := i
 	remaining := len(src) - i
@@ -131,8 +159,7 @@ func scanStringSyntax(src []byte, i int) int {
 		return i
 	}
 	if tail := len(src) - 8; tail >= start {
-		// The bytes of the final word that precede i were already cleared,
-		// so a match found here is at or after i.
+		// Overlapped final word: see scanStringSpecial.
 		if m := stringSyntaxMask(binary.LittleEndian.Uint64(src[tail:])); m != 0 {
 			return tail + bits.TrailingZeros64(m)/8
 		}
@@ -217,6 +244,10 @@ func scanStringSpecialSIMD(src []byte, i int) int {
 		i += 16
 	}
 	if i < n && n-16 >= start {
+		// Overlapped tail: one final block ending at n. The bytes in
+		// [tail, i) were already cleared above, and guarding on start keeps
+		// the load inside this call's span — bytes before start were never
+		// cleared — so the first match found is at or after i.
 		tail := n - 16
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, tail)))
 		m := v.Equal(quote).
@@ -285,6 +316,7 @@ func scanStringSyntaxSIMD(src []byte, i int) int {
 		i += 16
 	}
 	if i < n && n-16 >= start {
+		// Overlapped tail: see scanStringSpecialSIMD.
 		tail := n - 16
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, tail)))
 		m := v.Equal(quote).Or(v.Equal(slash)).Or(v.Less(ctrl))
@@ -363,6 +395,7 @@ func scanEncodedHTMLSpecialSIMD(src []byte, i int) int {
 		i += 16
 	}
 	if i < n && n-16 >= start {
+		// Overlapped tail: see scanStringSpecialSIMD.
 		tail := n - 16
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, tail)))
 		if lane := firstMaskLane(encodedHTMLSpecialMask(v, slash, gt, amp, bit2, bit4, ctrlOrNonASCII)); lane >= 0 {
@@ -435,6 +468,7 @@ func scanEncodedHTMLSyntaxSIMD(src []byte, i int) int {
 		i += 16
 	}
 	if i < n && n-16 >= start {
+		// Overlapped tail: see scanStringSpecialSIMD.
 		tail := n - 16
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, tail)))
 		if lane := firstMaskLane(encodedHTMLSyntaxMask(v, slash, gt, amp, bit2, bit4, ctrl)); lane >= 0 {
@@ -598,8 +632,9 @@ func copyHTMLStringPrefix(dst, src []byte) int {
 }
 
 // scanUnicodeEscapeRun validates complete groups of eight contiguous
-// \uXXXX escapes. It stops before a partial block or a surrogate so the
-// scalar path can preserve precise pair semantics.
+// \uXXXX escapes. It stops before a partial block and before any escape
+// whose first hex digit is d or D — the 0xDxxx range holding the
+// surrogates — so the scalar path can preserve precise pair semantics.
 func scanUnicodeEscapeRun(src []byte, i int) (int, bool) {
 	if len(src)-i < 48 || src[i] != '\\' || src[i+1] != 'u' {
 		return i, true
