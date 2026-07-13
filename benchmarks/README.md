@@ -56,25 +56,25 @@ unescaped strings into immutable input and has a different lifetime contract.
 
 | Corpus | `encoding/json` | simdjson owned | Source-backed | Rival | Rival time |
 |---|---:|---:|---:|---|---:|
-| Canada geometry | 1.257 ms | **290.2 us** | 226.8 us | Segment | 800.9 us |
-| CITM catalog | 2.548 ms | **1.082 ms** | 877.4 us | go-json | 1.321 ms |
-| Go source | 6.493 ms | **1.439 ms** | 1.073 ms | Segment | 2.318 ms |
-| Escaped strings | 205.4 us | **39.0 us** | 31.8 us | go-json | 68.7 us |
-| Unicode strings | 42.0 us | **10.8 us** | 7.2 us | go-json | 14.0 us |
-| Synthea FHIR | 3.855 ms | **1.964 ms** | 1.690 ms | go-json | 2.195 ms |
-| Twitter status | 1.407 ms | **527.3 us** | 445.6 us | go-json | 728.5 us |
+| Canada geometry | 1.257 ms | **260.7 us** | 224.2 us | Segment | 791.0 us |
+| CITM catalog | 2.548 ms | **1.078 ms** | 877.3 us | go-json | 1.315 ms |
+| Go source | 6.385 ms | **1.334 ms** | 1.004 ms | Segment | 2.250 ms |
+| Escaped strings | 203.9 us | **39.0 us** | 31.0 us | go-json | 67.9 us |
+| Unicode strings | 41.6 us | **10.0 us** | 7.1 us | go-json | 14.1 us |
+| Synthea FHIR | 3.748 ms | **1.839 ms** | 1.589 ms | go-json | 2.114 ms |
+| Twitter status | 1.374 ms | **506.6 us** | 425.2 us | go-json | 761.7 us |
 
 Source-backed refers only to unescaped string ownership. Slices, maps,
 pointers, escaped text, and custom method receivers may still allocate.
 
 | Corpus | Source-backed bytes/op | Source-backed allocs/op |
 |---|---:|---:|
-| Canada geometry | 268 B | 0 |
+| Canada geometry | 262 B | 0 |
 | CITM catalog | 1.677 MiB | 1,221 |
-| Go source | 9.56 KiB | 44 |
+| Go source | 9.0 KiB | 41 |
 | Escaped strings | 48.0 KiB | 1 |
 | Unicode strings | 18.0 KiB | 1 |
-| Synthea FHIR | 1.945 MiB | 348 |
+| Synthea FHIR | 1.944 MiB | 344 |
 | Twitter status | 631.1 KiB | 139 |
 
 ### Dynamic decode
@@ -83,13 +83,13 @@ These rows fully materialize an owned `any` tree.
 
 | Corpus | simdjson | Rival | Rival time | Lead |
 |---|---:|---|---:|---:|
-| Canada geometry | **942.9 us** | go-json | 1.891 ms | **2.01x** |
-| CITM catalog | **2.920 ms** | jsoniter | 4.508 ms | **1.54x** |
-| Go source | **4.986 ms** | go-json | 9.814 ms | **1.97x** |
-| Escaped strings | **35.1 us** | go-json | 77.5 us | **2.21x** |
-| Unicode strings | **15.5 us** | go-json | 21.7 us | **1.40x** |
-| Synthea FHIR | **4.557 ms** | jsoniter | 7.063 ms | **1.55x** |
-| Twitter status | **1.427 ms** | go-json | 2.089 ms | **1.46x** |
+| Canada geometry | **936.2 us** | go-json | 1.881 ms | **2.01x** |
+| CITM catalog | **2.918 ms** | jsoniter | 4.503 ms | **1.54x** |
+| Go source | **4.895 ms** | jsoniter | 9.807 ms | **2.00x** |
+| Escaped strings | **34.7 us** | go-json | 75.2 us | **2.17x** |
+| Unicode strings | **15.4 us** | go-json | 21.8 us | **1.42x** |
+| Synthea FHIR | **4.468 ms** | jsoniter | 6.895 ms | **1.54x** |
+| Twitter status | **1.387 ms** | jsoniter | 2.034 ms | **1.47x** |
 
 ### Strict validation
 
@@ -98,13 +98,13 @@ input.
 
 | Corpus | simdjson | Rival | Rival time | Lead |
 |---|---:|---|---:|---:|
-| Canada geometry | **128.2 us** | Segment | 223.8 us | **1.75x** |
-| CITM catalog | **647.2 us** | fastjson | 871.9 us | **1.35x** |
-| Go source | **952.2 us** | Segment | 1.199 ms | **1.26x** |
-| Escaped strings | **4.4 us** | Segment | 58.3 us | **13.25x** |
-| Unicode strings | **3.2 us** | fastjson | 7.1 us | **2.22x** |
-| Synthea FHIR | **780.3 us** | fastjson | 1.301 ms | **1.67x** |
-| Twitter status | **231.8 us** | fastjson | 402.5 us | **1.74x** |
+| Canada geometry | **130.5 us** | fastjson | 218.9 us | **1.68x** |
+| CITM catalog | **637.8 us** | fastjson | 858.0 us | **1.35x** |
+| Go source | **938.0 us** | Segment | 1.187 ms | **1.27x** |
+| Escaped strings | **4.4 us** | Segment | 58.0 us | **13.25x** |
+| Unicode strings | **3.2 us** | fastjson | 7.0 us | **2.16x** |
+| Synthea FHIR | **766.8 us** | fastjson | 1.279 ms | **1.67x** |
+| Twitter status | **225.8 us** | fastjson | 389.5 us | **1.72x** |
 
 ### Encode
 
@@ -113,13 +113,13 @@ caller-owned buffer and removes the output allocation.
 
 | Corpus | stdlib | simdjson owned | Compiled reuse | Rival | Rival time |
 |---|---:|---:|---:|---|---:|
-| Canada geometry | 687.8 us | 380.9 us | **306.4 us** | Segment | 517.1 us |
-| CITM catalog | 1.004 ms | 412.4 us | **251.1 us** | go-json | 397.4 us |
-| Go source | 3.332 ms | 1.381 ms | **720.6 us** | Segment | 1.458 ms |
-| Escaped strings | 20.9 us | 9.7 us | **6.5 us** | jsoniter | 22.0 us |
-| Unicode strings | 21.3 us | 9.8 us | **6.5 us** | Segment | 23.0 us |
-| Synthea FHIR | 6.289 ms | 2.579 ms | **1.394 ms** | Segment | 2.210 ms |
-| Twitter status | 742.5 us | 367.9 us | **209.3 us** | go-json | 360.4 us |
+| Canada geometry | 677.3 us | 371.4 us | **298.1 us** | Segment | 516.8 us |
+| CITM catalog | 1.021 ms | 417.8 us | **255.3 us** | go-json | 392.0 us |
+| Go source | 3.326 ms | 1.332 ms | **715.3 us** | Segment | 1.421 ms |
+| Escaped strings | 21.0 us | 6.6 us | **3.6 us** | jsoniter | 22.1 us |
+| Unicode strings | 21.3 us | 6.8 us | **3.6 us** | jsoniter | 22.0 us |
+| Synthea FHIR | 6.113 ms | 2.480 ms | **1.387 ms** | Segment | 2.106 ms |
+| Twitter status | 726.8 us | 341.8 us | **190.1 us** | go-json | 343.0 us |
 
 ### SIMD versus pure Go
 
@@ -128,13 +128,13 @@ selected once during initialization; short runs may remain scalar or SWAR.
 
 | simdjson path | SIMD wins | Geomean SIMD uplift |
 |---|---:|---:|
-| Validation | 4/7 | **1.378x** |
-| Dynamic owned | 3/7 | **1.052x** |
-| Dynamic source-backed | 2/7 | **1.049x** |
-| Typed owned | 3/7 | **1.052x** |
-| Typed source-backed | 4/7 | **1.097x** |
-| Encode owned | 6/7 | **1.329x** |
-| Encode compiled reuse | 6/7 | **1.473x** |
+| Validation | 5/7 | **1.384x** |
+| Dynamic owned | 5/7 | **1.056x** |
+| Dynamic source-backed | 4/7 | **1.070x** |
+| Typed owned | 5/7 | **1.105x** |
+| Typed source-backed | 5/7 | **1.133x** |
+| Encode owned | 7/7 | **1.517x** |
+| Encode compiled reuse | 7/7 | **1.798x** |
 
 ### Native Sonic context
 
@@ -175,11 +175,11 @@ before timing with case-sensitive field matching.
 
 | Workload | SIMD, source-backed | SIMD, owned |
 |---|---:|---:|
-| Small, fresh | **27.5 ns / 0** | 42.8 ns / 1 |
-| Medium, fresh | **2.30 us / 2** | 2.64 us / 3 |
-| Medium, reused | **2.11 us / 0** | 2.44 us / 1 |
-| Large, fresh | **68.0 us / 2** | 78.5 us / 3 |
-| Large, reused | **64.8 us / 0** | 73.8 us / 1 |
+| Small, fresh | **26.9 ns / 0** | 43.1 ns / 1 |
+| Medium, fresh | **2.38 us / 2** | 2.73 us / 3 |
+| Medium, reused | **2.14 us / 0** | 2.50 us / 1 |
+| Large, fresh | **71.0 us / 2** | 81.5 us / 3 |
+| Large, reused | **67.7 us / 0** | 75.4 us / 1 |
 
 The scalar-versus-SIMD control lives in the root module's `BenchmarkDecode*`
 benchmarks, which build in seconds and compare the same binary pair.
