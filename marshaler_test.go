@@ -233,7 +233,7 @@ type marshalerDocument struct {
 	ByKey   map[string]textPoint `json:"by_key"`
 }
 
-func TestCompiledValueMarshalerScratch(t *testing.T) {
+func TestCompiledValueMarshalerScratchAllocs(t *testing.T) {
 	type document struct {
 		Value staticValueMarshaler `json:"value"`
 	}
