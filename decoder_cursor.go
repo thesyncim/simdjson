@@ -533,8 +533,8 @@ func (c *decoderCursor) Int[T signedInteger](dst *T) error {
 	if !isDigit(fastByteAt(base, i)) {
 		return c.genericExpected[T]("number")
 	}
-	bits := int(unsafe.Sizeof(*dst)) * 8
-	limit := uint64(1) << (bits - 1)
+	width := int(unsafe.Sizeof(*dst)) * 8
+	limit := uint64(1) << (width - 1)
 	if !negative {
 		limit--
 	}
@@ -547,20 +547,30 @@ func (c *decoderCursor) Int[T signedInteger](dst *T) error {
 		}
 	} else {
 		if i+8 <= n {
-			digits := unsafe.Add(base, i)
-			if i+16 <= n && all16Digits(digits) {
-				value = parse16Digits(digits)
+			word := loadUint64LE(unsafe.Add(base, i))
+			if invalid := nonDigitMask8(word); invalid != 0 {
+				// One to seven digits ending at a proven non-digit: shift
+				// the digits to the top of the word, backfill ASCII zeros,
+				// and parse all of them at once. Values this short cannot
+				// overflow destinations wider than sixteen bits, so the
+				// range check folds away for them.
+				k := bits.TrailingZeros64(invalid) / 8
+				s := uint(8-k) * 8
+				value = parse8DigitsWord(word<<s | digitLower>>(64-s))
+				i += k
+				if width <= 16 && value > limit {
+					return c.genericError[T](start, "integer overflow")
+				}
+			} else if i+16 <= n && all16Digits(unsafe.Add(base, i)) {
+				value = parse16Digits(unsafe.Add(base, i))
 				i += 16
 				if value > limit {
 					return c.genericError[T](start, "integer overflow")
 				}
-			} else if all8Digits(digits) {
-				value = parse8Digits(digits)
+			} else {
+				value = parse8DigitsWord(word)
 				i += 8
-				// Eight digits always exceed the 8- and 16-bit ranges; the
-				// per-digit loop below only guards digits it parses itself.
-				// The condition folds away for wider destinations.
-				if bits <= 16 && value > limit {
+				if width <= 16 && value > limit {
 					return c.genericError[T](start, "integer overflow")
 				}
 			}
@@ -611,10 +621,10 @@ func (c *decoderCursor) Uint[T unsignedInteger](dst *T) error {
 	if !isDigit(fastByteAt(base, start)) {
 		return c.genericExpected[T]("number")
 	}
-	bits := int(unsafe.Sizeof(*dst)) * 8
+	width := int(unsafe.Sizeof(*dst)) * 8
 	limit := ^uint64(0)
-	if bits < 64 {
-		limit = uint64(1)<<bits - 1
+	if width < 64 {
+		limit = uint64(1)<<width - 1
 	}
 	cutoff, cutlim := limit/10, limit%10
 	i := start
@@ -626,20 +636,26 @@ func (c *decoderCursor) Uint[T unsignedInteger](dst *T) error {
 		}
 	} else {
 		if i+8 <= n {
-			digits := unsafe.Add(base, i)
-			if i+16 <= n && all16Digits(digits) {
-				value = parse16Digits(digits)
+			word := loadUint64LE(unsafe.Add(base, i))
+			if invalid := nonDigitMask8(word); invalid != 0 {
+				// See Int: parse a short digit run in one step.
+				k := bits.TrailingZeros64(invalid) / 8
+				s := uint(8-k) * 8
+				value = parse8DigitsWord(word<<s | digitLower>>(64-s))
+				i += k
+				if width <= 16 && value > limit {
+					return c.genericError[T](start, "unsigned integer overflow")
+				}
+			} else if i+16 <= n && all16Digits(unsafe.Add(base, i)) {
+				value = parse16Digits(unsafe.Add(base, i))
 				i += 16
 				if value > limit {
 					return c.genericError[T](start, "unsigned integer overflow")
 				}
-			} else if all8Digits(digits) {
-				value = parse8Digits(digits)
+			} else {
+				value = parse8DigitsWord(word)
 				i += 8
-				// Eight digits always exceed the 8- and 16-bit ranges; the
-				// per-digit loop below only guards digits it parses itself.
-				// The condition folds away for wider destinations.
-				if bits <= 16 && value > limit {
+				if width <= 16 && value > limit {
 					return c.genericError[T](start, "unsigned integer overflow")
 				}
 			}

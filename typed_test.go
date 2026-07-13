@@ -635,3 +635,65 @@ func TestDecodeEightDigitOverflowNarrowInts(t *testing.T) {
 		t.Fatalf("in-range decode failed: %v %+v", err, ok16)
 	}
 }
+
+func TestDecodeIntegerDigitRunSweep(t *testing.T) {
+	// The word-at-a-time short-run parser must agree with encoding/json for
+	// every digit count, terminator, and destination width, including the
+	// overflow boundaries of each width.
+	terminators := []string{"}", ",\"x\":0}", " }", ".5}", "e2}", "E2}"}
+	values := []string{
+		"1", "12", "123", "1234", "12345", "123456", "1234567", "12345678",
+		"123456789", "1234567890123456", "12345678901234567", "0",
+		"127", "128", "255", "256", "32767", "32768", "65535", "65536",
+		"2147483647", "2147483648", "4294967295", "4294967296",
+		"9223372036854775807", "9223372036854775808",
+		"18446744073709551615", "18446744073709551616",
+	}
+	check := func(src string, dec func([]byte) error, std func([]byte) error) {
+		errA := dec([]byte(src))
+		errB := std([]byte(src))
+		if (errA == nil) != (errB == nil) {
+			t.Fatalf("%s: simdjson err=%v, encoding/json err=%v", src, errA, errB)
+		}
+	}
+	for _, v := range values {
+		for _, sign := range []string{"", "-"} {
+			for _, term := range terminators {
+				src := `{"a":` + sign + v + term
+				var a8 struct {
+					A int8 `json:"a"`
+				}
+				var a16 struct {
+					A int16 `json:"a"`
+				}
+				var a32 struct {
+					A int32 `json:"a"`
+				}
+				var a64 struct {
+					A int64 `json:"a"`
+				}
+				var u8 struct {
+					A uint8 `json:"a"`
+				}
+				var u64v struct {
+					A uint64 `json:"a"`
+				}
+				check(src, func(b []byte) error { return Unmarshal(b, &a8) }, func(b []byte) error { return json.Unmarshal(b, &a8) })
+				check(src, func(b []byte) error { return Unmarshal(b, &a16) }, func(b []byte) error { return json.Unmarshal(b, &a16) })
+				check(src, func(b []byte) error { return Unmarshal(b, &a32) }, func(b []byte) error { return json.Unmarshal(b, &a32) })
+				check(src, func(b []byte) error { return Unmarshal(b, &a64) }, func(b []byte) error { return json.Unmarshal(b, &a64) })
+				check(src, func(b []byte) error { return Unmarshal(b, &u8) }, func(b []byte) error { return json.Unmarshal(b, &u8) })
+				check(src, func(b []byte) error { return Unmarshal(b, &u64v) }, func(b []byte) error { return json.Unmarshal(b, &u64v) })
+				// Value equality when both succeed.
+				var want, got struct {
+					A int64 `json:"a"`
+				}
+				if json.Unmarshal([]byte(src), &want) == nil {
+					if err := Unmarshal([]byte(src), &got); err != nil || got.A != want.A {
+						t.Fatalf("%s: got %d (%v), want %d", src, got.A, err, want.A)
+					}
+				}
+			}
+		}
+	}
+}
