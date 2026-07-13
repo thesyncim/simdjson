@@ -8,7 +8,10 @@ import "encoding/binary"
 // budget is 80 and one call to a non-inlineable function costs 57 by
 // itself, so almost any addition here de-inlines every call site.
 func skipSpace(src []byte, i int) int {
-	for i < len(src) {
+	// The unsigned form of the guard lets the prover drop the bounds check
+	// on src[i]: i is never negative here, and if it ever were the loop
+	// would simply exit as it does today.
+	for uint(i) < uint(len(src)) {
 		c := src[i]
 		if c > ' ' {
 			return i

@@ -85,9 +85,13 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 		cursor.depth++
 		cursor.i = i + 1
 	} else {
-		null, err := cursor.TryNull()
-		if err != nil {
-			return err
+		null := false
+		if !cursor.notNullFast() {
+			var err error
+			null, err = cursor.TryNull()
+			if err != nil {
+				return err
+			}
 		}
 		if null {
 			// encoding/json treats null on a struct as a no-op.
@@ -259,7 +263,7 @@ func (cursor *decoderCursor) matchObjectFieldExpected(first bool, expected *type
 		}
 		return true
 	}
-	if keyEnd+1 >= n || fastByteAt(base, keyEnd) != '"' || fastByteAt(base, keyEnd+1) != ':' {
+	if keyEnd+2 > n || loadUint16LE(unsafe.Add(base, keyEnd)) != quoteColonLE {
 		return false
 	}
 	if expected.keyLen > 7 && !matchStringAt(src, keyStart+8, expected.name[8:]) {
@@ -400,9 +404,13 @@ func decodeCompiledSlice(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 		cursor.depth++
 		cursor.i = i + 1
 	} else {
-		null, err := cursor.TryNull()
-		if err != nil {
-			return err
+		null := false
+		if !cursor.notNullFast() {
+			var err error
+			null, err = cursor.TryNull()
+			if err != nil {
+				return err
+			}
 		}
 		if null {
 			*(*typedSliceHeader)(dst) = typedSliceHeader{}
@@ -470,9 +478,13 @@ func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 			resetTyped(node, dst)
 		}
 	} else {
-		null, err := cursor.TryNull()
-		if err != nil {
-			return err
+		null := false
+		if !cursor.notNullFast() {
+			var err error
+			null, err = cursor.TryNull()
+			if err != nil {
+				return err
+			}
 		}
 		if null {
 			// encoding/json treats null on an array as a no-op.
@@ -662,9 +674,13 @@ func zeroTypedArrayTail(node *typedNode, dst unsafe.Pointer, from int) {
 }
 
 func decodeCompiledPointer(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
-	null, err := cursor.TryNull()
-	if err != nil {
-		return err
+	null := false
+	if !cursor.notNullFast() {
+		var err error
+		null, err = cursor.TryNull()
+		if err != nil {
+			return err
+		}
 	}
 	if null {
 		*(*unsafe.Pointer)(dst) = nil
@@ -696,9 +712,13 @@ func decodeCompiledPointer(cursor *decoderCursor, node *typedNode, dst unsafe.Po
 // element that is zeroed between entries, so nested slice capacity is never
 // shared between values.
 func decodeCompiledMap(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
-	null, err := cursor.TryNull()
-	if err != nil {
-		return err
+	null := false
+	if !cursor.notNullFast() {
+		var err error
+		null, err = cursor.TryNull()
+		if err != nil {
+			return err
+		}
 	}
 	if null {
 		reflect.NewAt(node.typ, noescape(dst)).Elem().SetZero()
@@ -803,9 +823,13 @@ func decodeCompiledAny(cursor *decoderCursor, dst unsafe.Pointer) error {
 	// Like encoding/json, an interface already holding a non-nil pointer is
 	// decoded into rather than replaced, except by null.
 	if existing := *(*any)(dst); existing != nil {
-		null, err := cursor.TryNull()
-		if err != nil {
-			return err
+		null := false
+		if !cursor.notNullFast() {
+			var err error
+			null, err = cursor.TryNull()
+			if err != nil {
+				return err
+			}
 		}
 		if null {
 			*(*any)(dst) = nil
@@ -862,9 +886,13 @@ func dynamicDecodeNode(typ reflect.Type) (*typedNode, error) {
 // and a held non-nil pointer is decoded into like encoding/json; any other
 // state cannot be decoded.
 func decodeCompiledIface(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
-	null, err := cursor.TryNull()
-	if err != nil {
-		return err
+	null := false
+	if !cursor.notNullFast() {
+		var err error
+		null, err = cursor.TryNull()
+		if err != nil {
+			return err
+		}
 	}
 	if null {
 		reflect.NewAt(node.typ, noescape(dst)).Elem().SetZero()
@@ -911,9 +939,13 @@ func (c *decoderCursor) stringToken() ([]byte, error) {
 }
 
 func decodeQuotedField(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
-	null, err := cursor.TryNull()
-	if err != nil {
-		return err
+	null := false
+	if !cursor.notNullFast() {
+		var err error
+		null, err = cursor.TryNull()
+		if err != nil {
+			return err
+		}
 	}
 	if null {
 		if node.baseKind == typedPointer || cursor.flags&decoderReplace != 0 {
@@ -958,9 +990,13 @@ func decodeQuotedField(cursor *decoderCursor, node *typedNode, dst unsafe.Pointe
 // decodeCompiledBytes decodes a base64 JSON string into a byte slice,
 // reusing destination capacity when possible.
 func decodeCompiledBytes(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
-	null, err := cursor.TryNull()
-	if err != nil {
-		return err
+	null := false
+	if !cursor.notNullFast() {
+		var err error
+		null, err = cursor.TryNull()
+		if err != nil {
+			return err
+		}
 	}
 	header := (*typedSliceHeader)(dst)
 	if null {

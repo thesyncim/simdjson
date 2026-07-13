@@ -61,6 +61,38 @@ func loadUint64LE(base unsafe.Pointer) uint64 {
 	return binary.LittleEndian.Uint64((*[8]byte)(base)[:])
 }
 
+func loadUint32LE(base unsafe.Pointer) uint32 {
+	return binary.LittleEndian.Uint32((*[4]byte)(base)[:])
+}
+
+func loadUint16LE(base unsafe.Pointer) uint16 {
+	return binary.LittleEndian.Uint16((*[2]byte)(base)[:])
+}
+
+// Little-endian word images of the JSON literals and the key epilogue,
+// compared in one load instead of byte-at-a-time.
+const (
+	wordTrueLE   = uint32('t') | uint32('r')<<8 | uint32('u')<<16 | uint32('e')<<24
+	wordAlseLE   = uint32('a') | uint32('l')<<8 | uint32('s')<<16 | uint32('e')<<24
+	wordNullLE   = uint32('n') | uint32('u')<<8 | uint32('l')<<16 | uint32('l')<<24
+	quoteColonLE = uint16('"') | uint16(':')<<8
+)
+
+func literalNullAt(src []byte, i int) bool {
+	return i+4 <= len(src) &&
+		loadUint32LE(unsafe.Add(unsafe.Pointer(unsafe.SliceData(src)), i)) == wordNullLE
+}
+
+func literalTrueAt(src []byte, i int) bool {
+	return i+4 <= len(src) &&
+		loadUint32LE(unsafe.Add(unsafe.Pointer(unsafe.SliceData(src)), i)) == wordTrueLE
+}
+
+func literalFalseAt(src []byte, i int) bool {
+	return i+5 <= len(src) && src[i] == 'f' &&
+		loadUint32LE(unsafe.Add(unsafe.Pointer(unsafe.SliceData(src)), i+1)) == wordAlseLE
+}
+
 func parse16DigitsScalar(base unsafe.Pointer) uint64 {
 	var value uint64
 	for i := 0; i < 16; i++ {

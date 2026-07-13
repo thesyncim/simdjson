@@ -65,19 +65,19 @@ func (p *parser) parseAnyValue(depth int, useNumber bool) (any, error) {
 	}
 	switch p.src[p.i] {
 	case 'n':
-		if !matchStringAt(p.src, p.i, "null") {
+		if !literalNullAt(p.src, p.i) {
 			return nil, p.err(p.i, "invalid literal")
 		}
 		p.i += 4
 		return nil, nil
 	case 't':
-		if !matchStringAt(p.src, p.i, "true") {
+		if !literalTrueAt(p.src, p.i) {
 			return nil, p.err(p.i, "invalid literal")
 		}
 		p.i += 4
 		return boxedAnyBool(true), nil
 	case 'f':
-		if !matchStringAt(p.src, p.i, "false") {
+		if !literalFalseAt(p.src, p.i) {
 			return nil, p.err(p.i, "invalid literal")
 		}
 		p.i += 5
@@ -133,18 +133,18 @@ func (p *parser) parseAnyArrayValues(values []any, depth int, useNumber bool) (a
 		var err error
 		switch p.src[p.i] {
 		case 'n':
-			if !matchStringAt(p.src, p.i, "null") {
+			if !literalNullAt(p.src, p.i) {
 				return nil, p.err(p.i, "invalid literal")
 			}
 			p.i += 4
 		case 't':
-			if !matchStringAt(p.src, p.i, "true") {
+			if !literalTrueAt(p.src, p.i) {
 				return nil, p.err(p.i, "invalid literal")
 			}
 			p.i += 4
 			v = boxedAnyBool(true)
 		case 'f':
-			if !matchStringAt(p.src, p.i, "false") {
+			if !literalFalseAt(p.src, p.i) {
 				return nil, p.err(p.i, "invalid literal")
 			}
 			p.i += 5
@@ -389,18 +389,18 @@ func (p *parser) parseAnyObject(depth int, useNumber bool) (any, error) {
 		var value any
 		switch p.src[p.i] {
 		case 'n':
-			if !matchStringAt(p.src, p.i, "null") {
+			if !literalNullAt(p.src, p.i) {
 				return nil, p.err(p.i, "invalid literal")
 			}
 			p.i += 4
 		case 't':
-			if !matchStringAt(p.src, p.i, "true") {
+			if !literalTrueAt(p.src, p.i) {
 				return nil, p.err(p.i, "invalid literal")
 			}
 			p.i += 4
 			value = boxedAnyBool(true)
 		case 'f':
-			if !matchStringAt(p.src, p.i, "false") {
+			if !literalFalseAt(p.src, p.i) {
 				return nil, p.err(p.i, "invalid literal")
 			}
 			p.i += 5

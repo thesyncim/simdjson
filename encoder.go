@@ -567,9 +567,13 @@ func appendSimpleFieldName(dst []byte, field *typedEncField, packed []byte) []by
 	}
 	start := len(dst)
 	dst = dst[:start+16]
-	block := int(field.encNameBlock) * 16
-	*(*[16]byte)(unsafe.Pointer(&dst[start])) = *(*[16]byte)(unsafe.Pointer(&packed[block]))
-	return dst[:start+int(field.encNameLen)]
+	// Base-pointer forms keep the block copy free of bounds checks; the
+	// cap guard above proved sixteen writable bytes and encNameBlock
+	// indexes blocks the compiler packed. The min is free — encNameLen is
+	// at most sixteen by construction — and lets the final reslice prove.
+	*(*[16]byte)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(dst)), start)) =
+		*(*[16]byte)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(packed)), int(field.encNameBlock)*16))
+	return dst[:start+min(int(field.encNameLen), 16)]
 }
 
 func (e *encodeState) encodeStructFieldValue(field *typedEncField, src unsafe.Pointer) error {

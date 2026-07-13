@@ -108,13 +108,22 @@ func (c *decoderCursor) TryNull() (bool, error) {
 	return c.tryNullSlow()
 }
 
+// notNullFast reports that the next byte proves a non-null value with no
+// leading whitespace, letting callers skip the TryNull call entirely on the
+// common present-value path. TryNull itself cannot fit the inlining budget
+// because of its mandatory slow-path call.
+func (c *decoderCursor) notNullFast() bool {
+	i := c.i
+	return i < len(c.src) && c.src[i] > ' ' && c.src[i] != 'n'
+}
+
 //go:noinline
 func (c *decoderCursor) tryNullSlow() (bool, error) {
 	c.skipSpace()
 	if c.i >= len(c.src) || c.src[c.i] != 'n' {
 		return false, nil
 	}
-	if !matchStringAt(c.src, c.i, "null") {
+	if !literalNullAt(c.src, c.i) {
 		return false, c.err(c.i, "invalid literal")
 	}
 	c.i += 4
@@ -189,7 +198,10 @@ func (c *decoderCursor) NextObjectField(first bool) (key string, ok bool, err er
 	} else {
 		keyEnd = scanStringSpecial(c.src, keyStart)
 	}
-	if keyEnd >= len(c.src) || c.src[keyEnd] != '"' || keyEnd+1 >= len(c.src) || c.src[keyEnd+1] != ':' {
+	// One 16-bit load checks the closing quote and colon together; the
+	// length guard covers both bytes.
+	if keyEnd+2 > len(c.src) ||
+		loadUint16LE(unsafe.Add(unsafe.Pointer(unsafe.SliceData(c.src)), keyEnd)) != quoteColonLE {
 		return c.nextObjectFieldSlow(first)
 	}
 	key = unsafe.String(unsafe.SliceData(c.src[keyStart:keyEnd]), keyEnd-keyStart)
@@ -363,13 +375,13 @@ func (c *decoderCursor) Bool[T boolValue](dst *T) error {
 	if i < len(c.src) {
 		switch c.src[i] {
 		case 't':
-			if matchStringAt(c.src, i, "true") {
+			if literalTrueAt(c.src, i) {
 				*dst = true
 				c.i = i + 4
 				return nil
 			}
 		case 'f':
-			if matchStringAt(c.src, i, "false") {
+			if literalFalseAt(c.src, i) {
 				*dst = false
 				c.i = i + 5
 				return nil
@@ -386,7 +398,7 @@ func (c *decoderCursor) boolSlow[T boolValue](dst *T) error {
 		return c.genericExpected[T]("boolean")
 	}
 	if c.src[i] == 'n' {
-		if !matchStringAt(c.src, i, "null") {
+		if !literalNullAt(c.src, i) {
 			return c.err(i, "invalid literal")
 		}
 		if c.flags&decoderReplace != 0 {
@@ -397,14 +409,14 @@ func (c *decoderCursor) boolSlow[T boolValue](dst *T) error {
 	}
 	switch c.src[i] {
 	case 't':
-		if !matchStringAt(c.src, i, "true") {
+		if !literalTrueAt(c.src, i) {
 			return c.err(i, "invalid literal")
 		}
 		*dst = true
 		c.i = i + 4
 		return nil
 	case 'f':
-		if !matchStringAt(c.src, i, "false") {
+		if !literalFalseAt(c.src, i) {
 			return c.err(i, "invalid literal")
 		}
 		*dst = false
@@ -433,7 +445,7 @@ func (c *decoderCursor) String[T stringValue](dst *T) error {
 //go:noinline
 func (c *decoderCursor) stringSlow[T stringValue](dst *T) error {
 	if c.i < len(c.src) && c.src[c.i] == 'n' {
-		if !matchStringAt(c.src, c.i, "null") {
+		if !literalNullAt(c.src, c.i) {
 			return c.err(c.i, "invalid literal")
 		}
 		if c.flags&decoderReplace != 0 {
@@ -470,7 +482,7 @@ func (c *decoderCursor) stringSlow[T stringValue](dst *T) error {
 // Number decodes a JSON number's original spelling into a defined string type.
 func (c *decoderCursor) Number[T stringValue](dst *T) error {
 	if c.i < len(c.src) && c.src[c.i] == 'n' {
-		if !matchStringAt(c.src, c.i, "null") {
+		if !literalNullAt(c.src, c.i) {
 			return c.err(c.i, "invalid literal")
 		}
 		if c.flags&decoderReplace != 0 {
@@ -495,7 +507,7 @@ func (c *decoderCursor) Number[T stringValue](dst *T) error {
 func (c *decoderCursor) Int[T signedInteger](dst *T) error {
 	n := len(c.src)
 	if c.i < n && c.src[c.i] == 'n' {
-		if !matchStringAt(c.src, c.i, "null") {
+		if !literalNullAt(c.src, c.i) {
 			return c.err(c.i, "invalid literal")
 		}
 		if c.flags&decoderReplace != 0 {
@@ -582,7 +594,7 @@ func (c *decoderCursor) Int[T signedInteger](dst *T) error {
 func (c *decoderCursor) Uint[T unsignedInteger](dst *T) error {
 	n := len(c.src)
 	if c.i < n && c.src[c.i] == 'n' {
-		if !matchStringAt(c.src, c.i, "null") {
+		if !literalNullAt(c.src, c.i) {
 			return c.err(c.i, "invalid literal")
 		}
 		if c.flags&decoderReplace != 0 {
@@ -669,7 +681,7 @@ func (c *decoderCursor) Float[T floatValue](dst *T) error {
 //go:noinline
 func (c *decoderCursor) floatSlow[T floatValue](dst *T) error {
 	if c.i < len(c.src) && c.src[c.i] == 'n' {
-		if !matchStringAt(c.src, c.i, "null") {
+		if !literalNullAt(c.src, c.i) {
 			return c.err(c.i, "invalid literal")
 		}
 		if c.flags&decoderReplace != 0 {

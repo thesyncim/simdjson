@@ -141,17 +141,17 @@ func validValueFast(src []byte, base unsafe.Pointer, n, i int, c byte, depth int
 	case '"':
 		return validStringFast(src, base, n, i)
 	case 't':
-		if i+4 > n || fastByteAt(base, i+1) != 'r' || fastByteAt(base, i+2) != 'u' || fastByteAt(base, i+3) != 'e' {
+		if i+4 > n || loadUint32LE(unsafe.Add(base, i)) != wordTrueLE {
 			return i, false
 		}
 		return i + 4, true
 	case 'f':
-		if i+5 > n || fastByteAt(base, i+1) != 'a' || fastByteAt(base, i+2) != 'l' || fastByteAt(base, i+3) != 's' || fastByteAt(base, i+4) != 'e' {
+		if i+5 > n || loadUint32LE(unsafe.Add(base, i+1)) != wordAlseLE {
 			return i, false
 		}
 		return i + 5, true
 	case 'n':
-		if i+4 > n || fastByteAt(base, i+1) != 'u' || fastByteAt(base, i+2) != 'l' || fastByteAt(base, i+3) != 'l' {
+		if i+4 > n || loadUint32LE(unsafe.Add(base, i)) != wordNullLE {
 			return i, false
 		}
 		return i + 4, true
@@ -173,6 +173,9 @@ func scanNumberFast(base unsafe.Pointer, n, i int) (int, bool) {
 	if fastByteAt(base, i) == '0' {
 		i++
 	} else if isOneNine(fastByteAt(base, i)) {
+		// Unlike the fraction below, the integer part stays byte-at-a-time:
+		// integer runs of eight or more digits are rare enough that a SWAR
+		// probe measured as a net loss on record-shaped documents.
 		for i++; i < n && isDigit(fastByteAt(base, i)); i++ {
 		}
 	} else {

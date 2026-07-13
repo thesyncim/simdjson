@@ -1,7 +1,6 @@
 package simdjson
 
 import (
-	"encoding/binary"
 	"errors"
 	"math/bits"
 	"strconv"
@@ -782,7 +781,7 @@ func (b *tapeBuilder) parseFast() tapeParseStatus {
 func (b *tapeBuilder) stringFast(start int, flags uint8) tapeParseStatus {
 	scanStart := start + 1
 	if start+9 <= len(b.src) {
-		if m := stringSpecialMask(binary.LittleEndian.Uint64(b.src[start+1:])); m != 0 {
+		if m := stringSpecialMask(loadUint64LE(unsafe.Add(b.base, start+1))); m != 0 {
 			j := start + 1 + bits.TrailingZeros64(m)/8
 			if b.src[j] == '"' {
 				if len(b.entries) == cap(b.entries) {
@@ -936,19 +935,19 @@ func (b *tapeBuilder) valueFast(depth int) tapeParseStatus {
 	case '"':
 		return b.stringFast(start, 0)
 	case 't':
-		if !matchStringAt(b.src, start, "true") {
+		if start+4 > n || loadUint32LE(unsafe.Add(base, start)) != wordTrueLE {
 			return tapeParseInvalid
 		}
 		b.i = start + 4
 		return b.emitScalar(start, Bool)
 	case 'f':
-		if !matchStringAt(b.src, start, "false") {
+		if start+5 > n || loadUint32LE(unsafe.Add(base, start+1)) != wordAlseLE {
 			return tapeParseInvalid
 		}
 		b.i = start + 5
 		return b.emitScalar(start, Bool)
 	case 'n':
-		if !matchStringAt(b.src, start, "null") {
+		if start+4 > n || loadUint32LE(unsafe.Add(base, start)) != wordNullLE {
 			return tapeParseInvalid
 		}
 		b.i = start + 4
