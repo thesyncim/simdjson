@@ -26,8 +26,14 @@ func TestSIMDScannerDispatch(t *testing.T) {
 	if backend == "scalar" {
 		return
 	}
-	if info.StringVectorBytes < 16 || info.StringMinBytes < 16 || info.ParseVectorBytes != 16 || info.FormatVectorBytes != 16 {
+	if info.StringVectorBytes < 16 || info.StringMinBytes < 16 {
 		t.Fatalf("selected scanner has invalid runtime info: %+v", info)
+	}
+	if info.ParseBackend != "scalar" && info.ParseVectorBytes != 16 {
+		t.Fatalf("vector parse backend %q reports vector bytes %d, want 16", info.ParseBackend, info.ParseVectorBytes)
+	}
+	if info.FormatBackend != "scalar" && info.FormatVectorBytes != 16 {
+		t.Fatalf("vector format backend %q reports vector bytes %d, want 16", info.FormatBackend, info.FormatVectorBytes)
 	}
 	if runtime.GOARCH == "arm64" && !info.Features.Has(CPUFeatureNEON) {
 		t.Fatalf("arm64 runtime features = %v, want NEON", info.Features)
