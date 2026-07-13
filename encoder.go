@@ -769,15 +769,39 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		return &EncodeError{Reason: "maximum nesting depth exceeded"}
 	}
 	e.depth++
-	entries := make([]mapEncodeEntry, 0, mapValue.Len())
+	mapLen := mapValue.Len()
+	entries := make([]mapEncodeEntry, 0, mapLen)
+	numericKeys := !node.mapKeyTextEncode && (node.mapKeyKind == mapKeyInt || node.mapKeyKind == mapKeyUint)
+	var keyArena []byte
+	if numericKeys && mapLen <= int(^uint(0)>>1)/20 {
+		keyArena = make([]byte, 0, mapLen*20)
+	}
 	iterator := mapValue.MapRange()
 	for iterator.Next() {
-		name, err := mapKeyName(node, iterator.Key())
-		if err != nil {
-			e.depth--
-			return &EncodeError{Reason: err.Error()}
+		key := iterator.Key()
+		var name string
+		if numericKeys {
+			start := len(keyArena)
+			if node.mapKeyKind == mapKeyInt {
+				value := key.Int()
+				if value < 0 {
+					keyArena = appendCompactInt(keyArena, value)
+				} else {
+					keyArena = appendCompactUint(keyArena, uint64(value))
+				}
+			} else {
+				keyArena = appendCompactUint(keyArena, key.Uint())
+			}
+			name = unsafe.String(unsafe.SliceData(keyArena[start:]), len(keyArena)-start)
+		} else {
+			var err error
+			name, err = mapKeyName(node, key)
+			if err != nil {
+				e.depth--
+				return &EncodeError{Reason: err.Error()}
+			}
 		}
-		entries = append(entries, mapEncodeEntry{name: name, key: iterator.Key()})
+		entries = append(entries, mapEncodeEntry{name: name, value: iterator.Value()})
 	}
 	slices.SortFunc(entries, func(a, b mapEncodeEntry) int { return strings.Compare(a.name, b.name) })
 	element := reflect.New(node.elem.typ)
@@ -790,7 +814,7 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		}
 		e.dst = appendEncodedJSONString(e.dst, entries[i].name, e.escapeHTML)
 		e.dst = append(e.dst, ':')
-		elementValue.Set(mapValue.MapIndex(entries[i].key))
+		elementValue.Set(entries[i].value)
 		if err := e.encodeNonAddressable(node.elem, elementPtr); err != nil {
 			e.depth--
 			return prependEncodePathField(err, entries[i].name)
@@ -802,8 +826,8 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 }
 
 type mapEncodeEntry struct {
-	name string
-	key  reflect.Value
+	name  string
+	value reflect.Value
 }
 
 // mapKeyName renders a map key as its JSON member name, following
@@ -1024,24 +1048,32 @@ func appendCompactUint(dst []byte, v uint64) []byte {
 	if v >= 1e10 {
 		return strconv.AppendUint(dst, v, 10)
 	}
-	var buffer [20]byte
-	i := len(buffer)
+	digits := int((bits.Len64(v)*1233)>>12) + 1
+	if v < pow10Uint64[digits-1] {
+		digits--
+	}
+	if cap(dst)-len(dst) < digits {
+		return strconv.AppendUint(dst, v, 10)
+	}
+	start := len(dst)
+	dst = dst[:start+digits]
+	i := len(dst)
 	for v >= 100 {
 		pair := (v % 100) * 2
 		v /= 100
 		i -= 2
-		buffer[i] = encodeDigitPairs[pair]
-		buffer[i+1] = encodeDigitPairs[pair+1]
+		dst[i] = encodeDigitPairs[pair]
+		dst[i+1] = encodeDigitPairs[pair+1]
 	}
 	if v >= 10 {
 		i -= 2
-		buffer[i] = encodeDigitPairs[v*2]
-		buffer[i+1] = encodeDigitPairs[v*2+1]
+		dst[i] = encodeDigitPairs[v*2]
+		dst[i+1] = encodeDigitPairs[v*2+1]
 	} else {
 		i--
-		buffer[i] = byte('0' + v)
+		dst[i] = byte('0' + v)
 	}
-	return append(dst, buffer[i:]...)
+	return dst
 }
 
 func appendCompactInt(dst []byte, v int64) []byte {

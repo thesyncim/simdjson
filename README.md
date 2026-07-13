@@ -37,8 +37,8 @@ for validation. Speedups are geometric means across all seven payloads.
 | Validate | Strict JSON and UTF-8 | **7/7** | **7/7** | **2.29x** | **2.03x** |
 | Typed decode | Owned strings, reused destination | **7/7** | **7/7** | **4.15x** | **1.60x** |
 | Dynamic decode | Owned `any` tree | **7/7** | **7/7** | **4.15x** | **1.89x** |
-| Encode | Owned output | **7/7** | **5/7** | **2.27x** | **1.33x** |
-| Encode | Reused output buffer | **7/7** | **7/7** | **2.42x** | **1.42x** |
+| Encode | Owned output | **7/7** | **7/7** | **2.27x** | **1.35x** |
+| Encode | Reused output buffer | **7/7** | **7/7** | **2.42x** | **1.44x** |
 
 The scorecard does not mix ownership contracts. Source-backed decode and reused
 output are reported separately below. Native Sonic uses a different compiler
@@ -102,19 +102,20 @@ caller-owned buffer and is shown separately.
 
 | Corpus | stdlib | simdjson owned | compiled reuse | Fastest tip rival | Native Sonic |
 |---|---:|---:|---:|---:|---:|
-| Canada geometry | 549.3 us | 425.7 us | **424.0 us** | Segment 449.7 us | 782.8 us |
-| CITM catalog | 761.7 us | 311.7 us | **294.2 us** | go-json 298.4 us | 836.2 us |
-| Go source | 2.561 ms | 1.134 ms | **1.094 ms** | Segment 1.130 ms | 3.711 ms |
-| Escaped strings | 17.06 us | 6.877 us | **6.258 us** | jsoniter 17.39 us | 19.73 us |
-| Unicode strings | 16.83 us | 6.935 us | **6.277 us** | jsoniter 17.38 us | 19.76 us |
-| Synthea FHIR | 5.060 ms | 1.649 ms | **1.564 ms** | Segment 1.680 ms | 6.834 ms |
-| Twitter status | 557.7 us | 234.3 us | **212.6 us** | go-json 267.0 us | 552.9 us |
+| Canada geometry | 538.1 us | **419.6 us** | 421.1 us | Segment 441.5 us | 782.8 us |
+| CITM catalog | 738.0 us | 295.4 us | **278.2 us** | Segment 296.8 us | 836.2 us |
+| Go source | 2.541 ms | 1.119 ms | **1.084 ms** | Segment 1.120 ms | 3.711 ms |
+| Escaped strings | 17.06 us | 6.929 us | **6.235 us** | jsoniter 18.02 us | 19.73 us |
+| Unicode strings | 17.10 us | 6.978 us | **6.254 us** | jsoniter 17.69 us | 19.76 us |
+| Synthea FHIR | 4.945 ms | 1.643 ms | **1.559 ms** | Segment 1.656 ms | 6.834 ms |
+| Twitter status | 544.6 us | 232.1 us | **210.9 us** | go-json 269.1 us | 552.9 us |
 
-Compiled reuse wins every exact-model row. Its hot struct plan classifies common
-adjacent field operations once, stores the fused opcode without enlarging the
-40-byte field record, and emits two fields per dispatch. Value-receiver custom
-marshalers use pooled, ordinary Go reflection values that are cleared before
-reuse; no interface-layout or runtime map-layout assumptions are involved.
+Both owned and compiled-reuse encoding win every exact-model row. Reuse also
+eliminates the output allocation. The hot struct plan classifies common adjacent
+field operations once, stores the fused opcode without enlarging the 40-byte
+field record, and emits two fields per dispatch. Integer map keys use one local
+byte arena and public reflection iteration; no interface-layout or runtime
+map-layout assumptions are involved.
 
 ### SIMD Versus Pure Go
 
@@ -128,8 +129,8 @@ selected once at initialization; short runs remain scalar or SWAR.
 | Dynamic source-backed | **7/7** | **1.09x** |
 | Typed owned | 3/7 | **1.06x** |
 | Typed source-backed | 6/7 | **1.09x** |
-| Encode owned | 4/7 | **1.37x** |
-| Encode compiled reuse | 5/7 | **1.41x** |
+| Encode owned | **7/7** | **1.37x** |
+| Encode compiled reuse | **7/7** | **1.42x** |
 
 Owned typed decode includes a source-sized copy that SIMD cannot accelerate;
 the source-backed row exposes parser uplift more directly. SIMD is not claimed

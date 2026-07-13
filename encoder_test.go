@@ -160,6 +160,35 @@ func BenchmarkAppendCompactUint(b *testing.B) {
 	}
 }
 
+func TestAppendCompactUintMatchesStrconv(t *testing.T) {
+	values := []uint64{0, 1, 9, 10, 99, 100, math.MaxUint64}
+	for _, power := range pow10Uint64 {
+		if power > 0 {
+			values = append(values, power-1)
+		}
+		values = append(values, power)
+		if power < math.MaxUint64 {
+			values = append(values, power+1)
+		}
+	}
+	state := uint64(0x9e3779b97f4a7c15)
+	for range 100000 {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		values = append(values, state)
+	}
+	for _, value := range values {
+		want := strconv.AppendUint(nil, value, 10)
+		for _, capacity := range []int{0, 2, 10, 20} {
+			got := appendCompactUint(make([]byte, 0, capacity), value)
+			if !bytes.Equal(got, want) {
+				t.Fatalf("appendCompactUint(%d, cap=%d) = %q, want %q", value, capacity, got, want)
+			}
+		}
+	}
+}
+
 func TestEncoderErrors(t *testing.T) {
 	type inner struct {
 		F float64 `json:"f"`
