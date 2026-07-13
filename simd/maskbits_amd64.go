@@ -7,6 +7,18 @@ import (
 	"simd/archsimd"
 )
 
+// maskNibbles returns a one-bit-per-lane mask; the name matches the arm64
+// helper whose extraction carries four bits per lane. maskLane recovers the
+// lane index from a non-zero value on either encoding.
+func maskNibbles(m archsimd.Mask8x16) uint64 {
+	return uint64(m.ToBits())
+}
+
+// maskLane converts a non-zero maskNibbles value to its lane index.
+func maskLane(nib uint64) int {
+	return bits.TrailingZeros64(nib)
+}
+
 func firstMaskLane(m archsimd.Mask8x16) int {
 	b := m.ToBits()
 	if b == 0 {

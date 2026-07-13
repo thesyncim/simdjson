@@ -24,7 +24,12 @@ var utf8LookupSecondHigh = [16]uint8{
 }
 
 func initStringScanner() {
-	scanStringSelectedMinBytes = 96
+	// The SWAR probes stay: most matches sit within the first 16 bytes and
+	// the span passed to the scanner is the remaining document, not the
+	// string. After the probes miss, the NEON scanner takes over once two
+	// full blocks remain to amortize its call and constant setup; shorter
+	// tails run the word-at-a-time loop in the dispatcher.
+	scanStringSelectedMinBytes = 32
 	scanStringProbeMinBytes = 17
 	scanStringSpecialBackend = "arm64-neon"
 	scanStringVectorBytes = 16

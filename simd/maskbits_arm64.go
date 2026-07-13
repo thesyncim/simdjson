@@ -7,17 +7,30 @@ import (
 	"simd/archsimd"
 )
 
+// nibbleShift holds the per-halfword shift count for the shrn idiom below.
+// Loading it from rodata is cheaper than materializing the vector from an
+// immediate (MOVD+VMOV+VDUP) at each extraction site.
+var nibbleShift = [8]int16{-4, -4, -4, -4, -4, -4, -4, -4}
+
+// maskNibbles extracts a 4-bits-per-lane nibble mask (the aarch64 shrn
+// idiom: shift halfword lanes right by four, then XTN) so one
+// vector-to-GPR transfer covers all 16 lanes.
+func maskNibbles(m archsimd.Mask8x16) uint64 {
+	shift := archsimd.LoadInt16x8Array(&nibbleShift)
+	return m.ToInt8x16().ToBits().ReshapeToUint16s().Shift(shift).TruncToUint8().ReshapeToUint64s().GetElem(0)
+}
+
+// maskLane converts a non-zero maskNibbles value to its lane index.
+func maskLane(nib uint64) int {
+	return bits.TrailingZeros64(nib) >> 2
+}
+
 func firstMaskLane(m archsimd.Mask8x16) int {
-	x := m.ToInt8x16().ToBits().ReshapeToUint64s()
-	lo := x.GetElem(0)
-	if lo != 0 {
-		return bits.TrailingZeros64(lo) / 8
+	nib := maskNibbles(m)
+	if nib == 0 {
+		return -1
 	}
-	hi := x.GetElem(1)
-	if hi != 0 {
-		return 8 + bits.TrailingZeros64(hi)/8
-	}
-	return -1
+	return maskLane(nib)
 }
 
 func maskHasAnyLane(m archsimd.Mask8x16) bool {

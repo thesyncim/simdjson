@@ -59,6 +59,7 @@ func simdInfo() SIMDInfo {
 }
 
 func scanStringSpecial(src []byte, i int) int {
+	start := i
 	remaining := len(src) - i
 	if remaining >= scanStringProbeMinBytes {
 		if m := stringSpecialMask(binary.LittleEndian.Uint64(src[i:])); m != 0 {
@@ -73,11 +74,22 @@ func scanStringSpecial(src []byte, i int) int {
 	if len(src)-i >= scanStringSelectedMinBytes {
 		return scanStringSpecialRuntime(src, i)
 	}
-	if i+8 <= len(src) {
+	for i+8 <= len(src) {
 		if m := stringSpecialMask(binary.LittleEndian.Uint64(src[i:])); m != 0 {
 			return i + bits.TrailingZeros64(m)/8
 		}
 		i += 8
+	}
+	if i == len(src) {
+		return i
+	}
+	if tail := len(src) - 8; tail >= start {
+		// The bytes of the final word that precede i were already cleared,
+		// so a match found here is at or after i.
+		if m := stringSpecialMask(binary.LittleEndian.Uint64(src[tail:])); m != 0 {
+			return tail + bits.TrailingZeros64(m)/8
+		}
+		return len(src)
 	}
 	for i < len(src) {
 		c := src[i]
@@ -94,6 +106,7 @@ func scanStringSpecialLong(src []byte, i int) int {
 }
 
 func scanStringSyntax(src []byte, i int) int {
+	start := i
 	remaining := len(src) - i
 	if remaining >= scanStringProbeMinBytes {
 		if m := stringSyntaxMask(binary.LittleEndian.Uint64(src[i:])); m != 0 {
@@ -108,11 +121,22 @@ func scanStringSyntax(src []byte, i int) int {
 	if len(src)-i >= scanStringSelectedMinBytes {
 		return scanStringSyntaxRuntime(src, i)
 	}
-	if i+8 <= len(src) {
+	for i+8 <= len(src) {
 		if m := stringSyntaxMask(binary.LittleEndian.Uint64(src[i:])); m != 0 {
 			return i + bits.TrailingZeros64(m)/8
 		}
 		i += 8
+	}
+	if i == len(src) {
+		return i
+	}
+	if tail := len(src) - 8; tail >= start {
+		// The bytes of the final word that precede i were already cleared,
+		// so a match found here is at or after i.
+		if m := stringSyntaxMask(binary.LittleEndian.Uint64(src[tail:])); m != 0 {
+			return tail + bits.TrailingZeros64(m)/8
+		}
+		return len(src)
 	}
 	for i < len(src) {
 		c := src[i]
@@ -131,6 +155,20 @@ func scanStringSpecialSIMD(src []byte, i int) int {
 	slash := archsimd.BroadcastUint8x16('\\')
 	ctrlOrNonASCII := archsimd.BroadcastInt8x16(0x20)
 	base := unsafe.Pointer(unsafe.SliceData(src))
+
+	// Ramp: the span is the remaining document, so the match usually lands
+	// near the entry point. Scan one single block before committing to
+	// 64-byte strides.
+	for k := 0; k < 1 && i+16 <= n; k++ {
+		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
+		m := v.Equal(quote).
+			Or(v.Equal(slash)).
+			Or(v.BitsToInt8().Less(ctrlOrNonASCII))
+		if nib := maskNibbles(m); nib != 0 {
+			return i + maskLane(nib)
+		}
+		i += 16
+	}
 
 	for i+64 <= n {
 		v0 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
@@ -152,16 +190,16 @@ func scanStringSpecialSIMD(src []byte, i int) int {
 			Or(v3.BitsToInt8().Less(ctrlOrNonASCII))
 
 		if maskHasAnyLane(m0.Or(m1).Or(m2).Or(m3)) {
-			if maskHasAnyLane(m0.Or(m1)) {
-				if lane := firstMaskLane(m0); lane >= 0 {
-					return i + lane
-				}
-				return i + 16 + firstMaskLane(m1)
+			if nib := maskNibbles(m0); nib != 0 {
+				return i + maskLane(nib)
 			}
-			if lane := firstMaskLane(m2); lane >= 0 {
-				return i + 32 + lane
+			if nib := maskNibbles(m1); nib != 0 {
+				return i + 16 + maskLane(nib)
 			}
-			return i + 48 + firstMaskLane(m3)
+			if nib := maskNibbles(m2); nib != 0 {
+				return i + 32 + maskLane(nib)
+			}
+			return i + 48 + maskLane(maskNibbles(m3))
 		}
 		i += 64
 	}
@@ -171,12 +209,12 @@ func scanStringSpecialSIMD(src []byte, i int) int {
 		m := v.Equal(quote).
 			Or(v.Equal(slash)).
 			Or(v.BitsToInt8().Less(ctrlOrNonASCII))
-		if lane := firstMaskLane(m); lane >= 0 {
-			return i + lane
+		if maskHasAnyLane(m) {
+			return i + firstMaskLane(m)
 		}
 		i += 16
 	}
-	if i < n && i-start >= 16 {
+	if i < n && n-16 >= start {
 		tail := n - 16
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, tail)))
 		m := v.Equal(quote).
@@ -198,6 +236,16 @@ func scanStringSyntaxSIMD(src []byte, i int) int {
 	ctrl := archsimd.BroadcastUint8x16(0x20)
 	base := unsafe.Pointer(unsafe.SliceData(src))
 
+	// Ramp: see scanStringSpecialSIMD.
+	for k := 0; k < 1 && i+16 <= n; k++ {
+		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
+		m := v.Equal(quote).Or(v.Equal(slash)).Or(v.Less(ctrl))
+		if nib := maskNibbles(m); nib != 0 {
+			return i + maskLane(nib)
+		}
+		i += 16
+	}
+
 	for i+64 <= n {
 		v0 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
 		v1 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i+16)))
@@ -210,16 +258,16 @@ func scanStringSyntaxSIMD(src []byte, i int) int {
 		m3 := v3.Equal(quote).Or(v3.Equal(slash)).Or(v3.Less(ctrl))
 
 		if maskHasAnyLane(m0.Or(m1).Or(m2).Or(m3)) {
-			if maskHasAnyLane(m0.Or(m1)) {
-				if lane := firstMaskLane(m0); lane >= 0 {
-					return i + lane
-				}
-				return i + 16 + firstMaskLane(m1)
+			if nib := maskNibbles(m0); nib != 0 {
+				return i + maskLane(nib)
 			}
-			if lane := firstMaskLane(m2); lane >= 0 {
-				return i + 32 + lane
+			if nib := maskNibbles(m1); nib != 0 {
+				return i + 16 + maskLane(nib)
 			}
-			return i + 48 + firstMaskLane(m3)
+			if nib := maskNibbles(m2); nib != 0 {
+				return i + 32 + maskLane(nib)
+			}
+			return i + 48 + maskLane(maskNibbles(m3))
 		}
 		i += 64
 	}
@@ -227,12 +275,12 @@ func scanStringSyntaxSIMD(src []byte, i int) int {
 	for i+16 <= n {
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
 		m := v.Equal(quote).Or(v.Equal(slash)).Or(v.Less(ctrl))
-		if lane := firstMaskLane(m); lane >= 0 {
-			return i + lane
+		if maskHasAnyLane(m) {
+			return i + firstMaskLane(m)
 		}
 		i += 16
 	}
-	if i < n && i-start >= 16 {
+	if i < n && n-16 >= start {
 		tail := n - 16
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, tail)))
 		m := v.Equal(quote).Or(v.Equal(slash)).Or(v.Less(ctrl))
@@ -269,6 +317,15 @@ func scanEncodedHTMLSpecialSIMD(src []byte, i int) int {
 	ctrlOrNonASCII := archsimd.BroadcastInt8x16(0x20)
 	base := unsafe.Pointer(unsafe.SliceData(src))
 
+	// Ramp: see scanStringSpecialSIMD.
+	for k := 0; k < 1 && i+16 <= n; k++ {
+		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
+		if nib := maskNibbles(encodedHTMLSpecialMask(v, slash, gt, amp, bit2, bit4, ctrlOrNonASCII)); nib != 0 {
+			return i + maskLane(nib)
+		}
+		i += 16
+	}
+
 	for i+64 <= n {
 		v0 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
 		v1 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i+16)))
@@ -279,27 +336,27 @@ func scanEncodedHTMLSpecialSIMD(src []byte, i int) int {
 		m2 := encodedHTMLSpecialMask(v2, slash, gt, amp, bit2, bit4, ctrlOrNonASCII)
 		m3 := encodedHTMLSpecialMask(v3, slash, gt, amp, bit2, bit4, ctrlOrNonASCII)
 		if maskHasAnyLane(m0.Or(m1).Or(m2).Or(m3)) {
-			if maskHasAnyLane(m0.Or(m1)) {
-				if lane := firstMaskLane(m0); lane >= 0 {
-					return i + lane
-				}
-				return i + 16 + firstMaskLane(m1)
+			if nib := maskNibbles(m0); nib != 0 {
+				return i + maskLane(nib)
 			}
-			if lane := firstMaskLane(m2); lane >= 0 {
-				return i + 32 + lane
+			if nib := maskNibbles(m1); nib != 0 {
+				return i + 16 + maskLane(nib)
 			}
-			return i + 48 + firstMaskLane(m3)
+			if nib := maskNibbles(m2); nib != 0 {
+				return i + 32 + maskLane(nib)
+			}
+			return i + 48 + maskLane(maskNibbles(m3))
 		}
 		i += 64
 	}
 	for i+16 <= n {
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
-		if lane := firstMaskLane(encodedHTMLSpecialMask(v, slash, gt, amp, bit2, bit4, ctrlOrNonASCII)); lane >= 0 {
-			return i + lane
+		if m := encodedHTMLSpecialMask(v, slash, gt, amp, bit2, bit4, ctrlOrNonASCII); maskHasAnyLane(m) {
+			return i + firstMaskLane(m)
 		}
 		i += 16
 	}
-	if i < n && i-start >= 16 {
+	if i < n && n-16 >= start {
 		tail := n - 16
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, tail)))
 		if lane := firstMaskLane(encodedHTMLSpecialMask(v, slash, gt, amp, bit2, bit4, ctrlOrNonASCII)); lane >= 0 {
@@ -330,6 +387,15 @@ func scanEncodedHTMLSyntaxSIMD(src []byte, i int) int {
 	ctrl := archsimd.BroadcastUint8x16(0x20)
 	base := unsafe.Pointer(unsafe.SliceData(src))
 
+	// Ramp: see scanStringSpecialSIMD.
+	for k := 0; k < 1 && i+16 <= n; k++ {
+		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
+		if nib := maskNibbles(encodedHTMLSyntaxMask(v, slash, gt, amp, bit2, bit4, ctrl)); nib != 0 {
+			return i + maskLane(nib)
+		}
+		i += 16
+	}
+
 	for i+64 <= n {
 		v0 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
 		v1 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i+16)))
@@ -340,27 +406,27 @@ func scanEncodedHTMLSyntaxSIMD(src []byte, i int) int {
 		m2 := encodedHTMLSyntaxMask(v2, slash, gt, amp, bit2, bit4, ctrl)
 		m3 := encodedHTMLSyntaxMask(v3, slash, gt, amp, bit2, bit4, ctrl)
 		if maskHasAnyLane(m0.Or(m1).Or(m2).Or(m3)) {
-			if maskHasAnyLane(m0.Or(m1)) {
-				if lane := firstMaskLane(m0); lane >= 0 {
-					return i + lane
-				}
-				return i + 16 + firstMaskLane(m1)
+			if nib := maskNibbles(m0); nib != 0 {
+				return i + maskLane(nib)
 			}
-			if lane := firstMaskLane(m2); lane >= 0 {
-				return i + 32 + lane
+			if nib := maskNibbles(m1); nib != 0 {
+				return i + 16 + maskLane(nib)
 			}
-			return i + 48 + firstMaskLane(m3)
+			if nib := maskNibbles(m2); nib != 0 {
+				return i + 32 + maskLane(nib)
+			}
+			return i + 48 + maskLane(maskNibbles(m3))
 		}
 		i += 64
 	}
 	for i+16 <= n {
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
-		if lane := firstMaskLane(encodedHTMLSyntaxMask(v, slash, gt, amp, bit2, bit4, ctrl)); lane >= 0 {
-			return i + lane
+		if m := encodedHTMLSyntaxMask(v, slash, gt, amp, bit2, bit4, ctrl); maskHasAnyLane(m) {
+			return i + firstMaskLane(m)
 		}
 		i += 16
 	}
-	if i < n && i-start >= 16 {
+	if i < n && n-16 >= start {
 		tail := n - 16
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, tail)))
 		if lane := firstMaskLane(encodedHTMLSyntaxMask(v, slash, gt, amp, bit2, bit4, ctrl)); lane >= 0 {
@@ -425,7 +491,8 @@ func copyStringPrefix(dst, src []byte) int {
 	for i+16 <= len(src) {
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(srcBase, i)))
 		m := v.Equal(quote).Or(v.Equal(slash)).Or(v.BitsToInt8().Less(ctrlOrNonASCII))
-		if lane := firstMaskLane(m); lane >= 0 {
+		if maskHasAnyLane(m) {
+			lane := firstMaskLane(m)
 			copy(dst[i:], src[i:i+lane])
 			return i + lane
 		}
@@ -497,7 +564,8 @@ func copyHTMLStringPrefix(dst, src []byte) int {
 	for i+16 <= len(src) {
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(srcBase, i)))
 		m := encodedHTMLSpecialMask(v, slash, gt, amp, bit2, bit4, ctrlOrNonASCII)
-		if lane := firstMaskLane(m); lane >= 0 {
+		if maskHasAnyLane(m) {
+			lane := firstMaskLane(m)
 			copy(dst[i:], src[i:i+lane])
 			return i + lane
 		}
