@@ -602,3 +602,36 @@ func FuzzMergeSemanticsMatchStdlib(f *testing.F) {
 		}
 	})
 }
+
+func TestDecodeEightDigitOverflowNarrowInts(t *testing.T) {
+	// Exactly eight digits skipped the limit check on the SWAR path, so
+	// values truncated silently into 8- and 16-bit destinations.
+	type narrow struct {
+		A int8   `json:"a"`
+		B int16  `json:"b"`
+		C uint8  `json:"c"`
+		D uint16 `json:"d"`
+	}
+	for _, src := range []string{
+		`{"a":12345678}`, `{"b":12345678}`, `{"c":12345678}`, `{"d":12345678}`,
+		`{"a":-12345678}`, `{"b":-12345678}`,
+	} {
+		var got narrow
+		err := Unmarshal([]byte(src), &got)
+		var want narrow
+		stdErr := json.Unmarshal([]byte(src), &want)
+		if (err == nil) != (stdErr == nil) {
+			t.Fatalf("%s: err=%v, encoding/json err=%v", src, err, stdErr)
+		}
+		if err == nil {
+			t.Fatalf("%s: expected overflow error, decoded %+v", src, got)
+		}
+	}
+	// Boundary neighbours must still decode.
+	var ok16 struct {
+		D uint16 `json:"d"`
+	}
+	if err := Unmarshal([]byte(`{"d":65535}`), &ok16); err != nil || ok16.D != 65535 {
+		t.Fatalf("in-range decode failed: %v %+v", err, ok16)
+	}
+}

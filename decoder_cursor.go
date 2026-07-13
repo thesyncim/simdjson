@@ -545,6 +545,12 @@ func (c *decoderCursor) Int[T signedInteger](dst *T) error {
 			} else if all8Digits(digits) {
 				value = parse8Digits(digits)
 				i += 8
+				// Eight digits always exceed the 8- and 16-bit ranges; the
+				// per-digit loop below only guards digits it parses itself.
+				// The condition folds away for wider destinations.
+				if bits <= 16 && value > limit {
+					return c.genericError[T](start, "integer overflow")
+				}
 			}
 		}
 		for i < n && isDigit(fastByteAt(base, i)) {
@@ -618,6 +624,12 @@ func (c *decoderCursor) Uint[T unsignedInteger](dst *T) error {
 			} else if all8Digits(digits) {
 				value = parse8Digits(digits)
 				i += 8
+				// Eight digits always exceed the 8- and 16-bit ranges; the
+				// per-digit loop below only guards digits it parses itself.
+				// The condition folds away for wider destinations.
+				if bits <= 16 && value > limit {
+					return c.genericError[T](start, "unsigned integer overflow")
+				}
 			}
 		}
 		for i < n && isDigit(fastByteAt(base, i)) {
