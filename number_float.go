@@ -427,6 +427,12 @@ func scanTypedTwoDigitFloat64(base unsafe.Pointer, n, start int) (end int, value
 			digits = 18
 			fractionDigits = 16
 			i += tailDigits
+			if c := fastByteAt(base, i); c != 'e' && c != 'E' {
+				value = scaleJSONFloat64Fixed(
+					mantissa, 0xe69594bec44de15c, 0xb3d141978676564c, 968, negative,
+				)
+				return i, value, true, true
+			}
 		}
 	}
 	for i < n && isDigit(fastByteAt(base, i)) {
@@ -494,6 +500,12 @@ func scanTypedThreeDigitFloat64(base unsafe.Pointer, n, start int) (end int, val
 			digits = 18
 			fractionDigits = 15
 			i += tailDigits
+			if c := fastByteAt(base, i); c != 'e' && c != 'E' {
+				value = scaleJSONFloat64Fixed(
+					mantissa, 0x901d7cf73ab0acda, 0xf062c8feb409f5ef, 972, negative,
+				)
+				return i, value, true, true
+			}
 		}
 	}
 	for i < n && isDigit(fastByteAt(base, i)) {

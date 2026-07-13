@@ -144,7 +144,7 @@ func TestEncoderFloatFormatsDifferential(t *testing.T) {
 }
 
 func BenchmarkAppendCompactUint(b *testing.B) {
-	for _, value := range []uint64{7, 42, 9999, 12345678, 1234567890123, math.MaxUint64} {
+	for _, value := range []uint64{7, 42, 9999, 12345678, 123456789, 1234567890, 1234567890123, math.MaxUint64} {
 		b.Run(fmt.Sprintf("%d/compact", value), func(b *testing.B) {
 			var dst []byte
 			for range b.N {

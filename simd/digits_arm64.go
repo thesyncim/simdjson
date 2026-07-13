@@ -1,11 +1,8 @@
 //go:build goexperiment.simd && arm64
 
-package simdjson
+package simd
 
-import (
-	"simd/archsimd"
-	"unsafe"
-)
+import "simd/archsimd"
 
 var (
 	digitWeights10ARM    = [...]uint8{10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1}
@@ -13,9 +10,11 @@ var (
 	digitWeights10000ARM = [...]uint32{10000, 1, 10000, 1}
 )
 
-func parse16Digits(base unsafe.Pointer) uint64 {
-	digits := archsimd.LoadUint8x16Array((*[16]uint8)(base)).Sub(archsimd.BroadcastUint8x16('0'))
-	weighted10 := digits.Mul(archsimd.LoadUint8x16Array(&digitWeights10ARM))
+// Parse16Digits reduces sixteen ASCII decimal digits without validating them.
+// Call All16Digits first when the input is not already known to be digits.
+func Parse16Digits(digits *[16]byte) uint64 {
+	values := archsimd.LoadUint8x16Array(digits).Sub(archsimd.BroadcastUint8x16('0'))
+	weighted10 := values.Mul(archsimd.LoadUint8x16Array(&digitWeights10ARM))
 	lo := weighted10.ExtendLo8ToUint16()
 	hi := weighted10.HiToLo().ExtendLo8ToUint16()
 	pairs := lo.ConcatAddPairs(hi)
@@ -26,6 +25,10 @@ func parse16Digits(base unsafe.Pointer) uint64 {
 	return uint64(eights.GetElem(0))*100000000 + uint64(eights.GetElem(1))
 }
 
-func numberSIMDBackend() string {
+func numberBackend() string {
 	return "arm64-neon"
+}
+
+func numberVectorBytes() int {
+	return 16
 }

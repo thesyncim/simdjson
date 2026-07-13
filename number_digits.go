@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"math/bits"
 	"unsafe"
+
+	simdkernels "github.com/thesyncim/simdjson/simd"
 )
 
 const (
@@ -36,19 +38,17 @@ func scanDigitsFast(base unsafe.Pointer, n, i int) int {
 }
 
 func all16Digits(base unsafe.Pointer) bool {
-	x0 := loadUint64LE(base)
-	x1 := loadUint64LE(unsafe.Add(base, 8))
-	return nonDigitMask8(x0) == 0 && nonDigitMask8(x1) == 0
+	return simdkernels.All16Digits((*[16]byte)(base))
 }
 
 func all8Digits(base unsafe.Pointer) bool {
-	return nonDigitMask8(loadUint64LE(base)) == 0
+	return simdkernels.All8Digits((*[8]byte)(base))
 }
 
 // parse8Digits reduces eight ASCII digits in three pairwise multiply stages.
 // It is the small-token companion to the architecture SIMD 16-digit parser.
 func parse8Digits(base unsafe.Pointer) uint64 {
-	return parse8DigitsWord(loadUint64LE(base))
+	return simdkernels.Parse8Digits((*[8]byte)(base))
 }
 
 func parse8DigitsWord(x uint64) uint64 {

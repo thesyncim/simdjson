@@ -42,6 +42,7 @@ const (
 	decoderCaseSensitive
 	decoderSourceOwned
 	decoderReplace
+	decoderExpectedSlow
 )
 
 // decoderCursor is the concrete, interface-free parser used by compiled typed

@@ -1036,6 +1036,12 @@ const encodeDigitPairs = "" +
 	"80818283848586878889" +
 	"90919293949596979899"
 
+func storeCompactDigitPair(dst unsafe.Pointer, i int, pair uint64) {
+	// appendCompactUint proves two output bytes and pair < 100 before each call.
+	src := unsafe.Add(unsafe.Pointer(unsafe.StringData(encodeDigitPairs)), pair*2)
+	*(*[2]byte)(unsafe.Add(dst, i)) = *(*[2]byte)(src)
+}
+
 // appendCompactUint formats v with two digits per store. It beats the
 // general strconv path on the short integers that dominate JSON documents.
 func appendCompactUint(dst []byte, v uint64) []byte {
@@ -1058,17 +1064,35 @@ func appendCompactUint(dst []byte, v uint64) []byte {
 	start := len(dst)
 	dst = dst[:start+digits]
 	i := len(dst)
-	for v >= 100 {
-		pair := (v % 100) * 2
+	base := unsafe.Pointer(unsafe.SliceData(dst))
+	switch {
+	case v >= 1e8:
+		pair := v % 100
 		v /= 100
 		i -= 2
-		dst[i] = encodeDigitPairs[pair]
-		dst[i+1] = encodeDigitPairs[pair+1]
+		storeCompactDigitPair(base, i, pair)
+		fallthrough
+	case v >= 1e6:
+		pair := v % 100
+		v /= 100
+		i -= 2
+		storeCompactDigitPair(base, i, pair)
+		fallthrough
+	case v >= 1e4:
+		pair := v % 100
+		v /= 100
+		i -= 2
+		storeCompactDigitPair(base, i, pair)
+		fallthrough
+	case v >= 100:
+		pair := v % 100
+		v /= 100
+		i -= 2
+		storeCompactDigitPair(base, i, pair)
 	}
 	if v >= 10 {
 		i -= 2
-		dst[i] = encodeDigitPairs[v*2]
-		dst[i+1] = encodeDigitPairs[v*2+1]
+		storeCompactDigitPair(base, i, v)
 	} else {
 		i--
 		dst[i] = byte('0' + v)

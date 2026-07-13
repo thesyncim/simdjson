@@ -110,3 +110,38 @@ func scaleJSONFloat64(mantissa uint64, exponent int, negative bool) (float64, bo
 	bits64 := packed&^(uint64(1)<<52) | uint64(1075-e)<<52
 	return math.Float64frombits(bits64), true
 }
+
+// scaleJSONFloat64Fixed is the exact negative-power conversion used by typed
+// fixed-shape fast paths. Callers prove a nonzero, normal result and supply the
+// already-selected power and binary exponent bias.
+func scaleJSONFloat64Fixed(mantissa, powerHi, powerLo uint64, exponentBias int, negative bool) float64 {
+	b := bits.Len64(mantissa)
+	normalized := mantissa << (64 - b)
+	hi, mid := bits.Mul64(normalized, powerHi)
+
+	var scaled jsonUnrounded
+	if hi&0xff != 0 {
+		scaled = jsonUnrounded(hi>>8 | 1)
+	} else {
+		mid2, _ := bits.Mul64(normalized, powerLo)
+		if mid < mid2 {
+			hi--
+		}
+		sticky := uint64(0)
+		if mid-mid2 > 1 {
+			sticky = 1
+		}
+		scaled = jsonUnrounded(hi>>8 | sticky)
+	}
+
+	if scaled >= jsonUnrounded(1<<53<<2-2) {
+		scaled = scaled>>1 | scaled&1
+		exponentBias++
+	}
+	packed := scaled.round()
+	if negative {
+		packed |= 1 << 63
+	}
+	packed = packed&^(uint64(1)<<52) | uint64(exponentBias+b)<<52
+	return math.Float64frombits(packed)
+}

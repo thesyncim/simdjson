@@ -112,7 +112,12 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 		var err error
 		if position < len(node.fields) {
 			field = &node.fields[position]
-			key, matched, ok, err = cursor.nextObjectFieldExpected(first, field)
+			if cursor.flags&decoderExpectedSlow == 0 && cursor.matchObjectFieldExpected(first, field) {
+				matched, ok = true, true
+			} else {
+				cursor.flags |= decoderExpectedSlow
+				key, matched, ok, err = cursor.nextObjectFieldExpectedSlow(first, field)
+			}
 		} else {
 			key, ok, err = cursor.NextObjectField(first)
 		}
@@ -216,7 +221,59 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 	}
 }
 
-func (cursor *decoderCursor) nextObjectFieldExpected(first bool, expected *typedField) (key string, matched, ok bool, err error) {
+func (cursor *decoderCursor) matchObjectFieldExpected(first bool, expected *typedField) bool {
+	src := cursor.src
+	i := cursor.i
+	n := len(src)
+	if i >= n || expected.keyMask == 0 {
+		return false
+	}
+	base := unsafe.Pointer(unsafe.SliceData(src))
+	if first {
+		if fastByteAt(base, i) != '"' {
+			return false
+		}
+	} else {
+		if fastByteAt(base, i) != ',' {
+			return false
+		}
+		i++
+		if i >= n || fastByteAt(base, i) != '"' {
+			return false
+		}
+	}
+
+	keyStart := i + 1
+	if keyStart+8 > n {
+		return false
+	}
+	word := loadUint64LE(unsafe.Add(base, keyStart))
+	if (word^expected.key)&expected.keyMask != 0 {
+		return false
+	}
+	keyEnd := keyStart + int(expected.keyLen)
+	if expected.keyLen <= 6 {
+		cursor.i = keyEnd + 2
+		if cursor.i < n && fastByteAt(base, cursor.i) <= ' ' {
+			cursor.skipSpace()
+		}
+		return true
+	}
+	if keyEnd+1 >= n || fastByteAt(base, keyEnd) != '"' || fastByteAt(base, keyEnd+1) != ':' {
+		return false
+	}
+	if expected.keyLen > 7 && !matchStringAt(src, keyStart+8, expected.name[8:]) {
+		return false
+	}
+	cursor.i = keyEnd + 2
+	if cursor.i < n && fastByteAt(base, cursor.i) <= ' ' {
+		cursor.skipSpace()
+	}
+	return true
+}
+
+//go:noinline
+func (cursor *decoderCursor) nextObjectFieldExpectedSlow(first bool, expected *typedField) (key string, matched, ok bool, err error) {
 	i := cursor.i
 	if i < len(cursor.src) && cursor.src[i] <= ' ' {
 		i = skipSpace(cursor.src, i)

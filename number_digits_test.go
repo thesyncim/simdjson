@@ -90,6 +90,42 @@ func TestScanTypedFloat64GeographicShapesMatchStrconv(t *testing.T) {
 	}
 }
 
+func TestScaleJSONFloat64FixedMatchesGeneric(t *testing.T) {
+	tests := []struct {
+		exponent     int
+		powerHi      uint64
+		powerLo      uint64
+		exponentBias int
+		minimum      uint64
+		span         uint64
+	}{
+		{-16, 0xe69594bec44de15c, 0xb3d141978676564c, 968, 1e17, 18e17},
+		{-15, 0x901d7cf73ab0acda, 0xf062c8feb409f5ef, 972, 1e17, 18e17},
+	}
+	for _, tc := range tests {
+		state := uint64(0x9e3779b97f4a7c15)
+		for range 100000 {
+			state ^= state << 13
+			state ^= state >> 7
+			state ^= state << 17
+			mantissa := tc.minimum + state%tc.span
+			for _, negative := range []bool{false, true} {
+				want, ok := scaleJSONFloat64(mantissa, tc.exponent, negative)
+				if !ok {
+					t.Fatalf("scaleJSONFloat64(%d, %d, %v) was not exact", mantissa, tc.exponent, negative)
+				}
+				got := scaleJSONFloat64Fixed(
+					mantissa, tc.powerHi, tc.powerLo, tc.exponentBias, negative,
+				)
+				if math.Float64bits(got) != math.Float64bits(want) {
+					t.Fatalf("fixed scale of %d*10^%d = %.17g (%#x), want %.17g (%#x)",
+						mantissa, tc.exponent, got, math.Float64bits(got), want, math.Float64bits(want))
+				}
+			}
+		}
+	}
+}
+
 func TestParse8Digits(t *testing.T) {
 	for value := uint64(0); value < 100000000; value += 7919 {
 		text := []byte(fmt.Sprintf("%08d", value))
