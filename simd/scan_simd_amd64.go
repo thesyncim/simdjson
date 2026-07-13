@@ -83,6 +83,10 @@ func scanEncodedHTMLSyntaxRuntime(src []byte, i int) int {
 	}
 }
 
+func validUTF8NoLineSeparatorRuntime(src []byte) bool {
+	return validUTF8NoLineSeparatorGeneric(src)
+}
+
 func validUTF8Runtime(src []byte) bool {
 	if len(src) < 16 {
 		return utf8.Valid(src)

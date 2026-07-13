@@ -648,6 +648,12 @@ func validUTF8Fast(src []byte) bool {
 // encoder so each full vector is loaded once. It reports false for malformed
 // UTF-8 or for U+2028/U+2029, both of which require the scalar escaping path.
 func validUTF8NoLineSeparatorFast(src []byte) bool {
+	return validUTF8NoLineSeparatorRuntime(src)
+}
+
+// validUTF8NoLineSeparatorGeneric is the range-compare implementation used
+// where no faster arch-specific kernel exists.
+func validUTF8NoLineSeparatorGeneric(src []byte) bool {
 	if len(src) < 16 {
 		return utf8.Valid(src) && !hasJSONLineSeparatorScalar(src, 0)
 	}

@@ -544,3 +544,33 @@ func BenchmarkCopyHTMLStringPrefixASCII(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkValidUTF8NoLineSeparator(b *testing.B) {
+	unit := []byte("json-ハンドラ-héllo-🙂-données-")
+	for _, n := range []int{64, 512, 4096} {
+		src := make([]byte, 0, n+64)
+		for len(src) < n {
+			src = append(src, unit...)
+		}
+		src = src[:n:n]
+		for len(src) > 0 && src[len(src)-1]&0xc0 == 0x80 {
+			src = src[:len(src)-1]
+		}
+		b.Run(fmt.Sprintf("generic/%d", len(src)), func(b *testing.B) {
+			b.SetBytes(int64(len(src)))
+			for range b.N {
+				if !validUTF8NoLineSeparatorGeneric(src) {
+					b.Fatal("rejected clean input")
+				}
+			}
+		})
+		b.Run(fmt.Sprintf("runtime/%d", len(src)), func(b *testing.B) {
+			b.SetBytes(int64(len(src)))
+			for range b.N {
+				if !validUTF8NoLineSeparatorRuntime(src) {
+					b.Fatal("rejected clean input")
+				}
+			}
+		})
+	}
+}
