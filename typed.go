@@ -274,6 +274,7 @@ type typedNode struct {
 	fieldTable       []int16
 	fieldTableMask   uint32
 	encFields        []typedEncField
+	encNameData      []byte
 	fieldHops        [][]typedFieldHop
 	hopResets        []uintptr
 	reset            []typedResetOp
@@ -300,13 +301,15 @@ type typedField struct {
 // typedEncField holds the complete encoder-only view of a struct field, so the
 // hot encode loop does not touch the larger decoder field record.
 type typedEncField struct {
-	encName   string
-	node      *typedNode
-	offset    uintptr
-	hop       int16
-	encOp     typedOp
-	pairOp    typedEncPairOp
-	omitEmpty bool
+	encName      string
+	node         *typedNode
+	offset       uintptr
+	hop          int16
+	encNameBlock uint16
+	encOp        typedOp
+	pairOp       typedEncPairOp
+	encNameLen   uint8
+	omitEmpty    bool
 }
 
 type typedEncPairOp uint8
@@ -329,6 +332,16 @@ const (
 	typedEncPairUint64Uint64
 	typedEncPairStringFloat64
 	typedEncPairStructInt64
+	typedEncPairInt64Int64
+	typedEncPairInt64String
+	typedEncPairStringInt64
+	typedEncPairInt64Slice
+	typedEncPairSliceInt64
+	typedEncPairSliceAny
+	typedEncPairAnySlice
+	typedEncPairAnyAny
+	typedEncPairAnyInt64
+	typedEncPairMapMap
 )
 
 type typedCompiler struct {
@@ -564,6 +577,21 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 			for i := 0; i+1 < len(node.encFields); i += 2 {
 				node.encFields[i].pairOp = classifyTypedEncPair(node.encFields[i].encOp, node.encFields[i+1].encOp)
 			}
+			if len(node.encFields) != 0 {
+				node.encFields[0].encName = node.encFields[0].encName[1:]
+			}
+			const blockBytes = 16
+			for i := range node.encFields {
+				field := &node.encFields[i]
+				block := len(node.encNameData) / blockBytes
+				if len(field.encName) <= blockBytes && block <= int(^uint16(0)) {
+					field.encNameBlock = uint16(block)
+					field.encNameLen = uint8(len(field.encName))
+					start := len(node.encNameData)
+					node.encNameData = append(node.encNameData, make([]byte, blockBytes)...)
+					copy(node.encNameData[start:], field.encName)
+				}
+			}
 		}
 		if len(node.fields) <= 64 {
 			if len(node.fields) == 64 {
@@ -636,6 +664,26 @@ func classifyTypedEncPair(first, second typedOp) typedEncPairOp {
 		return typedEncPairStringFloat64
 	case first == typedOpStruct && second == typedOpInt64:
 		return typedEncPairStructInt64
+	case first == typedOpInt64 && second == typedOpInt64:
+		return typedEncPairInt64Int64
+	case first == typedOpInt64 && second == typedOpString:
+		return typedEncPairInt64String
+	case first == typedOpString && second == typedOpInt64:
+		return typedEncPairStringInt64
+	case first == typedOpInt64 && second == typedOpSlice:
+		return typedEncPairInt64Slice
+	case first == typedOpSlice && second == typedOpInt64:
+		return typedEncPairSliceInt64
+	case first == typedOpSlice && second == typedOpAny:
+		return typedEncPairSliceAny
+	case first == typedOpAny && second == typedOpSlice:
+		return typedEncPairAnySlice
+	case first == typedOpAny && second == typedOpAny:
+		return typedEncPairAnyAny
+	case first == typedOpAny && second == typedOpInt64:
+		return typedEncPairAnyInt64
+	case first == typedOpMap && second == typedOpMap:
+		return typedEncPairMapMap
 	default:
 		return typedEncPairFallback
 	}

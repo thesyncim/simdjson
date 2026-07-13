@@ -50,6 +50,19 @@ func store16DigitsScalar(dst *[16]byte, value uint64) {
 	binary.LittleEndian.PutUint64(dst[8:], second)
 }
 
+func storeDateTimePartsScalar(dst *[20]byte, year, month, day, hour, minute, second uint32) {
+	var digits [16]byte
+	Store8Digits((*[8]byte)(digits[:8]), uint64(year)*10_000+uint64(month)*100+uint64(day))
+	Store8Digits((*[8]byte)(digits[8:]), uint64(hour)*1_000_000+uint64(minute)*10_000+uint64(second)*100)
+	copy(dst[:], `"0000-00-00T00:00:00`)
+	dst[1], dst[2], dst[3], dst[4] = digits[0], digits[1], digits[2], digits[3]
+	dst[6], dst[7] = digits[4], digits[5]
+	dst[9], dst[10] = digits[6], digits[7]
+	dst[12], dst[13] = digits[8], digits[9]
+	dst[15], dst[16] = digits[10], digits[11]
+	dst[18], dst[19] = digits[12], digits[13]
+}
+
 // encodeTwoFourDigitChunks converts two values below 10000 into eight unpacked
 // decimal digits using parallel reciprocal division within one scalar word.
 func encodeTwoFourDigitChunks(hi, lo uint64) uint64 {

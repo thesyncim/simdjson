@@ -502,7 +502,7 @@ func BenchmarkStringScannerQuoteAtEnd(b *testing.B) {
 }
 
 func BenchmarkEncodedHTMLScannerASCII(b *testing.B) {
-	lengths := []int{16, 32, 48, 64, 96, 128, 256, 512, 1024}
+	lengths := []int{16, 17, 24, 31, 32, 33, 47, 48, 63, 64, 95, 96, 127, 128, 256, 512, 1024}
 	for _, n := range lengths {
 		src := longScanCase(n, -1, 0)
 		b.Run(fmt.Sprintf("scalar/%d", n), func(b *testing.B) {
@@ -524,7 +524,7 @@ func BenchmarkEncodedHTMLScannerASCII(b *testing.B) {
 }
 
 func BenchmarkCopyHTMLStringPrefixASCII(b *testing.B) {
-	lengths := []int{16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048}
+	lengths := []int{1, 4, 8, 15, 16, 17, 24, 31, 32, 33, 47, 48, 63, 64, 95, 96, 127, 128, 192, 256, 384, 512, 768, 1024, 2048}
 	for _, n := range lengths {
 		src := longScanCase(n, -1, 0)
 		dst := make([]byte, n)

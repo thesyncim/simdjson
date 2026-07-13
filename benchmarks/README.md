@@ -22,7 +22,7 @@ enter simdjson's root module graph.
   `goexperiment.jsonv2` tag.
 
 The synthetic fixtures are 31 bytes, 4,240 bytes (32 records), and 136,586
-bytes (1,024 records). Exact-corpus results use six 200 ms samples; synthetic
+bytes (1,024 records). Exact-corpus results use six 300 ms single-CPU samples; synthetic
 published results use five one-second samples.
 
 ## Exact standard-library corpus
@@ -30,7 +30,7 @@ published results use five one-second samples.
 ```sh
 GOEXPERIMENT=simd "$TIP_GO" test -run='^$' \
   -bench='^BenchmarkStdlibCorpus$' \
-  -benchmem -benchtime=200ms -count=6 .
+  -benchmem -benchtime=300ms -count=6 -cpu=1 .
 ```
 
 The benchmark exposes `valid`, `dynamic-owned`, `typed-reused`, and `encode`

@@ -271,13 +271,11 @@ func (e *encodeState) encodeKind(node *typedNode, src unsafe.Pointer, kind typed
 }
 
 func (e *encodeState) encodeTime(src unsafe.Pointer) error {
-	e.dst = append(e.dst, '"')
 	var err error
-	e.dst, err = (*time.Time)(src).AppendText(e.dst)
+	e.dst, err = simdkernels.AppendTime(e.dst, *(*time.Time)(src))
 	if err != nil {
 		return &EncodeError{Reason: "MarshalJSON: Time.MarshalJSON: " + strings.TrimPrefix(err.Error(), "Time.AppendText: ")}
 	}
-	e.dst = append(e.dst, '"')
 	return nil
 }
 
@@ -372,15 +370,12 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 
 func (e *encodeState) encodeSimpleStructPairs(node *typedNode, src unsafe.Pointer) error {
 	fields := node.encFields
+	packedNames := node.encNameData
 	i := 0
 	for ; i+1 < len(fields); i += 2 {
 		first := &fields[i]
 		second := &fields[i+1]
-		name := first.encName
-		if i == 0 {
-			name = name[1:]
-		}
-		e.dst = append(e.dst, name...)
+		e.dst = appendSimpleFieldName(e.dst, first, packedNames)
 		firstSrc := unsafe.Add(src, first.offset)
 		secondSrc := unsafe.Add(src, second.offset)
 		errorIndex := i
@@ -388,103 +383,160 @@ func (e *encodeState) encodeSimpleStructPairs(node *typedNode, src unsafe.Pointe
 		switch first.pairOp {
 		case typedEncPairStringString:
 			e.dst = appendEncodedJSONString(e.dst, *(*string)(firstSrc), e.escapeHTML)
-			e.dst = append(e.dst, second.encName...)
+			e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 			e.dst = appendEncodedJSONString(e.dst, *(*string)(secondSrc), e.escapeHTML)
 		case typedEncPairSliceString:
 			err = e.encodeSlice(first.node, firstSrc)
 			if err == nil {
-				e.dst = append(e.dst, second.encName...)
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 				e.dst = appendEncodedJSONString(e.dst, *(*string)(secondSrc), e.escapeHTML)
 			}
 		case typedEncPairSliceStruct:
 			err = e.encodeSlice(first.node, firstSrc)
 			if err == nil {
-				e.dst = append(e.dst, second.encName...)
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 				errorIndex = i + 1
 				err = e.encodeStruct(second.node, secondSrc)
 			}
 		case typedEncPairSliceSlice:
 			err = e.encodeSlice(first.node, firstSrc)
 			if err == nil {
-				e.dst = append(e.dst, second.encName...)
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 				errorIndex = i + 1
 				err = e.encodeSlice(second.node, secondSrc)
 			}
 		case typedEncPairStructStruct:
 			err = e.encodeStruct(first.node, firstSrc)
 			if err == nil {
-				e.dst = append(e.dst, second.encName...)
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 				errorIndex = i + 1
 				err = e.encodeStruct(second.node, secondSrc)
 			}
 		case typedEncPairMarshalerMarshaler:
 			err = e.encodeMarshaler(first.node, firstSrc)
 			if err == nil {
-				e.dst = append(e.dst, second.encName...)
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 				errorIndex = i + 1
 				err = e.encodeMarshaler(second.node, secondSrc)
 			}
 		case typedEncPairStructSlice:
 			err = e.encodeStruct(first.node, firstSrc)
 			if err == nil {
-				e.dst = append(e.dst, second.encName...)
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 				errorIndex = i + 1
 				err = e.encodeSlice(second.node, secondSrc)
 			}
 		case typedEncPairStringSlice:
 			e.dst = appendEncodedJSONString(e.dst, *(*string)(firstSrc), e.escapeHTML)
-			e.dst = append(e.dst, second.encName...)
+			e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 			errorIndex = i + 1
 			err = e.encodeSlice(second.node, secondSrc)
 		case typedEncPairMarshalerStruct:
 			err = e.encodeMarshaler(first.node, firstSrc)
 			if err == nil {
-				e.dst = append(e.dst, second.encName...)
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 				errorIndex = i + 1
 				err = e.encodeStruct(second.node, secondSrc)
 			}
 		case typedEncPairMarshalerString:
 			err = e.encodeMarshaler(first.node, firstSrc)
 			if err == nil {
-				e.dst = append(e.dst, second.encName...)
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 				e.dst = appendEncodedJSONString(e.dst, *(*string)(secondSrc), e.escapeHTML)
 			}
 		case typedEncPairStructString:
 			err = e.encodeStruct(first.node, firstSrc)
 			if err == nil {
-				e.dst = append(e.dst, second.encName...)
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 				e.dst = appendEncodedJSONString(e.dst, *(*string)(secondSrc), e.escapeHTML)
 			}
 		case typedEncPairStringStruct:
 			e.dst = appendEncodedJSONString(e.dst, *(*string)(firstSrc), e.escapeHTML)
-			e.dst = append(e.dst, second.encName...)
+			e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 			errorIndex = i + 1
 			err = e.encodeStruct(second.node, secondSrc)
 		case typedEncPairFloat64Int64:
 			err = e.encodeFloat(*(*float64)(firstSrc), 64)
 			if err == nil {
-				e.dst = append(e.dst, second.encName...)
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 				e.dst = appendCompactInt(e.dst, *(*int64)(secondSrc))
 			}
 		case typedEncPairUint64Uint64:
 			e.dst = appendCompactUint(e.dst, *(*uint64)(firstSrc))
-			e.dst = append(e.dst, second.encName...)
+			e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 			e.dst = appendCompactUint(e.dst, *(*uint64)(secondSrc))
 		case typedEncPairStringFloat64:
 			e.dst = appendEncodedJSONString(e.dst, *(*string)(firstSrc), e.escapeHTML)
-			e.dst = append(e.dst, second.encName...)
+			e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 			errorIndex = i + 1
 			err = e.encodeFloat(*(*float64)(secondSrc), 64)
 		case typedEncPairStructInt64:
 			err = e.encodeStruct(first.node, firstSrc)
 			if err == nil {
-				e.dst = append(e.dst, second.encName...)
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 				e.dst = appendCompactInt(e.dst, *(*int64)(secondSrc))
+			}
+		case typedEncPairInt64Int64:
+			e.dst = appendCompactInt(e.dst, *(*int64)(firstSrc))
+			e.dst = appendSimpleFieldName(e.dst, second, packedNames)
+			e.dst = appendCompactInt(e.dst, *(*int64)(secondSrc))
+		case typedEncPairInt64String:
+			e.dst = appendCompactInt(e.dst, *(*int64)(firstSrc))
+			e.dst = appendSimpleFieldName(e.dst, second, packedNames)
+			e.dst = appendEncodedJSONString(e.dst, *(*string)(secondSrc), e.escapeHTML)
+		case typedEncPairStringInt64:
+			e.dst = appendEncodedJSONString(e.dst, *(*string)(firstSrc), e.escapeHTML)
+			e.dst = appendSimpleFieldName(e.dst, second, packedNames)
+			e.dst = appendCompactInt(e.dst, *(*int64)(secondSrc))
+		case typedEncPairInt64Slice:
+			e.dst = appendCompactInt(e.dst, *(*int64)(firstSrc))
+			e.dst = appendSimpleFieldName(e.dst, second, packedNames)
+			errorIndex = i + 1
+			err = e.encodeSlice(second.node, secondSrc)
+		case typedEncPairSliceInt64:
+			err = e.encodeSlice(first.node, firstSrc)
+			if err == nil {
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
+				e.dst = appendCompactInt(e.dst, *(*int64)(secondSrc))
+			}
+		case typedEncPairSliceAny:
+			err = e.encodeSlice(first.node, firstSrc)
+			if err == nil {
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
+				errorIndex = i + 1
+				err = e.encodeAny(secondSrc)
+			}
+		case typedEncPairAnySlice:
+			err = e.encodeAny(firstSrc)
+			if err == nil {
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
+				errorIndex = i + 1
+				err = e.encodeSlice(second.node, secondSrc)
+			}
+		case typedEncPairAnyAny:
+			err = e.encodeAny(firstSrc)
+			if err == nil {
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
+				errorIndex = i + 1
+				err = e.encodeAny(secondSrc)
+			}
+		case typedEncPairAnyInt64:
+			err = e.encodeAny(firstSrc)
+			if err == nil {
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
+				e.dst = appendCompactInt(e.dst, *(*int64)(secondSrc))
+			}
+		case typedEncPairMapMap:
+			err = e.encodeMap(first.node, firstSrc)
+			if err == nil {
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
+				errorIndex = i + 1
+				err = e.encodeMap(second.node, secondSrc)
 			}
 		default:
 			err = e.encodeStructFieldValue(first, firstSrc)
 			if err == nil {
-				e.dst = append(e.dst, second.encName...)
+				e.dst = appendSimpleFieldName(e.dst, second, packedNames)
 				errorIndex = i + 1
 				err = e.encodeStructFieldValue(second, secondSrc)
 			}
@@ -496,11 +548,7 @@ func (e *encodeState) encodeSimpleStructPairs(node *typedNode, src unsafe.Pointe
 	}
 	if i < len(fields) {
 		field := &fields[i]
-		name := field.encName
-		if i == 0 {
-			name = name[1:]
-		}
-		e.dst = append(e.dst, name...)
+		e.dst = appendSimpleFieldName(e.dst, field, packedNames)
 		if err := e.encodeStructFieldValue(field, unsafe.Add(src, field.offset)); err != nil {
 			e.depth--
 			return prependEncodePathField(err, node.fields[i].name)
@@ -509,6 +557,17 @@ func (e *encodeState) encodeSimpleStructPairs(node *typedNode, src unsafe.Pointe
 	e.dst = append(e.dst, '}')
 	e.depth--
 	return nil
+}
+
+func appendSimpleFieldName(dst []byte, field *typedEncField, packed []byte) []byte {
+	if field.encNameLen == 0 || cap(dst)-len(dst) < 16 {
+		return append(dst, field.encName...)
+	}
+	start := len(dst)
+	dst = dst[:start+16]
+	block := int(field.encNameBlock) * 16
+	*(*[16]byte)(unsafe.Pointer(&dst[start])) = *(*[16]byte)(unsafe.Pointer(&packed[block]))
+	return dst[:start+int(field.encNameLen)]
 }
 
 func (e *encodeState) encodeStructFieldValue(field *typedEncField, src unsafe.Pointer) error {
@@ -919,19 +978,10 @@ func (e *encodeState) encodeFloat(value float64, bits int) error {
 		}
 	}
 
-	format := byte('f')
-	if abs := math.Abs(value); abs != 0 {
-		if bits == 64 && (abs < 1e-6 || abs >= 1e21) ||
-			bits == 32 && (float32(abs) < 1e-6 || float32(abs) >= 1e21) {
-			format = 'e'
-		}
-	}
-	e.dst = strconv.AppendFloat(e.dst, value, format, -1, bits)
-	if format == 'e' {
-		if n := len(e.dst); n >= 4 && e.dst[n-4] == 'e' && e.dst[n-3] == '-' && e.dst[n-2] == '0' {
-			e.dst[n-2] = e.dst[n-1]
-			e.dst = e.dst[:n-1]
-		}
+	if bits == 32 {
+		e.dst, _ = simdkernels.AppendFloat32(e.dst, float32(value))
+	} else {
+		e.dst, _ = simdkernels.AppendFloat64(e.dst, value)
 	}
 	return nil
 }
@@ -1158,16 +1208,42 @@ func appendCompactInt(dst []byte, v int64) []byte {
 // with HTML escaping disabled: control bytes, quotes, and backslashes are
 // escaped, invalid UTF-8 becomes �, and U+2028/U+2029 are escaped.
 func appendEncodedJSONString(dst []byte, s string, escapeHTML bool) []byte {
+	const fusedCopyMinBytes = 16
+
 	if len(s) == 0 {
 		return append(dst, '"', '"')
+	}
+	if len(s) >= fusedCopyMinBytes {
+		dst = slices.Grow(dst, len(s)+2)
 	}
 	dst = append(dst, '"')
 	src := unsafe.Slice(unsafe.StringData(s), len(s))
 	first := 0
-	if escapeHTML {
-		first = scanEncodedHTMLSpecialFast(src, 0)
-	} else {
-		first = scanStringSpecial(src, 0)
+	copiedPrefix := false
+	if len(s) >= fusedCopyMinBytes {
+		start := len(dst)
+		dst = dst[:start+len(s)]
+		if escapeHTML {
+			first = simdkernels.CopyHTMLStringPrefix(dst[start:], src)
+		} else {
+			first = simdkernels.CopyStringPrefix(dst[start:], src)
+		}
+		if first >= 0 {
+			if first == len(src) {
+				return append(dst, '"')
+			}
+			dst = dst[:start+first]
+			copiedPrefix = true
+		} else {
+			dst = dst[:start]
+		}
+	}
+	if !copiedPrefix {
+		if escapeHTML {
+			first = scanEncodedHTMLSpecialFast(src, 0)
+		} else {
+			first = scanStringSpecial(src, 0)
+		}
 	}
 	if first == len(src) {
 		dst = append(dst, s...)
@@ -1178,6 +1254,9 @@ func appendEncodedJSONString(dst []byte, s string, escapeHTML bool) []byte {
 		unicodeClean = validUTF8NoLineSeparatorFast(src)
 	}
 	start := 0
+	if copiedPrefix {
+		start = first
+	}
 	for i := first; i < len(s); {
 		// The scanners stop at exactly the escape-relevant set: quotes,
 		// backslashes, control bytes, non-ASCII, and in HTML mode the

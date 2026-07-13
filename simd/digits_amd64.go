@@ -30,6 +30,10 @@ func store16Digits(dst *[16]byte, value uint64) {
 	store16DigitsScalar(dst, value)
 }
 
+func storeDateTimeParts(dst *[20]byte, year, month, day, hour, minute, second uint32) {
+	storeDateTimePartsScalar(dst, year, month, day, hour, minute, second)
+}
+
 func parseBackend() string {
 	if useAVXDigitParser {
 		return "amd64-avx"

@@ -13,7 +13,7 @@ The published exact-corpus run used Go 1.26.4 on Apple M4 Max:
 ```sh
 GOTOOLCHAIN=go1.26.4 go test -run='^$' \
   -bench='^BenchmarkStdlibCorpusNativeSonic$' \
-  -benchmem -benchtime=300ms -count=6 .
+  -benchmem -benchtime=300ms -count=6 -cpu=1 .
 ```
 
 It benchmarks native validation, owned dynamic decode, typed reused decode in

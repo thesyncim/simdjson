@@ -21,10 +21,10 @@ geospatial data, catalogs, Go source statistics, escaped and Unicode strings,
 FHIR, and Twitter data. The benchmark uses the exact upstream concrete models,
 not reduced lookalikes.
 
-These are medians of six 200 ms samples on an Apple M4 Max (`darwin/arm64`) with
-Go commit `03845e30f7b73d1703bd8c21017297f6eecb76d6`. Compilation is outside the
-timer. Results and encoded output are checked against `encoding/json` before
-timing.
+These are medians of six 300 ms, single-CPU samples on an Apple M4 Max
+(`darwin/arm64`) with Go commit
+`03845e30f7b73d1703bd8c21017297f6eecb76d6`. Compilation is outside the timer.
+Results and encoded output are checked against `encoding/json` before timing.
 
 ### Scorecard
 
@@ -34,11 +34,11 @@ for validation. Speedups are geometric means across all seven payloads.
 
 | Operation | Contract | Wins vs stdlib | Wins vs rival | vs stdlib | vs rival |
 |---|---|---:|---:|---:|---:|
-| Validate | Strict JSON and UTF-8 | **7/7** | **7/7** | **2.38x** | **2.18x** |
-| Typed decode | Owned strings, reused destination | **7/7** | **7/7** | **4.70x** | **1.87x** |
-| Dynamic decode | Owned `any` tree | **7/7** | **7/7** | **4.26x** | **1.93x** |
-| Encode | Owned output | **7/7** | **7/7** | **2.36x** | **1.41x** |
-| Encode | Reused output buffer | **7/7** | **7/7** | **2.52x** | **1.50x** |
+| Validate | Strict JSON and UTF-8 | **7/7** | **7/7** | **2.34x** | **2.20x** |
+| Typed decode | Owned strings, reused destination | **7/7** | **7/7** | **3.37x** | **1.52x** |
+| Dynamic decode | Owned `any` tree | **7/7** | **7/7** | **3.28x** | **1.71x** |
+| Encode | Owned output | **7/7** | **4/7** | **2.19x** | **1.30x** |
+| Encode | Reused output buffer | **7/7** | **7/7** | **3.54x** | **2.09x** |
 
 The scorecard does not mix ownership contracts. Source-backed decode and reused
 output are reported separately below. Native Sonic uses a different compiler
@@ -52,25 +52,25 @@ contract.
 
 | Corpus | `encoding/json` | simdjson owned | simdjson source-backed | Fastest tip rival | Native Sonic owned |
 |---|---:|---:|---:|---:|---:|
-| Canada geometry | 1.255 ms | **236.8 us** | 226.6 us | go-json 765.2 us | 441.2 us |
-| CITM catalog | 2.589 ms | **772.2 us** | 698.1 us | go-json 1.083 ms | 1.433 ms |
-| Go source | 6.532 ms | **1.130 ms** | 1.055 ms | Segment 2.196 ms | 3.321 ms |
-| Escaped strings | 188.1 us | **27.44 us** | 25.39 us | go-json 62.10 us | 30.80 us |
-| Unicode strings | 40.51 us | **5.636 us** | 4.756 us | go-json 11.64 us | 11.02 us |
-| Synthea FHIR | 3.831 ms | **1.396 ms** | 1.322 ms | go-json 1.719 ms | 2.695 ms |
-| Twitter status | 1.381 ms | **379.7 us** | 351.4 us | go-json 608.4 us | 707.9 us |
+| Canada geometry | 1.257 ms | **290.2 us** | 226.8 us | Segment 800.9 us | 438.9 us |
+| CITM catalog | 2.548 ms | **1.082 ms** | 877.4 us | go-json 1.321 ms | 1.685 ms |
+| Go source | 6.493 ms | **1.439 ms** | 1.073 ms | Segment 2.318 ms | 4.318 ms |
+| Escaped strings | 205.4 us | **39.0 us** | 31.8 us | go-json 68.7 us | 33.2 us |
+| Unicode strings | 42.0 us | **10.8 us** | 7.2 us | go-json 14.0 us | 12.2 us |
+| Synthea FHIR | 3.855 ms | **1.964 ms** | 1.690 ms | go-json 2.195 ms | 3.456 ms |
+| Twitter status | 1.407 ms | **527.3 us** | 445.6 us | go-json 728.5 us | 768.7 us |
 
 Source-backed allocation counts are not zero for container-heavy models:
 
 | Corpus | Bytes/op | Allocs/op |
 |---|---:|---:|
-| Canada geometry | 407 B | 1 |
-| CITM catalog | 1.677 MiB | 1,227 |
-| Go source | 13.85 KiB | 64 |
+| Canada geometry | 268 B | 0 |
+| CITM catalog | 1.677 MiB | 1,221 |
+| Go source | 9.56 KiB | 44 |
 | Escaped strings | 48.0 KiB | 1 |
 | Unicode strings | 18.0 KiB | 1 |
-| Synthea FHIR | 1.948 MiB | 356 |
-| Twitter status | 631.3 KiB | 140 |
+| Synthea FHIR | 1.945 MiB | 348 |
+| Twitter status | 631.1 KiB | 139 |
 
 Slices, maps, pointers, escaped text, and custom method receivers still require
 storage. Source-backed refers specifically to unescaped string ownership.
@@ -82,13 +82,13 @@ JSON syntax and allocates nothing on valid input.
 
 | Corpus | simdjson dynamic | Fastest tip rival | Native Sonic dynamic | simdjson strict valid | Fastest strict tip rival | Native Sonic syntax-only |
 |---|---:|---:|---:|---:|---:|---:|
-| Canada geometry | **704.9 us** | go-json 1.465 ms | 746.3 us | **124.2 us** | fastjson 210.9 us | 191.5 us |
-| CITM catalog | **1.878 ms** | go-json 3.358 ms | 2.649 ms | **659.9 us** | fastjson 864.1 us | 786.1 us |
-| Go source | **3.401 ms** | jsoniter 7.559 ms | 5.584 ms | **952.1 us** | Segment 1.215 ms | 1.549 ms |
-| Escaped strings | **26.78 us** | go-json 67.99 us | 32.00 us | **4.406 us** | Segment 58.39 us | 3.329 us |
-| Unicode strings | **9.009 us** | go-json 16.53 us | 12.64 us | **3.257 us** | fastjson 7.093 us | 1.744 us |
-| Synthea FHIR | **2.748 ms** | go-json 4.598 ms | 4.472 ms | **773.2 us** | fastjson 1.274 ms | 858.0 us |
-| Twitter status | **916.4 us** | go-json 1.445 ms | 992.9 us | **231.2 us** | fastjson 396.3 us | 233.9 us |
+| Canada geometry | **942.9 us** | go-json 1.891 ms | 809.6 us | **128.2 us** | Segment 223.8 us | 188.8 us |
+| CITM catalog | **2.920 ms** | jsoniter 4.508 ms | 3.254 ms | **647.2 us** | fastjson 871.9 us | 784.7 us |
+| Go source | **4.986 ms** | go-json 9.814 ms | 6.918 ms | **952.2 us** | Segment 1.199 ms | 1.551 ms |
+| Escaped strings | **35.1 us** | go-json 77.5 us | 33.9 us | **4.4 us** | Segment 58.3 us | 3.4 us |
+| Unicode strings | **15.5 us** | go-json 21.7 us | 14.3 us | **3.2 us** | fastjson 7.1 us | 1.7 us |
+| Synthea FHIR | **4.557 ms** | jsoniter 7.063 ms | 5.635 ms | **780.3 us** | fastjson 1.301 ms | 867.0 us |
+| Twitter status | **1.427 ms** | go-json 2.089 ms | 1.230 ms | **231.8 us** | fastjson 402.5 us | 235.8 us |
 
 Sonic v1.15.2 documents that its native `Valid` does not check invalid UTF-8,
 so that column is syntax-only context and is excluded from strict winners and
@@ -102,22 +102,23 @@ caller-owned buffer and is shown separately.
 
 | Corpus | stdlib | simdjson owned | compiled reuse | Fastest tip rival | Native Sonic |
 |---|---:|---:|---:|---:|---:|
-| Canada geometry | 594.1 us | 451.9 us | **443.3 us** | Segment 483.5 us | 772.3 us |
-| CITM catalog | 825.3 us | 298.5 us | **284.9 us** | Segment 319.6 us | 843.0 us |
-| Go source | 2.731 ms | 1.120 ms | **1.061 ms** | Segment 1.210 ms | 3.716 ms |
-| Escaped strings | 17.80 us | 7.268 us | **6.705 us** | Segment 19.29 us | 19.43 us |
-| Unicode strings | 17.92 us | 7.369 us | **6.760 us** | Segment 19.55 us | 19.29 us |
-| Synthea FHIR | 5.459 ms | 1.741 ms | **1.638 ms** | Segment 1.826 ms | 6.854 ms |
-| Twitter status | 596.2 us | 242.7 us | **219.5 us** | go-json 287.0 us | 554.6 us |
+| Canada geometry | 687.8 us | 380.9 us | **306.4 us** | Segment 517.1 us | 794.8 us |
+| CITM catalog | 1.004 ms | 412.4 us | **251.1 us** | go-json 397.4 us | 975.8 us |
+| Go source | 3.332 ms | 1.381 ms | **720.6 us** | Segment 1.458 ms | 4.627 ms |
+| Escaped strings | 20.9 us | 9.7 us | **6.5 us** | jsoniter 22.0 us | 20.9 us |
+| Unicode strings | 21.3 us | 9.8 us | **6.5 us** | Segment 23.0 us | 20.9 us |
+| Synthea FHIR | 6.289 ms | 2.579 ms | **1.394 ms** | Segment 2.210 ms | 8.988 ms |
+| Twitter status | 742.5 us | 367.9 us | **209.3 us** | go-json 360.4 us | 611.9 us |
 
-Both owned and compiled-reuse encoding win every exact-model row. Reuse also
-eliminates the output allocation. The hot struct plan classifies common adjacent
-field operations once, stores the fused opcode without enlarging the 40-byte
-field record, and emits two fields per dispatch. Integer map keys use one local
-byte arena and public reflection iteration; no interface-layout or runtime
-map-layout assumptions are involved. Decimal integers use compact pair stores,
-an exact 8-digit SWAR lane, a cold 10-digit lane, and a 16-digit SIMD formatter
-for large values without enlarging the common short-number instruction path.
+Owned `Marshal` beats stdlib on all seven rows and the fastest compatible rival
+on four. Compile-once buffer reuse removes the output allocation and wins all
+seven rival rows, with a 2.09x geometric lead. The plan classifies common
+adjacent field operations once and emits two fields per dispatch. Names up to
+16 bytes live in compiler-owned fixed blocks and copy with one guarded vector
+load/store without enlarging the 40-byte field record. Integer map keys use a
+local byte arena and public reflection iteration; no interface-layout or
+runtime map-layout assumptions are involved. Integer, float, string, and
+RFC3339 time formatting all use shape-specific SIMD or SWAR paths.
 
 ### SIMD Versus Pure Go
 
@@ -126,13 +127,13 @@ selected once at initialization; short runs remain scalar or SWAR.
 
 | simdjson path | SIMD wins | Geomean SIMD uplift |
 |---|---:|---:|
-| Validation | 6/7 | **1.39x** |
-| Dynamic owned | 3/7 | **1.08x** |
-| Dynamic source-backed | 2/7 | **1.09x** |
-| Typed owned | 4/7 | **1.14x** |
-| Typed source-backed | 5/7 | **1.16x** |
-| Encode owned | 6/7 | **1.40x** |
-| Encode compiled reuse | 6/7 | **1.43x** |
+| Validation | 4/7 | **1.378x** |
+| Dynamic owned | 3/7 | **1.052x** |
+| Dynamic source-backed | 2/7 | **1.049x** |
+| Typed owned | 3/7 | **1.052x** |
+| Typed source-backed | 4/7 | **1.097x** |
+| Encode owned | 6/7 | **1.329x** |
+| Encode compiled reuse | 6/7 | **1.473x** |
 
 Owned typed decode includes a source-sized copy that SIMD cannot accelerate;
 the source-backed row exposes parser uplift more directly. SIMD is not claimed
@@ -252,6 +253,8 @@ if len(src) >= 16 {
 The package also exposes:
 
 - `Store8Digits` and `Store16Digits` for fixed-width decimal formatting;
+- `AppendFloat32` and `AppendFloat64` with `encoding/json` spelling;
+- `AppendTime` for quoted RFC3339Nano formatting;
 - JSON and HTML-safe string scanners, including syntax-only variants;
 - fused `CopyStringPrefix` and `CopyHTMLStringPrefix` scanners;
 - strict UTF-8, U+2028/U+2029, and contiguous `\uXXXX` kernels;
@@ -265,28 +268,32 @@ samples produced these medians, all with zero allocations:
 |---|---:|---:|---:|
 | Parse 16 digits | **1.031 ns** | scalar 6.664 ns | **6.46x** |
 | Store 8 digits | **1.497 ns** | `strconv` 5.783 ns | **3.86x** |
-| Store 16 digits | **2.225 ns** | scalar 3.142 ns | **1.41x** |
-| Store 16 digits | **2.225 ns** | `strconv` 8.187 ns | **3.68x** |
+| Store 16 digits | **2.228 ns** | scalar 3.128 ns | **1.40x** |
+| Store 16 digits | **2.228 ns** | `strconv` 8.112 ns | **3.64x** |
+| Append float64 | **15.49 ns** | `strconv` 24.09 ns | **1.56x** |
+| Append quoted time | **19.53 ns** | `time.AppendText` 31.64 ns | **1.62x** |
+| Store date/time digits | **3.138 ns** | scalar 4.686 ns | **1.49x** |
 
 ## SIMD Dispatch
 
 `GOEXPERIMENT=simd` enables Go-native kernels. Runtime capabilities are read
 once, and implementation choices are fixed during package initialization.
 
-| Runtime | String scanning | Decimal parse | Decimal format |
+| Runtime | String scanning | Decimal parse | Decimal and time format |
 |---|---|---|---|
-| arm64 | NEON on sustained runs; scalar/SWAR tails | NEON 16-digit reduction | NEON 16-digit formatting |
+| arm64 | NEON on sustained runs; overlap-vector tails | NEON 16-digit reduction | NEON 16-digit and RFC3339 formatting |
 | amd64 with AVX-512 | 64-byte AVX-512 | AVX 16-digit reduction | Scalar SWAR |
 | amd64 with AVX2 | 32-byte AVX2 | AVX 16-digit reduction | Scalar SWAR |
 | Other build or CPU | Scalar Go | Scalar Go | Scalar SWAR |
 
 Other vector paths include strict UTF-8 validation using ARM64 `TBL` lookup,
 contiguous `\uXXXX` validation, U+2028/U+2029 detection, syntax scans used by
-string encoding, and shape-dispatched typed decimals. Decimal parsing uses
-register-only SWAR for 8-byte blocks and Go-native SIMD for full 16-digit runs.
-Every vector load is length-guarded. `simd.Current()` reports independent
-string, decimal-parse, and decimal-format backends and widths, the string
-threshold, and detected CPU features.
+string encoding, SIMD placement for common shortest-float shapes, and
+shape-dispatched typed decimals. Decimal parsing uses register-only SWAR for
+8-byte blocks and Go-native SIMD for full 16-digit runs. Every vector load is
+length-guarded. `simd.Current()` reports independent string,
+decimal-parse, and decimal-format backends and widths, the string threshold,
+and detected CPU features.
 
 ## Safety Model
 
@@ -295,6 +302,9 @@ narrow:
 
 - vector loads and stores run only when a complete block remains;
 - public fused-copy kernels reject short or overlapping destinations;
+- packed field-name stores require 16 bytes of destination capacity and read
+  only compiler-owned, exact-width blocks;
+- direct float stores prove the final output size before extending the slice;
 - integer pair stores follow a capacity extension and a table index below 100;
 - typed offsets and strides come from public `reflect` metadata;
 - maps use public reflection APIs and never assume runtime layout;
@@ -319,6 +329,8 @@ The suite includes:
 - typed and dynamic differentials against `encoding/json`;
 - field dominance, tags, merge behavior, duplicate names, numeric boundaries,
   UTF-8, escapes, custom methods, map keys, depth, and error paths;
+- 500,000 randomized float spellings and 700,000 randomized/boundary timestamps
+  against the Go standard library;
 - randomized scalar/SIMD differentials across lengths and alignments;
 - fuzzers for validation, transforms, typed decode, encode, numbers, and SIMD
   scanners.
@@ -353,10 +365,10 @@ TIP_GO="$HOME/sdk/simdjson-gotip/bin/go"
 
 cd benchmarks
 "$TIP_GO" test -run '^$' -bench '^BenchmarkStdlibCorpus$' -benchmem \
-  -benchtime=200ms -count=6 . > corpus-pure.txt
+  -benchtime=300ms -count=6 -cpu=1 . > corpus-pure.txt
 GOEXPERIMENT=simd "$TIP_GO" test -run '^$' \
   -bench '^BenchmarkStdlibCorpus$' -benchmem \
-  -benchtime=200ms -count=6 . > corpus-simd.txt
+  -benchtime=300ms -count=6 -cpu=1 . > corpus-simd.txt
 
 "$TIP_GO" run golang.org/x/perf/cmd/benchstat@v0.0.0-20260615155930-9e4b9ddef5b6 \
   corpus-pure.txt corpus-simd.txt
@@ -364,7 +376,7 @@ GOEXPERIMENT=simd "$TIP_GO" test -run '^$' \
 cd legacy
 GOTOOLCHAIN=go1.26.4 go test -run '^$' \
   -bench '^BenchmarkStdlibCorpusNativeSonic$' -benchmem \
-  -benchtime=300ms -count=6 . > corpus-sonic.txt
+  -benchtime=300ms -count=6 -cpu=1 . > corpus-sonic.txt
 ```
 
 `scripts/check-stdlib-corpus.sh` verifies the compressed payloads and generated
