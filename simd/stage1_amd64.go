@@ -32,10 +32,10 @@ func Stage1Block(p *[64]byte, m *Stage1Masks) {
 	hi2 := v2.ReshapeToUint16s().ShiftAllRight(4).ReshapeToUint8s().And(lowNibble)
 	hi3 := v3.ReshapeToUint16s().ShiftAllRight(4).ReshapeToUint8s().And(lowNibble)
 
-	c0 := loTable.Permute(v0.And(lowNibble)).And(hiTable.Permute(hi0))
-	c1 := loTable.Permute(v1.And(lowNibble)).And(hiTable.Permute(hi1))
-	c2 := loTable.Permute(v2.And(lowNibble)).And(hiTable.Permute(hi2))
-	c3 := loTable.Permute(v3.And(lowNibble)).And(hiTable.Permute(hi3))
+	c0 := loTable.PermuteOrZero(v0.And(lowNibble).BitsToInt8()).And(hiTable.PermuteOrZero(hi0.BitsToInt8()))
+	c1 := loTable.PermuteOrZero(v1.And(lowNibble).BitsToInt8()).And(hiTable.PermuteOrZero(hi1.BitsToInt8()))
+	c2 := loTable.PermuteOrZero(v2.And(lowNibble).BitsToInt8()).And(hiTable.PermuteOrZero(hi2.BitsToInt8()))
+	c3 := loTable.PermuteOrZero(v3.And(lowNibble).BitsToInt8()).And(hiTable.PermuteOrZero(hi3.BitsToInt8()))
 
 	m.Whitespace = stage1Movemask64(
 		c0.And(wsBits).NotEqual(zero),
