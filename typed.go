@@ -347,6 +347,7 @@ const (
 type typedCompiler struct {
 	nodes           map[reflect.Type]*typedNode
 	encScratchTypes []reflect.Type
+	encHasMap       bool
 	escapeHTML      bool
 }
 
@@ -482,6 +483,7 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 		node.mapKeyTextEncode = typ.Key().Implements(textMarshalerReflectType)
 		node.kind = typedMap
 		node.op = typedOpMap
+		c.encHasMap = true
 		elem, err := c.compile(typ.Elem(), path+"[key]")
 		if err != nil {
 			return err

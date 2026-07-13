@@ -17,16 +17,24 @@ type encoderMarshalerScratch struct {
 
 type encoderScratch struct {
 	marshalers []encoderMarshalerScratch
+	// mapEntries and mapKeyArena are reused by encodeMap so sorted map
+	// encoding does not allocate per map. Ownership transfers to one
+	// encodeMap call at a time; nested maps fall back to fresh slices.
+	mapEntries  []mapEncodeEntry
+	mapKeyArena []byte
 }
 
 func (s *encoderScratch) reset() {
 	for i := range s.marshalers {
 		s.marshalers[i].value.SetZero()
 	}
+	// Entries hold key strings and reflect values from the encoded maps;
+	// drop those references before the scratch returns to the pool.
+	clear(s.mapEntries[:cap(s.mapEntries)])
 }
 
-func newEncoderScratchPool(types []reflect.Type) *sync.Pool {
-	if len(types) == 0 {
+func newEncoderScratchPool(types []reflect.Type, hasMap bool) *sync.Pool {
+	if len(types) == 0 && !hasMap {
 		return nil
 	}
 	types = append([]reflect.Type(nil), types...)

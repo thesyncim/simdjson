@@ -51,7 +51,7 @@ func CompileEncoder[T any](opts EncoderOptions) (Encoder[T], error) {
 	return Encoder[T]{
 		root:       root,
 		escapeHTML: escapeHTML,
-		scratch:    newEncoderScratchPool(compiler.encScratchTypes),
+		scratch:    newEncoderScratchPool(compiler.encScratchTypes, compiler.encHasMap),
 	}, nil
 }
 
@@ -832,10 +832,24 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	}
 	e.depth++
 	mapLen := mapValue.Len()
-	entries := make([]mapEncodeEntry, 0, mapLen)
-	numericKeys := !node.mapKeyTextEncode && (node.mapKeyKind == mapKeyInt || node.mapKeyKind == mapKeyUint)
+	// The entry list and numeric-key arena come from the per-call scratch
+	// so sorted map encoding does not allocate per map. Ownership moves to
+	// this call while it runs; a nested map sees nil scratch slices and
+	// allocates its own.
+	var entries []mapEncodeEntry
 	var keyArena []byte
-	if numericKeys && mapLen <= int(^uint(0)>>1)/20 {
+	scratch := e.scratch
+	if scratch != nil {
+		entries = scratch.mapEntries[:0]
+		keyArena = scratch.mapKeyArena[:0]
+		scratch.mapEntries = nil
+		scratch.mapKeyArena = nil
+	}
+	if cap(entries) < mapLen {
+		entries = make([]mapEncodeEntry, 0, mapLen)
+	}
+	numericKeys := !node.mapKeyTextEncode && (node.mapKeyKind == mapKeyInt || node.mapKeyKind == mapKeyUint)
+	if numericKeys && cap(keyArena) < mapLen*20 && mapLen <= int(^uint(0)>>1)/20 {
 		keyArena = make([]byte, 0, mapLen*20)
 	}
 	iterator := mapValue.MapRange()
@@ -859,6 +873,7 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 			var err error
 			name, err = mapKeyName(node, key)
 			if err != nil {
+				e.releaseMapScratch(entries, keyArena)
 				e.depth--
 				return &EncodeError{Reason: err.Error()}
 			}
@@ -878,13 +893,29 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		e.dst = append(e.dst, ':')
 		elementValue.Set(entries[i].value)
 		if err := e.encodeNonAddressable(node.elem, elementPtr); err != nil {
+			// Clone: numeric key names alias the pooled arena, and the
+			// error must outlive this call's ownership of it.
+			name := strings.Clone(entries[i].name)
+			e.releaseMapScratch(entries, keyArena)
 			e.depth--
-			return prependEncodePathField(err, entries[i].name)
+			return prependEncodePathField(err, name)
 		}
 	}
 	e.dst = append(e.dst, '}')
+	e.releaseMapScratch(entries, keyArena)
 	e.depth--
 	return nil
+}
+
+// releaseMapScratch returns encodeMap's working slices to the scratch,
+// keeping their grown capacity for the next map.
+func (e *encodeState) releaseMapScratch(entries []mapEncodeEntry, keyArena []byte) {
+	scratch := e.scratch
+	if scratch == nil || scratch.mapEntries != nil {
+		return
+	}
+	scratch.mapEntries = entries[:0]
+	scratch.mapKeyArena = keyArena[:0]
 }
 
 type mapEncodeEntry struct {
