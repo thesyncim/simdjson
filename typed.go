@@ -282,6 +282,7 @@ type typedNode struct {
 	encSimple        bool
 	allSet           uint64
 	encScratch       int32
+	encMapElem       int32
 }
 
 type typedField struct {
@@ -349,6 +350,10 @@ type typedCompiler struct {
 	encScratchTypes []reflect.Type
 	encHasMap       bool
 	escapeHTML      bool
+	// dynamic marks plans compiled for interface values at encode time.
+	// Their nodes run against whatever static plan is executing, so they
+	// must never carry indexes into that plan's scratch slots.
+	dynamic bool
 }
 
 var jsonNumberReflectType = reflect.TypeFor[json.Number]()
@@ -358,7 +363,7 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 	if node := c.nodes[typ]; node != nil {
 		return node, nil
 	}
-	node := &typedNode{typ: typ, name: typ.String(), size: typ.Size(), encScratch: -1}
+	node := &typedNode{typ: typ, name: typ.String(), size: typ.Size(), encScratch: -1, encMapElem: -1}
 	c.nodes[typ] = node
 
 	if err := c.compileStructural(node, typ, path); err != nil {
@@ -484,6 +489,12 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 		node.kind = typedMap
 		node.op = typedOpMap
 		c.encHasMap = true
+		if !c.dynamic {
+			// Reserve an addressable element of the value type in the
+			// encoder scratch so encodeMap reuses one box per map type.
+			node.encMapElem = int32(len(c.encScratchTypes))
+			c.encScratchTypes = append(c.encScratchTypes, typ.Elem())
+		}
 		elem, err := c.compile(typ.Elem(), path+"[key]")
 		if err != nil {
 			return err
@@ -823,7 +834,7 @@ func (c *typedCompiler) applyInterfaceKinds(node *typedNode, typ reflect.Type) b
 		node.encOp = typedOpMarshaler
 		applied = true
 	}
-	if typ.Implements(jsonMarshalerReflectType) || typ.Implements(textMarshalerReflectType) {
+	if !c.dynamic && (typ.Implements(jsonMarshalerReflectType) || typ.Implements(textMarshalerReflectType)) {
 		node.encScratch = int32(len(c.encScratchTypes))
 		c.encScratchTypes = append(c.encScratchTypes, typ)
 	}

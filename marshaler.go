@@ -17,11 +17,13 @@ type encoderMarshalerScratch struct {
 
 type encoderScratch struct {
 	marshalers []encoderMarshalerScratch
-	// mapEntries and mapKeyArena are reused by encodeMap so sorted map
-	// encoding does not allocate per map. Ownership transfers to one
-	// encodeMap call at a time; nested maps fall back to fresh slices.
+	// mapEntries, mapKeyArena, and mapIter are reused by encodeMap so
+	// sorted map encoding does not allocate per map. Ownership transfers
+	// to one encodeMap call at a time; nested maps fall back to fresh
+	// allocations.
 	mapEntries  []mapEncodeEntry
 	mapKeyArena []byte
+	mapIter     *reflect.MapIter
 }
 
 func (s *encoderScratch) reset() {

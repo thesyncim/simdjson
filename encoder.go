@@ -756,7 +756,7 @@ func dynamicEncodeNode(typ reflect.Type, escapeHTML bool) (*typedNode, error) {
 		cached := entry.(*dynamicEncodeEntry)
 		return cached.node, cached.err
 	}
-	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode), escapeHTML: escapeHTML}
+	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode), escapeHTML: escapeHTML, dynamic: true}
 	node, err := compiler.compile(typ, typ.String())
 	entry, _ := dynamicEncodeNodes.LoadOrStore(key, &dynamicEncodeEntry{node: node, err: err})
 	cached := entry.(*dynamicEncodeEntry)
@@ -852,7 +852,16 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	if numericKeys && cap(keyArena) < mapLen*20 && mapLen <= int(^uint(0)>>1)/20 {
 		keyArena = make([]byte, 0, mapLen*20)
 	}
-	iterator := mapValue.MapRange()
+	var iterator *reflect.MapIter
+	if scratch != nil {
+		iterator = scratch.mapIter
+		scratch.mapIter = nil
+	}
+	if iterator == nil {
+		iterator = mapValue.MapRange()
+	} else {
+		iterator.Reset(mapValue)
+	}
 	for iterator.Next() {
 		key := iterator.Key()
 		var name string
@@ -873,7 +882,7 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 			var err error
 			name, err = mapKeyName(node, key)
 			if err != nil {
-				e.releaseMapScratch(entries, keyArena)
+				e.releaseMapScratch(entries, keyArena, iterator)
 				e.depth--
 				return &EncodeError{Reason: err.Error()}
 			}
@@ -881,9 +890,17 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		entries = append(entries, mapEncodeEntry{name: name, value: iterator.Value()})
 	}
 	slices.SortFunc(entries, func(a, b mapEncodeEntry) int { return strings.Compare(a.name, b.name) })
-	element := reflect.New(node.elem.typ)
-	elementPtr := element.UnsafePointer()
-	elementValue := element.Elem()
+	// The addressable element box comes from the compile-reserved scratch
+	// slot when available. Reuse across nesting levels of the same map
+	// type is safe: the slot is set immediately before each encode and
+	// never read after it returns.
+	var elementValue reflect.Value
+	if scratch != nil && node.encMapElem >= 0 {
+		elementValue = scratch.marshalers[node.encMapElem].value
+	} else {
+		elementValue = reflect.New(node.elem.typ).Elem()
+	}
+	elementPtr := elementValue.Addr().UnsafePointer()
 	e.dst = append(e.dst, '{')
 	for i := range entries {
 		if i > 0 {
@@ -896,26 +913,31 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 			// Clone: numeric key names alias the pooled arena, and the
 			// error must outlive this call's ownership of it.
 			name := strings.Clone(entries[i].name)
-			e.releaseMapScratch(entries, keyArena)
+			e.releaseMapScratch(entries, keyArena, iterator)
 			e.depth--
 			return prependEncodePathField(err, name)
 		}
 	}
 	e.dst = append(e.dst, '}')
-	e.releaseMapScratch(entries, keyArena)
+	e.releaseMapScratch(entries, keyArena, iterator)
 	e.depth--
 	return nil
 }
 
-// releaseMapScratch returns encodeMap's working slices to the scratch,
-// keeping their grown capacity for the next map.
-func (e *encodeState) releaseMapScratch(entries []mapEncodeEntry, keyArena []byte) {
+// releaseMapScratch returns encodeMap's working state to the scratch,
+// keeping grown capacity for the next map. The iterator is unbound first
+// so the pool never keeps the encoded map alive.
+func (e *encodeState) releaseMapScratch(entries []mapEncodeEntry, keyArena []byte, iterator *reflect.MapIter) {
 	scratch := e.scratch
 	if scratch == nil || scratch.mapEntries != nil {
 		return
 	}
 	scratch.mapEntries = entries[:0]
 	scratch.mapKeyArena = keyArena[:0]
+	if scratch.mapIter == nil {
+		iterator.Reset(reflect.Value{})
+		scratch.mapIter = iterator
+	}
 }
 
 type mapEncodeEntry struct {
