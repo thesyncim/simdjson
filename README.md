@@ -34,11 +34,11 @@ for validation. Speedups are geometric means across all seven payloads.
 
 | Operation | Contract | Wins vs stdlib | Wins vs rival | vs stdlib | vs rival |
 |---|---|---:|---:|---:|---:|
-| Validate | Syntax only | **7/7** | **7/7** | **1.95x** | **1.79x** |
+| Validate | Strict JSON and UTF-8 | **7/7** | **7/7** | **2.29x** | **2.03x** |
 | Typed decode | Owned strings, reused destination | **7/7** | **7/7** | **4.15x** | **1.60x** |
 | Dynamic decode | Owned `any` tree | **7/7** | **7/7** | **4.15x** | **1.89x** |
-| Encode | Owned output | **7/7** | **5/7** | **2.27x** | **1.31x** |
-| Encode | Reused output buffer | **7/7** | **7/7** | **2.40x** | **1.39x** |
+| Encode | Owned output | **7/7** | **5/7** | **2.27x** | **1.33x** |
+| Encode | Reused output buffer | **7/7** | **7/7** | **2.42x** | **1.42x** |
 
 The scorecard does not mix ownership contracts. Source-backed decode and reused
 output are reported separately below. Native Sonic uses a different compiler
@@ -80,19 +80,20 @@ storage. Source-backed refers specifically to unescaped string ownership.
 Dynamic rows fully materialize owned `any` trees. Validation only checks strict
 JSON syntax and allocates nothing on valid input.
 
-| Corpus | simdjson dynamic | Fastest tip rival | Native Sonic dynamic | simdjson valid | Fastest tip rival | Native Sonic valid |
+| Corpus | simdjson dynamic | Fastest tip rival | Native Sonic dynamic | simdjson strict valid | Fastest strict tip rival | Native Sonic syntax-only |
 |---|---:|---:|---:|---:|---:|---:|
-| Canada geometry | **695.2 us** | go-json 1.432 ms | 737.5 us | **165.9 us** | fastjson 212.8 us | 189.0 us |
-| CITM catalog | **1.717 ms** | jsoniter 3.191 ms | 2.627 ms | **673.8 us** | fastjson 847.7 us | 780.7 us |
-| Go source | **3.302 ms** | jsoniter 7.337 ms | 5.523 ms | **1.010 ms** | Segment 1.178 ms | 1.552 ms |
-| Escaped strings | **25.96 us** | go-json 68.37 us | 32.02 us | 4.357 us | Segment 54.36 us | **3.327 us** |
-| Unicode strings | **11.15 us** | go-json 15.99 us | 12.96 us | 6.077 us | fastjson 6.940 us | **1.742 us** |
-| Synthea FHIR | **2.562 ms** | go-json 4.384 ms | 4.402 ms | **832.3 us** | fastjson 1.269 ms | 854.6 us |
-| Twitter status | **898.4 us** | go-json 1.397 ms | 1.002 ms | 274.7 us | fastjson 389.6 us | **233.8 us** |
+| Canada geometry | **695.2 us** | go-json 1.432 ms | 737.5 us | **155.7 us** | fastjson 192.0 us | 189.0 us |
+| CITM catalog | **1.717 ms** | jsoniter 3.191 ms | 2.627 ms | **575.9 us** | fastjson 767.1 us | 780.7 us |
+| Go source | **3.302 ms** | jsoniter 7.337 ms | 5.523 ms | **936.0 us** | Segment 1.124 ms | 1.552 ms |
+| Escaped strings | **25.96 us** | go-json 68.37 us | 32.02 us | **4.124 us** | Segment 54.58 us | 3.327 us |
+| Unicode strings | **11.15 us** | go-json 15.99 us | 12.96 us | **3.057 us** | fastjson 6.237 us | 1.742 us |
+| Synthea FHIR | **2.562 ms** | go-json 4.384 ms | 4.402 ms | **717.6 us** | fastjson 1.166 ms | 854.6 us |
+| Twitter status | **898.4 us** | go-json 1.397 ms | 1.002 ms | **215.5 us** | fastjson 359.5 us | 233.8 us |
 
-Sonic v1.15.2 remains faster on three specialist validation rows. simdjson wins
-all seven owned dynamic rows against both the same-toolchain field and native
-Sonic.
+Sonic v1.15.2 documents that its native `Valid` does not check invalid UTF-8,
+so that column is syntax-only context and is excluded from strict winners and
+speedups. simdjson wins all seven strict validation and owned dynamic rows
+against the compatible same-toolchain field.
 
 ### Encode
 
@@ -101,13 +102,13 @@ caller-owned buffer and is shown separately.
 
 | Corpus | stdlib | simdjson owned | compiled reuse | Fastest tip rival | Native Sonic |
 |---|---:|---:|---:|---:|---:|
-| Canada geometry | 547.7 us | 421.0 us | **419.9 us** | Segment 444.4 us | 782.8 us |
-| CITM catalog | 761.6 us | 309.2 us | **293.4 us** | Segment 297.0 us | 836.2 us |
-| Go source | 2.604 ms | 1.134 ms | **1.093 ms** | Segment 1.123 ms | 3.711 ms |
-| Escaped strings | 16.84 us | 7.034 us | **6.493 us** | jsoniter 16.78 us | 19.73 us |
-| Unicode strings | 16.94 us | 7.098 us | **6.532 us** | jsoniter 16.87 us | 19.76 us |
-| Synthea FHIR | 5.057 ms | 1.643 ms | **1.561 ms** | Segment 1.666 ms | 6.834 ms |
-| Twitter status | 562.7 us | 236.2 us | **212.6 us** | go-json 270.3 us | 552.9 us |
+| Canada geometry | 549.3 us | 425.7 us | **424.0 us** | Segment 449.7 us | 782.8 us |
+| CITM catalog | 761.7 us | 311.7 us | **294.2 us** | go-json 298.4 us | 836.2 us |
+| Go source | 2.561 ms | 1.134 ms | **1.094 ms** | Segment 1.130 ms | 3.711 ms |
+| Escaped strings | 17.06 us | 6.877 us | **6.258 us** | jsoniter 17.39 us | 19.73 us |
+| Unicode strings | 16.83 us | 6.935 us | **6.277 us** | jsoniter 17.38 us | 19.76 us |
+| Synthea FHIR | 5.060 ms | 1.649 ms | **1.564 ms** | Segment 1.680 ms | 6.834 ms |
+| Twitter status | 557.7 us | 234.3 us | **212.6 us** | go-json 267.0 us | 552.9 us |
 
 Compiled reuse wins every exact-model row. Its hot struct plan classifies common
 adjacent field operations once, stores the fused opcode without enlarging the
@@ -122,13 +123,13 @@ selected once at initialization; short runs remain scalar or SWAR.
 
 | simdjson path | SIMD wins | Geomean SIMD uplift |
 |---|---:|---:|
-| Validation | **7/7** | **1.26x** |
+| Validation | 4/7 | **1.38x** |
 | Dynamic owned | **7/7** | **1.08x** |
 | Dynamic source-backed | **7/7** | **1.09x** |
 | Typed owned | 3/7 | **1.06x** |
 | Typed source-backed | 6/7 | **1.09x** |
-| Encode owned | **7/7** | **1.37x** |
-| Encode compiled reuse | **7/7** | **1.41x** |
+| Encode owned | 4/7 | **1.37x** |
+| Encode compiled reuse | 5/7 | **1.41x** |
 
 Owned typed decode includes a source-sized copy that SIMD cannot accelerate;
 the source-backed row exposes parser uplift more directly. SIMD is not claimed
@@ -236,11 +237,12 @@ once, and implementation choices are fixed during package initialization.
 | amd64 with AVX2 | 32-byte AVX2 | AVX 16-digit reduction |
 | Other build or CPU | Scalar Go | Scalar Go |
 
-Other vector paths include strict UTF-8 validation, contiguous `\uXXXX`
-validation, U+2028/U+2029 detection, syntax scans used by string encoding, and
-shape-dispatched typed decimals that reduce 16 significant digits in one SIMD
-pass. Every vector load is length-guarded. `CurrentSIMD()` reports the selected
-backend, vector width, threshold, number backend, and CPU features.
+Other vector paths include strict UTF-8 validation using ARM64 `TBL` lookup,
+contiguous `\uXXXX` validation, U+2028/U+2029 detection, syntax scans used by
+string encoding, and shape-dispatched typed decimals that reduce 16 significant
+digits in one SIMD pass. Every vector load is length-guarded. `CurrentSIMD()`
+reports the selected backend, vector width, threshold, number backend, and CPU
+features.
 
 ## Safety Model
 

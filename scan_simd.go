@@ -395,81 +395,7 @@ func unicodeEscapeVectorMasks(v, expected archsimd.Uint8x16, hexMask, firstMask 
 }
 
 func validUTF8Fast(src []byte) bool {
-	if len(src) < 16 {
-		return utf8.Valid(src)
-	}
-	base := unsafe.Pointer(unsafe.SliceData(src))
-	b80 := archsimd.BroadcastUint8x16(0x80)
-	b90 := archsimd.BroadcastUint8x16(0x90)
-	ba0 := archsimd.BroadcastUint8x16(0xa0)
-	bc0 := archsimd.BroadcastUint8x16(0xc0)
-	bc2 := archsimd.BroadcastUint8x16(0xc2)
-	be0 := archsimd.BroadcastUint8x16(0xe0)
-	bed := archsimd.BroadcastUint8x16(0xed)
-	bf0 := archsimd.BroadcastUint8x16(0xf0)
-	bf4 := archsimd.BroadcastUint8x16(0xf4)
-	bf5 := archsimd.BroadcastUint8x16(0xf5)
-	zero := archsimd.BroadcastUint8x16(0)
-	prevLead := zero
-	prevLead34 := zero
-	prevLead4 := zero
-	prevE0 := zero
-	prevED := zero
-	prevF0 := zero
-	prevF4 := zero
-
-	i := 0
-	for i+16 <= len(src) {
-		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
-		ascii := v.Less(b80)
-		continuation := v.GreaterEqual(b80).And(v.Less(bc0))
-		lead2 := v.GreaterEqual(bc2).And(v.Less(be0))
-		lead3 := v.GreaterEqual(be0).And(v.Less(bf0))
-		lead4 := v.GreaterEqual(bf0).And(v.Less(bf5))
-		if maskHasAnyLane(maskNot(ascii.Or(continuation).Or(lead2).Or(lead3).Or(lead4))) {
-			return false
-		}
-
-		lead := lead2.Or(lead3).Or(lead4).ToInt8x16().ToBits()
-		lead34 := lead3.Or(lead4).ToInt8x16().ToBits()
-		lead4Bytes := lead4.ToInt8x16().ToBits()
-		expected := lead.ConcatShiftBytesRight(prevLead, 15).
-			Or(lead34.ConcatShiftBytesRight(prevLead34, 14)).
-			Or(lead4Bytes.ConcatShiftBytesRight(prevLead4, 13))
-		actual := continuation.ToInt8x16().ToBits()
-		if maskHasAnyLane(actual.NotEqual(expected)) {
-			return false
-		}
-
-		afterE0 := v.Equal(be0).ToInt8x16().ToBits().ConcatShiftBytesRight(prevE0, 15).BitsToInt8().ToMask()
-		afterED := v.Equal(bed).ToInt8x16().ToBits().ConcatShiftBytesRight(prevED, 15).BitsToInt8().ToMask()
-		afterF0 := v.Equal(bf0).ToInt8x16().ToBits().ConcatShiftBytesRight(prevF0, 15).BitsToInt8().ToMask()
-		afterF4 := v.Equal(bf4).ToInt8x16().ToBits().ConcatShiftBytesRight(prevF4, 15).BitsToInt8().ToMask()
-		if maskHasAnyLane(afterE0.And(v.Less(ba0)).
-			Or(afterED.And(v.GreaterEqual(ba0))).
-			Or(afterF0.And(v.Less(b90))).
-			Or(afterF4.And(v.GreaterEqual(b90)))) {
-			return false
-		}
-
-		prevLead = lead
-		prevLead34 = lead34
-		prevLead4 = lead4Bytes
-		prevE0 = v.Equal(be0).ToInt8x16().ToBits()
-		prevED = v.Equal(bed).ToInt8x16().ToBits()
-		prevF0 = v.Equal(bf0).ToInt8x16().ToBits()
-		prevF4 = v.Equal(bf4).ToInt8x16().ToBits()
-		i += 16
-	}
-
-	tail := i
-	for tail > 0 && i-tail < 3 && src[tail-1]&0xc0 == 0x80 {
-		tail--
-	}
-	if tail > 0 {
-		tail--
-	}
-	return utf8.Valid(src[tail:])
+	return validUTF8Runtime(src)
 }
 
 // validUTF8NoLineSeparatorFast combines the two predicates needed by the
@@ -507,14 +433,11 @@ func validUTF8NoLineSeparatorFast(src []byte) bool {
 	i := 0
 	for i+16 <= len(src) {
 		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, i)))
-		ascii := v.Less(b80)
 		continuation := v.GreaterEqual(b80).And(v.Less(bc0))
 		lead2 := v.GreaterEqual(bc2).And(v.Less(be0))
 		lead3 := v.GreaterEqual(be0).And(v.Less(bf0))
 		lead4 := v.GreaterEqual(bf0).And(v.Less(bf5))
-		if maskHasAnyLane(maskNot(ascii.Or(continuation).Or(lead2).Or(lead3).Or(lead4))) {
-			return false
-		}
+		invalid := v.GreaterEqual(bc0).And(v.Less(bc2)).Or(v.GreaterEqual(bf5))
 
 		lead := lead2.Or(lead3).Or(lead4).ToInt8x16().ToBits()
 		lead34 := lead3.Or(lead4).ToInt8x16().ToBits()
@@ -523,9 +446,7 @@ func validUTF8NoLineSeparatorFast(src []byte) bool {
 			Or(lead34.ConcatShiftBytesRight(prevLead34, 14)).
 			Or(lead4Bytes.ConcatShiftBytesRight(prevLead4, 13))
 		actual := continuation.ToInt8x16().ToBits()
-		if maskHasAnyLane(actual.NotEqual(expected)) {
-			return false
-		}
+		invalid = invalid.Or(actual.NotEqual(expected))
 
 		e0Bits := v.Equal(be0).ToInt8x16().ToBits()
 		edBits := v.Equal(bed).ToInt8x16().ToBits()
@@ -535,19 +456,18 @@ func validUTF8NoLineSeparatorFast(src []byte) bool {
 		afterED := edBits.ConcatShiftBytesRight(prevED, 15).BitsToInt8().ToMask()
 		afterF0 := f0Bits.ConcatShiftBytesRight(prevF0, 15).BitsToInt8().ToMask()
 		afterF4 := f4Bits.ConcatShiftBytesRight(prevF4, 15).BitsToInt8().ToMask()
-		if maskHasAnyLane(afterE0.And(v.Less(ba0)).
+		invalid = invalid.Or(afterE0.And(v.Less(ba0)).
 			Or(afterED.And(v.GreaterEqual(ba0))).
 			Or(afterF0.And(v.Less(b90))).
-			Or(afterF4.And(v.GreaterEqual(b90)))) {
-			return false
-		}
+			Or(afterF4.And(v.GreaterEqual(b90))))
 
 		e2Bits := v.Equal(e2).ToInt8x16().ToBits()
 		b80Bits := v.Equal(b80).ToInt8x16().ToBits()
 		precededByE280 := e2Bits.ConcatShiftBytesRight(prevE2, 14).
 			And(b80Bits.ConcatShiftBytesRight(prev80, 15))
 		lineEnd := v.Equal(a8).Or(v.Equal(a9)).ToInt8x16().ToBits()
-		if maskHasAnyLane(lineEnd.And(precededByE280).BitsToInt8().ToMask()) {
+		invalid = invalid.Or(lineEnd.And(precededByE280).BitsToInt8().ToMask())
+		if maskHasAnyLane(invalid) {
 			return false
 		}
 

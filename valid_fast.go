@@ -33,6 +33,20 @@ func validStringFast(src []byte, base unsafe.Pointer, n, i int) (int, bool) {
 			if fastByteAt(base, j) == '"' {
 				return j + 1, true
 			}
+		} else {
+			start += 8
+			if start+8 <= n {
+				if m := stringSpecialMask(binary.LittleEndian.Uint64(src[start:])); m != 0 {
+					j := start + bits.TrailingZeros64(m)/8
+					if fastByteAt(base, j) == '"' {
+						return j + 1, true
+					}
+				} else {
+					start += 8
+				}
+			}
+			end, _, ok := scanJSONStringFastFrom(src, base, start)
+			return end, ok
 		}
 	}
 	end, _, ok := scanJSONStringFastLong(src, base, i)
@@ -196,14 +210,19 @@ func scanJSONStringFast(src []byte, base unsafe.Pointer, i int, short bool) (int
 }
 
 func scanJSONStringFastLong(src []byte, base unsafe.Pointer, i int) (int, bool, bool) {
+	return scanJSONStringFastFrom(src, base, i+1)
+}
+
+func scanJSONStringFastFrom(src []byte, base unsafe.Pointer, i int) (int, bool, bool) {
 	escaped := false
-	i++
 	for {
-		if end, ok := scanUnicodeEscapeRun(src, i); !ok {
-			return i, escaped, false
-		} else if end != i {
-			escaped = true
-			i = end
+		if i+1 < len(src) && fastByteAt(base, i) == '\\' && fastByteAt(base, i+1) == 'u' {
+			if end, ok := scanUnicodeEscapeRun(src, i); !ok {
+				return i, escaped, false
+			} else if end != i {
+				escaped = true
+				i = end
+			}
 		}
 		for i+6 <= len(src) && fastByteAt(base, i) == '\\' && fastByteAt(base, i+1) == 'u' {
 			escaped = true
