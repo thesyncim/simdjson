@@ -8,10 +8,22 @@ func Parse16Digits(digits *[16]byte) uint64 {
 	return parse16DigitsScalar(digits)
 }
 
-func numberBackend() string {
+func store16Digits(dst *[16]byte, value uint64) {
+	store16DigitsScalar(dst, value)
+}
+
+func parseBackend() string {
 	return "scalar"
 }
 
-func numberVectorBytes() int {
+func parseVectorBytes() int {
+	return 0
+}
+
+func formatBackend() string {
+	return "scalar"
+}
+
+func formatVectorBytes() int {
 	return 0
 }

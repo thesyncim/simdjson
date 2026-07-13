@@ -8,19 +8,6 @@ const (
 	digitHigh  = uint64(0x8080808080808080)
 )
 
-// Backend describes the implementation selected for the exported kernels.
-type Backend struct {
-	Name        string
-	SIMD        bool
-	VectorBytes int
-}
-
-// Current reports the implementation selected once during package startup.
-func Current() Backend {
-	name := numberBackend()
-	return Backend{Name: name, SIMD: name != "scalar", VectorBytes: numberVectorBytes()}
-}
-
 // All8Digits reports whether every byte is an ASCII decimal digit.
 func All8Digits(digits *[8]byte) bool {
 	return nonDigitMask8(binary.LittleEndian.Uint64(digits[:])) == 0
@@ -39,6 +26,40 @@ func Parse8Digits(digits *[8]byte) uint64 {
 	x = (x & 0x0f0f0f0f0f0f0f0f) * 2561 >> 8
 	x = (x & 0x00ff00ff00ff00ff) * 6553601 >> 16
 	return (x & 0x0000ffff0000ffff) * 42949672960001 >> 32
+}
+
+// Store8Digits writes value as exactly eight ASCII decimal digits, including
+// leading zeroes. Value must be less than 10^8.
+func Store8Digits(dst *[8]byte, value uint64) {
+	encoded := uint64(0x3030303030303030) + encodeTwoFourDigitChunks(value/10_000, value%10_000)
+	binary.LittleEndian.PutUint64(dst[:], encoded)
+}
+
+// Store16Digits writes value as exactly sixteen ASCII decimal digits, including
+// leading zeroes. Value must be less than 10^16.
+func Store16Digits(dst *[16]byte, value uint64) {
+	store16Digits(dst, value)
+}
+
+func store16DigitsScalar(dst *[16]byte, value uint64) {
+	hi := value / 100_000_000
+	lo := value - hi*100_000_000
+	first := uint64(0x3030303030303030) + encodeTwoFourDigitChunks(hi/10_000, hi%10_000)
+	second := uint64(0x3030303030303030) + encodeTwoFourDigitChunks(lo/10_000, lo%10_000)
+	binary.LittleEndian.PutUint64(dst[:8], first)
+	binary.LittleEndian.PutUint64(dst[8:], second)
+}
+
+// encodeTwoFourDigitChunks converts two values below 10000 into eight unpacked
+// decimal digits using parallel reciprocal division within one scalar word.
+func encodeTwoFourDigitChunks(hi, lo uint64) uint64 {
+	merged := hi | lo<<32
+	top := ((merged * 10486) >> 20) & (0x7f | 0x7f<<32)
+	bottom := merged - 100*top
+	hundreds := bottom<<16 + top
+	tens := (hundreds * 103) >> 10
+	tens &= 0x0f | 0x0f<<16 | 0x0f<<32 | 0x0f<<48
+	return tens + (hundreds-10*tens)<<8
 }
 
 func nonDigitMask8(x uint64) uint64 {

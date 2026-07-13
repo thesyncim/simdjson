@@ -1,6 +1,6 @@
 //go:build goexperiment.simd && (arm64 || amd64)
 
-package simdjson
+package simd
 
 import (
 	"encoding/binary"
@@ -42,22 +42,19 @@ func init() {
 	initStringScanner()
 }
 
-func simdEnabled() bool {
-	return scanStringSpecialBackend != "scalar"
-}
-
-func simdBackend() string {
-	return scanStringSpecialBackend
-}
-
 func simdInfo() SIMDInfo {
+	parse := parseBackend()
+	format := formatBackend()
 	return SIMDInfo{
-		Enabled:       simdEnabled(),
-		Backend:       scanStringSpecialBackend,
-		NumberBackend: numberSIMDBackend(),
-		VectorBytes:   scanStringVectorBytes,
-		MinBytes:      scanStringSelectedMinBytes,
-		Features:      scanCPUFeatures,
+		Enabled:           scanStringSpecialBackend != "scalar" || parse != "scalar" || format != "scalar",
+		StringBackend:     scanStringSpecialBackend,
+		ParseBackend:      parse,
+		FormatBackend:     format,
+		StringVectorBytes: scanStringVectorBytes,
+		ParseVectorBytes:  parseVectorBytes(),
+		FormatVectorBytes: formatVectorBytes(),
+		StringMinBytes:    scanStringSelectedMinBytes,
+		Features:          scanCPUFeatures,
 	}
 }
 
@@ -341,6 +338,123 @@ func encodedHTMLSyntaxMask(v, quote, slash, lt, gt, amp, ctrl archsimd.Uint8x16)
 		Or(v.Equal(gt)).
 		Or(v.Equal(amp)).
 		Or(v.Less(ctrl))
+}
+
+func copyStringPrefix(dst, src []byte) int {
+	quote := archsimd.BroadcastUint8x16('"')
+	slash := archsimd.BroadcastUint8x16('\\')
+	ctrlOrNonASCII := archsimd.BroadcastInt8x16(0x20)
+	srcBase := unsafe.Pointer(unsafe.SliceData(src))
+	dstBase := unsafe.Pointer(unsafe.SliceData(dst))
+	i := 0
+	for i+64 <= len(src) {
+		v0 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(srcBase, i)))
+		v1 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(srcBase, i+16)))
+		v2 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(srcBase, i+32)))
+		v3 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(srcBase, i+48)))
+		m0 := v0.Equal(quote).Or(v0.Equal(slash)).Or(v0.BitsToInt8().Less(ctrlOrNonASCII))
+		m1 := v1.Equal(quote).Or(v1.Equal(slash)).Or(v1.BitsToInt8().Less(ctrlOrNonASCII))
+		m2 := v2.Equal(quote).Or(v2.Equal(slash)).Or(v2.BitsToInt8().Less(ctrlOrNonASCII))
+		m3 := v3.Equal(quote).Or(v3.Equal(slash)).Or(v3.BitsToInt8().Less(ctrlOrNonASCII))
+		if maskHasAnyLane(m0.Or(m1).Or(m2).Or(m3)) {
+			if lane := firstMaskLane(m0); lane >= 0 {
+				copy(dst[i:], src[i:i+lane])
+				return i + lane
+			}
+			v0.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i)))
+			if lane := firstMaskLane(m1); lane >= 0 {
+				copy(dst[i+16:], src[i+16:i+16+lane])
+				return i + 16 + lane
+			}
+			v1.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i+16)))
+			if lane := firstMaskLane(m2); lane >= 0 {
+				copy(dst[i+32:], src[i+32:i+32+lane])
+				return i + 32 + lane
+			}
+			v2.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i+32)))
+			lane := firstMaskLane(m3)
+			copy(dst[i+48:], src[i+48:i+48+lane])
+			return i + 48 + lane
+		}
+		v0.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i)))
+		v1.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i+16)))
+		v2.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i+32)))
+		v3.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i+48)))
+		i += 64
+	}
+	for i+16 <= len(src) {
+		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(srcBase, i)))
+		m := v.Equal(quote).Or(v.Equal(slash)).Or(v.BitsToInt8().Less(ctrlOrNonASCII))
+		if lane := firstMaskLane(m); lane >= 0 {
+			copy(dst[i:], src[i:i+lane])
+			return i + lane
+		}
+		v.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i)))
+		i += 16
+	}
+	end := scanStringSpecialScalar(src, i)
+	copy(dst[i:], src[i:end])
+	return end
+}
+
+func copyHTMLStringPrefix(dst, src []byte) int {
+	quote := archsimd.BroadcastUint8x16('"')
+	slash := archsimd.BroadcastUint8x16('\\')
+	lt := archsimd.BroadcastUint8x16('<')
+	gt := archsimd.BroadcastUint8x16('>')
+	amp := archsimd.BroadcastUint8x16('&')
+	ctrlOrNonASCII := archsimd.BroadcastInt8x16(0x20)
+	srcBase := unsafe.Pointer(unsafe.SliceData(src))
+	dstBase := unsafe.Pointer(unsafe.SliceData(dst))
+	i := 0
+	for i+64 <= len(src) {
+		v0 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(srcBase, i)))
+		v1 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(srcBase, i+16)))
+		v2 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(srcBase, i+32)))
+		v3 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(srcBase, i+48)))
+		m0 := encodedHTMLSpecialMask(v0, quote, slash, lt, gt, amp, ctrlOrNonASCII)
+		m1 := encodedHTMLSpecialMask(v1, quote, slash, lt, gt, amp, ctrlOrNonASCII)
+		m2 := encodedHTMLSpecialMask(v2, quote, slash, lt, gt, amp, ctrlOrNonASCII)
+		m3 := encodedHTMLSpecialMask(v3, quote, slash, lt, gt, amp, ctrlOrNonASCII)
+		if maskHasAnyLane(m0.Or(m1).Or(m2).Or(m3)) {
+			if lane := firstMaskLane(m0); lane >= 0 {
+				copy(dst[i:], src[i:i+lane])
+				return i + lane
+			}
+			v0.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i)))
+			if lane := firstMaskLane(m1); lane >= 0 {
+				copy(dst[i+16:], src[i+16:i+16+lane])
+				return i + 16 + lane
+			}
+			v1.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i+16)))
+			if lane := firstMaskLane(m2); lane >= 0 {
+				copy(dst[i+32:], src[i+32:i+32+lane])
+				return i + 32 + lane
+			}
+			v2.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i+32)))
+			lane := firstMaskLane(m3)
+			copy(dst[i+48:], src[i+48:i+48+lane])
+			return i + 48 + lane
+		}
+		v0.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i)))
+		v1.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i+16)))
+		v2.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i+32)))
+		v3.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i+48)))
+		i += 64
+	}
+	for i+16 <= len(src) {
+		v := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(srcBase, i)))
+		m := encodedHTMLSpecialMask(v, quote, slash, lt, gt, amp, ctrlOrNonASCII)
+		if lane := firstMaskLane(m); lane >= 0 {
+			copy(dst[i:], src[i:i+lane])
+			return i + lane
+		}
+		v.StoreArray((*[16]uint8)(unsafe.Add(dstBase, i)))
+		i += 16
+	}
+	end := scanEncodedHTMLSpecialScalar(src, i)
+	copy(dst[i:], src[i:end])
+	return end
 }
 
 // scanUnicodeEscapeRun validates complete groups of eight contiguous

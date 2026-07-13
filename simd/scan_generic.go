@@ -1,4 +1,4 @@
-package simdjson
+package simd
 
 import (
 	"encoding/binary"
@@ -67,6 +67,53 @@ func scanStringSyntaxScalar(src []byte, i int) int {
 		i++
 	}
 	return limit
+}
+
+func scanEncodedHTMLSyntaxScalar(src []byte, i int) int {
+	for i+8 <= len(src) {
+		x := binary.LittleEndian.Uint64(src[i:])
+		m := stringSyntaxMask(x) | byteEqMask(x, '<') | byteEqMask(x, '>') | byteEqMask(x, '&')
+		if m != 0 {
+			return i + bits.TrailingZeros64(m)/8
+		}
+		i += 8
+	}
+	for i < len(src) {
+		c := src[i]
+		if c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' || c < 0x20 {
+			return i
+		}
+		i++
+	}
+	return len(src)
+}
+
+func scanEncodedHTMLSpecialScalar(src []byte, i int) int {
+	for i+8 <= len(src) {
+		x := binary.LittleEndian.Uint64(src[i:])
+		m := stringSpecialMask(x) | byteEqMask(x, '<') | byteEqMask(x, '>') | byteEqMask(x, '&')
+		if m != 0 {
+			return i + bits.TrailingZeros64(m)/8
+		}
+		i += 8
+	}
+	for i < len(src) {
+		c := src[i]
+		if c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' || c < 0x20 || c >= 0x80 {
+			return i
+		}
+		i++
+	}
+	return len(src)
+}
+
+func hasJSONLineSeparatorScalar(src []byte, start int) bool {
+	for i := start; i+2 < len(src); i++ {
+		if src[i] == 0xe2 && src[i+1] == 0x80 && (src[i+2] == 0xa8 || src[i+2] == 0xa9) {
+			return true
+		}
+	}
+	return false
 }
 
 func invalidUTF8Index(src []byte, start, end int) int {

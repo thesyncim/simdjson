@@ -34,11 +34,11 @@ for validation. Speedups are geometric means across all seven payloads.
 
 | Operation | Contract | Wins vs stdlib | Wins vs rival | vs stdlib | vs rival |
 |---|---|---:|---:|---:|---:|
-| Validate | Strict JSON and UTF-8 | **7/7** | **7/7** | **2.31x** | **2.38x** |
+| Validate | Strict JSON and UTF-8 | **7/7** | **7/7** | **2.38x** | **2.18x** |
 | Typed decode | Owned strings, reused destination | **7/7** | **7/7** | **4.70x** | **1.87x** |
-| Dynamic decode | Owned `any` tree | **7/7** | **7/7** | **4.26x** | **1.91x** |
-| Encode | Owned output | **7/7** | **7/7** | **2.36x** | **1.39x** |
-| Encode | Reused output buffer | **7/7** | **7/7** | **2.53x** | **1.49x** |
+| Dynamic decode | Owned `any` tree | **7/7** | **7/7** | **4.26x** | **1.93x** |
+| Encode | Owned output | **7/7** | **7/7** | **2.36x** | **1.41x** |
+| Encode | Reused output buffer | **7/7** | **7/7** | **2.52x** | **1.50x** |
 
 The scorecard does not mix ownership contracts. Source-backed decode and reused
 output are reported separately below. Native Sonic uses a different compiler
@@ -52,13 +52,13 @@ contract.
 
 | Corpus | `encoding/json` | simdjson owned | simdjson source-backed | Fastest tip rival | Native Sonic owned |
 |---|---:|---:|---:|---:|---:|
-| Canada geometry | 1.257 ms | **241.9 us** | 231.2 us | go-json 771.5 us | 440.5 us |
-| CITM catalog | 2.561 ms | **759.9 us** | 673.1 us | go-json 1.063 ms | 1.423 ms |
-| Go source | 6.236 ms | **1.107 ms** | 1.036 ms | Segment 2.168 ms | 3.345 ms |
-| Escaped strings | 190.8 us | **27.28 us** | 25.40 us | go-json 61.47 us | 30.69 us |
-| Unicode strings | 40.93 us | **5.952 us** | 5.320 us | go-json 11.74 us | 11.28 us |
-| Synthea FHIR | 3.858 ms | **1.366 ms** | 1.303 ms | go-json 1.688 ms | 2.653 ms |
-| Twitter status | 1.371 ms | **362.6 us** | 337.1 us | go-json 593.4 us | 699.8 us |
+| Canada geometry | 1.255 ms | **236.8 us** | 226.6 us | go-json 765.2 us | 441.2 us |
+| CITM catalog | 2.589 ms | **772.2 us** | 698.1 us | go-json 1.083 ms | 1.433 ms |
+| Go source | 6.532 ms | **1.130 ms** | 1.055 ms | Segment 2.196 ms | 3.321 ms |
+| Escaped strings | 188.1 us | **27.44 us** | 25.39 us | go-json 62.10 us | 30.80 us |
+| Unicode strings | 40.51 us | **5.636 us** | 4.756 us | go-json 11.64 us | 11.02 us |
+| Synthea FHIR | 3.831 ms | **1.396 ms** | 1.322 ms | go-json 1.719 ms | 2.695 ms |
+| Twitter status | 1.381 ms | **379.7 us** | 351.4 us | go-json 608.4 us | 707.9 us |
 
 Source-backed allocation counts are not zero for container-heavy models:
 
@@ -82,13 +82,13 @@ JSON syntax and allocates nothing on valid input.
 
 | Corpus | simdjson dynamic | Fastest tip rival | Native Sonic dynamic | simdjson strict valid | Fastest strict tip rival | Native Sonic syntax-only |
 |---|---:|---:|---:|---:|---:|---:|
-| Canada geometry | **716.0 us** | go-json 1.476 ms | 737.5 us | **134.2 us** | fastjson 219.1 us | 189.0 us |
-| CITM catalog | **1.769 ms** | jsoniter 3.291 ms | 2.627 ms | **674.8 us** | fastjson 1.161 ms | 780.7 us |
-| Go source | **3.382 ms** | jsoniter 7.622 ms | 5.523 ms | **946.5 us** | Segment 1.215 ms | 1.552 ms |
-| Escaped strings | **29.40 us** | go-json 66.98 us | 32.02 us | **4.325 us** | Segment 66.32 us | 3.327 us |
-| Unicode strings | **9.130 us** | go-json 16.62 us | 12.96 us | **3.390 us** | fastjson 7.182 us | 1.742 us |
-| Synthea FHIR | **2.702 ms** | go-json 4.506 ms | 4.402 ms | **773.9 us** | fastjson 1.498 ms | 854.6 us |
-| Twitter status | **894.5 us** | go-json 1.402 ms | 1.002 ms | **229.1 us** | fastjson 430.4 us | 233.8 us |
+| Canada geometry | **704.9 us** | go-json 1.465 ms | 746.3 us | **124.2 us** | fastjson 210.9 us | 191.5 us |
+| CITM catalog | **1.878 ms** | go-json 3.358 ms | 2.649 ms | **659.9 us** | fastjson 864.1 us | 786.1 us |
+| Go source | **3.401 ms** | jsoniter 7.559 ms | 5.584 ms | **952.1 us** | Segment 1.215 ms | 1.549 ms |
+| Escaped strings | **26.78 us** | go-json 67.99 us | 32.00 us | **4.406 us** | Segment 58.39 us | 3.329 us |
+| Unicode strings | **9.009 us** | go-json 16.53 us | 12.64 us | **3.257 us** | fastjson 7.093 us | 1.744 us |
+| Synthea FHIR | **2.748 ms** | go-json 4.598 ms | 4.472 ms | **773.2 us** | fastjson 1.274 ms | 858.0 us |
+| Twitter status | **916.4 us** | go-json 1.445 ms | 992.9 us | **231.2 us** | fastjson 396.3 us | 233.9 us |
 
 Sonic v1.15.2 documents that its native `Valid` does not check invalid UTF-8,
 so that column is syntax-only context and is excluded from strict winners and
@@ -102,21 +102,22 @@ caller-owned buffer and is shown separately.
 
 | Corpus | stdlib | simdjson owned | compiled reuse | Fastest tip rival | Native Sonic |
 |---|---:|---:|---:|---:|---:|
-| Canada geometry | 594.4 us | 453.0 us | **445.7 us** | Segment 484.0 us | 782.8 us |
-| CITM catalog | 810.8 us | 302.8 us | **284.8 us** | go-json 322.3 us | 836.2 us |
-| Go source | 2.752 ms | 1.119 ms | **1.056 ms** | Segment 1.230 ms | 3.711 ms |
-| Escaped strings | 18.66 us | 7.467 us | **6.759 us** | jsoniter 19.44 us | 19.73 us |
-| Unicode strings | 18.67 us | 7.451 us | **6.717 us** | jsoniter 18.97 us | 19.76 us |
-| Synthea FHIR | 5.402 ms | 1.753 ms | **1.650 ms** | Segment 1.790 ms | 6.834 ms |
-| Twitter status | 585.1 us | 239.6 us | **219.9 us** | go-json 278.9 us | 552.9 us |
+| Canada geometry | 594.1 us | 451.9 us | **443.3 us** | Segment 483.5 us | 772.3 us |
+| CITM catalog | 825.3 us | 298.5 us | **284.9 us** | Segment 319.6 us | 843.0 us |
+| Go source | 2.731 ms | 1.120 ms | **1.061 ms** | Segment 1.210 ms | 3.716 ms |
+| Escaped strings | 17.80 us | 7.268 us | **6.705 us** | Segment 19.29 us | 19.43 us |
+| Unicode strings | 17.92 us | 7.369 us | **6.760 us** | Segment 19.55 us | 19.29 us |
+| Synthea FHIR | 5.459 ms | 1.741 ms | **1.638 ms** | Segment 1.826 ms | 6.854 ms |
+| Twitter status | 596.2 us | 242.7 us | **219.5 us** | go-json 287.0 us | 554.6 us |
 
 Both owned and compiled-reuse encoding win every exact-model row. Reuse also
 eliminates the output allocation. The hot struct plan classifies common adjacent
 field operations once, stores the fused opcode without enlarging the 40-byte
 field record, and emits two fields per dispatch. Integer map keys use one local
 byte arena and public reflection iteration; no interface-layout or runtime
-map-layout assumptions are involved. Decimal integers below 10 digits are
-emitted with an unrolled pair reducer and guarded two-byte table stores.
+map-layout assumptions are involved. Decimal integers use compact pair stores,
+an exact 8-digit SWAR lane, a cold 10-digit lane, and a 16-digit SIMD formatter
+for large values without enlarging the common short-number instruction path.
 
 ### SIMD Versus Pure Go
 
@@ -125,13 +126,13 @@ selected once at initialization; short runs remain scalar or SWAR.
 
 | simdjson path | SIMD wins | Geomean SIMD uplift |
 |---|---:|---:|
-| Validation | 5/7 | **1.37x** |
-| Dynamic owned | 3/7 | **1.07x** |
-| Dynamic source-backed | 4/7 | **1.09x** |
-| Typed owned | 5/7 | **1.13x** |
-| Typed source-backed | 4/7 | **1.14x** |
-| Encode owned | 5/7 | **1.39x** |
-| Encode compiled reuse | 6/7 | **1.42x** |
+| Validation | 6/7 | **1.39x** |
+| Dynamic owned | 3/7 | **1.08x** |
+| Dynamic source-backed | 2/7 | **1.09x** |
+| Typed owned | 4/7 | **1.14x** |
+| Typed source-backed | 5/7 | **1.16x** |
+| Encode owned | 6/7 | **1.40x** |
+| Encode compiled reuse | 6/7 | **1.43x** |
 
 Owned typed decode includes a source-sized copy that SIMD cannot accelerate;
 the source-backed row exposes parser uplift more directly. SIMD is not claimed
@@ -211,7 +212,7 @@ current values, while null clears pointers, maps, slices, and interfaces.
 | JSON Pointer | `GetRaw`, `ScanRaw`, `CompilePointer` | Aliases source |
 | Strict validation | `Valid`, `Validate` | No result allocation |
 | Transforms | `AppendCompact`, `AppendIndent`, `AppendCanonicalize` | Caller-owned output |
-| SIMD byte kernels | `simd` subpackage | Caller-provided fixed blocks |
+| SIMD byte kernels | `simd` subpackage | Caller-provided slices and fixed blocks |
 
 `DecodeArray` decodes a top-level array while reusing caller-provided slice
 capacity. Decode errors use `*DecodeError` with byte offset and destination
@@ -230,9 +231,13 @@ alias the caller-provided `IndexEntry` workspace.
 
 ## Reusable SIMD Kernels
 
-`github.com/thesyncim/simdjson/simd` exposes the same fixed-width digit kernels
-used by the parser. The array-pointer API proves load width at the call site,
-does not allocate, and keeps validation explicit:
+`github.com/thesyncim/simdjson/simd` owns every architecture-specific kernel,
+runtime feature probe, and dispatch decision. The root parser contains only
+JSON policy adapters. The subpackage can be used independently and adds no
+module dependencies.
+
+The fixed-array digit API proves load and store widths at the call site, does
+not allocate, and keeps validation explicit:
 
 ```go
 if len(src) >= 16 {
@@ -244,41 +249,52 @@ if len(src) >= 16 {
 }
 ```
 
-`All8Digits`, `Parse8Digits`, and `Current` are also available. The package
-uses NEON or AVX under `GOEXPERIMENT=simd` and the same portable API otherwise.
-More parser-independent classification kernels can move here without exposing
-the JSON parser's unchecked cursors or ownership policy.
+The package also exposes:
 
-On the M4 Max benchmark host, the public 16-digit reducer has a 1.047 ns median
-versus 6.657 ns for the scalar implementation: 6.36x faster, with zero
-allocations in either path. These are ten 500 ms samples from
-`BenchmarkParse16Digits` under the pinned tip toolchain documented below.
+- `Store8Digits` and `Store16Digits` for fixed-width decimal formatting;
+- JSON and HTML-safe string scanners, including syntax-only variants;
+- fused `CopyStringPrefix` and `CopyHTMLStringPrefix` scanners;
+- strict UTF-8, U+2028/U+2029, and contiguous `\uXXXX` kernels;
+- 64-bit string classification masks; and
+- `Current`, which reports the runtime-selected backends and CPU features.
+
+All APIs have portable fallbacks. On the M4 Max benchmark host, eight 500 ms
+samples produced these medians, all with zero allocations:
+
+| Kernel | Selected | Control | Speedup |
+|---|---:|---:|---:|
+| Parse 16 digits | **1.031 ns** | scalar 6.664 ns | **6.46x** |
+| Store 8 digits | **1.497 ns** | `strconv` 5.783 ns | **3.86x** |
+| Store 16 digits | **2.225 ns** | scalar 3.142 ns | **1.41x** |
+| Store 16 digits | **2.225 ns** | `strconv` 8.187 ns | **3.68x** |
 
 ## SIMD Dispatch
 
 `GOEXPERIMENT=simd` enables Go-native kernels. Runtime capabilities are read
 once, and implementation choices are fixed during package initialization.
 
-| Runtime | String scanning | Decimal reduction |
-|---|---|---|
-| arm64 | NEON on sustained runs; scalar/SWAR tails | NEON pairwise 16-digit reduction |
-| amd64 with AVX-512 | 64-byte AVX-512 | AVX 16-digit reduction |
-| amd64 with AVX2 | 32-byte AVX2 | AVX 16-digit reduction |
-| Other build or CPU | Scalar Go | Scalar Go |
+| Runtime | String scanning | Decimal parse | Decimal format |
+|---|---|---|---|
+| arm64 | NEON on sustained runs; scalar/SWAR tails | NEON 16-digit reduction | NEON 16-digit formatting |
+| amd64 with AVX-512 | 64-byte AVX-512 | AVX 16-digit reduction | Scalar SWAR |
+| amd64 with AVX2 | 32-byte AVX2 | AVX 16-digit reduction | Scalar SWAR |
+| Other build or CPU | Scalar Go | Scalar Go | Scalar SWAR |
 
 Other vector paths include strict UTF-8 validation using ARM64 `TBL` lookup,
 contiguous `\uXXXX` validation, U+2028/U+2029 detection, syntax scans used by
 string encoding, and shape-dispatched typed decimals. Decimal parsing uses
 register-only SWAR for 8-byte blocks and Go-native SIMD for full 16-digit runs.
-Every vector load is length-guarded. `CurrentSIMD()` reports the selected
-backend, vector width, threshold, number backend, and CPU features.
+Every vector load is length-guarded. `simd.Current()` reports independent
+string, decimal-parse, and decimal-format backends and widths, the string
+threshold, and detected CPU features.
 
 ## Safety Model
 
 simdjson uses `unsafe` only in measured internal paths and keeps those uses
 narrow:
 
-- vector loads run only when a complete block remains;
+- vector loads and stores run only when a complete block remains;
+- public fused-copy kernels reject short or overlapping destinations;
 - integer pair stores follow a capacity extension and a table index below 100;
 - typed offsets and strides come from public `reflect` metadata;
 - maps use public reflection APIs and never assume runtime layout;

@@ -1,6 +1,6 @@
 //go:build goexperiment.simd && (arm64 || amd64)
 
-package simdjson
+package simd
 
 import (
 	"fmt"
@@ -10,22 +10,23 @@ import (
 )
 
 var scanSink int
+var copySink byte
 
 func TestSIMDScannerDispatch(t *testing.T) {
-	info := CurrentSIMD()
-	backend := info.Backend
+	info := Current()
+	backend := info.StringBackend
 	var featureNames [len(cpuFeatureNames)]string
-	t.Logf("runtime SIMD: backend=%s number=%s vector=%d min=%d features=%v", info.Backend, info.NumberBackend, info.VectorBytes, info.MinBytes, info.Features.AppendNames(featureNames[:0]))
+	t.Logf("runtime SIMD: string=%s parse=%s format=%s string-vector=%d parse-vector=%d format-vector=%d min=%d features=%v", info.StringBackend, info.ParseBackend, info.FormatBackend, info.StringVectorBytes, info.ParseVectorBytes, info.FormatVectorBytes, info.StringMinBytes, info.Features.AppendNames(featureNames[:0]))
 	if runtime.GOARCH == "arm64" && backend != "arm64-neon" {
-		t.Fatalf("CurrentSIMD().Backend = %q on arm64, want arm64-neon", backend)
+		t.Fatalf("Current().StringBackend = %q on arm64, want arm64-neon", backend)
 	}
-	if runtime.GOARCH == "arm64" && info.NumberBackend != "arm64-neon" {
-		t.Fatalf("CurrentSIMD().NumberBackend = %q on arm64, want arm64-neon", info.NumberBackend)
+	if runtime.GOARCH == "arm64" && (info.ParseBackend != "arm64-neon" || info.FormatBackend != "arm64-neon") {
+		t.Fatalf("Current decimal backends = parse %q format %q on arm64, want arm64-neon", info.ParseBackend, info.FormatBackend)
 	}
 	if backend == "scalar" {
 		return
 	}
-	if info.VectorBytes < 16 || info.MinBytes < 16 {
+	if info.StringVectorBytes < 16 || info.StringMinBytes < 16 || info.ParseVectorBytes != 16 || info.FormatVectorBytes != 16 {
 		t.Fatalf("selected scanner has invalid runtime info: %+v", info)
 	}
 	if runtime.GOARCH == "arm64" && !info.Features.Has(CPUFeatureNEON) {
@@ -239,6 +240,69 @@ func TestSIMDEncodedHTMLScannersMatchScalar(t *testing.T) {
 	}
 }
 
+func TestSIMDCopyStringPrefix(t *testing.T) {
+	for length := 16; length <= 512; length++ {
+		for srcOffset := 0; srcOffset < 32; srcOffset++ {
+			for dstOffset := 0; dstOffset < 32; dstOffset++ {
+				srcStorage := make([]byte, srcOffset+length)
+				dstStorage := make([]byte, dstOffset+length)
+				src := srcStorage[srcOffset:]
+				dst := dstStorage[dstOffset:]
+				for i := range src {
+					src[i] = byte('a' + i%26)
+				}
+				if got := CopyStringPrefix(dst, src); got != len(src) {
+					t.Fatalf("CopyStringPrefix(length=%d srcOffset=%d dstOffset=%d) = %d", length, srcOffset, dstOffset, got)
+				}
+				if string(dst) != string(src) {
+					t.Fatalf("CopyStringPrefix(length=%d srcOffset=%d dstOffset=%d) copied different bytes", length, srcOffset, dstOffset)
+				}
+			}
+		}
+	}
+
+	specials := []byte{'"', '\\', 0, 0x1f, 0x80, 0xff}
+	for _, special := range specials {
+		for at := 0; at < 96; at++ {
+			src := longScanCase(96, at, special)
+			if got := CopyStringPrefix(make([]byte, len(src)), src); got != at {
+				t.Fatalf("CopyStringPrefix(byte %#02x at %d) = %d", special, at, got)
+			}
+		}
+	}
+}
+
+func TestSIMDCopyHTMLStringPrefix(t *testing.T) {
+	src := longScanCase(257, -1, 0)
+	dst := make([]byte, len(src))
+	if CopyHTMLStringPrefix(dst, src) != len(src) || string(dst) != string(src) {
+		t.Fatal("CopyHTMLStringPrefix rejected or changed clean ASCII")
+	}
+	for _, special := range []byte{'"', '\\', '<', '>', '&', 0, 0x1f, 0x80, 0xff} {
+		for at := 0; at < 96; at++ {
+			dirty := longScanCase(96, at, special)
+			if got := CopyHTMLStringPrefix(make([]byte, len(dirty)), dirty); got != at {
+				t.Fatalf("CopyHTMLStringPrefix(byte %#02x at %d) = %d", special, at, got)
+			}
+		}
+	}
+}
+
+func TestSIMDCopyStringPrefixRejectsInvalidBuffers(t *testing.T) {
+	clean := []byte("0123456789abcdef0123456789abcdef")
+	if CopyStringPrefix(make([]byte, len(clean)-1), clean) != -1 {
+		t.Fatal("CopyStringPrefix accepted a short destination")
+	}
+	if CopyStringPrefix(clean, clean) != -1 {
+		t.Fatal("CopyStringPrefix accepted identical slices")
+	}
+	storage := make([]byte, len(clean)+8)
+	copy(storage, clean)
+	if CopyStringPrefix(storage[4:4+len(clean)], storage[:len(clean)]) != -1 {
+		t.Fatal("CopyStringPrefix accepted overlapping slices")
+	}
+}
+
 func TestSIMDEncodedHTMLScannersRespectBounds(t *testing.T) {
 	state := uint64(0x9e3779b97f4a7c15)
 	for alignment := 0; alignment < 32; alignment++ {
@@ -360,6 +424,20 @@ func FuzzSIMDScannersMatchScalar(f *testing.F) {
 		if got := scanEncodedHTMLSyntaxSIMD(src, start); got != wantHTMLSyntax {
 			t.Fatalf("direct SIMD HTML syntax scan = %d, scalar = %d", got, wantHTMLSyntax)
 		}
+
+		dst := make([]byte, len(src))
+		wantPrefix := scanStringSpecialScalar(src, 0)
+		if got := CopyStringPrefix(dst, src); got != wantPrefix {
+			t.Fatalf("string prefix = %d, scalar = %d", got, wantPrefix)
+		} else if string(dst[:got]) != string(src[:got]) {
+			t.Fatal("string prefix copied different bytes")
+		}
+		wantHTMLPrefix := scanEncodedHTMLSpecialScalar(src, 0)
+		if got := CopyHTMLStringPrefix(dst, src); got != wantHTMLPrefix {
+			t.Fatalf("HTML prefix = %d, scalar = %d", got, wantHTMLPrefix)
+		} else if string(dst[:got]) != string(src[:got]) {
+			t.Fatal("HTML prefix copied different bytes")
+		}
 	})
 }
 
@@ -441,6 +519,28 @@ func BenchmarkEncodedHTMLScannerASCII(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				scanSink = scanEncodedHTMLSpecialSIMD(src, 0)
 			}
+		})
+	}
+}
+
+func BenchmarkCopyHTMLStringPrefixASCII(b *testing.B) {
+	lengths := []int{16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048}
+	for _, n := range lengths {
+		src := longScanCase(n, -1, 0)
+		dst := make([]byte, n)
+		b.Run(fmt.Sprintf("separate/%d", n), func(b *testing.B) {
+			for range b.N {
+				if scanEncodedHTMLSpecialFast(src, 0) == len(src) {
+					copy(dst, src)
+				}
+			}
+			copySink = dst[n-1]
+		})
+		b.Run(fmt.Sprintf("fused/%d", n), func(b *testing.B) {
+			for range b.N {
+				copyHTMLStringPrefix(dst, src)
+			}
+			copySink = dst[n-1]
 		})
 	}
 }

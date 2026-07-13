@@ -3,7 +3,6 @@ package simdjson
 import (
 	"encoding"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -17,6 +16,8 @@ import (
 	"time"
 	"unicode/utf8"
 	"unsafe"
+
+	simdkernels "github.com/thesyncim/simdjson/simd"
 )
 
 // EncoderOptions controls encoding output.
@@ -1052,7 +1053,10 @@ func appendCompactUint(dst []byte, v uint64) []byte {
 		return append(dst, encodeDigitPairs[v*2], encodeDigitPairs[v*2+1])
 	}
 	if v >= 1e10 {
-		return strconv.AppendUint(dst, v, 10)
+		return appendCompactUintLarge(dst, v)
+	}
+	if v >= 1e9 {
+		return appendCompactUint10(dst, v)
 	}
 	digits := int((bits.Len64(v)*1233)>>12) + 1
 	if v < pow10Uint64[digits-1] {
@@ -1065,6 +1069,10 @@ func appendCompactUint(dst []byte, v uint64) []byte {
 	dst = dst[:start+digits]
 	i := len(dst)
 	base := unsafe.Pointer(unsafe.SliceData(dst))
+	if digits == 8 {
+		simdkernels.Store8Digits((*[8]byte)(unsafe.Add(base, start)), v)
+		return dst
+	}
 	switch {
 	case v >= 1e8:
 		pair := v % 100
@@ -1097,6 +1105,44 @@ func appendCompactUint(dst []byte, v uint64) []byte {
 		i--
 		dst[i] = byte('0' + v)
 	}
+	return dst
+}
+
+//go:noinline
+func appendCompactUint10(dst []byte, v uint64) []byte {
+	if cap(dst)-len(dst) < 10 {
+		return strconv.AppendUint(dst, v, 10)
+	}
+	hi := v / 1e8
+	lo := v - hi*1e8
+	start := len(dst)
+	dst = dst[:start+10]
+	base := unsafe.Pointer(unsafe.SliceData(dst))
+	storeCompactDigitPair(base, start, hi)
+	simdkernels.Store8Digits((*[8]byte)(unsafe.Add(base, start+2)), lo)
+	return dst
+}
+
+//go:noinline
+func appendCompactUintLarge(dst []byte, v uint64) []byte {
+	digits := int((bits.Len64(v)*1233)>>12) + 1
+	if v < pow10Uint64[digits-1] {
+		digits--
+	}
+	if cap(dst)-len(dst) < digits {
+		return strconv.AppendUint(dst, v, 10)
+	}
+	if v < 1e16 {
+		var block [16]byte
+		simdkernels.Store16Digits(&block, v)
+		return append(dst, block[16-digits:]...)
+	}
+	hi := v / 1e16
+	lo := v - hi*1e16
+	dst = appendCompactUint(dst, hi)
+	start := len(dst)
+	dst = dst[:start+16]
+	simdkernels.Store16Digits((*[16]byte)(dst[start:]), lo)
 	return dst
 }
 
@@ -1192,51 +1238,4 @@ func appendEncodedJSONString(dst []byte, s string, escapeHTML bool) []byte {
 	}
 	dst = append(dst, s[start:]...)
 	return append(dst, '"')
-}
-
-func hasJSONLineSeparatorScalar(src []byte, start int) bool {
-	for i := start; i+2 < len(src); i++ {
-		if src[i] == 0xe2 && src[i+1] == 0x80 && (src[i+2] == 0xa8 || src[i+2] == 0xa9) {
-			return true
-		}
-	}
-	return false
-}
-
-func scanEncodedHTMLSyntaxScalar(src []byte, i int) int {
-	for i+8 <= len(src) {
-		x := binary.LittleEndian.Uint64(src[i:])
-		m := stringSyntaxMask(x) | byteEqMask(x, '<') | byteEqMask(x, '>') | byteEqMask(x, '&')
-		if m != 0 {
-			return i + bits.TrailingZeros64(m)/8
-		}
-		i += 8
-	}
-	for i < len(src) {
-		c := src[i]
-		if c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' || c < 0x20 {
-			return i
-		}
-		i++
-	}
-	return len(src)
-}
-
-func scanEncodedHTMLSpecialScalar(src []byte, i int) int {
-	for i+8 <= len(src) {
-		x := binary.LittleEndian.Uint64(src[i:])
-		m := stringSpecialMask(x) | byteEqMask(x, '<') | byteEqMask(x, '>') | byteEqMask(x, '&')
-		if m != 0 {
-			return i + bits.TrailingZeros64(m)/8
-		}
-		i += 8
-	}
-	for i < len(src) {
-		c := src[i]
-		if c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' || c < 0x20 || c >= 0x80 {
-			return i
-		}
-		i++
-	}
-	return len(src)
 }

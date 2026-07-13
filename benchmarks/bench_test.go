@@ -13,6 +13,7 @@ import (
 	simdjsongo "github.com/minio/simdjson-go"
 	segmentjson "github.com/segmentio/encoding/json"
 	"github.com/thesyncim/simdjson"
+	simdkernels "github.com/thesyncim/simdjson/simd"
 	"github.com/valyala/fastjson"
 )
 
@@ -111,7 +112,7 @@ func BenchmarkValidLateInvalid(b *testing.B) {
 }
 
 func benchmarkValid(b *testing.B, src []byte) {
-	b.Run("simdjson-"+simdjson.CurrentSIMD().Backend, func(b *testing.B) {
+	b.Run("simdjson-"+simdkernels.Current().StringBackend, func(b *testing.B) {
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {

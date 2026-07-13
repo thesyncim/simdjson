@@ -1,16 +1,8 @@
 //go:build !goexperiment.simd || (!arm64 && !amd64)
 
-package simdjson
+package simd
 
 import "unicode/utf8"
-
-func simdEnabled() bool {
-	return false
-}
-
-func simdBackend() string {
-	return "scalar"
-}
 
 func scanStringSpecial(src []byte, i int) int {
 	return scanStringSpecialScalar(src, i)
@@ -48,6 +40,25 @@ func hasJSONLineSeparatorFast(src []byte, start int) bool {
 	return hasJSONLineSeparatorScalar(src, start)
 }
 
+func copyStringPrefix(dst, src []byte) int {
+	end := scanStringSpecialScalar(src, 0)
+	copy(dst, src[:end])
+	return end
+}
+
+func copyHTMLStringPrefix(dst, src []byte) int {
+	end := scanEncodedHTMLSpecialScalar(src, 0)
+	copy(dst, src[:end])
+	return end
+}
+
 func simdInfo() SIMDInfo {
-	return SIMDInfo{Backend: "scalar", NumberBackend: numberSIMDBackend()}
+	return SIMDInfo{
+		Enabled:           parseBackend() != "scalar" || formatBackend() != "scalar",
+		StringBackend:     "scalar",
+		ParseBackend:      parseBackend(),
+		FormatBackend:     formatBackend(),
+		ParseVectorBytes:  parseVectorBytes(),
+		FormatVectorBytes: formatVectorBytes(),
+	}
 }

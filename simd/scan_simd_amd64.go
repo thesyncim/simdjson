@@ -1,6 +1,6 @@
 //go:build goexperiment.simd && amd64
 
-package simdjson
+package simd
 
 import (
 	"math/bits"

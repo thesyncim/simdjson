@@ -64,6 +64,6 @@
 // The module currently requires a Go 1.27 development toolchain for generic
 // methods. Building with GOEXPERIMENT=simd on arm64 or amd64 enables vector
 // kernels for string and number scanning through Go's experimental
-// simd/archsimd package; other builds use scalar equivalents selected at
-// package initialization. [CurrentSIMD] reports the active backend.
+// simd/archsimd package. Architecture code, portable fallbacks, and runtime
+// reporting live in the public github.com/thesyncim/simdjson/simd subpackage.
 package simdjson

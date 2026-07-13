@@ -1,8 +1,8 @@
-package simdjson
+package simd
 
 // CPUFeature identifies a runtime CPU capability visible to Go's experimental
-// archsimd package. A detected feature is not necessarily used by the JSON
-// scanner; CurrentSIMD reports the selected implementation separately.
+// archsimd package. A detected feature is not necessarily used by a kernel;
+// Current reports each selected implementation separately.
 type CPUFeature uint64
 
 const (
@@ -73,17 +73,20 @@ func (f CPUFeatures) AppendNames(dst []string) []string {
 	return dst
 }
 
-// SIMDInfo describes the scanner selected once during package initialization.
+// SIMDInfo describes the implementations selected once during package initialization.
 type SIMDInfo struct {
-	Enabled       bool
-	Backend       string
-	NumberBackend string
-	VectorBytes   int
-	MinBytes      int
-	Features      CPUFeatures
+	Enabled           bool
+	StringBackend     string
+	ParseBackend      string
+	FormatBackend     string
+	StringVectorBytes int
+	ParseVectorBytes  int
+	FormatVectorBytes int
+	StringMinBytes    int
+	Features          CPUFeatures
 }
 
-// CurrentSIMD reports the runtime-selected scanner and detected CPU features.
-func CurrentSIMD() SIMDInfo {
+// Current reports the runtime-selected string, decimal, and CPU backends.
+func Current() SIMDInfo {
 	return simdInfo()
 }
