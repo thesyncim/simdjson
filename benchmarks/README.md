@@ -45,11 +45,11 @@ before timing with case-sensitive field matching.
 
 | Workload | SIMD, source-backed | SIMD, owned |
 |---|---:|---:|
-| Small, fresh | **28.2 ns / 0** | 42.5 ns / 1 |
-| Medium, fresh | **2.60 us / 2** | 2.57 us / 3 |
-| Medium, reused | **2.20 us / 0** | 2.45 us / 1 |
-| Large, fresh | **70.1 us / 2** | 75.3 us / 3 |
-| Large, reused | **68.5 us / 0** | 73.3 us / 1 |
+| Small, fresh | **27.6 ns / 0** | 40.0 ns / 1 |
+| Medium, fresh | **2.18 us / 2** | 2.46 us / 3 |
+| Medium, reused | **2.11 us / 0** | 2.32 us / 1 |
+| Large, fresh | **67.7 us / 2** | 74.5 us / 3 |
+| Large, reused | **66.9 us / 0** | 71.4 us / 1 |
 
 The scalar-versus-SIMD control lives in the root module's `BenchmarkDecode*`
 benchmarks, which build in seconds and compare the same binary pair.
@@ -93,8 +93,8 @@ GOEXPERIMENT=simd,jsonv2 "$TIP_GO" test \
 The measured tip compiler was:
 
 ```text
-go version go1.27-devel_d468ad36 Tue Jul 7 05:58:00 2026 -0700 darwin/arm64
-commit d468ad3648be469ffc4090e4586c29709182d6b6
+go version go1.27-devel_03845e30 Fri Jul 10 12:31:49 2026 -0700 darwin/arm64
+commit 03845e30f7b73d1703bd8c21017297f6eecb76d6
 ```
 
 From the repository root, build that exact toolchain and set `TIP_GO` with:

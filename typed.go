@@ -540,7 +540,12 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 					}
 				}
 				compiledField.key |= uint64('"') << (len(name) * 8)
-				compiledField.keyMask = ^uint64(0) >> ((7 - len(name)) * 8)
+				if len(name) <= 6 {
+					compiledField.key |= uint64(':') << ((len(name) + 1) * 8)
+					compiledField.keyMask = ^uint64(0) >> ((6 - len(name)) * 8)
+				} else {
+					compiledField.keyMask = ^uint64(0)
+				}
 				compiledField.keyLen = uint8(len(name))
 			} else if len(name) <= 255 {
 				for byteIndex := range 8 {

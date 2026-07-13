@@ -183,7 +183,11 @@ func scanNumberFast(base unsafe.Pointer, n, i int) (int, bool) {
 		if i >= n || !isDigit(fastByteAt(base, i)) {
 			return i, false
 		}
-		for i++; i < n && isDigit(fastByteAt(base, i)); i++ {
+		if i+8 <= n && isDigit(fastByteAt(base, i+7)) {
+			i = scanDigitsFast(base, n, i)
+		} else {
+			for i++; i < n && isDigit(fastByteAt(base, i)); i++ {
+			}
 		}
 	}
 	if i < n && (fastByteAt(base, i) == 'e' || fastByteAt(base, i) == 'E') {

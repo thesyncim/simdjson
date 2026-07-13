@@ -780,6 +780,7 @@ func (b *tapeBuilder) parseFast() tapeParseStatus {
 
 // stringFast records one string entry starting at the opening quote.
 func (b *tapeBuilder) stringFast(start int, flags uint8) tapeParseStatus {
+	scanStart := start + 1
 	if start+9 <= len(b.src) {
 		if m := stringSpecialMask(binary.LittleEndian.Uint64(b.src[start+1:])); m != 0 {
 			j := start + 1 + bits.TrailingZeros64(m)/8
@@ -793,9 +794,12 @@ func (b *tapeBuilder) stringFast(start int, flags uint8) tapeParseStatus {
 				b.i = j + 1
 				return tapeParseOK
 			}
+			scanStart = j
+		} else {
+			scanStart += 8
 		}
 	}
-	end, escaped, ok := scanJSONStringFastLong(b.src, b.base, start)
+	end, escaped, ok := scanJSONStringFastFrom(b.src, b.base, scanStart)
 	if !ok {
 		return tapeParseInvalid
 	}

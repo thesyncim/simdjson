@@ -273,6 +273,13 @@ func (cursor *decoderCursor) nextObjectFieldExpected(first bool, expected *typed
 		}
 		if diff == 0 {
 			keyEnd := keyStart + int(expected.keyLen)
+			if expected.keyLen <= 6 {
+				cursor.i = keyEnd + 2
+				if cursor.i < len(cursor.src) && cursor.src[cursor.i] <= ' ' {
+					cursor.skipSpace()
+				}
+				return "", true, true, nil
+			}
 			matchedName := expected.keyLen <= 7
 			if !matchedName && keyEnd+1 < len(cursor.src) && cursor.src[keyEnd] == '"' {
 				matchedName = !foldedHead && matchStringAt(cursor.src, keyStart+8, expected.name[8:])

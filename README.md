@@ -22,7 +22,7 @@ FHIR, and Twitter data. The benchmark uses the exact upstream concrete models,
 not reduced lookalikes.
 
 These are medians of six 200 ms samples on an Apple M4 Max (`darwin/arm64`) with
-Go commit `d468ad3648be469ffc4090e4586c29709182d6b6`. Compilation is outside the
+Go commit `03845e30f7b73d1703bd8c21017297f6eecb76d6`. Compilation is outside the
 timer. Results and encoded output are checked against `encoding/json` before
 timing.
 
@@ -34,11 +34,11 @@ for validation. Speedups are geometric means across all seven payloads.
 
 | Operation | Contract | Wins vs stdlib | Wins vs rival | vs stdlib | vs rival |
 |---|---|---:|---:|---:|---:|
-| Validate | Strict JSON and UTF-8 | **7/7** | **7/7** | **2.29x** | **2.03x** |
-| Typed decode | Owned strings, reused destination | **7/7** | **7/7** | **4.15x** | **1.60x** |
-| Dynamic decode | Owned `any` tree | **7/7** | **7/7** | **4.15x** | **1.89x** |
-| Encode | Owned output | **7/7** | **7/7** | **2.27x** | **1.35x** |
-| Encode | Reused output buffer | **7/7** | **7/7** | **2.42x** | **1.44x** |
+| Validate | Strict JSON and UTF-8 | **7/7** | **7/7** | **2.35x** | **2.15x** |
+| Typed decode | Owned strings, reused destination | **7/7** | **7/7** | **4.69x** | **1.84x** |
+| Dynamic decode | Owned `any` tree | **7/7** | **7/7** | **4.31x** | **1.93x** |
+| Encode | Owned output | **7/7** | **7/7** | **2.33x** | **1.35x** |
+| Encode | Reused output buffer | **7/7** | **7/7** | **2.46x** | **1.43x** |
 
 The scorecard does not mix ownership contracts. Source-backed decode and reused
 output are reported separately below. Native Sonic uses a different compiler
@@ -52,25 +52,25 @@ contract.
 
 | Corpus | `encoding/json` | simdjson owned | simdjson source-backed | Fastest tip rival | Native Sonic owned |
 |---|---:|---:|---:|---:|---:|
-| Canada geometry | 1.197 ms | **359.7 us** | 359.5 us | go-json 698.4 us | 440.5 us |
-| CITM catalog | 2.513 ms | **697.3 us** | 632.7 us | go-json 988.9 us | 1.423 ms |
-| Go source | 5.925 ms | **1.144 ms** | 1.097 ms | Segment 2.070 ms | 3.345 ms |
-| Escaped strings | 173.8 us | **26.04 us** | 26.10 us | go-json 56.65 us | 30.69 us |
-| Unicode strings | 40.29 us | **7.586 us** | 6.881 us | go-json 10.37 us | 11.28 us |
-| Synthea FHIR | 3.617 ms | **1.312 ms** | 1.214 ms | go-json 1.556 ms | 2.653 ms |
-| Twitter status | 1.297 ms | **368.6 us** | 332.2 us | go-json 562.4 us | 699.8 us |
+| Canada geometry | 1.163 ms | **232.9 us** | 227.9 us | go-json 679.8 us | 440.5 us |
+| CITM catalog | 2.451 ms | **685.4 us** | 620.8 us | go-json 992.8 us | 1.423 ms |
+| Go source | 5.968 ms | **1.132 ms** | 1.069 ms | go-json 2.074 ms | 3.345 ms |
+| Escaped strings | 178.8 us | **26.01 us** | 23.75 us | go-json 56.77 us | 30.69 us |
+| Unicode strings | 37.89 us | **5.179 us** | 4.405 us | go-json 10.61 us | 11.28 us |
+| Synthea FHIR | 3.586 ms | **1.265 ms** | 1.207 ms | go-json 1.586 ms | 2.653 ms |
+| Twitter status | 1.268 ms | **342.3 us** | 321.9 us | go-json 571.0 us | 699.8 us |
 
 Source-backed allocation counts are not zero for container-heavy models:
 
 | Corpus | Bytes/op | Allocs/op |
 |---|---:|---:|
-| Canada geometry | 629 B | 2 |
-| CITM catalog | 1.68 MiB | 1,224 |
-| Go source | 14.6 KiB | 68 |
+| Canada geometry | 395 B | 1 |
+| CITM catalog | 1.677 MiB | 1,224 |
+| Go source | 14.32 KiB | 66 |
 | Escaped strings | 48.0 KiB | 1 |
 | Unicode strings | 18.0 KiB | 1 |
-| Synthea FHIR | 1.95 MiB | 351 |
-| Twitter status | 631 KiB | 140 |
+| Synthea FHIR | 1.946 MiB | 351 |
+| Twitter status | 631.2 KiB | 139 |
 
 Slices, maps, pointers, escaped text, and custom method receivers still require
 storage. Source-backed refers specifically to unescaped string ownership.
@@ -82,13 +82,13 @@ JSON syntax and allocates nothing on valid input.
 
 | Corpus | simdjson dynamic | Fastest tip rival | Native Sonic dynamic | simdjson strict valid | Fastest strict tip rival | Native Sonic syntax-only |
 |---|---:|---:|---:|---:|---:|---:|
-| Canada geometry | **695.2 us** | go-json 1.432 ms | 737.5 us | **155.7 us** | fastjson 192.0 us | 189.0 us |
-| CITM catalog | **1.717 ms** | jsoniter 3.191 ms | 2.627 ms | **575.9 us** | fastjson 767.1 us | 780.7 us |
-| Go source | **3.302 ms** | jsoniter 7.337 ms | 5.523 ms | **936.0 us** | Segment 1.124 ms | 1.552 ms |
-| Escaped strings | **25.96 us** | go-json 68.37 us | 32.02 us | **4.124 us** | Segment 54.58 us | 3.327 us |
-| Unicode strings | **11.15 us** | go-json 15.99 us | 12.96 us | **3.057 us** | fastjson 6.237 us | 1.742 us |
-| Synthea FHIR | **2.562 ms** | go-json 4.384 ms | 4.402 ms | **717.6 us** | fastjson 1.166 ms | 854.6 us |
-| Twitter status | **898.4 us** | go-json 1.397 ms | 1.002 ms | **215.5 us** | fastjson 359.5 us | 233.8 us |
+| Canada geometry | **643.6 us** | go-json 1.292 ms | 737.5 us | **122.7 us** | fastjson 185.5 us | 189.0 us |
+| CITM catalog | **1.600 ms** | go-json 3.008 ms | 2.627 ms | **608.3 us** | fastjson 783.8 us | 780.7 us |
+| Go source | **3.135 ms** | jsoniter 7.020 ms | 5.523 ms | **906.5 us** | Segment 1.144 ms | 1.552 ms |
+| Escaped strings | **25.40 us** | go-json 61.20 us | 32.02 us | **4.159 us** | Segment 55.21 us | 3.327 us |
+| Unicode strings | **8.274 us** | go-json 14.98 us | 12.96 us | **3.050 us** | fastjson 6.971 us | 1.742 us |
+| Synthea FHIR | **2.447 ms** | go-json 4.189 ms | 4.402 ms | **741.8 us** | fastjson 1.216 ms | 854.6 us |
+| Twitter status | **838.6 us** | go-json 1.329 ms | 1.002 ms | **217.3 us** | fastjson 376.7 us | 233.8 us |
 
 Sonic v1.15.2 documents that its native `Valid` does not check invalid UTF-8,
 so that column is syntax-only context and is excluded from strict winners and
@@ -102,13 +102,13 @@ caller-owned buffer and is shown separately.
 
 | Corpus | stdlib | simdjson owned | compiled reuse | Fastest tip rival | Native Sonic |
 |---|---:|---:|---:|---:|---:|
-| Canada geometry | 538.1 us | **419.6 us** | 421.1 us | Segment 441.5 us | 782.8 us |
-| CITM catalog | 738.0 us | 295.4 us | **278.2 us** | Segment 296.8 us | 836.2 us |
-| Go source | 2.541 ms | 1.119 ms | **1.084 ms** | Segment 1.120 ms | 3.711 ms |
-| Escaped strings | 17.06 us | 6.929 us | **6.235 us** | jsoniter 18.02 us | 19.73 us |
-| Unicode strings | 17.10 us | 6.978 us | **6.254 us** | jsoniter 17.69 us | 19.76 us |
-| Synthea FHIR | 4.945 ms | 1.643 ms | **1.559 ms** | Segment 1.656 ms | 6.834 ms |
-| Twitter status | 544.6 us | 232.1 us | **210.9 us** | go-json 269.1 us | 552.9 us |
+| Canada geometry | 557.3 us | 429.1 us | **426.4 us** | Segment 452.9 us | 782.8 us |
+| CITM catalog | 762.5 us | 293.2 us | **279.0 us** | Segment 301.4 us | 836.2 us |
+| Go source | 2.616 ms | 1.131 ms | **1.077 ms** | Segment 1.144 ms | 3.711 ms |
+| Escaped strings | 17.09 us | 6.763 us | **6.360 us** | jsoniter 17.19 us | 19.73 us |
+| Unicode strings | 17.18 us | 6.819 us | **6.405 us** | jsoniter 16.89 us | 19.76 us |
+| Synthea FHIR | 5.116 ms | 1.656 ms | **1.567 ms** | Segment 1.703 ms | 6.834 ms |
+| Twitter status | 560.0 us | 231.5 us | **212.4 us** | Segment 269.2 us | 552.9 us |
 
 Both owned and compiled-reuse encoding win every exact-model row. Reuse also
 eliminates the output allocation. The hot struct plan classifies common adjacent
@@ -124,13 +124,13 @@ selected once at initialization; short runs remain scalar or SWAR.
 
 | simdjson path | SIMD wins | Geomean SIMD uplift |
 |---|---:|---:|
-| Validation | 4/7 | **1.38x** |
-| Dynamic owned | **7/7** | **1.08x** |
-| Dynamic source-backed | **7/7** | **1.09x** |
-| Typed owned | 3/7 | **1.06x** |
-| Typed source-backed | 6/7 | **1.09x** |
-| Encode owned | **7/7** | **1.37x** |
-| Encode compiled reuse | **7/7** | **1.42x** |
+| Validation | 5/7 | **1.43x** |
+| Dynamic owned | 3/7 | **1.08x** |
+| Dynamic source-backed | 3/7 | **1.09x** |
+| Typed owned | 5/7 | **1.14x** |
+| Typed source-backed | 6/7 | **1.16x** |
+| Encode owned | 6/7 | **1.39x** |
+| Encode compiled reuse | **7/7** | **1.45x** |
 
 Owned typed decode includes a source-sized copy that SIMD cannot accelerate;
 the source-backed row exposes parser uplift more directly. SIMD is not claimed
@@ -240,10 +240,10 @@ once, and implementation choices are fixed during package initialization.
 
 Other vector paths include strict UTF-8 validation using ARM64 `TBL` lookup,
 contiguous `\uXXXX` validation, U+2028/U+2029 detection, syntax scans used by
-string encoding, and shape-dispatched typed decimals that reduce 16 significant
-digits in one SIMD pass. Every vector load is length-guarded. `CurrentSIMD()`
-reports the selected backend, vector width, threshold, number backend, and CPU
-features.
+string encoding, and shape-dispatched typed decimals. Decimal parsing uses
+register-only SWAR for 8-byte blocks and Go-native SIMD for full 16-digit runs.
+Every vector load is length-guarded. `CurrentSIMD()` reports the selected
+backend, vector width, threshold, number backend, and CPU features.
 
 ## Safety Model
 

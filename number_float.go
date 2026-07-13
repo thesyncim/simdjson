@@ -278,6 +278,15 @@ func scanTypedFloat64(base unsafe.Pointer, n, start int) (end int, value float64
 		all16Digits(unsafe.Add(base, i+2)) {
 		return scanTypedLeadingZeroFloat64(base, n, start)
 	}
+	if i <= n-11 && isOneNine(fastByteAt(base, i)) && isDigit(fastByteAt(base, i+1)) {
+		if fastByteAt(base, i+2) == '.' && all8Digits(unsafe.Add(base, i+3)) {
+			return scanTypedTwoDigitFloat64(base, n, start)
+		}
+		if i <= n-12 && isDigit(fastByteAt(base, i+2)) && fastByteAt(base, i+3) == '.' &&
+			all8Digits(unsafe.Add(base, i+4)) {
+			return scanTypedThreeDigitFloat64(base, n, start)
+		}
+	}
 	if start <= n-8 {
 		word := loadUint64LE(unsafe.Add(base, start))
 		if byteEqMask(word, ',')|byteEqMask(word, ']')|byteEqMask(word, '}') != 0 {
@@ -370,6 +379,137 @@ func scanTypedSimpleFloat64(base unsafe.Pointer, n, start int) (end int, value f
 
 	if digits <= 18 {
 		decimalExponent := exponent - fractionDigits
+		if mantissa >= uint64(1)<<52 && decimalExponent >= -22 && decimalExponent < 0 {
+			value, exact = scaleJSONFloat64(mantissa, decimalExponent, negative)
+		} else {
+			value, exact = (jsonNumber{
+				mantissa: mantissa,
+				exponent: decimalExponent,
+				negative: negative,
+			}).exactFloat64()
+		}
+	}
+	return i, value, exact, true
+}
+
+// scanTypedTwoDigitFloat64 handles the long DD.dddddddd shape common in
+// geographic data. The dispatcher has proved both integer digits, the decimal
+// point, and the first eight fractional digits.
+func scanTypedTwoDigitFloat64(base unsafe.Pointer, n, start int) (end int, value float64, exact, ok bool) {
+	i := start
+	negative := false
+	if fastByteAt(base, i) == '-' {
+		negative = true
+		i++
+	}
+	mantissa := uint64(fastByteAt(base, i)-'0')*10 + uint64(fastByteAt(base, i+1)-'0')
+	mantissa = mantissa*1e8 + parse8Digits(unsafe.Add(base, i+3))
+	i += 11
+	digits := 10
+	fractionDigits := 8
+	if i+8 <= n {
+		word := loadUint64LE(unsafe.Add(base, i))
+		invalid := nonDigitMask8(word)
+		tailDigits := 0
+		switch {
+		case invalid&0x0000808080808080 != 0:
+		case invalid&0x0080000000000000 != 0:
+			tailDigits = 6
+			word = word&0x0000ffffffffffff | digitLower&0xffff000000000000
+		case invalid&0x8000000000000000 != 0:
+			tailDigits = 7
+			word = word&0x00ffffffffffffff | digitLower&0xff00000000000000
+		default:
+			tailDigits = 8
+		}
+		if tailDigits != 0 {
+			mantissa = mantissa*1e8 + parse8DigitsWord(word)
+			digits = 18
+			fractionDigits = 16
+			i += tailDigits
+		}
+	}
+	for i < n && isDigit(fastByteAt(base, i)) {
+		digits++
+		fractionDigits++
+		if digits <= 18 {
+			mantissa = mantissa*10 + uint64(fastByteAt(base, i)-'0')
+		}
+		i++
+	}
+
+	if i < n && (fastByteAt(base, i) == 'e' || fastByteAt(base, i) == 'E') {
+		return scanTypedSimpleFloat64(base, n, start)
+	}
+
+	if digits <= 18 {
+		decimalExponent := -fractionDigits
+		if mantissa >= uint64(1)<<52 && decimalExponent >= -22 && decimalExponent < 0 {
+			value, exact = scaleJSONFloat64(mantissa, decimalExponent, negative)
+		} else {
+			value, exact = (jsonNumber{
+				mantissa: mantissa,
+				exponent: decimalExponent,
+				negative: negative,
+			}).exactFloat64()
+		}
+	}
+	return i, value, exact, true
+}
+
+// scanTypedThreeDigitFloat64 handles DDD.dddddddddddddd values while keeping
+// the mantissa inside the 18-digit exact-scaling envelope.
+func scanTypedThreeDigitFloat64(base unsafe.Pointer, n, start int) (end int, value float64, exact, ok bool) {
+	i := start
+	negative := false
+	if fastByteAt(base, i) == '-' {
+		negative = true
+		i++
+	}
+	mantissa := uint64(fastByteAt(base, i)-'0')*100 +
+		uint64(fastByteAt(base, i+1)-'0')*10 + uint64(fastByteAt(base, i+2)-'0')
+	mantissa = mantissa*1e8 + parse8Digits(unsafe.Add(base, i+4))
+	i += 12
+	digits := 11
+	fractionDigits := 8
+	if i+8 <= n {
+		word := loadUint64LE(unsafe.Add(base, i))
+		invalid := nonDigitMask8(word)
+		tailDigits := 0
+		switch {
+		case invalid&0x0000808080808080 != 0:
+		case invalid&0x0080000000000000 != 0:
+			tailDigits = 6
+			word = word&0x0000ffffffffffff | digitLower&0xffff000000000000
+		case invalid&0x8000000000000000 != 0:
+			tailDigits = 7
+			word = word&0x00ffffffffffffff | digitLower&0xff00000000000000
+		default:
+			digits = 19
+			fractionDigits = 16
+			i += 8
+		}
+		if tailDigits != 0 {
+			mantissa = mantissa*1e7 + parse8DigitsWord(word)/10
+			digits = 18
+			fractionDigits = 15
+			i += tailDigits
+		}
+	}
+	for i < n && isDigit(fastByteAt(base, i)) {
+		digits++
+		fractionDigits++
+		if digits <= 18 {
+			mantissa = mantissa*10 + uint64(fastByteAt(base, i)-'0')
+		}
+		i++
+	}
+
+	if i < n && (fastByteAt(base, i) == 'e' || fastByteAt(base, i) == 'E') {
+		return scanTypedSimpleFloat64(base, n, start)
+	}
+	if digits <= 18 {
+		decimalExponent := -fractionDigits
 		if mantissa >= uint64(1)<<52 && decimalExponent >= -22 && decimalExponent < 0 {
 			value, exact = scaleJSONFloat64(mantissa, decimalExponent, negative)
 		} else {

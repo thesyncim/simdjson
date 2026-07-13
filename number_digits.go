@@ -2,34 +2,56 @@ package simdjson
 
 import (
 	"encoding/binary"
+	"math/bits"
 	"unsafe"
 )
 
+const (
+	digitLower = uint64(0x3030303030303030)
+	digitUpper = uint64(0x4646464646464646)
+	digitHigh  = uint64(0x8080808080808080)
+)
+
+func nonDigitMask8(x uint64) uint64 {
+	return ((x + digitUpper) | (x - digitLower)) & digitHigh
+}
+
+// scanDigitsFast advances over a decimal digit run. Short runs stay scalar;
+// sustained runs classify eight bytes per iteration and locate the delimiter
+// directly from the first non-digit lane.
+func scanDigitsFast(base unsafe.Pointer, n, i int) int {
+	if i+4 <= n && isDigit(fastByteAt(base, i+3)) {
+		for i+8 <= n {
+			invalid := nonDigitMask8(loadUint64LE(unsafe.Add(base, i)))
+			if invalid != 0 {
+				return i + bits.TrailingZeros64(invalid)/8
+			}
+			i += 8
+		}
+	}
+	for i < n && isDigit(fastByteAt(base, i)) {
+		i++
+	}
+	return i
+}
+
 func all16Digits(base unsafe.Pointer) bool {
-	const (
-		lower = 0x3030303030303030
-		upper = 0x4646464646464646
-		high  = 0x8080808080808080
-	)
 	x0 := loadUint64LE(base)
 	x1 := loadUint64LE(unsafe.Add(base, 8))
-	return ((x0+upper)|(x0-lower))&high == 0 && ((x1+upper)|(x1-lower))&high == 0
+	return nonDigitMask8(x0) == 0 && nonDigitMask8(x1) == 0
 }
 
 func all8Digits(base unsafe.Pointer) bool {
-	const (
-		lower = 0x3030303030303030
-		upper = 0x4646464646464646
-		high  = 0x8080808080808080
-	)
-	x := loadUint64LE(base)
-	return ((x+upper)|(x-lower))&high == 0
+	return nonDigitMask8(loadUint64LE(base)) == 0
 }
 
 // parse8Digits reduces eight ASCII digits in three pairwise multiply stages.
 // It is the small-token companion to the architecture SIMD 16-digit parser.
 func parse8Digits(base unsafe.Pointer) uint64 {
-	x := loadUint64LE(base)
+	return parse8DigitsWord(loadUint64LE(base))
+}
+
+func parse8DigitsWord(x uint64) uint64 {
 	x = (x & 0x0f0f0f0f0f0f0f0f) * 2561 >> 8
 	x = (x & 0x00ff00ff00ff00ff) * 6553601 >> 16
 	return (x & 0x0000ffff0000ffff) * 42949672960001 >> 32

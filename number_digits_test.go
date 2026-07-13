@@ -58,6 +58,38 @@ func TestScanTypedFloat64FormattedValues(t *testing.T) {
 	}
 }
 
+func TestScanTypedFloat64GeographicShapesMatchStrconv(t *testing.T) {
+	for _, text := range []string{
+		"12.12345678",
+		"12.1234567890123",
+		"65.61361699999998",
+		"-43.42027300000001",
+		"99.1234567890123456",
+		"100.12345678",
+		"141.00299000000003",
+		"-179.9999999999999",
+		"100.123456789012345",
+		"12.12345678901234e+2",
+		"-141.00299000000003e-2",
+	} {
+		for _, delimiter := range []byte{',', ']', '}'} {
+			src := append([]byte(text), delimiter)
+			end, got, exact, ok := scanTypedFloat64(unsafe.Pointer(unsafe.SliceData(src)), len(src), 0)
+			if !ok || !exact || end != len(text) {
+				t.Fatalf("scanTypedFloat64(%q) = end %d, exact %v, ok %v", text, end, exact, ok)
+			}
+			want, err := strconv.ParseFloat(text, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if math.Float64bits(got) != math.Float64bits(want) {
+				t.Fatalf("scanTypedFloat64(%q) = %.17g (%#x), want %.17g (%#x)",
+					text, got, math.Float64bits(got), want, math.Float64bits(want))
+			}
+		}
+	}
+}
+
 func TestParse8Digits(t *testing.T) {
 	for value := uint64(0); value < 100000000; value += 7919 {
 		text := []byte(fmt.Sprintf("%08d", value))
@@ -100,6 +132,43 @@ func TestAll16DigitsEveryBytePosition(t *testing.T) {
 			}
 		}
 		digits[i] = '0'
+	}
+}
+
+func TestScanDigitsFast(t *testing.T) {
+	for prefix := 0; prefix <= 40; prefix++ {
+		for suffix := 0; suffix <= 16; suffix++ {
+			text := make([]byte, prefix+1+suffix)
+			for i := range text {
+				text[i] = '7'
+			}
+			text[prefix] = ','
+			base := unsafe.Pointer(unsafe.SliceData(text))
+			for start := 0; start <= prefix; start++ {
+				if got := scanDigitsFast(base, len(text), start); got != prefix {
+					t.Fatalf("prefix=%d suffix=%d start=%d: got %d", prefix, suffix, start, got)
+				}
+			}
+		}
+	}
+
+	var bytes [16]byte
+	for i := range bytes {
+		bytes[i] = '0'
+	}
+	base := unsafe.Pointer(&bytes[0])
+	for position := range bytes {
+		for value := 0; value < 256; value++ {
+			bytes[position] = byte(value)
+			want := position
+			if value >= '0' && value <= '9' {
+				want = len(bytes)
+			}
+			if got := scanDigitsFast(base, len(bytes), 0); got != want {
+				t.Fatalf("position=%d value=%#02x: got %d, want %d", position, value, got, want)
+			}
+		}
+		bytes[position] = '0'
 	}
 }
 

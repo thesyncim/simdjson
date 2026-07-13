@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-go_tip_commit=d468ad3648be469ffc4090e4586c29709182d6b6
+go_tip_commit=03845e30f7b73d1703bd8c21017297f6eecb76d6
 destination=${1:-"$HOME/sdk/simdjson-gotip"}
 bootstrap_go=${BOOTSTRAP_GO:-go}
 
