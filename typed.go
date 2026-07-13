@@ -581,15 +581,39 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 				node.encFields[0].encName = node.encFields[0].encName[1:]
 			}
 			const blockBytes = 16
+			// A wide store is safe when successful encoding is guaranteed to
+			// overwrite every byte through its end. Keep the last short-name
+			// tail out of the packed table so AppendJSON never modifies bytes
+			// past its result.
+			tailMin := 1 // closing brace
+			for i := len(node.encFields) - 1; i >= 0; i-- {
+				field := &node.encFields[i]
+				valueMin := minimumTypedEncodedBytes(field.node, field.encOp)
+				if valueMin >= blockBytes-tailMin {
+					tailMin = blockBytes
+				} else {
+					tailMin += valueMin
+				}
+				n := len(field.encName)
+				if n <= blockBytes && tailMin >= blockBytes-n {
+					field.encNameLen = uint8(n)
+				}
+				if n >= blockBytes-tailMin {
+					tailMin = blockBytes
+				} else {
+					tailMin += n
+				}
+			}
 			for i := range node.encFields {
 				field := &node.encFields[i]
 				block := len(node.encNameData) / blockBytes
-				if len(field.encName) <= blockBytes && block <= int(^uint16(0)) {
+				if field.encNameLen != 0 && block <= int(^uint16(0)) {
 					field.encNameBlock = uint16(block)
-					field.encNameLen = uint8(len(field.encName))
 					start := len(node.encNameData)
 					node.encNameData = append(node.encNameData, make([]byte, blockBytes)...)
 					copy(node.encNameData[start:], field.encName)
+				} else {
+					field.encNameLen = 0
 				}
 			}
 		}
@@ -628,6 +652,28 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 		return c.unsupported(typ, path, "kind "+typ.Kind().String()+" would require interface or reflective value dispatch")
 	}
 	return nil
+}
+
+func minimumTypedEncodedBytes(node *typedNode, op typedOp) int {
+	switch op {
+	case typedOpBool:
+		return 4
+	case typedOpString, typedOpQuoted:
+		return 2
+	case typedOpStruct, typedOpSlice, typedOpMap:
+		return 2
+	case typedOpArray:
+		if node.length == 0 {
+			return 2
+		}
+		element := minimumTypedEncodedBytes(node.elem, node.elem.encOp)
+		if element >= (int(^uint(0)>>1)-1)/node.length {
+			return 1
+		}
+		return 1 + node.length*(element+1)
+	default:
+		return 1
+	}
 }
 
 func classifyTypedEncPair(first, second typedOp) typedEncPairOp {

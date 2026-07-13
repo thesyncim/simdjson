@@ -55,9 +55,11 @@ func CompileEncoder[T any](opts EncoderOptions) (Encoder[T], error) {
 	}, nil
 }
 
-// AppendJSON appends src encoded as compact JSON to dst. Ordinary compiled
-// sources remain stack eligible. Pointer-receiver custom methods use a
-// heap-backed receiver copied back before AppendJSON returns.
+// AppendJSON appends src encoded as compact JSON to dst. The backing storage of
+// dst must not overlap storage reachable from src. Ordinary compiled sources
+// remain stack eligible. Pointer-receiver custom methods use a heap-backed
+// receiver copied back before AppendJSON returns. On error AppendJSON returns
+// dst unchanged in length, but its unused capacity may contain partial output.
 func (plan Encoder[T]) AppendJSON(dst []byte, src *T) ([]byte, error) {
 	if plan.root == nil {
 		return dst, fmt.Errorf("simdjson: zero Encoder")

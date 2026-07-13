@@ -2,41 +2,95 @@ package simd
 
 import "unsafe"
 
-// IndexStringSpecial returns the first byte at or after start that is a quote,
-// backslash, control byte, or non-ASCII byte. It returns len(src) when none is
-// present.
-func IndexStringSpecial(src []byte, start int) int {
+// Unchecked exposes scanner entry points for hot callers that have already
+// proved 0 <= start <= len(src). Violating that precondition may panic or cause
+// an out-of-bounds vector access. The ordinary package functions below clamp
+// start and are the safe default.
+var Unchecked UncheckedScans
+
+// UncheckedScans is the precondition-based scanner surface exposed through
+// Unchecked. Its methods omit public-boundary offset normalization.
+type UncheckedScans struct{}
+
+// IndexStringSpecial is the unchecked form of the package function.
+func (UncheckedScans) IndexStringSpecial(src []byte, start int) int {
 	return scanStringSpecial(src, start)
 }
 
-// IndexStringSpecialLong bypasses the short-input probe and enters the selected
-// long scanner directly.
-func IndexStringSpecialLong(src []byte, start int) int {
+// IndexStringSpecialLong is the unchecked form of the package function.
+func (UncheckedScans) IndexStringSpecialLong(src []byte, start int) int {
 	return scanStringSpecialLong(src, start)
 }
 
-// IndexStringSyntax returns the first quote, backslash, or control byte at or
-// after start. Non-ASCII bytes are allowed.
-func IndexStringSyntax(src []byte, start int) int {
+// IndexStringSyntax is the unchecked form of the package function.
+func (UncheckedScans) IndexStringSyntax(src []byte, start int) int {
 	return scanStringSyntax(src, start)
 }
 
-// IndexHTMLStringSpecial is IndexStringSpecial with '<', '>', and '&' added to
-// the stop set used by HTML-safe JSON encoders.
-func IndexHTMLStringSpecial(src []byte, start int) int {
+// IndexHTMLStringSpecial is the unchecked form of the package function.
+func (UncheckedScans) IndexHTMLStringSpecial(src []byte, start int) int {
 	return scanEncodedHTMLSpecialFast(src, start)
 }
 
-// IndexHTMLStringSyntax is IndexStringSyntax with '<', '>', and '&' added to
-// the stop set used by HTML-safe JSON encoders.
-func IndexHTMLStringSyntax(src []byte, start int) int {
+// IndexHTMLStringSyntax is the unchecked form of the package function.
+func (UncheckedScans) IndexHTMLStringSyntax(src []byte, start int) int {
 	return scanEncodedHTMLSyntaxFast(src, start)
+}
+
+// ScanUnicodeEscapeRun is the unchecked form of the package function.
+func (UncheckedScans) ScanUnicodeEscapeRun(src []byte, start int) (end int, ok bool) {
+	return scanUnicodeEscapeRun(src, start)
+}
+
+// HasJSONLineSeparator is the unchecked form of the package function.
+func (UncheckedScans) HasJSONLineSeparator(src []byte, start int) bool {
+	return hasJSONLineSeparatorFast(src, start)
+}
+
+// ScanStringUnicodeRun is the unchecked form of the package function.
+func (UncheckedScans) ScanStringUnicodeRun(src []byte, start int) (next, bad int) {
+	return scanStringUnicodeRun(src, start)
+}
+
+// IndexStringSpecial returns the first byte at or after start that is a quote,
+// backslash, control byte, or non-ASCII byte. It returns len(src) when none is
+// present. Start is clamped to the bounds of src.
+func IndexStringSpecial(src []byte, start int) int {
+	return scanStringSpecial(src, normalizeStart(src, start))
+}
+
+// IndexStringSpecialLong bypasses the short-input probe and enters the selected
+// long scanner directly. Start is clamped to the bounds of src.
+func IndexStringSpecialLong(src []byte, start int) int {
+	return scanStringSpecialLong(src, normalizeStart(src, start))
+}
+
+// IndexStringSyntax returns the first quote, backslash, or control byte at or
+// after start. Non-ASCII bytes are allowed. Start is clamped to the bounds of
+// src.
+func IndexStringSyntax(src []byte, start int) int {
+	return scanStringSyntax(src, normalizeStart(src, start))
+}
+
+// IndexHTMLStringSpecial is IndexStringSpecial with '<', '>', and '&' added to
+// the stop set used by HTML-safe JSON encoders. Start is clamped to the bounds
+// of src.
+func IndexHTMLStringSpecial(src []byte, start int) int {
+	return scanEncodedHTMLSpecialFast(src, normalizeStart(src, start))
+}
+
+// IndexHTMLStringSyntax is IndexStringSyntax with '<', '>', and '&' added to
+// the stop set used by HTML-safe JSON encoders. Start is clamped to the bounds
+// of src.
+func IndexHTMLStringSyntax(src []byte, start int) int {
+	return scanEncodedHTMLSyntaxFast(src, normalizeStart(src, start))
 }
 
 // ScanUnicodeEscapeRun validates complete vector-sized groups of contiguous
 // JSON \uXXXX escapes. It returns start when a scalar decision is required.
+// Start is clamped to the bounds of src.
 func ScanUnicodeEscapeRun(src []byte, start int) (end int, ok bool) {
-	return scanUnicodeEscapeRun(src, start)
+	return scanUnicodeEscapeRun(src, normalizeStart(src, start))
 }
 
 // ValidUTF8 reports whether src consists entirely of valid UTF-8.
@@ -51,9 +105,9 @@ func ValidUTF8NoLineSeparator(src []byte) bool {
 }
 
 // HasJSONLineSeparator reports whether U+2028 or U+2029 occurs at or after
-// start.
+// start. Start is clamped to the bounds of src.
 func HasJSONLineSeparator(src []byte, start int) bool {
-	return hasJSONLineSeparatorFast(src, start)
+	return hasJSONLineSeparatorFast(src, normalizeStart(src, start))
 }
 
 // StringSpecialMask64 returns a high-bit byte mask for quote, backslash,
@@ -76,8 +130,19 @@ func ByteEqualMask64(word uint64, value byte) uint64 {
 
 // ScanStringUnicodeRun scans a non-ASCII string run and returns the next byte
 // to inspect and the first malformed UTF-8 byte, or -1 when the run is valid.
+// Start is clamped to the bounds of src.
 func ScanStringUnicodeRun(src []byte, start int) (next, bad int) {
-	return scanStringUnicodeRun(src, start)
+	return scanStringUnicodeRun(src, normalizeStart(src, start))
+}
+
+func normalizeStart(src []byte, start int) int {
+	if uint(start) <= uint(len(src)) {
+		return start
+	}
+	if start < 0 {
+		return 0
+	}
+	return len(src)
 }
 
 // CopyStringPrefix copies bytes that do not require JSON string escaping and

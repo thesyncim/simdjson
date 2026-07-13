@@ -75,25 +75,55 @@ Source-backed allocation counts are not zero for container-heavy models:
 Slices, maps, pointers, escaped text, and custom method receivers still require
 storage. Source-backed refers specifically to unescaped string ownership.
 
-### Dynamic And Validation
+### Dynamic Decode
 
-Dynamic rows fully materialize owned `any` trees. Validation only checks strict
-JSON syntax and allocates nothing on valid input.
+Every row builds a fully owned `any` tree. The rival column is the fastest
+compatible library measured with the same Go tip compiler. Lower is better;
+lead is rival time divided by simdjson time.
 
-| Corpus | simdjson dynamic | Fastest tip rival | Native Sonic dynamic | simdjson strict valid | Fastest strict tip rival | Native Sonic syntax-only |
-|---|---:|---:|---:|---:|---:|---:|
-| Canada geometry | **942.9 us** | go-json 1.891 ms | 809.6 us | **128.2 us** | Segment 223.8 us | 188.8 us |
-| CITM catalog | **2.920 ms** | jsoniter 4.508 ms | 3.254 ms | **647.2 us** | fastjson 871.9 us | 784.7 us |
-| Go source | **4.986 ms** | go-json 9.814 ms | 6.918 ms | **952.2 us** | Segment 1.199 ms | 1.551 ms |
-| Escaped strings | **35.1 us** | go-json 77.5 us | 33.9 us | **4.4 us** | Segment 58.3 us | 3.4 us |
-| Unicode strings | **15.5 us** | go-json 21.7 us | 14.3 us | **3.2 us** | fastjson 7.1 us | 1.7 us |
-| Synthea FHIR | **4.557 ms** | jsoniter 7.063 ms | 5.635 ms | **780.3 us** | fastjson 1.301 ms | 867.0 us |
-| Twitter status | **1.427 ms** | go-json 2.089 ms | 1.230 ms | **231.8 us** | fastjson 402.5 us | 235.8 us |
+| Corpus | simdjson | Rival | Rival time | Lead |
+|---|---:|---|---:|---:|
+| Canada geometry | **942.9 us** | go-json | 1.891 ms | **2.01x** |
+| CITM catalog | **2.920 ms** | jsoniter | 4.508 ms | **1.54x** |
+| Go source | **4.986 ms** | go-json | 9.814 ms | **1.97x** |
+| Escaped strings | **35.1 us** | go-json | 77.5 us | **2.21x** |
+| Unicode strings | **15.5 us** | go-json | 21.7 us | **1.40x** |
+| Synthea FHIR | **4.557 ms** | jsoniter | 7.063 ms | **1.55x** |
+| Twitter status | **1.427 ms** | go-json | 2.089 ms | **1.46x** |
 
-Sonic v1.15.2 documents that its native `Valid` does not check invalid UTF-8,
-so that column is syntax-only context and is excluded from strict winners and
-speedups. simdjson wins all seven strict validation and owned dynamic rows
-against the compatible same-toolchain field.
+### Strict Validation
+
+Validation checks both JSON syntax and UTF-8 and allocates nothing for valid
+input. simdjson wins all seven rows against the fastest strict Go tip rival.
+
+| Corpus | simdjson | Rival | Rival time | Lead |
+|---|---:|---|---:|---:|
+| Canada geometry | **128.2 us** | Segment | 223.8 us | **1.75x** |
+| CITM catalog | **647.2 us** | fastjson | 871.9 us | **1.35x** |
+| Go source | **952.2 us** | Segment | 1.199 ms | **1.26x** |
+| Escaped strings | **4.4 us** | Segment | 58.3 us | **13.25x** |
+| Unicode strings | **3.2 us** | fastjson | 7.1 us | **2.22x** |
+| Synthea FHIR | **780.3 us** | fastjson | 1.301 ms | **1.67x** |
+| Twitter status | **231.8 us** | fastjson | 402.5 us | **1.74x** |
+
+<details>
+<summary>Native Sonic context (Go 1.26.4, not a fair Go tip comparison)</summary>
+
+| Corpus | Owned dynamic decode | Syntax-only `Valid` |
+|---|---:|---:|
+| Canada geometry | 809.6 us | 188.8 us |
+| CITM catalog | 3.254 ms | 784.7 us |
+| Go source | 6.918 ms | 1.551 ms |
+| Escaped strings | 33.9 us | 3.4 us |
+| Unicode strings | 14.3 us | 1.7 us |
+| Synthea FHIR | 5.635 ms | 867.0 us |
+| Twitter status | 1.230 ms | 235.8 us |
+
+Sonic v1.15.2 falls back to `encoding/json` on Go 1.27, so these native results
+come from the isolated Go 1.26.4 module. Sonic's `Valid` does not reject invalid
+UTF-8, so its validation numbers are syntax-only and not strict competitors.
+
+</details>
 
 ### Encode
 
@@ -113,12 +143,14 @@ caller-owned buffer and is shown separately.
 Owned `Marshal` beats stdlib on all seven rows and the fastest compatible rival
 on four. Compile-once buffer reuse removes the output allocation and wins all
 seven rival rows, with a 2.09x geometric lead. The plan classifies common
-adjacent field operations once and emits two fields per dispatch. Names up to
-16 bytes live in compiler-owned fixed blocks and copy with one guarded vector
-load/store without enlarging the 40-byte field record. Integer map keys use a
-local byte arena and public reflection iteration; no interface-layout or
-runtime map-layout assumptions are involved. Integer, float, string, and
-RFC3339 time formatting all use shape-specific SIMD or SWAR paths.
+adjacent field operations once and emits two fields per dispatch. Eligible
+names up to 16 bytes live in compiler-owned fixed blocks and copy with one
+guarded vector load/store without enlarging the 40-byte field record. A name is
+eligible only when the compiler proves later output covers the full store;
+short tail names use exact append. Integer map keys use a local byte arena and
+public reflection iteration; no interface-layout or runtime map-layout
+assumptions are involved. Integer, float, string, and RFC3339 time formatting
+all use shape-specific SIMD or SWAR paths.
 
 ### SIMD Versus Pure Go
 
@@ -301,15 +333,20 @@ simdjson uses `unsafe` only in measured internal paths and keeps those uses
 narrow:
 
 - vector loads and stores run only when a complete block remains;
+- public scanners clamp offsets; the explicit `simd.Unchecked` surface requires
+  callers to prove `0 <= start <= len(src)`;
 - public fused-copy kernels reject short or overlapping destinations;
-- packed field-name stores require 16 bytes of destination capacity and read
-  only compiler-owned, exact-width blocks;
+- packed field-name stores require 16 bytes of destination capacity, read only
+  compiler-owned blocks, and are emitted only when successful final output
+  covers the complete store;
 - direct float stores prove the final output size before extending the slice;
 - integer pair stores follow a capacity extension and a table index below 100;
 - typed offsets and strides come from public `reflect` metadata;
 - maps use public reflection APIs and never assume runtime layout;
 - no `go:linkname`, hand-written assembly, C, or interface-layout fabrication;
 - source-backed APIs explicitly require immutable input;
+- `AppendJSON` requires destination storage to be disjoint from storage
+  reachable through its source value;
 - pointer-receiver custom methods use heap-backed shadows that remain valid
   across stack growth and GC;
 - pure and SIMD builds run differential tests, race detection, `checkptr=2`,

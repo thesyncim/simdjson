@@ -54,13 +54,51 @@ func TestAppendTimeErrorsDoNotChangeDestination(t *testing.T) {
 		time.Date(10_000, 1, 1, 0, 0, 0, 0, time.UTC),
 		time.Date(2026, 1, 1, 0, 0, 0, 0, time.FixedZone("invalid", 24*60*60)),
 	} {
-		dst := []byte("prefix")
+		storage := bytes.Repeat([]byte{0xa5}, 64)
+		copy(storage, "prefix")
+		before := append([]byte(nil), storage...)
+		dst := storage[:len("prefix"):48]
 		got, err := AppendTime(dst, value)
 		if err == nil {
 			t.Fatalf("AppendTime(%v) succeeded", value)
 		}
 		if string(got) != "prefix" {
 			t.Fatalf("AppendTime changed destination to %q", got)
+		}
+		if !bytes.Equal(storage, before) {
+			t.Fatalf("AppendTime(%v) modified destination backing", value)
+		}
+	}
+}
+
+func TestAppendTimeRespectsDestinationBounds(t *testing.T) {
+	values := []time.Time{
+		time.Date(0, 1, 2, 3, 4, 5, 0, time.UTC),
+		time.Date(2026, 7, 13, 14, 37, 52, 123_456_700, time.UTC),
+		time.Date(9999, 12, 31, 23, 59, 59, 999_999_999, time.FixedZone("east", 14*60*60+45*60)),
+		time.Date(2026, 1, 1, 0, 0, 0, 1, time.FixedZone("sub-minute", -30)),
+	}
+	for _, value := range values {
+		want := []byte("pre:\"")
+		var err error
+		want, err = value.AppendText(want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, '"')
+		for capacity := 0; capacity <= len(want)+16; capacity++ {
+			storage := bytes.Repeat([]byte{0xa5}, len("pre:")+capacity+32)
+			copy(storage, "pre:")
+			dst := storage[: len("pre:") : len("pre:")+capacity]
+			got, gotErr := AppendTime(dst, value)
+			if gotErr != nil || !bytes.Equal(got, want) {
+				t.Fatalf("AppendTime(%v, cap=%d) = %q, %v, want %q", value, capacity, got, gotErr, want)
+			}
+			for i, b := range storage[len("pre:")+capacity:] {
+				if b != 0xa5 {
+					t.Fatalf("AppendTime(%v, cap=%d) wrote past capacity at byte %d", value, capacity, len("pre:")+capacity+i)
+				}
+			}
 		}
 	}
 }

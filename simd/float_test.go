@@ -1,6 +1,7 @@
 package simd
 
 import (
+	"bytes"
 	"math"
 	"strconv"
 	"testing"
@@ -64,10 +65,63 @@ func TestAppendFloat32MatchesJSON(t *testing.T) {
 
 func TestAppendFloatInvalidPreservesDestination(t *testing.T) {
 	for _, value := range []float64{math.NaN(), math.Inf(-1), math.Inf(1)} {
-		dst := []byte("prefix")
+		storage := bytes.Repeat([]byte{0xa5}, 64)
+		copy(storage, "prefix")
+		before := append([]byte(nil), storage...)
+		dst := storage[:len("prefix"):48]
 		got, ok := AppendFloat64(dst, value)
 		if ok || string(got) != "prefix" {
 			t.Fatalf("AppendFloat64(%v) = %q, %v", value, got, ok)
+		}
+		if !bytes.Equal(storage, before) {
+			t.Fatalf("AppendFloat64(%v) modified destination backing", value)
+		}
+	}
+}
+
+func TestAppendFloatRespectsDestinationBounds(t *testing.T) {
+	float64Values := []float64{
+		0, math.Copysign(0, -1), 43.508331000000055,
+		-59.975554999999986, 1e-7, 1e20, 1e21,
+		math.SmallestNonzeroFloat64, math.MaxFloat64,
+	}
+	for _, value := range float64Values {
+		want := appendJSONFloat([]byte("pre:"), value, 64)
+		for capacity := 0; capacity <= len(want)+16; capacity++ {
+			storage := bytes.Repeat([]byte{0xa5}, len("pre:")+capacity+32)
+			copy(storage, "pre:")
+			dst := storage[: len("pre:") : len("pre:")+capacity]
+			got, ok := AppendFloat64(dst, value)
+			if !ok || !bytes.Equal(got, want) {
+				t.Fatalf("AppendFloat64(%v, cap=%d) = %q, %v, want %q", value, capacity, got, ok, want)
+			}
+			for i, b := range storage[len("pre:")+capacity:] {
+				if b != 0xa5 {
+					t.Fatalf("AppendFloat64(%v, cap=%d) wrote past capacity at byte %d", value, capacity, len("pre:")+capacity+i)
+				}
+			}
+		}
+	}
+
+	float32Values := []float32{
+		0, float32(math.Copysign(0, -1)), 0.1, -0.1, 1e-7,
+		1e20, 1e21, math.SmallestNonzeroFloat32, math.MaxFloat32,
+	}
+	for _, value := range float32Values {
+		want := appendJSONFloat([]byte("pre:"), float64(value), 32)
+		for capacity := 0; capacity <= len(want)+16; capacity++ {
+			storage := bytes.Repeat([]byte{0xa5}, len("pre:")+capacity+32)
+			copy(storage, "pre:")
+			dst := storage[: len("pre:") : len("pre:")+capacity]
+			got, ok := AppendFloat32(dst, value)
+			if !ok || !bytes.Equal(got, want) {
+				t.Fatalf("AppendFloat32(%v, cap=%d) = %q, %v, want %q", value, capacity, got, ok, want)
+			}
+			for i, b := range storage[len("pre:")+capacity:] {
+				if b != 0xa5 {
+					t.Fatalf("AppendFloat32(%v, cap=%d) wrote past capacity at byte %d", value, capacity, len("pre:")+capacity+i)
+				}
+			}
 		}
 	}
 }
