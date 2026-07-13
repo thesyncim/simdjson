@@ -5,9 +5,40 @@ import (
 	"encoding/json"
 	"reflect"
 	"runtime"
+	"sync"
 	"time"
 	"unsafe"
 )
+
+type encoderMarshalerScratch struct {
+	value reflect.Value
+	boxed any
+}
+
+type encoderScratch struct {
+	marshalers []encoderMarshalerScratch
+}
+
+func (s *encoderScratch) reset() {
+	for i := range s.marshalers {
+		s.marshalers[i].value.SetZero()
+	}
+}
+
+func newEncoderScratchPool(types []reflect.Type) *sync.Pool {
+	if len(types) == 0 {
+		return nil
+	}
+	types = append([]reflect.Type(nil), types...)
+	return &sync.Pool{New: func() any {
+		scratch := &encoderScratch{marshalers: make([]encoderMarshalerScratch, len(types))}
+		for i, typ := range types {
+			value := reflect.New(typ)
+			scratch.marshalers[i] = encoderMarshalerScratch{value: value.Elem(), boxed: value.Interface()}
+		}
+		return scratch
+	}}
+}
 
 // valueInterfaceAt copies T into an interface. Calling a value-receiver method
 // on that interface cannot expose p to user code.
@@ -151,10 +182,15 @@ func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, k
 			return nil
 		}
 		boxed, shadow = copiedLoadedPointerReceiverAt(node.typ, pointer)
-	} else if kind == typedMarshalerJSON && node.typ.Implements(jsonMarshalerReflectType) {
-		boxed = valueInterfaceAt(node.typ, src)
-	} else if kind == typedMarshalerText && node.typ.Implements(textMarshalerReflectType) {
-		boxed = valueInterfaceAt(node.typ, src)
+	} else if (kind == typedMarshalerJSON && node.typ.Implements(jsonMarshalerReflectType)) ||
+		(kind == typedMarshalerText && node.typ.Implements(textMarshalerReflectType)) {
+		if e.scratch == nil || node.encScratch < 0 {
+			boxed = valueInterfaceAt(node.typ, src)
+		} else {
+			slot := &e.scratch.marshalers[node.encScratch]
+			slot.value.Set(reflect.NewAt(node.typ, noescape(src)).Elem())
+			boxed = slot.boxed
+		}
 	} else {
 		boxed, shadow = copiedPointerReceiverAt(node.typ, src)
 	}

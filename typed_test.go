@@ -23,6 +23,9 @@ func TestTypedDecoderCursorStaysCompact(t *testing.T) {
 	if size := unsafe.Sizeof(decoderCursor{}); size > 64 {
 		t.Fatalf("typed decoder cursor size = %d bytes, want <= 64", size)
 	}
+	if size := unsafe.Sizeof(typedEncField{}); size > 40 {
+		t.Fatalf("typed encoder field size = %d bytes, want <= 40", size)
+	}
 }
 
 type typedTestDocument struct {

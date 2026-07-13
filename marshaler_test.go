@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -194,6 +195,17 @@ type failingMarshaler struct{}
 
 func (failingMarshaler) MarshalJSON() ([]byte, error) { return nil, errors.New("boom") }
 
+type staticValueMarshaler int
+
+var staticValueJSON = []byte("7")
+
+func (v staticValueMarshaler) MarshalJSON() ([]byte, error) {
+	if v != 7 {
+		return nil, errors.New("unexpected static value")
+	}
+	return staticValueJSON, nil
+}
+
 type pointerOnlyMarshaler struct {
 	Value int `json:"value"`
 }
@@ -219,6 +231,58 @@ type marshalerDocument struct {
 	Box     rawJSONBox           `json:"box"`
 	Boxes   []rawJSONBox         `json:"boxes"`
 	ByKey   map[string]textPoint `json:"by_key"`
+}
+
+func TestCompiledValueMarshalerScratch(t *testing.T) {
+	type document struct {
+		Value staticValueMarshaler `json:"value"`
+	}
+	encoder, err := CompileEncoder[document](EncoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := document{Value: 7}
+	buffer := make([]byte, 0, 32)
+	allocs := testing.AllocsPerRun(100, func() {
+		out, encodeErr := encoder.AppendJSON(buffer[:0], &value)
+		if encodeErr != nil || string(out) != `{"value":7}` {
+			t.Fatalf("AppendJSON = %s, %v", out, encodeErr)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("value marshaler allocations = %v, want 0", allocs)
+	}
+	scratch := encoder.scratch.Get().(*encoderScratch)
+	if !scratch.marshalers[0].value.IsZero() {
+		t.Fatal("pooled marshaler scratch retained the encoded value")
+	}
+	encoder.scratch.Put(scratch)
+
+	var wait sync.WaitGroup
+	errs := make(chan error, 8)
+	for range 8 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			local := make([]byte, 0, 32)
+			for range 100 {
+				out, encodeErr := encoder.AppendJSON(local[:0], &value)
+				if encodeErr != nil {
+					errs <- encodeErr
+					return
+				}
+				if string(out) != `{"value":7}` {
+					errs <- fmt.Errorf("unexpected concurrent output %q", out)
+					return
+				}
+			}
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
 }
 
 func TestMarshalersMatchStdlib(t *testing.T) {

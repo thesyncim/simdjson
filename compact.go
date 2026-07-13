@@ -8,6 +8,17 @@ type compactParser struct {
 }
 
 func appendCompact(dst, src []byte, maxDepth int) ([]byte, error) {
+	switch len(src) {
+	case 4:
+		if src[0] == 'n' && src[1] == 'u' && src[2] == 'l' && src[3] == 'l' ||
+			src[0] == 't' && src[1] == 'r' && src[2] == 'u' && src[3] == 'e' {
+			return append(dst, src...), nil
+		}
+	case 5:
+		if src[0] == 'f' && src[1] == 'a' && src[2] == 'l' && src[3] == 's' && src[4] == 'e' {
+			return append(dst, src...), nil
+		}
+	}
 	if maxDepth <= 0 {
 		maxDepth = defaultMaxDepth
 	}

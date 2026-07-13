@@ -278,7 +278,9 @@ type typedNode struct {
 	hopResets        []uintptr
 	reset            []typedResetOp
 	ready            bool
+	encSimple        bool
 	allSet           uint64
+	encScratch       int32
 }
 
 type typedField struct {
@@ -303,12 +305,36 @@ type typedEncField struct {
 	offset    uintptr
 	hop       int16
 	encOp     typedOp
+	pairOp    typedEncPairOp
 	omitEmpty bool
 }
 
+type typedEncPairOp uint8
+
+const (
+	typedEncPairFallback typedEncPairOp = iota
+	typedEncPairStringString
+	typedEncPairSliceString
+	typedEncPairSliceStruct
+	typedEncPairSliceSlice
+	typedEncPairStructStruct
+	typedEncPairMarshalerMarshaler
+	typedEncPairStructSlice
+	typedEncPairStringSlice
+	typedEncPairMarshalerStruct
+	typedEncPairMarshalerString
+	typedEncPairStructString
+	typedEncPairStringStruct
+	typedEncPairFloat64Int64
+	typedEncPairUint64Uint64
+	typedEncPairStringFloat64
+	typedEncPairStructInt64
+)
+
 type typedCompiler struct {
-	nodes      map[reflect.Type]*typedNode
-	escapeHTML bool
+	nodes           map[reflect.Type]*typedNode
+	encScratchTypes []reflect.Type
+	escapeHTML      bool
 }
 
 var jsonNumberReflectType = reflect.TypeFor[json.Number]()
@@ -318,7 +344,7 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 	if node := c.nodes[typ]; node != nil {
 		return node, nil
 	}
-	node := &typedNode{typ: typ, name: typ.String(), size: typ.Size()}
+	node := &typedNode{typ: typ, name: typ.String(), size: typ.Size(), encScratch: -1}
 	c.nodes[typ] = node
 
 	if err := c.compileStructural(node, typ, path); err != nil {
@@ -451,6 +477,7 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 	case reflect.Struct:
 		node.kind = typedStruct
 		node.op = typedOpStruct
+		node.encSimple = true
 		for _, resolved := range resolveStructFields(typ) {
 			fieldNode, err := c.compile(resolved.typ, path+"."+resolved.name)
 			if err != nil {
@@ -470,6 +497,7 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 				hop:    -1,
 			}
 			if hops != nil {
+				node.encSimple = false
 				compiledField.hop = int16(len(node.fieldHops))
 				node.fieldHops = append(node.fieldHops, hops)
 				// The embedded pointer slot is not a leaf field, so replace
@@ -477,12 +505,15 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 				node.hopResets = append(node.hopResets, hops[0].offset)
 			}
 			encField := typedEncField{
-				encName:   string(appendEncodedJSONString(nil, resolved.name, c.escapeHTML)) + ":",
+				encName:   "," + string(appendEncodedJSONString(nil, resolved.name, c.escapeHTML)) + ":",
 				node:      fieldNode,
 				offset:    offset,
 				hop:       compiledField.hop,
 				encOp:     fieldNode.encOp,
 				omitEmpty: resolved.omitEmpty,
+			}
+			if resolved.omitEmpty {
+				node.encSimple = false
 			}
 			if resolved.quoted {
 				quotedNode := fieldNode
@@ -524,6 +555,11 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 			}
 			node.fields = append(node.fields, compiledField)
 		}
+		if node.encSimple {
+			for i := 0; i+1 < len(node.encFields); i += 2 {
+				node.encFields[i].pairOp = classifyTypedEncPair(node.encFields[i].encOp, node.encFields[i+1].encOp)
+			}
+		}
 		if len(node.fields) <= 64 {
 			if len(node.fields) == 64 {
 				node.allSet = ^uint64(0)
@@ -559,6 +595,45 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 		return c.unsupported(typ, path, "kind "+typ.Kind().String()+" would require interface or reflective value dispatch")
 	}
 	return nil
+}
+
+func classifyTypedEncPair(first, second typedOp) typedEncPairOp {
+	switch {
+	case first == typedOpString && second == typedOpString:
+		return typedEncPairStringString
+	case first == typedOpSlice && second == typedOpString:
+		return typedEncPairSliceString
+	case first == typedOpSlice && second == typedOpStruct:
+		return typedEncPairSliceStruct
+	case first == typedOpSlice && second == typedOpSlice:
+		return typedEncPairSliceSlice
+	case first == typedOpStruct && second == typedOpStruct:
+		return typedEncPairStructStruct
+	case first == typedOpMarshaler && second == typedOpMarshaler:
+		return typedEncPairMarshalerMarshaler
+	case first == typedOpStruct && second == typedOpSlice:
+		return typedEncPairStructSlice
+	case first == typedOpString && second == typedOpSlice:
+		return typedEncPairStringSlice
+	case first == typedOpMarshaler && second == typedOpStruct:
+		return typedEncPairMarshalerStruct
+	case first == typedOpMarshaler && second == typedOpString:
+		return typedEncPairMarshalerString
+	case first == typedOpStruct && second == typedOpString:
+		return typedEncPairStructString
+	case first == typedOpString && second == typedOpStruct:
+		return typedEncPairStringStruct
+	case first == typedOpFloat64 && second == typedOpInt64:
+		return typedEncPairFloat64Int64
+	case first == typedOpUint64 && second == typedOpUint64:
+		return typedEncPairUint64Uint64
+	case first == typedOpString && second == typedOpFloat64:
+		return typedEncPairStringFloat64
+	case first == typedOpStruct && second == typedOpInt64:
+		return typedEncPairStructInt64
+	default:
+		return typedEncPairFallback
+	}
 }
 
 // typedMapKeyKind classifies how map keys convert to and from JSON member
@@ -646,6 +721,10 @@ func (c *typedCompiler) applyInterfaceKinds(node *typedNode, typ reflect.Type) b
 		node.encKind = typedMarshalerText
 		node.encOp = typedOpMarshaler
 		applied = true
+	}
+	if typ.Implements(jsonMarshalerReflectType) || typ.Implements(textMarshalerReflectType) {
+		node.encScratch = int32(len(c.encScratchTypes))
+		c.encScratchTypes = append(c.encScratchTypes, typ)
 	}
 	return applied
 }

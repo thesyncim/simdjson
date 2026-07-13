@@ -34,6 +34,7 @@ type EncoderOptions struct {
 type Encoder[T any] struct {
 	root       *typedNode
 	escapeHTML bool
+	scratch    *sync.Pool
 }
 
 // CompileEncoder builds an encoder for T. It supports the same types as
@@ -46,7 +47,11 @@ func CompileEncoder[T any](opts EncoderOptions) (Encoder[T], error) {
 	if err != nil {
 		return Encoder[T]{}, err
 	}
-	return Encoder[T]{root: root, escapeHTML: escapeHTML}, nil
+	return Encoder[T]{
+		root:       root,
+		escapeHTML: escapeHTML,
+		scratch:    newEncoderScratchPool(compiler.encScratchTypes),
+	}, nil
 }
 
 // AppendJSON appends src encoded as compact JSON to dst. Ordinary compiled
@@ -60,7 +65,15 @@ func (plan Encoder[T]) AppendJSON(dst []byte, src *T) ([]byte, error) {
 		return dst, fmt.Errorf("simdjson: encode source is nil")
 	}
 	e := encodeState{dst: dst, escapeHTML: plan.escapeHTML}
-	if err := e.encode(plan.root, unsafe.Pointer(src)); err != nil {
+	if plan.scratch != nil {
+		e.scratch = plan.scratch.Get().(*encoderScratch)
+	}
+	err := e.encode(plan.root, unsafe.Pointer(src))
+	if plan.scratch != nil {
+		e.scratch.reset()
+		plan.scratch.Put(e.scratch)
+	}
+	if err != nil {
 		return dst, err
 	}
 	return e.dst, nil
@@ -159,6 +172,7 @@ type encodeState struct {
 	dst        []byte
 	depth      int
 	escapeHTML bool
+	scratch    *encoderScratch
 }
 
 func (e *encodeState) encode(node *typedNode, src unsafe.Pointer) error {
@@ -272,6 +286,9 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 	}
 	e.depth++
 	e.dst = append(e.dst, '{')
+	if node.encSimple {
+		return e.encodeSimpleStructPairs(node, src)
+	}
 	first := true
 	for i := range node.encFields {
 		encField := &node.encFields[i]
@@ -287,11 +304,12 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 		if encField.omitEmpty && typedValueIsEmpty(encField.node, fieldSrc) {
 			continue
 		}
-		if !first {
-			e.dst = append(e.dst, ',')
+		name := encField.encName
+		if first {
+			name = name[1:]
+			first = false
 		}
-		first = false
-		e.dst = append(e.dst, encField.encName...)
+		e.dst = append(e.dst, name...)
 		var err error
 		switch encField.encOp {
 		case typedOpBool:
@@ -348,6 +366,199 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 	}
 	e.dst = append(e.dst, '}')
 	e.depth--
+	return nil
+}
+
+func (e *encodeState) encodeSimpleStructPairs(node *typedNode, src unsafe.Pointer) error {
+	fields := node.encFields
+	i := 0
+	for ; i+1 < len(fields); i += 2 {
+		first := &fields[i]
+		second := &fields[i+1]
+		name := first.encName
+		if i == 0 {
+			name = name[1:]
+		}
+		e.dst = append(e.dst, name...)
+		firstSrc := unsafe.Add(src, first.offset)
+		secondSrc := unsafe.Add(src, second.offset)
+		errorIndex := i
+		var err error
+		switch first.pairOp {
+		case typedEncPairStringString:
+			e.dst = appendEncodedJSONString(e.dst, *(*string)(firstSrc), e.escapeHTML)
+			e.dst = append(e.dst, second.encName...)
+			e.dst = appendEncodedJSONString(e.dst, *(*string)(secondSrc), e.escapeHTML)
+		case typedEncPairSliceString:
+			err = e.encodeSlice(first.node, firstSrc)
+			if err == nil {
+				e.dst = append(e.dst, second.encName...)
+				e.dst = appendEncodedJSONString(e.dst, *(*string)(secondSrc), e.escapeHTML)
+			}
+		case typedEncPairSliceStruct:
+			err = e.encodeSlice(first.node, firstSrc)
+			if err == nil {
+				e.dst = append(e.dst, second.encName...)
+				errorIndex = i + 1
+				err = e.encodeStruct(second.node, secondSrc)
+			}
+		case typedEncPairSliceSlice:
+			err = e.encodeSlice(first.node, firstSrc)
+			if err == nil {
+				e.dst = append(e.dst, second.encName...)
+				errorIndex = i + 1
+				err = e.encodeSlice(second.node, secondSrc)
+			}
+		case typedEncPairStructStruct:
+			err = e.encodeStruct(first.node, firstSrc)
+			if err == nil {
+				e.dst = append(e.dst, second.encName...)
+				errorIndex = i + 1
+				err = e.encodeStruct(second.node, secondSrc)
+			}
+		case typedEncPairMarshalerMarshaler:
+			err = e.encodeMarshaler(first.node, firstSrc)
+			if err == nil {
+				e.dst = append(e.dst, second.encName...)
+				errorIndex = i + 1
+				err = e.encodeMarshaler(second.node, secondSrc)
+			}
+		case typedEncPairStructSlice:
+			err = e.encodeStruct(first.node, firstSrc)
+			if err == nil {
+				e.dst = append(e.dst, second.encName...)
+				errorIndex = i + 1
+				err = e.encodeSlice(second.node, secondSrc)
+			}
+		case typedEncPairStringSlice:
+			e.dst = appendEncodedJSONString(e.dst, *(*string)(firstSrc), e.escapeHTML)
+			e.dst = append(e.dst, second.encName...)
+			errorIndex = i + 1
+			err = e.encodeSlice(second.node, secondSrc)
+		case typedEncPairMarshalerStruct:
+			err = e.encodeMarshaler(first.node, firstSrc)
+			if err == nil {
+				e.dst = append(e.dst, second.encName...)
+				errorIndex = i + 1
+				err = e.encodeStruct(second.node, secondSrc)
+			}
+		case typedEncPairMarshalerString:
+			err = e.encodeMarshaler(first.node, firstSrc)
+			if err == nil {
+				e.dst = append(e.dst, second.encName...)
+				e.dst = appendEncodedJSONString(e.dst, *(*string)(secondSrc), e.escapeHTML)
+			}
+		case typedEncPairStructString:
+			err = e.encodeStruct(first.node, firstSrc)
+			if err == nil {
+				e.dst = append(e.dst, second.encName...)
+				e.dst = appendEncodedJSONString(e.dst, *(*string)(secondSrc), e.escapeHTML)
+			}
+		case typedEncPairStringStruct:
+			e.dst = appendEncodedJSONString(e.dst, *(*string)(firstSrc), e.escapeHTML)
+			e.dst = append(e.dst, second.encName...)
+			errorIndex = i + 1
+			err = e.encodeStruct(second.node, secondSrc)
+		case typedEncPairFloat64Int64:
+			err = e.encodeFloat(*(*float64)(firstSrc), 64)
+			if err == nil {
+				e.dst = append(e.dst, second.encName...)
+				e.dst = appendCompactInt(e.dst, *(*int64)(secondSrc))
+			}
+		case typedEncPairUint64Uint64:
+			e.dst = appendCompactUint(e.dst, *(*uint64)(firstSrc))
+			e.dst = append(e.dst, second.encName...)
+			e.dst = appendCompactUint(e.dst, *(*uint64)(secondSrc))
+		case typedEncPairStringFloat64:
+			e.dst = appendEncodedJSONString(e.dst, *(*string)(firstSrc), e.escapeHTML)
+			e.dst = append(e.dst, second.encName...)
+			errorIndex = i + 1
+			err = e.encodeFloat(*(*float64)(secondSrc), 64)
+		case typedEncPairStructInt64:
+			err = e.encodeStruct(first.node, firstSrc)
+			if err == nil {
+				e.dst = append(e.dst, second.encName...)
+				e.dst = appendCompactInt(e.dst, *(*int64)(secondSrc))
+			}
+		default:
+			err = e.encodeStructFieldValue(first, firstSrc)
+			if err == nil {
+				e.dst = append(e.dst, second.encName...)
+				errorIndex = i + 1
+				err = e.encodeStructFieldValue(second, secondSrc)
+			}
+		}
+		if err != nil {
+			e.depth--
+			return prependEncodePathField(err, node.fields[errorIndex].name)
+		}
+	}
+	if i < len(fields) {
+		field := &fields[i]
+		name := field.encName
+		if i == 0 {
+			name = name[1:]
+		}
+		e.dst = append(e.dst, name...)
+		if err := e.encodeStructFieldValue(field, unsafe.Add(src, field.offset)); err != nil {
+			e.depth--
+			return prependEncodePathField(err, node.fields[i].name)
+		}
+	}
+	e.dst = append(e.dst, '}')
+	e.depth--
+	return nil
+}
+
+func (e *encodeState) encodeStructFieldValue(field *typedEncField, src unsafe.Pointer) error {
+	switch field.encOp {
+	case typedOpBool:
+		if *(*bool)(src) {
+			e.dst = append(e.dst, "true"...)
+		} else {
+			e.dst = append(e.dst, "false"...)
+		}
+	case typedOpString:
+		e.dst = appendEncodedJSONString(e.dst, *(*string)(src), e.escapeHTML)
+	case typedOpNumber:
+		return e.encodeNumberLiteral(*(*string)(src))
+	case typedOpInt8:
+		e.dst = appendCompactInt(e.dst, int64(*(*int8)(src)))
+	case typedOpInt16:
+		e.dst = appendCompactInt(e.dst, int64(*(*int16)(src)))
+	case typedOpInt32:
+		e.dst = appendCompactInt(e.dst, int64(*(*int32)(src)))
+	case typedOpInt64:
+		e.dst = appendCompactInt(e.dst, *(*int64)(src))
+	case typedOpUint8:
+		e.dst = appendCompactUint(e.dst, uint64(*(*uint8)(src)))
+	case typedOpUint16:
+		e.dst = appendCompactUint(e.dst, uint64(*(*uint16)(src)))
+	case typedOpUint32:
+		e.dst = appendCompactUint(e.dst, uint64(*(*uint32)(src)))
+	case typedOpUint64:
+		e.dst = appendCompactUint(e.dst, *(*uint64)(src))
+	case typedOpFloat32:
+		return e.encodeFloat(float64(*(*float32)(src)), 32)
+	case typedOpFloat64:
+		return e.encodeFloat(*(*float64)(src), 64)
+	case typedOpStruct:
+		return e.encodeStruct(field.node, src)
+	case typedOpSlice:
+		return e.encodeSlice(field.node, src)
+	case typedOpArray:
+		return e.encodeArray(field.node, src)
+	case typedOpMap:
+		return e.encodeMap(field.node, src)
+	case typedOpAny:
+		return e.encodeAny(src)
+	case typedOpQuoted:
+		return e.encodeQuoted(field.node, src)
+	case typedOpMarshaler:
+		return e.encodeMarshaler(field.node, src)
+	default:
+		return e.encode(field.node, src)
+	}
 	return nil
 }
 
@@ -845,6 +1056,9 @@ func appendCompactInt(dst []byte, v int64) []byte {
 // with HTML escaping disabled: control bytes, quotes, and backslashes are
 // escaped, invalid UTF-8 becomes �, and U+2028/U+2029 are escaped.
 func appendEncodedJSONString(dst []byte, s string, escapeHTML bool) []byte {
+	if len(s) == 0 {
+		return append(dst, '"', '"')
+	}
 	dst = append(dst, '"')
 	src := unsafe.Slice(unsafe.StringData(s), len(s))
 	first := 0
