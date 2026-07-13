@@ -38,6 +38,136 @@ groups. Owned and source-backed rows are distinct. Sonic is omitted when its
 API reports stdlib fallback; run `BenchmarkStdlibCorpusNativeSonic` in
 `legacy/` with Go 1.26.4 for native numbers.
 
+## Published corpus snapshot
+
+These are medians of six 300 ms, single-CPU samples on an Apple M4 Max
+(`darwin/arm64`) using Go commit
+`03845e30f7b73d1703bd8c21017297f6eecb76d6`. Compilation happens before the
+timer. Every result is checked against `encoding/json` before measurement.
+
+"Rival" is the fastest compatible same-toolchain result from go-json v0.10.6,
+Segment encoding v0.5.4, jsoniter v1.1.12, or fastjson v1.6.10. The headline
+speedups in the root README are geometric means over all seven payloads.
+
+### Typed decode
+
+The owned row is the conventional comparison. Source-backed decoding aliases
+unescaped strings into immutable input and has a different lifetime contract.
+
+| Corpus | `encoding/json` | simdjson owned | Source-backed | Rival | Rival time |
+|---|---:|---:|---:|---|---:|
+| Canada geometry | 1.257 ms | **290.2 us** | 226.8 us | Segment | 800.9 us |
+| CITM catalog | 2.548 ms | **1.082 ms** | 877.4 us | go-json | 1.321 ms |
+| Go source | 6.493 ms | **1.439 ms** | 1.073 ms | Segment | 2.318 ms |
+| Escaped strings | 205.4 us | **39.0 us** | 31.8 us | go-json | 68.7 us |
+| Unicode strings | 42.0 us | **10.8 us** | 7.2 us | go-json | 14.0 us |
+| Synthea FHIR | 3.855 ms | **1.964 ms** | 1.690 ms | go-json | 2.195 ms |
+| Twitter status | 1.407 ms | **527.3 us** | 445.6 us | go-json | 728.5 us |
+
+Source-backed refers only to unescaped string ownership. Slices, maps,
+pointers, escaped text, and custom method receivers may still allocate.
+
+| Corpus | Source-backed bytes/op | Source-backed allocs/op |
+|---|---:|---:|
+| Canada geometry | 268 B | 0 |
+| CITM catalog | 1.677 MiB | 1,221 |
+| Go source | 9.56 KiB | 44 |
+| Escaped strings | 48.0 KiB | 1 |
+| Unicode strings | 18.0 KiB | 1 |
+| Synthea FHIR | 1.945 MiB | 348 |
+| Twitter status | 631.1 KiB | 139 |
+
+### Dynamic decode
+
+These rows fully materialize an owned `any` tree.
+
+| Corpus | simdjson | Rival | Rival time | Lead |
+|---|---:|---|---:|---:|
+| Canada geometry | **942.9 us** | go-json | 1.891 ms | **2.01x** |
+| CITM catalog | **2.920 ms** | jsoniter | 4.508 ms | **1.54x** |
+| Go source | **4.986 ms** | go-json | 9.814 ms | **1.97x** |
+| Escaped strings | **35.1 us** | go-json | 77.5 us | **2.21x** |
+| Unicode strings | **15.5 us** | go-json | 21.7 us | **1.40x** |
+| Synthea FHIR | **4.557 ms** | jsoniter | 7.063 ms | **1.55x** |
+| Twitter status | **1.427 ms** | go-json | 2.089 ms | **1.46x** |
+
+### Strict validation
+
+Validation checks both JSON syntax and UTF-8 and allocates nothing for valid
+input.
+
+| Corpus | simdjson | Rival | Rival time | Lead |
+|---|---:|---|---:|---:|
+| Canada geometry | **128.2 us** | Segment | 223.8 us | **1.75x** |
+| CITM catalog | **647.2 us** | fastjson | 871.9 us | **1.35x** |
+| Go source | **952.2 us** | Segment | 1.199 ms | **1.26x** |
+| Escaped strings | **4.4 us** | Segment | 58.3 us | **13.25x** |
+| Unicode strings | **3.2 us** | fastjson | 7.1 us | **2.22x** |
+| Synthea FHIR | **780.3 us** | fastjson | 1.301 ms | **1.67x** |
+| Twitter status | **231.8 us** | fastjson | 402.5 us | **1.74x** |
+
+### Encode
+
+Owned rows compare `Marshal` with `Marshal`. Compiled reuse appends into a
+caller-owned buffer and removes the output allocation.
+
+| Corpus | stdlib | simdjson owned | Compiled reuse | Rival | Rival time |
+|---|---:|---:|---:|---|---:|
+| Canada geometry | 687.8 us | 380.9 us | **306.4 us** | Segment | 517.1 us |
+| CITM catalog | 1.004 ms | 412.4 us | **251.1 us** | go-json | 397.4 us |
+| Go source | 3.332 ms | 1.381 ms | **720.6 us** | Segment | 1.458 ms |
+| Escaped strings | 20.9 us | 9.7 us | **6.5 us** | jsoniter | 22.0 us |
+| Unicode strings | 21.3 us | 9.8 us | **6.5 us** | Segment | 23.0 us |
+| Synthea FHIR | 6.289 ms | 2.579 ms | **1.394 ms** | Segment | 2.210 ms |
+| Twitter status | 742.5 us | 367.9 us | **209.3 us** | go-json | 360.4 us |
+
+### SIMD versus pure Go
+
+Both binaries use the same pinned Go tip compiler and corpus. SIMD dispatch is
+selected once during initialization; short runs may remain scalar or SWAR.
+
+| simdjson path | SIMD wins | Geomean SIMD uplift |
+|---|---:|---:|
+| Validation | 4/7 | **1.378x** |
+| Dynamic owned | 3/7 | **1.052x** |
+| Dynamic source-backed | 2/7 | **1.049x** |
+| Typed owned | 3/7 | **1.052x** |
+| Typed source-backed | 4/7 | **1.097x** |
+| Encode owned | 6/7 | **1.329x** |
+| Encode compiled reuse | 6/7 | **1.473x** |
+
+### Native Sonic context
+
+Sonic v1.15.2 falls back to `encoding/json` on Go 1.27. Its native results use
+an isolated Go 1.26.4 module and are excluded from the headline winner and
+speedup calculations. Sonic's `Valid` is syntax-only because it accepts
+invalid UTF-8.
+
+| Corpus | Typed owned | Dynamic owned | Encode owned | Syntax-only `Valid` |
+|---|---:|---:|---:|---:|
+| Canada geometry | 438.9 us | 809.6 us | 794.8 us | 188.8 us |
+| CITM catalog | 1.685 ms | 3.254 ms | 975.8 us | 784.7 us |
+| Go source | 4.318 ms | 6.918 ms | 4.627 ms | 1.551 ms |
+| Escaped strings | 33.2 us | 33.9 us | 20.9 us | 3.4 us |
+| Unicode strings | 12.2 us | 14.3 us | 20.9 us | 1.7 us |
+| Synthea FHIR | 3.456 ms | 5.635 ms | 8.988 ms | 867.0 us |
+| Twitter status | 768.7 us | 1.230 ms | 611.9 us | 235.8 us |
+
+## SIMD kernel snapshot
+
+These Apple M4 Max medians use eight 500 ms samples and guarded public APIs.
+All rows report zero allocations.
+
+| Kernel | Selected | Control | Speedup |
+|---|---:|---:|---:|
+| Parse 16 digits | **1.031 ns** | scalar 6.664 ns | **6.46x** |
+| Store 8 digits | **1.497 ns** | `strconv` 5.783 ns | **3.86x** |
+| Store 16 digits | **2.228 ns** | scalar 3.128 ns | **1.40x** |
+| Store 16 digits | **2.228 ns** | `strconv` 8.112 ns | **3.64x** |
+| Append float64 | **15.49 ns** | `strconv` 24.09 ns | **1.56x** |
+| Append quoted time | **19.53 ns** | `time.AppendText` 31.64 ns | **1.62x** |
+| Store date/time digits | **3.138 ns** | scalar 4.686 ns | **1.49x** |
+
 ## Compiled decoder
 
 These results exclude `CompileDecoder[T]` construction. Plans are initialized
@@ -128,7 +258,7 @@ another pinned environment.
 - `BenchmarkParseTyped`: typed fresh and reused decoding across conventional,
   compiled zero-copy, compiled owned, and competitor modes.
 - `BenchmarkParseTypedJSONV2`: direct `encoding/json/v2` typed decoding.
-- `Valid`: syntax validation only.
+- `Valid`: strict JSON syntax and UTF-8 validation.
 - `ParseAny`: full conventional `any` materialization.
 - `ParseAnyNumbers16`: materialization of 1,024 exact 16-digit integers.
 - `ParseNative`: each library's native structural representation.
