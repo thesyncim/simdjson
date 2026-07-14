@@ -203,6 +203,11 @@ func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, k
 			slot.value.Set(reflect.NewAt(node.typ, noescape(src)).Elem())
 			boxed = slot.boxed
 		}
+	} else if e.nonAddr {
+		// The value type does not implement the interface and the value is
+		// not addressable, so encoding/json cannot call the pointer-receiver
+		// method: it falls back to the default encoding.
+		return e.encodeKind(node, src, node.encNonAddrKind)
 	} else {
 		boxed, shadow = copiedPointerReceiverAt(node.typ, src)
 	}
@@ -305,4 +310,40 @@ func escapeHTMLInPlaceTail(buf []byte, from int) []byte {
 		}
 	}
 	return append(buf[:from], escaped...)
+}
+
+// computeEncPtrMarshaler marks encHasPtrMarshaler bottom-up. A pointer-only
+// marshaler leaf qualifies; a struct or array qualifies when it reaches one
+// through fields or elements without crossing a pointer, slice, or map, which
+// restore or independently handle addressability. Every reachable node is
+// visited so its own subtree is marked; cycles resolve to false because a
+// cycle must pass through a pointer.
+func computeEncPtrMarshaler(node *typedNode, active map[*typedNode]bool) bool {
+	if node == nil || active[node] {
+		return false
+	}
+	active[node] = true
+	defer delete(active, node)
+
+	has := false
+	switch node.encKind {
+	case typedMarshalerJSON, typedMarshalerText:
+		// encNonAddrKind holds the non-marshaler fallback only when the
+		// value type does not implement the interface itself.
+		has = node.encNonAddrKind != node.encKind
+	case typedStruct:
+		for i := range node.encFields {
+			child := computeEncPtrMarshaler(node.encFields[i].node, active)
+			switch node.encFields[i].encOp {
+			case typedOpMarshaler, typedOpStruct, typedOpArray:
+				has = has || child
+			}
+		}
+	case typedArray:
+		has = computeEncPtrMarshaler(node.elem, active)
+	case typedPointer, typedSlice, typedMap:
+		computeEncPtrMarshaler(node.elem, active)
+	}
+	node.encHasPtrMarshaler = has
+	return has
 }

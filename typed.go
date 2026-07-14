@@ -332,9 +332,14 @@ type typedNode struct {
 	reset         []typedResetOp
 	ready         bool
 	encSimple     bool
-	allSet        uint64
-	encScratch    int32
-	encMapElem    int32
+	// encHasPtrMarshaler marks types that can reach a pointer-receiver
+	// marshaler through struct fields or array elements without crossing a
+	// pointer, slice, or map. Only these pay the non-addressable flag when
+	// encoded as a map value or interface content.
+	encHasPtrMarshaler bool
+	allSet             uint64
+	encScratch         int32
+	encMapElem         int32
 }
 
 // typedField is one struct member of a compiled decode plan. The key fields

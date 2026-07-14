@@ -48,6 +48,7 @@ func CompileEncoder[T any](opts EncoderOptions) (Encoder[T], error) {
 	if err != nil {
 		return Encoder[T]{}, err
 	}
+	computeEncPtrMarshaler(root, make(map[*typedNode]bool))
 	return Encoder[T]{
 		root:       root,
 		escapeHTML: escapeHTML,
@@ -182,8 +183,14 @@ type encodeState struct {
 	// longer double-count against the container depth limit.
 	ptrRun     int
 	escapeHTML bool
-	scratch    *encoderScratch
-	timeCache  simdkernels.TimeCache
+	// nonAddr is set while encoding a value reached without addressability —
+	// a map value or interface content, inherited through structs and
+	// arrays, cleared through pointers and slices. It reroutes a
+	// pointer-receiver marshaler to its default encoding, matching
+	// encoding/json's condAddrEncoder.
+	nonAddr   bool
+	scratch   *encoderScratch
+	timeCache simdkernels.TimeCache
 }
 
 func (e *encodeState) encode(node *typedNode, src unsafe.Pointer) error {
@@ -275,6 +282,13 @@ func (e *encodeState) encodeKind(node *typedNode, src unsafe.Pointer, kind typed
 			return &EncodeError{Reason: "maximum nesting depth exceeded"}
 		}
 		e.ptrRun = run + 1
+		if e.nonAddr {
+			e.nonAddr = false
+			err := e.encode(node.elem, pointer)
+			e.nonAddr = true
+			e.ptrRun = run
+			return err
+		}
 		err := e.encode(node.elem, pointer)
 		e.ptrRun = run
 		return err
@@ -857,6 +871,9 @@ func dynamicEncodeNode(typ reflect.Type, escapeHTML bool) (*typedNode, error) {
 	}
 	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode), escapeHTML: escapeHTML, dynamic: true}
 	node, err := compiler.compile(typ, typ.String())
+	if err == nil {
+		computeEncPtrMarshaler(node, make(map[*typedNode]bool))
+	}
 	entry, _ := dynamicEncodeNodes.LoadOrStore(key, &dynamicEncodeEntry{node: node, err: err})
 	cached := entry.(*dynamicEncodeEntry)
 	return cached.node, cached.err
@@ -913,8 +930,30 @@ func (e *encodeState) encodeDynamicValue(value reflect.Value) error {
 	return encodeErr
 }
 
+// encodeNonAddressable encodes a value reached without addressability — a map
+// value or interface content — where encoding/json cannot take the address to
+// call a pointer-receiver marshaler. The nonAddr flag it raises reroutes those
+// marshalers to their default encoding at the one dispatch point that cares,
+// and pointers and slices below restore addressability by lowering it again.
 func (e *encodeState) encodeNonAddressable(node *typedNode, src unsafe.Pointer) error {
+	if node.encHasPtrMarshaler {
+		return e.encodeNonAddressableMarshaler(node, src)
+	}
 	return e.encodeKind(node, src, node.encNonAddrKind)
+}
+
+// encodeNonAddressableMarshaler is the cold half of encodeNonAddressable, for
+// the rare types that reach a pointer-receiver marshaler through fields or
+// elements. Splitting it out keeps the common encodeNonAddressable a single
+// tail call that inlines into the map and interface loops.
+//
+//go:noinline
+func (e *encodeState) encodeNonAddressableMarshaler(node *typedNode, src unsafe.Pointer) error {
+	prev := e.nonAddr
+	e.nonAddr = true
+	err := e.encodeKind(node, src, node.encKind)
+	e.nonAddr = prev
+	return err
 }
 
 // encodeMap writes a map with string keys as an object with byte-sorted
@@ -1003,6 +1042,11 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		elementValue = reflect.New(node.elem.typ).Elem()
 	}
 	elementPtr := elementValue.Addr().UnsafePointer()
+	// The value type is loop invariant, so the non-addressable dispatch is
+	// resolved once: ordinary values encode directly as they did before the
+	// addressability handling, and only marshaler-bearing types raise the
+	// flag.
+	elemHasMarshaler := node.elem.encHasPtrMarshaler
 	e.dst = append(e.dst, '{')
 	for i := range entries {
 		if i > 0 {
@@ -1011,7 +1055,13 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		e.dst = appendEncodedJSONString(e.dst, entries[i].name, e.escapeHTML)
 		e.dst = append(e.dst, ':')
 		elementValue.Set(entries[i].value)
-		if err := e.encodeNonAddressable(node.elem, elementPtr); err != nil {
+		var err error
+		if elemHasMarshaler {
+			err = e.encodeNonAddressableMarshaler(node.elem, elementPtr)
+		} else {
+			err = e.encodeKind(node.elem, elementPtr, node.elem.encNonAddrKind)
+		}
+		if err != nil {
 			// Clone: numeric key names alias the pooled arena, and the
 			// error must outlive this call's ownership of it.
 			name := strings.Clone(entries[i].name)
