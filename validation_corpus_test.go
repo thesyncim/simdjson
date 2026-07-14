@@ -43,6 +43,10 @@ func TestJSONTestSuite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The JSONTestSuite corpus is vendored under testdata and fixed at this
+	// revision: 318 files total. Pinning the count catches an accidental
+	// partial checkout or a corpus update that silently changes coverage, so
+	// any change to the number below is a deliberate corpus refresh.
 	if len(entries) != 318 {
 		t.Fatalf("JSONTestSuite case count = %d, want 318", len(entries))
 	}
@@ -66,6 +70,11 @@ func TestJSONTestSuite(t *testing.T) {
 			checkValidationConsistency(t, data, want)
 		})
 	}
+	// The corpus splits by filename prefix: y_ must-accept (95), n_ must-reject
+	// (188), i_ implementation-defined (35). These per-group counts are fixed by
+	// the vendored corpus revision; pinning them proves every file was seen and
+	// classified, so a miscounted or misnamed file fails here rather than
+	// silently skipping coverage.
 	if counts['y'] != 95 || counts['n'] != 188 || counts['i'] != 35 {
 		t.Fatalf("JSONTestSuite groups = y:%d n:%d i:%d", counts['y'], counts['n'], counts['i'])
 	}

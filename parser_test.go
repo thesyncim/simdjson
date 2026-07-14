@@ -52,7 +52,12 @@ func TestParseAndPointer(t *testing.T) {
 	}
 }
 
-func TestValidCases(t *testing.T) {
+// TestValidateAcceptsOneOfEachGrammarFamily is a smoke test: one canonical
+// member of every top-level JSON grammar family (literals, numbers, empty and
+// non-empty strings including multibyte, nested object) must validate. The
+// exhaustive corpus lives in TestValidateMatchesStdlibGrammarCorpus; this keeps
+// a fast, human-readable sanity check on the accept path.
+func TestValidateAcceptsOneOfEachGrammarFamily(t *testing.T) {
 	valid := [][]byte{
 		[]byte(`null`),
 		[]byte(`true`),
@@ -70,7 +75,13 @@ func TestValidCases(t *testing.T) {
 	}
 }
 
-func TestInvalidCases(t *testing.T) {
+// TestValidateRejectsMalformedGrammarFamilies is the reject-path smoke test:
+// one representative of each malformation class — truncated literal, leading
+// zero, bare decimal point, unterminated and control- or byte-corrupted
+// strings, bad escapes, lone surrogates, trailing comma, missing colon, and an
+// unclosed object. TestValidateMatchesStdlibGrammarCorpus is the exhaustive
+// cross-check against encoding/json.
+func TestValidateRejectsMalformedGrammarFamilies(t *testing.T) {
 	invalid := [][]byte{
 		nil,
 		[]byte(`tru`),
@@ -175,6 +186,11 @@ func TestBuildIndexAndTraverse(t *testing.T) {
 	}
 }
 
+// TestIndexIterators exercises each tape iterator API in its own subtest. The
+// shared document {"a":[10,20],"b":false} has a nested array so the flat
+// iterators can prove they reject non-flat containers, and a scalar-only object
+// tape covers the flat-object path. Every subtest rebuilds its iterator from
+// the shared root so a failure names the exact API at fault.
 func TestIndexIterators(t *testing.T) {
 	src := []byte(`{"a":[10,20],"b":false}`)
 	storage := make([]IndexEntry, 8)
@@ -182,154 +198,171 @@ func TestIndexIterators(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	objects, ok := tape.Root().ObjectIter()
-	if !ok {
-		t.Fatal("root is not object")
-	}
-	key, value, ok := objects.Next()
-	if !ok || stringMust(key.StringBytes()) != "a" || value.Kind() != Array {
-		t.Fatalf("first member = %q, %v, %v", stringMust(key.StringBytes()), value.Kind(), ok)
-	}
-	array, ok := value.ArrayIter()
-	if !ok {
-		t.Fatal("a is not array")
-	}
-	first, ok := array.Next()
-	if !ok {
-		t.Fatal("first array value missing")
-	}
-	second, ok := array.Next()
-	if !ok {
-		t.Fatal("second array value missing")
-	}
-	if a, _ := first.Int64(); a != 10 {
-		t.Fatalf("first array value = %d", a)
-	}
-	if b, _ := second.Int64(); b != 20 {
-		t.Fatalf("second array value = %d", b)
-	}
-	if _, ok := array.Next(); ok {
-		t.Fatal("array iterator produced extra value")
-	}
-	key, value, ok = objects.Next()
-	if !ok || stringMust(key.StringBytes()) != "b" {
-		t.Fatalf("second key = %q, %v", stringMust(key.StringBytes()), ok)
-	}
-	if b, ok := value.Bool(); !ok || b {
-		t.Fatalf("second value = %v, %v, want false, true", b, ok)
-	}
-	if _, _, ok := objects.Next(); ok {
-		t.Fatal("object iterator produced extra member")
-	}
 
-	array, _ = valueFrom(t, tape.Root(), "a").ArrayIter()
-	if kind, ok := array.NextKind(); !ok || kind != Number {
-		t.Fatalf("NextKind() = %v, %v, want number", kind, ok)
-	}
-	if raw, ok := array.NextRaw(); !ok || string(raw.Bytes()) != "20" {
-		t.Fatalf("NextRaw() = %q, %v, want 20", raw.Bytes(), ok)
-	}
-	if _, ok := array.NextRaw(); ok {
-		t.Fatal("raw array iterator produced extra value")
-	}
-
-	array, _ = valueFrom(t, tape.Root(), "a").ArrayIter()
-	for index, want := range []string{"10", "20"} {
-		if !array.Valid() || array.CurrentKind() != Number || array.CurrentRaw().String() != want {
-			t.Fatalf("array cursor %d = %v, %q", index, array.CurrentKind(), array.CurrentRaw().String())
+	t.Run("ObjectIter and nested ArrayIter Next", func(t *testing.T) {
+		objects, ok := tape.Root().ObjectIter()
+		if !ok {
+			t.Fatal("root is not object")
 		}
-		array = array.Advance()
-	}
-	if array.Valid() || array.Current().Kind() != Invalid {
-		t.Fatal("exhausted array cursor is valid")
-	}
-
-	objects, _ = tape.Root().ObjectIter()
-	rawKey, rawValue, ok := objects.NextRaw()
-	if !ok || string(rawKey.Bytes()) != `"a"` || string(rawValue.Bytes()) != `[10,20]` {
-		t.Fatalf("object NextRaw() = %q, %q, %v", rawKey.Bytes(), rawValue.Bytes(), ok)
-	}
-
-	flatArray, ok := valueFrom(t, tape.Root(), "a").FlatArrayIter()
-	if !ok {
-		t.Fatal("a is not a flat array")
-	}
-	if kind, ok := flatArray.NextKind(); !ok || kind != Number {
-		t.Fatalf("flat NextKind() = %v, %v, want number", kind, ok)
-	}
-	if raw, ok := flatArray.NextRaw(); !ok || string(raw.Bytes()) != "20" {
-		t.Fatalf("flat NextRaw() = %q, %v, want 20", raw.Bytes(), ok)
-	}
-	if _, ok := flatArray.Next(); ok {
-		t.Fatal("flat array iterator produced extra value")
-	}
-	flatArray, _ = valueFrom(t, tape.Root(), "a").FlatArrayIter()
-	for flatArray.Valid() {
-		if flatArray.CurrentKind() != Number || flatArray.Current().Kind() != Number {
-			t.Fatalf("flat cursor kind = %v", flatArray.CurrentKind())
+		key, value, ok := objects.Next()
+		if !ok || stringMust(key.StringBytes()) != "a" || value.Kind() != Array {
+			t.Fatalf("first member = %q, %v, %v", stringMust(key.StringBytes()), value.Kind(), ok)
 		}
-		flatArray = flatArray.Advance()
-	}
-	if flatArray.CurrentRaw().Bytes() != nil {
-		t.Fatal("exhausted flat array cursor returned raw value")
-	}
-	if _, ok := tape.Root().FlatObjectIter(); ok {
-		t.Fatal("object with non-empty container value reported as flat")
-	}
+		array, ok := value.ArrayIter()
+		if !ok {
+			t.Fatal("a is not array")
+		}
+		first, ok := array.Next()
+		if !ok {
+			t.Fatal("first array value missing")
+		}
+		second, ok := array.Next()
+		if !ok {
+			t.Fatal("second array value missing")
+		}
+		if a, _ := first.Int64(); a != 10 {
+			t.Fatalf("first array value = %d", a)
+		}
+		if b, _ := second.Int64(); b != 20 {
+			t.Fatalf("second array value = %d", b)
+		}
+		if _, ok := array.Next(); ok {
+			t.Fatal("array iterator produced extra value")
+		}
+		key, value, ok = objects.Next()
+		if !ok || stringMust(key.StringBytes()) != "b" {
+			t.Fatalf("second key = %q, %v", stringMust(key.StringBytes()), ok)
+		}
+		if b, ok := value.Bool(); !ok || b {
+			t.Fatalf("second value = %v, %v, want false, true", b, ok)
+		}
+		if _, _, ok := objects.Next(); ok {
+			t.Fatal("object iterator produced extra member")
+		}
+	})
 
-	objects, _ = tape.Root().ObjectIter()
-	for objects.Valid() {
-		key, value := objects.Current()
-		if key.Kind() != String || value.Kind() == Invalid {
-			t.Fatalf("object cursor = %v, %v", key.Kind(), value.Kind())
+	t.Run("ArrayIter NextKind and NextRaw", func(t *testing.T) {
+		array, _ := valueFrom(t, tape.Root(), "a").ArrayIter()
+		if kind, ok := array.NextKind(); !ok || kind != Number {
+			t.Fatalf("NextKind() = %v, %v, want number", kind, ok)
 		}
-		rawKey, rawValue := objects.CurrentRaw()
-		if len(rawKey.Bytes()) == 0 || len(rawValue.Bytes()) == 0 {
-			t.Fatal("object cursor returned empty raw value")
+		if raw, ok := array.NextRaw(); !ok || string(raw.Bytes()) != "20" {
+			t.Fatalf("NextRaw() = %q, %v, want 20", raw.Bytes(), ok)
 		}
-		objects = objects.Advance()
-	}
-	if key, value := objects.Current(); key.Kind() != Invalid || value.Kind() != Invalid {
-		t.Fatal("exhausted object cursor returned values")
-	}
+		if _, ok := array.NextRaw(); ok {
+			t.Fatal("raw array iterator produced extra value")
+		}
+	})
 
-	flatObjectTape, err := BuildIndex([]byte(`{"a":1,"b":false,"c":[]}`), storage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	flatObject, ok := flatObjectTape.Root().FlatObjectIter()
-	if !ok {
-		t.Fatal("scalar object is not flat")
-	}
-	for index, want := range []struct {
-		key  string
-		kind Kind
-	}{{"a", Number}, {"b", Bool}, {"c", Array}} {
-		key, value, ok := flatObject.Next()
-		if !ok || stringMust(key.StringBytes()) != want.key || value.Kind() != want.kind {
-			t.Fatalf("flat object member %d = %q, %v, %v", index, stringMust(key.StringBytes()), value.Kind(), ok)
+	t.Run("ArrayIter cursor", func(t *testing.T) {
+		array, _ := valueFrom(t, tape.Root(), "a").ArrayIter()
+		for index, want := range []string{"10", "20"} {
+			if !array.Valid() || array.CurrentKind() != Number || array.CurrentRaw().String() != want {
+				t.Fatalf("array cursor %d = %v, %q", index, array.CurrentKind(), array.CurrentRaw().String())
+			}
+			array = array.Advance()
 		}
-	}
-	if _, _, ok := flatObject.Next(); ok {
-		t.Fatal("flat object iterator produced extra member")
-	}
-	flatObject, _ = flatObjectTape.Root().FlatObjectIter()
-	for flatObject.Valid() {
-		key, value := flatObject.Current()
-		rawKey, rawValue := flatObject.CurrentRaw()
-		if key.Kind() != String || value.Kind() == Invalid || len(rawKey.Bytes()) == 0 || len(rawValue.Bytes()) == 0 {
-			t.Fatal("flat object cursor returned invalid member")
+		if array.Valid() || array.Current().Kind() != Invalid {
+			t.Fatal("exhausted array cursor is valid")
 		}
-		flatObject = flatObject.Advance()
-	}
+	})
 
-	nestedTape, err := BuildIndex([]byte(`[[1],2]`), storage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := nestedTape.Root().FlatArrayIter(); ok {
-		t.Fatal("array with non-empty container value reported as flat")
-	}
+	t.Run("ObjectIter NextRaw", func(t *testing.T) {
+		objects, _ := tape.Root().ObjectIter()
+		rawKey, rawValue, ok := objects.NextRaw()
+		if !ok || string(rawKey.Bytes()) != `"a"` || string(rawValue.Bytes()) != `[10,20]` {
+			t.Fatalf("object NextRaw() = %q, %q, %v", rawKey.Bytes(), rawValue.Bytes(), ok)
+		}
+	})
+
+	t.Run("FlatArrayIter", func(t *testing.T) {
+		flatArray, ok := valueFrom(t, tape.Root(), "a").FlatArrayIter()
+		if !ok {
+			t.Fatal("a is not a flat array")
+		}
+		if kind, ok := flatArray.NextKind(); !ok || kind != Number {
+			t.Fatalf("flat NextKind() = %v, %v, want number", kind, ok)
+		}
+		if raw, ok := flatArray.NextRaw(); !ok || string(raw.Bytes()) != "20" {
+			t.Fatalf("flat NextRaw() = %q, %v, want 20", raw.Bytes(), ok)
+		}
+		if _, ok := flatArray.Next(); ok {
+			t.Fatal("flat array iterator produced extra value")
+		}
+		flatArray, _ = valueFrom(t, tape.Root(), "a").FlatArrayIter()
+		for flatArray.Valid() {
+			if flatArray.CurrentKind() != Number || flatArray.Current().Kind() != Number {
+				t.Fatalf("flat cursor kind = %v", flatArray.CurrentKind())
+			}
+			flatArray = flatArray.Advance()
+		}
+		if flatArray.CurrentRaw().Bytes() != nil {
+			t.Fatal("exhausted flat array cursor returned raw value")
+		}
+		if _, ok := tape.Root().FlatObjectIter(); ok {
+			t.Fatal("object with non-empty container value reported as flat")
+		}
+	})
+
+	t.Run("ObjectIter cursor", func(t *testing.T) {
+		objects, _ := tape.Root().ObjectIter()
+		for objects.Valid() {
+			key, value := objects.Current()
+			if key.Kind() != String || value.Kind() == Invalid {
+				t.Fatalf("object cursor = %v, %v", key.Kind(), value.Kind())
+			}
+			rawKey, rawValue := objects.CurrentRaw()
+			if len(rawKey.Bytes()) == 0 || len(rawValue.Bytes()) == 0 {
+				t.Fatal("object cursor returned empty raw value")
+			}
+			objects = objects.Advance()
+		}
+		if key, value := objects.Current(); key.Kind() != Invalid || value.Kind() != Invalid {
+			t.Fatal("exhausted object cursor returned values")
+		}
+	})
+
+	t.Run("FlatObjectIter", func(t *testing.T) {
+		flatObjectTape, err := BuildIndex([]byte(`{"a":1,"b":false,"c":[]}`), storage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		flatObject, ok := flatObjectTape.Root().FlatObjectIter()
+		if !ok {
+			t.Fatal("scalar object is not flat")
+		}
+		for index, want := range []struct {
+			key  string
+			kind Kind
+		}{{"a", Number}, {"b", Bool}, {"c", Array}} {
+			key, value, ok := flatObject.Next()
+			if !ok || stringMust(key.StringBytes()) != want.key || value.Kind() != want.kind {
+				t.Fatalf("flat object member %d = %q, %v, %v", index, stringMust(key.StringBytes()), value.Kind(), ok)
+			}
+		}
+		if _, _, ok := flatObject.Next(); ok {
+			t.Fatal("flat object iterator produced extra member")
+		}
+		flatObject, _ = flatObjectTape.Root().FlatObjectIter()
+		for flatObject.Valid() {
+			key, value := flatObject.Current()
+			rawKey, rawValue := flatObject.CurrentRaw()
+			if key.Kind() != String || value.Kind() == Invalid || len(rawKey.Bytes()) == 0 || len(rawValue.Bytes()) == 0 {
+				t.Fatal("flat object cursor returned invalid member")
+			}
+			flatObject = flatObject.Advance()
+		}
+	})
+
+	t.Run("FlatArrayIter rejects nested containers", func(t *testing.T) {
+		nestedTape, err := BuildIndex([]byte(`[[1],2]`), storage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := nestedTape.Root().FlatArrayIter(); ok {
+			t.Fatal("array with non-empty container value reported as flat")
+		}
+	})
 }
 
 func valueFrom(t *testing.T, value Node, key string) Node {
@@ -425,6 +458,11 @@ func TestBuildIndexAllocs(t *testing.T) {
 }
 
 func TestIndexStorageIsCompact(t *testing.T) {
+	// 20 bytes is the tape's memory contract: callers size their IndexEntry
+	// storage from RequiredIndexEntries, so the per-entry footprint is part of
+	// the API's memory cost. A silent grow (e.g. padding from a new field)
+	// would inflate every caller's tape allocation, so it must be a deliberate,
+	// reviewed change rather than a drift.
 	if size := unsafe.Sizeof(IndexEntry{}); size != 20 {
 		t.Fatalf("IndexEntry size = %d, want 20", size)
 	}
@@ -1766,730 +1804,6 @@ func TestScalarValidatorAllocs(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("ValidateString allocs = %v, want 0", allocs)
 	}
-}
-
-func BenchmarkValid(b *testing.B) {
-	src := benchmarkJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if !Valid(src) {
-			b.Fatal("invalid")
-		}
-	}
-}
-
-func BenchmarkStdlibValid(b *testing.B) {
-	src := benchmarkJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if !json.Valid(src) {
-			b.Fatal("invalid")
-		}
-	}
-}
-
-func BenchmarkValidNumber(b *testing.B) {
-	src := []byte(`-12.34e+56`)
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if !ValidNumber(src) {
-			b.Fatal("invalid")
-		}
-	}
-}
-
-func BenchmarkStdlibValidNumber(b *testing.B) {
-	src := []byte(`-12.34e+56`)
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if !json.Valid(src) {
-			b.Fatal("invalid")
-		}
-	}
-}
-
-func BenchmarkValidString(b *testing.B) {
-	src := []byte(`"plain ascii string"`)
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if !ValidString(src) {
-			b.Fatal("invalid")
-		}
-	}
-}
-
-func BenchmarkStdlibValidString(b *testing.B) {
-	src := []byte(`"plain ascii string"`)
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if !json.Valid(src) {
-			b.Fatal("invalid")
-		}
-	}
-}
-
-func BenchmarkValidSmall(b *testing.B) {
-	src := smallJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if !Valid(src) {
-			b.Fatal("invalid")
-		}
-	}
-}
-
-func BenchmarkStdlibValidSmall(b *testing.B) {
-	src := smallJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if !json.Valid(src) {
-			b.Fatal("invalid")
-		}
-	}
-}
-
-func BenchmarkValidLongString(b *testing.B) {
-	src := longStringJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if !Valid(src) {
-			b.Fatal("invalid")
-		}
-	}
-}
-
-func BenchmarkStdlibValidLongString(b *testing.B) {
-	src := longStringJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if !json.Valid(src) {
-			b.Fatal("invalid")
-		}
-	}
-}
-
-func BenchmarkValidLongUnicodeString(b *testing.B) {
-	src := longUnicodeStringJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if !Valid(src) {
-			b.Fatal("invalid")
-		}
-	}
-}
-
-func BenchmarkStdlibValidLongUnicodeString(b *testing.B) {
-	src := longUnicodeStringJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if !json.Valid(src) {
-			b.Fatal("invalid")
-		}
-	}
-}
-
-func BenchmarkParse(b *testing.B) {
-	src := benchmarkJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if _, err := Parse(src); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkStdlibUnmarshal(b *testing.B) {
-	src := benchmarkJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		var v any
-		if err := json.Unmarshal(src, &v); err != nil {
-			b.Fatal(err)
-		}
-		benchmarkSink = v
-	}
-}
-
-func BenchmarkParseOptionsZeroCopy(b *testing.B) {
-	src := benchmarkJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if _, err := parseOptionsZeroCopyForTest(src); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkBuildIndex(b *testing.B) {
-	src := benchmarkJSON()
-	count, err := RequiredIndexEntries(src)
-	if err != nil {
-		b.Fatal(err)
-	}
-	storage := make([]IndexEntry, count)
-	b.SetBytes(int64(len(src)))
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		tape, err := BuildIndex(src, storage)
-		if err != nil {
-			b.Fatal(err)
-		}
-		indexBenchmarkSink = tape.Len()
-	}
-}
-
-func BenchmarkBuildIndexPointerCompiled(b *testing.B) {
-	src := benchmarkJSON()
-	count, err := RequiredIndexEntries(src)
-	if err != nil {
-		b.Fatal(err)
-	}
-	storage := make([]IndexEntry, count)
-	pointer := MustCompilePointer("/items/2/message")
-	b.SetBytes(int64(len(src)))
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		tape, err := BuildIndex(src, storage)
-		if err != nil {
-			b.Fatal(err)
-		}
-		value, ok, err := tape.PointerCompiled(pointer)
-		if err != nil || !ok {
-			b.Fatal("pointer missing")
-		}
-		indexBenchmarkSink = len(value.Raw().Bytes())
-	}
-}
-
-func BenchmarkIndexArrayIter4(b *testing.B) {
-	src := rawArrayJSON()
-	storage := make([]IndexEntry, len(src))
-	tape, err := BuildIndex(src, storage)
-	if err != nil {
-		b.Fatal(err)
-	}
-	root := tape.Root()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		iter, ok := root.ArrayIter()
-		if !ok {
-			b.Fatal("root is not array")
-		}
-		total := 0
-		for {
-			value, ok := iter.Next()
-			if !ok {
-				break
-			}
-			total += int(value.Kind())
-		}
-		indexBenchmarkSink = total
-	}
-}
-
-func BenchmarkIndexArrayIter1024(b *testing.B) {
-	src := []byte("[" + strings.Repeat("0,", 1023) + "0]")
-	storage := make([]IndexEntry, 1025)
-	tape, err := BuildIndex(src, storage)
-	if err != nil {
-		b.Fatal(err)
-	}
-	root := tape.Root()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		iter, ok := root.ArrayIter()
-		if !ok {
-			b.Fatal("root is not array")
-		}
-		total := 0
-		for {
-			value, ok := iter.Next()
-			if !ok {
-				break
-			}
-			total += int(value.Kind())
-		}
-		indexBenchmarkSink = total
-	}
-}
-
-func BenchmarkIndexArrayIterKind1024(b *testing.B) {
-	src := []byte("[" + strings.Repeat("0,", 1023) + "0]")
-	storage := make([]IndexEntry, 1025)
-	tape, err := BuildIndex(src, storage)
-	if err != nil {
-		b.Fatal(err)
-	}
-	root := tape.Root()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		iter, ok := root.ArrayIter()
-		if !ok {
-			b.Fatal("root is not array")
-		}
-		total := 0
-		for {
-			kind, ok := iter.NextKind()
-			if !ok {
-				break
-			}
-			total += int(kind)
-		}
-		indexBenchmarkSink = total
-	}
-}
-
-func BenchmarkIndexArrayCursorKind1024(b *testing.B) {
-	src := []byte("[" + strings.Repeat("0,", 1023) + "0]")
-	storage := make([]IndexEntry, 1025)
-	tape, err := BuildIndex(src, storage)
-	if err != nil {
-		b.Fatal(err)
-	}
-	root := tape.Root()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		iter, ok := root.ArrayIter()
-		if !ok {
-			b.Fatal("root is not an array")
-		}
-		total := 0
-		for iter.Valid() {
-			total += int(iter.CurrentKind())
-			iter = iter.Advance()
-		}
-		indexBenchmarkSink = total
-	}
-}
-
-func BenchmarkIndexFlatArrayIterKind1024(b *testing.B) {
-	src := []byte("[" + strings.Repeat("0,", 1023) + "0]")
-	storage := make([]IndexEntry, 1025)
-	tape, err := BuildIndex(src, storage)
-	if err != nil {
-		b.Fatal(err)
-	}
-	root := tape.Root()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		iter, ok := root.FlatArrayIter()
-		if !ok {
-			b.Fatal("root is not a flat array")
-		}
-		total := 0
-		for {
-			kind, ok := iter.NextKind()
-			if !ok {
-				break
-			}
-			total += int(kind)
-		}
-		indexBenchmarkSink = total
-	}
-}
-
-func BenchmarkIndexFlatArrayDirectKind1024(b *testing.B) {
-	src := []byte("[" + strings.Repeat("0,", 1023) + "0]")
-	storage := make([]IndexEntry, 1025)
-	tape, err := BuildIndex(src, storage)
-	if err != nil {
-		b.Fatal(err)
-	}
-	root := tape.Root()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		entry := tapeEntryOffset(root.entry, 1)
-		remaining := root.entry.count
-		total := 0
-		for remaining != 0 {
-			total += int(entry.kind)
-			remaining--
-			if remaining != 0 {
-				entry = tapeEntryOffset(entry, 1)
-			}
-		}
-		indexBenchmarkSink = total
-	}
-}
-
-func BenchmarkIndexFlatArrayCursorKind1024(b *testing.B) {
-	src := []byte("[" + strings.Repeat("0,", 1023) + "0]")
-	storage := make([]IndexEntry, 1025)
-	tape, err := BuildIndex(src, storage)
-	if err != nil {
-		b.Fatal(err)
-	}
-	root := tape.Root()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		iter, ok := root.FlatArrayIter()
-		if !ok {
-			b.Fatal("root is not a flat array")
-		}
-		total := 0
-		for iter.Valid() {
-			total += int(iter.CurrentKind())
-			iter = iter.Advance()
-		}
-		indexBenchmarkSink = total
-	}
-}
-
-func BenchmarkIndexArrayIterRaw1024(b *testing.B) {
-	src := []byte("[" + strings.Repeat("0,", 1023) + "0]")
-	storage := make([]IndexEntry, 1025)
-	tape, err := BuildIndex(src, storage)
-	if err != nil {
-		b.Fatal(err)
-	}
-	root := tape.Root()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		iter, ok := root.ArrayIter()
-		if !ok {
-			b.Fatal("root is not array")
-		}
-		total := 0
-		for {
-			raw, ok := iter.NextRaw()
-			if !ok {
-				break
-			}
-			total += len(raw.Bytes())
-		}
-		indexBenchmarkSink = total
-	}
-}
-
-func BenchmarkIndexObjectIter(b *testing.B) {
-	src := rawObjectJSON()
-	storage := make([]IndexEntry, len(src))
-	tape, err := BuildIndex(src, storage)
-	if err != nil {
-		b.Fatal(err)
-	}
-	root := tape.Root()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		iter, ok := root.ObjectIter()
-		if !ok {
-			b.Fatal("root is not object")
-		}
-		total := 0
-		for {
-			key, value, ok := iter.Next()
-			if !ok {
-				break
-			}
-			total += int(key.Kind()) + int(value.Kind())
-		}
-		indexBenchmarkSink = total
-	}
-}
-
-func BenchmarkIndexObjectCursor1024(b *testing.B) {
-	src := []byte("{" + strings.Repeat(`"a":0,`, 1023) + `"a":0}`)
-	storage := make([]IndexEntry, 2049)
-	tape, err := BuildIndex(src, storage)
-	if err != nil {
-		b.Fatal(err)
-	}
-	root := tape.Root()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		iter, ok := root.ObjectIter()
-		if !ok {
-			b.Fatal("root is not an object")
-		}
-		total := 0
-		for iter.Valid() {
-			key, value := iter.Current()
-			total += int(key.Kind()) + int(value.Kind())
-			iter = iter.Advance()
-		}
-		indexBenchmarkSink = total
-	}
-}
-
-func BenchmarkIndexFlatObjectCursor1024(b *testing.B) {
-	src := []byte("{" + strings.Repeat(`"a":0,`, 1023) + `"a":0}`)
-	storage := make([]IndexEntry, 2049)
-	tape, err := BuildIndex(src, storage)
-	if err != nil {
-		b.Fatal(err)
-	}
-	root := tape.Root()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		iter, ok := root.FlatObjectIter()
-		if !ok {
-			b.Fatal("root is not a flat object")
-		}
-		total := 0
-		for iter.Valid() {
-			key, value := iter.Current()
-			total += int(key.Kind()) + int(value.Kind())
-			iter = iter.Advance()
-		}
-		indexBenchmarkSink = total
-	}
-}
-
-func BenchmarkParseOptionsZeroCopySmall(b *testing.B) {
-	src := smallJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		if _, err := parseOptionsZeroCopyForTest(src); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkStdlibUnmarshalSmall(b *testing.B) {
-	src := smallJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		var v any
-		if err := json.Unmarshal(src, &v); err != nil {
-			b.Fatal(err)
-		}
-		benchmarkSink = v
-	}
-}
-
-func BenchmarkPointer(b *testing.B) {
-	src := benchmarkJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		v, ok, err := Get(src, "/items/2/message")
-		if err != nil || !ok || v.kind != String {
-			b.Fatal(v, ok, err)
-		}
-	}
-}
-
-func BenchmarkPointerZeroCopy(b *testing.B) {
-	src := benchmarkJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		v, ok, err := GetOptions(src, "/items/2/message", Options{ZeroCopy: true})
-		if err != nil || !ok || v.kind != String {
-			b.Fatal(v, ok, err)
-		}
-	}
-}
-
-func BenchmarkGetRaw(b *testing.B) {
-	src := benchmarkJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		raw, ok, err := GetRaw(src, "/items/2/message")
-		if err != nil || !ok || raw.Kind() != String {
-			b.Fatal(raw, ok, err)
-		}
-	}
-}
-
-func BenchmarkScanRaw(b *testing.B) {
-	src := benchmarkJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		raw, ok, err := ScanRaw(src, "/items/2/message")
-		if err != nil || !ok || raw.Kind() != String {
-			b.Fatal(raw, ok, err)
-		}
-	}
-}
-
-func BenchmarkGetRawCompiled(b *testing.B) {
-	src := benchmarkJSON()
-	ptr := MustCompilePointer("/items/2/message")
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		raw, ok, err := ptr.GetRaw(src)
-		if err != nil || !ok || raw.Kind() != String {
-			b.Fatal(raw, ok, err)
-		}
-	}
-}
-
-func BenchmarkScanRawCompiled(b *testing.B) {
-	src := benchmarkJSON()
-	ptr := MustCompilePointer("/items/2/message")
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		raw, ok, err := ptr.ScanRaw(src)
-		if err != nil || !ok || raw.Kind() != String {
-			b.Fatal(raw, ok, err)
-		}
-	}
-}
-
-func BenchmarkGetRawEarly(b *testing.B) {
-	src := benchmarkJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		raw, ok, err := GetRaw(src, "/items/0/id")
-		if err != nil || !ok || raw.Kind() != Number {
-			b.Fatal(raw, ok, err)
-		}
-	}
-}
-
-func BenchmarkScanRawEarly(b *testing.B) {
-	src := benchmarkJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		raw, ok, err := ScanRaw(src, "/items/0/id")
-		if err != nil || !ok || raw.Kind() != Number {
-			b.Fatal(raw, ok, err)
-		}
-	}
-}
-
-func BenchmarkScanRawEarlyCompiled(b *testing.B) {
-	src := benchmarkJSON()
-	ptr := MustCompilePointer("/items/0/id")
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		raw, ok, err := ptr.ScanRaw(src)
-		if err != nil || !ok || raw.Kind() != Number {
-			b.Fatal(raw, ok, err)
-		}
-	}
-}
-
-func BenchmarkGetRawLongString(b *testing.B) {
-	src := longStringJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		raw, ok, err := GetRaw(src, "/s")
-		if err != nil || !ok || raw.Kind() != String {
-			b.Fatal(raw, ok, err)
-		}
-	}
-}
-
-func BenchmarkScanRawLongString(b *testing.B) {
-	src := longStringJSON()
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		raw, ok, err := ScanRaw(src, "/s")
-		if err != nil || !ok || raw.Kind() != String {
-			b.Fatal(raw, ok, err)
-		}
-	}
-}
-
-func BenchmarkScanRawLongStringCompiled(b *testing.B) {
-	src := longStringJSON()
-	ptr := MustCompilePointer("/s")
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		raw, ok, err := ptr.ScanRaw(src)
-		if err != nil || !ok || raw.Kind() != String {
-			b.Fatal(raw, ok, err)
-		}
-	}
-}
-
-func BenchmarkAppendCompact(b *testing.B) {
-	src := benchmarkJSON()
-	dst := make([]byte, 0, len(src))
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		out, err := AppendCompact(dst[:0], src)
-		if err != nil {
-			b.Fatal(err)
-		}
-		dst = out[:0]
-	}
-}
-
-func BenchmarkStdlibCompact(b *testing.B) {
-	src := benchmarkJSON()
-	var dst bytes.Buffer
-	dst.Grow(len(src))
-	b.SetBytes(int64(len(src)))
-	for i := 0; i < b.N; i++ {
-		dst.Reset()
-		if err := json.Compact(&dst, src); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkEachArrayRaw(b *testing.B) {
-	src := rawArrayJSON()
-	b.SetBytes(int64(len(src)))
-	total := 0
-	for i := 0; i < b.N; i++ {
-		if err := EachArray(src, func(_ int, value RawValue) error {
-			total += len(value.Bytes())
-			return nil
-		}); err != nil {
-			b.Fatal(err)
-		}
-	}
-	benchmarkSink = total
-}
-
-func BenchmarkStdlibArrayRawMessages(b *testing.B) {
-	src := rawArrayJSON()
-	b.SetBytes(int64(len(src)))
-	var total int
-	for i := 0; i < b.N; i++ {
-		var values []json.RawMessage
-		if err := json.Unmarshal(src, &values); err != nil {
-			b.Fatal(err)
-		}
-		for _, value := range values {
-			total += len(value)
-		}
-	}
-	benchmarkSink = total
-}
-
-func BenchmarkEachObjectRaw(b *testing.B) {
-	src := rawObjectJSON()
-	b.SetBytes(int64(len(src)))
-	total := 0
-	for i := 0; i < b.N; i++ {
-		if err := EachObject(src, func(key string, value RawValue) error {
-			total += len(key) + len(value.Bytes())
-			return nil
-		}); err != nil {
-			b.Fatal(err)
-		}
-	}
-	benchmarkSink = total
-}
-
-func BenchmarkStdlibObjectRawMessages(b *testing.B) {
-	src := rawObjectJSON()
-	b.SetBytes(int64(len(src)))
-	var total int
-	for i := 0; i < b.N; i++ {
-		var values map[string]json.RawMessage
-		if err := json.Unmarshal(src, &values); err != nil {
-			b.Fatal(err)
-		}
-		for key, value := range values {
-			total += len(key) + len(value)
-		}
-	}
-	benchmarkSink = total
 }
 
 func benchmarkJSON() []byte {
