@@ -56,26 +56,26 @@ unescaped strings into immutable input and has a different lifetime contract.
 
 | Corpus | `encoding/json` | simdjson owned | Source-backed | Rival | Rival time |
 |---|---:|---:|---:|---|---:|
-| Canada geometry | 1.222 ms | **264.9 us** | 230.5 us | go-json | 769.5 us |
-| CITM catalog | 2.548 ms | **1.054 ms** | 856.9 us | go-json | 1.288 ms |
-| Go source | 6.300 ms | **1.305 ms** | 978.3 us | Segment | 2.200 ms |
-| Escaped strings | 195.7 us | **39.4 us** | 31.3 us | go-json | 68.3 us |
-| Unicode strings | 40.7 us | **9.4 us** | 6.9 us | go-json | 13.3 us |
-| Synthea FHIR | 3.677 ms | **1.855 ms** | 1.600 ms | go-json | 2.051 ms |
-| Twitter status | 1.365 ms | **484.7 us** | 409.4 us | go-json | 697.6 us |
+| Canada geometry | 1.307 ms | **266.9 us** | 230.1 us | Segment | 791.0 us |
+| CITM catalog | 2.627 ms | **1.137 ms** | 951.2 us | go-json | 1.354 ms |
+| Go source | 6.448 ms | **1.377 ms** | 1.026 ms | Segment | 2.315 ms |
+| Escaped strings | 207.3 us | **40.9 us** | 32.0 us | go-json | 68.6 us |
+| Unicode strings | 44.2 us | **10.6 us** | 7.3 us | go-json | 14.4 us |
+| Synthea FHIR | 3.842 ms | **1.996 ms** | 1.690 ms | go-json | 2.202 ms |
+| Twitter status | 1.427 ms | **524.2 us** | 435.3 us | go-json | 726.6 us |
 
 Source-backed refers only to unescaped string ownership. Slices, maps,
 pointers, escaped text, and custom method receivers may still allocate.
 
 | Corpus | Source-backed bytes/op | Source-backed allocs/op |
 |---|---:|---:|
-| Canada geometry | 270 B | 0 |
-| CITM catalog | 1.677 MiB | 1,220 |
-| Go source | 8.7 KiB | 40 |
+| Canada geometry | 267 B | 0 |
+| CITM catalog | 1.677 MiB | 1,224 |
+| Go source | 9.2 KiB | 42 |
 | Escaped strings | 48.0 KiB | 1 |
 | Unicode strings | 18.0 KiB | 1 |
-| Synthea FHIR | 1.944 MiB | 344 |
-| Twitter status | 631.0 KiB | 139 |
+| Synthea FHIR | 1.945 MiB | 347 |
+| Twitter status | 631.1 KiB | 139 |
 
 ### Dynamic decode
 
@@ -83,13 +83,13 @@ These rows fully materialize an owned `any` tree.
 
 | Corpus | simdjson | Rival | Rival time | Lead |
 |---|---:|---|---:|---:|
-| Canada geometry | **894.2 us** | go-json | 1.842 ms | **2.06x** |
-| CITM catalog | **2.730 ms** | jsoniter | 4.422 ms | **1.62x** |
-| Go source | **4.910 ms** | go-json | 9.648 ms | **1.97x** |
-| Escaped strings | **34.3 us** | go-json | 77.4 us | **2.25x** |
-| Unicode strings | **15.3 us** | go-json | 21.0 us | **1.37x** |
-| Synthea FHIR | **4.213 ms** | jsoniter | 6.751 ms | **1.60x** |
-| Twitter status | **1.307 ms** | jsoniter | 1.993 ms | **1.52x** |
+| Canada geometry | **946.5 us** | go-json | 1.908 ms | **2.02x** |
+| CITM catalog | **2.919 ms** | jsoniter | 4.588 ms | **1.57x** |
+| Go source | **5.005 ms** | go-json | 9.948 ms | **1.99x** |
+| Escaped strings | **35.2 us** | go-json | 77.9 us | **2.21x** |
+| Unicode strings | **16.2 us** | go-json | 22.2 us | **1.38x** |
+| Synthea FHIR | **4.650 ms** | jsoniter | 7.002 ms | **1.51x** |
+| Twitter status | **1.437 ms** | go-json | 2.126 ms | **1.48x** |
 
 ### Strict validation
 
@@ -98,13 +98,13 @@ input.
 
 | Corpus | simdjson | Rival | Rival time | Lead |
 |---|---:|---|---:|---:|
-| Canada geometry | **125.7 us** | fastjson | 215.4 us | **1.71x** |
-| CITM catalog | **640.8 us** | fastjson | 835.3 us | **1.30x** |
-| Go source | **937.5 us** | Segment | 1.190 ms | **1.27x** |
-| Escaped strings | **4.3 us** | Segment | 57.1 us | **13.29x** |
-| Unicode strings | **3.2 us** | fastjson | 6.9 us | **2.14x** |
-| Synthea FHIR | **758.2 us** | fastjson | 1.245 ms | **1.64x** |
-| Twitter status | **224.9 us** | fastjson | 389.0 us | **1.73x** |
+| Canada geometry | **135.1 us** | Segment | 224.3 us | **1.66x** |
+| CITM catalog | **645.2 us** | fastjson | 868.8 us | **1.35x** |
+| Go source | **957.2 us** | Segment | 1.218 ms | **1.27x** |
+| Escaped strings | **4.4 us** | Segment | 60.3 us | **13.65x** |
+| Unicode strings | **3.3 us** | fastjson | 7.2 us | **2.19x** |
+| Synthea FHIR | **726.9 us** | fastjson | 1.292 ms | **1.78x** |
+| Twitter status | **230.3 us** | fastjson | 400.0 us | **1.74x** |
 
 ### Encode
 
@@ -113,13 +113,13 @@ caller-owned buffer and removes the output allocation.
 
 | Corpus | stdlib | simdjson owned | Compiled reuse | Rival | Rival time |
 |---|---:|---:|---:|---|---:|
-| Canada geometry | 690.1 us | 371.7 us | **301.6 us** | Segment | 520.1 us |
-| CITM catalog | 967.3 us | 394.0 us | **223.7 us** | Segment | 380.0 us |
-| Go source | 3.225 ms | 1.260 ms | **677.7 us** | Segment | 1.360 ms |
-| Escaped strings | 20.7 us | 6.6 us | **3.6 us** | jsoniter | 22.4 us |
-| Unicode strings | 20.8 us | 6.6 us | **3.6 us** | jsoniter | 21.9 us |
-| Synthea FHIR | 5.974 ms | 2.163 ms | **1.089 ms** | Segment | 2.060 ms |
-| Twitter status | 720.3 us | 320.3 us | **171.2 us** | go-json | 326.6 us |
+| Canada geometry | 689.7 us | 393.7 us | **312.8 us** | Segment | 524.9 us |
+| CITM catalog | 1.084 ms | 396.1 us | **232.3 us** | Segment | 403.1 us |
+| Go source | 3.340 ms | 1.371 ms | **694.9 us** | Segment | 1.440 ms |
+| Escaped strings | 21.7 us | 7.1 us | **3.7 us** | jsoniter | 23.5 us |
+| Unicode strings | 21.5 us | 7.0 us | **3.8 us** | Segment | 23.3 us |
+| Synthea FHIR | 6.210 ms | 2.198 ms | **1.069 ms** | Segment | 2.149 ms |
+| Twitter status | 743.5 us | 338.9 us | **179.8 us** | go-json | 361.0 us |
 
 ### SIMD versus pure Go
 
@@ -128,13 +128,13 @@ selected once during initialization; short runs may remain scalar or SWAR.
 
 | simdjson path | SIMD wins | Geomean SIMD uplift |
 |---|---:|---:|
-| Validation | 6/7 | **1.399x** |
-| Dynamic owned | 5/7 | **1.069x** |
-| Dynamic source-backed | 4/7 | **1.078x** |
-| Typed owned | 4/7 | **1.099x** |
-| Typed source-backed | 4/7 | **1.127x** |
-| Encode owned | 6/7 | **1.536x** |
-| Encode compiled reuse | 7/7 | **1.822x** |
+| Validation | 5/7 | **1.383x** |
+| Dynamic owned | 6/7 | **1.066x** |
+| Dynamic source-backed | 7/7 | **1.083x** |
+| Typed owned | 5/7 | **1.092x** |
+| Typed source-backed | 5/7 | **1.120x** |
+| Encode owned | 7/7 | **1.510x** |
+| Encode compiled reuse | 7/7 | **1.780x** |
 
 ### Native Sonic context
 

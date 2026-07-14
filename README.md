@@ -167,14 +167,14 @@ speedup across all seven payloads.
 
 | Operation | Contract | vs stdlib | vs fastest rival | vs native Sonic | SIMD vs pure Go |
 |---|---|---:|---:|---:|---:|
-| Validate | Strict JSON + UTF-8 | **2.34x** | **2.17x** | **1.06x** | **1.399x** |
-| Typed decode | Owned strings | **3.50x** | **1.57x** | **1.61x** | **1.099x** |
-| Dynamic decode | Owned `any` tree | **3.30x** | **1.75x** | **1.08x** | **1.069x** |
-| Encode | Owned output | **2.56x** | **1.48x** | **2.86x** | **1.536x** |
-| Encode | Reused output buffer | **4.47x** | **2.60x** | — | **1.822x** |
+| Validate | Strict JSON + UTF-8 | **2.39x** | **2.22x** | **1.04x** | **1.383x** |
+| Typed decode | Owned strings | **3.46x** | **1.54x** | **1.51x** | **1.092x** |
+| Dynamic decode | Owned `any` tree | **3.29x** | **1.71x** | **1.02x** | **1.066x** |
+| Encode | Owned output | **2.54x** | **1.49x** | **2.72x** | **1.510x** |
+| Encode | Reused output buffer | **4.52x** | **2.66x** | — | **1.780x** |
 
 Every stdlib row wins all seven payloads. Every rival row wins all seven except
-owned encode, which wins five. Comparisons use the same Go tip compiler and do
+owned encode, which wins six. Comparisons use the same Go tip compiler and do
 not mix owned and source-backed results. The Sonic column compares against
 native Sonic v1.15.2 compiled with the previous stable Go (1.26.4) in an
 isolated module, because Sonic falls back to `encoding/json` on Go tip; it is
