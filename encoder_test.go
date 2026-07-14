@@ -382,6 +382,65 @@ func TestMapsMatchStdlib(t *testing.T) {
 	}
 }
 
+// textMapKey is a comparable key rendered through encoding.TextMarshaler, so it
+// exercises encodeMap's text-key branch through the reused key box.
+type textMapKey int
+
+func (k textMapKey) MarshalText() ([]byte, error) {
+	return []byte("k" + strconv.Itoa(int(k))), nil
+}
+
+// TestMapKeyKindsMatchStdlib pins the signed, unsigned, and TextMarshaler key
+// paths byte for byte against encoding/json. Each renders its name from the
+// reused key box that replaced per-entry reflect key boxing.
+func TestMapKeyKindsMatchStdlib(t *testing.T) {
+	type doc struct {
+		Signed   map[int]string     `json:"signed"`
+		Unsigned map[uint16]int     `json:"unsigned"`
+		Text     map[textMapKey]int `json:"text"`
+	}
+	v := doc{
+		Signed:   map[int]string{3: "c", 1: "a", -2: "neg", 2: "b"},
+		Unsigned: map[uint16]int{10: 1, 2: 2, 40000: 3},
+		Text:     map[textMapKey]int{5: 1, 1: 2, 3: 3},
+	}
+	got, err := Marshal(&v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := json.Marshal(&v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("map key encoding differs:\nsimdjson %s\nstdlib   %s", got, want)
+	}
+}
+
+// TestMapEncodeAllocationFree guards the zero-allocation property of the
+// SetIterKey/SetIterValue rewrite: a reused encoder emits a populated map
+// without allocating once its pooled scratch has warmed.
+func TestMapEncodeAllocationFree(t *testing.T) {
+	type doc struct {
+		M map[string]int `json:"m"`
+	}
+	enc, err := CompileEncoder[doc](EncoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := doc{M: map[string]int{"a": 1, "b": 2, "c": 3, "d": 4}}
+	buf := make([]byte, 0, 64)
+	if buf, err = enc.AppendJSON(buf[:0], &v); err != nil { // warm the scratch
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		buf, _ = enc.AppendJSON(buf[:0], &v)
+	})
+	if allocs != 0 {
+		t.Fatalf("populated map encode allocated %.1f times per run, want 0", allocs)
+	}
+}
+
 func TestMapDecodeMergesLikeStdlib(t *testing.T) {
 	decoder, err := CompileDecoder[map[string]int](DecoderOptions{})
 	if err != nil {

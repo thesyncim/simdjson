@@ -465,7 +465,7 @@ func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsa
 	} else {
 		keyBox = reflect.New(inline.mapType.Key()).Elem()
 	}
-	backing := e.takeInlineBacking(elem.typ, mapLen)
+	backing := e.takeValueBacking(elem.typ, mapLen)
 
 	for slot := 0; iterator.Next(); slot++ {
 		valueSlot := backing.Index(slot)
@@ -500,47 +500,47 @@ func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsa
 			break
 		}
 	}
-	e.releaseInlineBacking(backing, elem.typ, usedSlots)
+	e.releaseValueBacking(backing, elem.typ, usedSlots)
 	e.releaseMapScratch(entries, keyArena, iterator)
 	return retErr
 }
 
-// takeInlineBacking borrows the scratch's reused value backing with room for at
+// takeValueBacking borrows the scratch's reused value backing with room for at
 // least n elements, growing or re-typing the slice as needed. The returned
 // slice keeps its full length, so the caller indexes slots [0, n) directly and
-// never reslices (Value.Slice would allocate a fresh header). A nested catch-
-// all sees the backing already taken and allocates its own; the reserved backing
-// is restored by releaseInlineBacking.
-func (e *encodeState) takeInlineBacking(elemType reflect.Type, n int) reflect.Value {
+// never reslices (Value.Slice would allocate a fresh header). A nested map or
+// catch-all sees the backing already taken and allocates its own; the reserved
+// backing is restored by releaseValueBacking.
+func (e *encodeState) takeValueBacking(elemType reflect.Type, n int) reflect.Value {
 	scratch := e.scratch
-	if scratch != nil && scratch.inlineElem == elemType && scratch.inlineBacking.IsValid() && scratch.inlineBacking.Len() >= n {
-		backing := scratch.inlineBacking
-		scratch.inlineBacking = reflect.Value{}
-		scratch.inlineElem = nil
+	if scratch != nil && scratch.valueBackingElem == elemType && scratch.valueBacking.IsValid() && scratch.valueBacking.Len() >= n {
+		backing := scratch.valueBacking
+		scratch.valueBacking = reflect.Value{}
+		scratch.valueBackingElem = nil
 		return backing
 	}
 	if scratch != nil {
-		scratch.inlineBacking = reflect.Value{}
-		scratch.inlineElem = nil
+		scratch.valueBacking = reflect.Value{}
+		scratch.valueBackingElem = nil
 	}
 	return reflect.MakeSlice(reflect.SliceOf(elemType), n, n)
 }
 
-// releaseInlineBacking clears the used slots, so the pool never pins the last
+// releaseValueBacking clears the used slots, so the pool never pins the last
 // map's values, then returns the backing for reuse with its grown length. The
 // tail past used stays zero across calls, so clearing only [0, used) is enough;
 // zeroing the element bytes is a valid nil state for any type.
-func (e *encodeState) releaseInlineBacking(backing reflect.Value, elemType reflect.Type, used int) {
+func (e *encodeState) releaseValueBacking(backing reflect.Value, elemType reflect.Type, used int) {
 	if used > 0 {
 		base := backing.Index(0).Addr().UnsafePointer()
 		clear(unsafe.Slice((*byte)(base), uintptr(used)*elemType.Size()))
 	}
 	scratch := e.scratch
-	if scratch == nil || scratch.inlineElem != nil {
-		return // a nested catch-all already restored a backing; drop this one
+	if scratch == nil || scratch.valueBackingElem != nil {
+		return // a nested map already restored a backing; drop this one
 	}
-	scratch.inlineBacking = backing
-	scratch.inlineElem = elemType
+	scratch.valueBacking = backing
+	scratch.valueBackingElem = elemType
 }
 
 // encodeSimpleStructPairs runs a simple struct's pair program. The caller
@@ -1115,21 +1115,23 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	}
 	e.depth++
 	mapLen := mapValue.Len()
-	// The entry list and numeric-key arena come from the per-call scratch
-	// so sorted map encoding does not allocate per map. Ownership moves to
-	// this call while it runs; a nested map sees nil scratch slices and
-	// allocates its own.
-	// keyArena backs the rendered key names; entries alias it, so both are
-	// pooled and recycled together and nothing may retain a name past this
-	// call (error paths clone before storing one in an EncodeError).
+	// The entry list, numeric-key arena, and iterator come from the per-call
+	// scratch so sorted map encoding does not allocate per map. Ownership moves
+	// to this call while it runs; a nested map sees them taken and allocates its
+	// own. keyArena backs rendered numeric key names, which entries alias, so
+	// both recycle together and nothing may retain a name past this call (error
+	// paths clone before storing one in an EncodeError).
 	var entries []mapEncodeEntry
 	var keyArena []byte
+	var iterator *reflect.MapIter
 	scratch := e.scratch
 	if scratch != nil {
 		entries = scratch.mapEntries[:0]
 		keyArena = scratch.mapKeyArena[:0]
+		iterator = scratch.mapIter
 		scratch.mapEntries = nil
 		scratch.mapKeyArena = nil
+		scratch.mapIter = nil
 	}
 	if cap(entries) < mapLen {
 		entries = make([]mapEncodeEntry, 0, mapLen)
@@ -1138,59 +1140,60 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	if numericKeys && cap(keyArena) < mapLen*20 && mapLen <= int(^uint(0)>>1)/20 {
 		keyArena = make([]byte, 0, mapLen*20)
 	}
-	var iterator *reflect.MapIter
-	if scratch != nil {
-		iterator = scratch.mapIter
-		scratch.mapIter = nil
-	}
 	if iterator == nil {
 		iterator = mapValue.MapRange()
 	} else {
 		iterator.Reset(mapValue)
 	}
-	for iterator.Next() {
-		key := iterator.Key()
+
+	// Copy each key into a reserved box with SetIterKey and each value into its
+	// own backing slot with SetIterValue, so neither MapIter.Key nor
+	// MapIter.Value allocates a fresh value per entry. Independent slots keep a
+	// value that recurses into the same map type correct.
+	var keyBox reflect.Value
+	if scratch != nil && node.encMapKey >= 0 {
+		keyBox = scratch.marshalers[node.encMapKey].value
+	} else {
+		keyBox = reflect.New(node.typ.Key()).Elem()
+	}
+	backing := e.takeValueBacking(node.elem.typ, mapLen)
+
+	for slot := 0; iterator.Next(); slot++ {
+		keyBox.SetIterKey(iterator)
 		var name string
 		if numericKeys {
 			start := len(keyArena)
 			if node.mapKeyKind == mapKeyInt {
-				value := key.Int()
+				value := keyBox.Int()
 				if value < 0 {
 					keyArena = appendCompactInt(keyArena, value)
 				} else {
 					keyArena = appendCompactUint(keyArena, uint64(value))
 				}
 			} else {
-				keyArena = appendCompactUint(keyArena, key.Uint())
+				keyArena = appendCompactUint(keyArena, keyBox.Uint())
 			}
 			name = unsafe.String(unsafe.SliceData(keyArena[start:]), len(keyArena)-start)
 		} else {
 			var err error
-			name, err = mapKeyName(node, key)
+			name, err = mapKeyName(node, keyBox)
 			if err != nil {
+				e.releaseValueBacking(backing, node.elem.typ, slot)
 				e.releaseMapScratch(entries, keyArena, iterator)
 				e.depth--
 				return &EncodeError{Reason: err.Error()}
 			}
 		}
-		entries = append(entries, mapEncodeEntry{name: name, value: iterator.Value()})
+		valueSlot := backing.Index(slot)
+		valueSlot.SetIterValue(iterator)
+		entries = append(entries, mapEncodeEntry{name: name, value: valueSlot})
 	}
+	usedSlots := len(entries)
 	slices.SortFunc(entries, func(a, b mapEncodeEntry) int { return strings.Compare(a.name, b.name) })
-	// The addressable element box comes from the compile-reserved scratch
-	// slot when available. Reuse across nesting levels of the same map
-	// type is safe: the slot is set immediately before each encode and
-	// never read after it returns.
-	var elementValue reflect.Value
-	if scratch != nil && node.encMapElem >= 0 {
-		elementValue = scratch.marshalers[node.encMapElem].value
-	} else {
-		elementValue = reflect.New(node.elem.typ).Elem()
-	}
-	elementPtr := elementValue.Addr().UnsafePointer()
+
 	// The value type is loop invariant, so the non-addressable dispatch is
-	// resolved once: ordinary values encode directly as they did before the
-	// addressability handling, and only marshaler-bearing types raise the
-	// flag.
+	// resolved once: ordinary values encode directly, and only marshaler-
+	// bearing types raise the flag.
 	elemHasMarshaler := node.elem.encHasPtrMarshaler
 	e.dst = append(e.dst, '{')
 	for i := range entries {
@@ -1199,23 +1202,25 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		}
 		e.dst = appendEncodedJSONString(e.dst, entries[i].name, e.escapeHTML)
 		e.dst = append(e.dst, ':')
-		elementValue.Set(entries[i].value)
+		valuePtr := entries[i].value.Addr().UnsafePointer()
 		var err error
 		if elemHasMarshaler {
-			err = e.encodeNonAddressableMarshaler(node.elem, elementPtr)
+			err = e.encodeNonAddressableMarshaler(node.elem, valuePtr)
 		} else {
-			err = e.encodeKind(node.elem, elementPtr, node.elem.encNonAddrKind)
+			err = e.encodeKind(node.elem, valuePtr, node.elem.encNonAddrKind)
 		}
 		if err != nil {
 			// Clone: numeric key names alias the pooled arena, and the
 			// error must outlive this call's ownership of it.
 			name := strings.Clone(entries[i].name)
+			e.releaseValueBacking(backing, node.elem.typ, usedSlots)
 			e.releaseMapScratch(entries, keyArena, iterator)
 			e.depth--
 			return prependEncodePathField(err, name)
 		}
 	}
 	e.dst = append(e.dst, '}')
+	e.releaseValueBacking(backing, node.elem.typ, usedSlots)
 	e.releaseMapScratch(entries, keyArena, iterator)
 	e.depth--
 	return nil

@@ -19,14 +19,15 @@ type encoderScratch struct {
 	mapEntries  []mapEncodeEntry
 	mapKeyArena []byte
 	mapIter     *reflect.MapIter
-	// inlineBacking is a reused addressable slice of a ",inline" map's value
-	// type. Sorted catch-all encoding copies each value into a slot with
-	// SetIterValue so the entries can be reordered without reflect allocating
-	// one value box per member. inlineElem records the element type currently
-	// backed; ownership borrows and restores like mapEntries so nested catch-
-	// alls fall back to fresh allocations.
-	inlineBacking reflect.Value
-	inlineElem    reflect.Type
+	// valueBacking is a reused addressable slice of a map's (or ",inline"
+	// catch-all's) value type. Encoding copies each value into its own slot
+	// with SetIterValue so the entries can be reordered without reflect
+	// allocating one value box per member, and so a value that recurses into
+	// the same type has independent storage. valueBackingElem records the
+	// element type currently backed; ownership borrows and restores like
+	// mapEntries so nested maps fall back to fresh allocations.
+	valueBacking     reflect.Value
+	valueBackingElem reflect.Type
 }
 
 func (s *encoderScratch) reset() {

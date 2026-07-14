@@ -355,7 +355,7 @@ type typedNode struct {
 	inlineMap  *typedInlineMap
 	allSet     uint64
 	encScratch int32
-	encMapElem int32
+	encMapKey  int32
 }
 
 // typedInlineMap describes a struct's ",inline" map[string]T catch-all: where
@@ -468,7 +468,7 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 	if node := c.nodes[typ]; node != nil {
 		return node, nil
 	}
-	node := &typedNode{typ: typ, name: typ.String(), size: typ.Size(), encScratch: -1, encMapElem: -1}
+	node := &typedNode{typ: typ, name: typ.String(), size: typ.Size(), encScratch: -1, encMapKey: -1}
 	c.nodes[typ] = node
 
 	if err := c.compileStructural(node, typ, path); err != nil {
@@ -598,10 +598,12 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 		node.op = typedOpMap
 		c.encHasMap = true
 		if !c.dynamic {
-			// Reserve an addressable element of the value type in the
-			// encoder scratch so encodeMap reuses one box per map type.
-			node.encMapElem = int32(len(c.encScratchTypes))
-			c.encScratchTypes = append(c.encScratchTypes, typ.Elem())
+			// Reserve an addressable box of the key type in the encoder
+			// scratch so encodeMap copies each member name into it with
+			// SetIterKey instead of letting reflect box a fresh key; values
+			// collect into the pooled valueBacking for independent slots.
+			node.encMapKey = int32(len(c.encScratchTypes))
+			c.encScratchTypes = append(c.encScratchTypes, typ.Key())
 		}
 		elem, err := c.compile(typ.Elem(), path+"[key]")
 		if err != nil {
