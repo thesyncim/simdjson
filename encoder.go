@@ -679,12 +679,38 @@ func (e *encodeState) encodeSlice(node *typedNode, src unsafe.Pointer) error {
 func (e *encodeState) encodeStructSlice(node *typedNode, header *typedSliceHeader) error {
 	e.depth++
 	e.dst = append(e.dst, '[')
+	elem := node.elem
+	if elem.encSimple && header.len > 0 {
+		// The depth test and the simple-struct dispatch are the same for
+		// every element; run them once and drive the pair encoder
+		// directly. An empty slice keeps succeeding at the depth limit,
+		// exactly as the per-element check behaved.
+		if e.depth >= defaultMaxDepth {
+			e.depth--
+			return &EncodeError{Reason: "maximum nesting depth exceeded"}
+		}
+		for index := 0; index < header.len; index++ {
+			if index > 0 {
+				e.dst = append(e.dst, ',')
+			}
+			element := unsafe.Add(header.data, uintptr(index)*elem.size)
+			e.depth++
+			e.dst = append(e.dst, '{')
+			if err := e.encodeSimpleStructPairs(elem, element); err != nil {
+				e.depth--
+				return prependEncodePathIndex(err, index)
+			}
+		}
+		e.dst = append(e.dst, ']')
+		e.depth--
+		return nil
+	}
 	for index := 0; index < header.len; index++ {
 		if index > 0 {
 			e.dst = append(e.dst, ',')
 		}
-		element := unsafe.Add(header.data, uintptr(index)*node.elem.size)
-		if err := e.encodeStruct(node.elem, element); err != nil {
+		element := unsafe.Add(header.data, uintptr(index)*elem.size)
+		if err := e.encodeStruct(elem, element); err != nil {
 			e.depth--
 			return prependEncodePathIndex(err, index)
 		}
