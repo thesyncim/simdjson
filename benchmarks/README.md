@@ -56,25 +56,25 @@ unescaped strings into immutable input and has a different lifetime contract.
 
 | Corpus | `encoding/json` | simdjson owned | Source-backed | Rival | Rival time |
 |---|---:|---:|---:|---|---:|
-| Canada geometry | 1.167 ms | **250.3 us** | 218.4 us | Segment | 713.0 us |
-| CITM catalog | 2.459 ms | **1.011 ms** | 820.5 us | go-json | 1.245 ms |
-| Go source | 6.088 ms | **1.409 ms** | 982.8 us | Segment | 2.176 ms |
-| Escaped strings | 193.2 us | **36.5 us** | 30.0 us | go-json | 65.1 us |
-| Unicode strings | 40.8 us | **9.5 us** | 6.7 us | go-json | 13.1 us |
-| Synthea FHIR | 3.590 ms | **1.766 ms** | 1.522 ms | go-json | 2.021 ms |
-| Twitter status | 1.340 ms | **473.2 us** | 398.8 us | go-json | 688.3 us |
+| Canada geometry | 1.239 ms | **258.6 us** | 221.4 us | Segment | 770.7 us |
+| CITM catalog | 2.520 ms | **1.061 ms** | 872.8 us | go-json | 1.325 ms |
+| Go source | 6.279 ms | **1.372 ms** | 1.020 ms | Segment | 2.290 ms |
+| Escaped strings | 205.6 us | **40.1 us** | 31.8 us | go-json | 68.7 us |
+| Unicode strings | 43.7 us | **10.3 us** | 7.2 us | go-json | 14.0 us |
+| Synthea FHIR | 3.793 ms | **1.931 ms** | 1.629 ms | go-json | 2.113 ms |
+| Twitter status | 1.410 ms | **509.8 us** | 428.1 us | go-json | 749.6 us |
 
 Source-backed refers only to unescaped string ownership. Slices, maps,
 pointers, escaped text, and custom method receivers may still allocate.
 
 | Corpus | Source-backed bytes/op | Source-backed allocs/op |
 |---|---:|---:|
-| Canada geometry | 250 B | 0 |
-| CITM catalog | 1.676 MiB | 1,219 |
-| Go source | 8.8 KiB | 40 |
+| Canada geometry | 263 B | 0 |
+| CITM catalog | 1.677 MiB | 1,221 |
+| Go source | 9.1 KiB | 42 |
 | Escaped strings | 48.0 KiB | 1 |
 | Unicode strings | 18.0 KiB | 1 |
-| Synthea FHIR | 1.944 MiB | 342 |
+| Synthea FHIR | 1.944 MiB | 345 |
 | Twitter status | 631.0 KiB | 139 |
 
 ### Dynamic decode
@@ -83,13 +83,13 @@ These rows fully materialize an owned `any` tree.
 
 | Corpus | simdjson | Rival | Rival time | Lead |
 |---|---:|---|---:|---:|
-| Canada geometry | **863.7 us** | go-json | 1.746 ms | **2.02x** |
-| CITM catalog | **2.694 ms** | jsoniter | 4.197 ms | **1.56x** |
-| Go source | **4.682 ms** | go-json | 9.328 ms | **1.99x** |
-| Escaped strings | **32.8 us** | go-json | 73.7 us | **2.25x** |
-| Unicode strings | **14.6 us** | go-json | 20.4 us | **1.40x** |
-| Synthea FHIR | **4.123 ms** | jsoniter | 6.451 ms | **1.56x** |
-| Twitter status | **1.301 ms** | go-json | 1.963 ms | **1.51x** |
+| Canada geometry | **921.4 us** | go-json | 1.842 ms | **2.00x** |
+| CITM catalog | **2.990 ms** | jsoniter | 4.571 ms | **1.53x** |
+| Go source | **4.967 ms** | go-json | 9.877 ms | **1.99x** |
+| Escaped strings | **34.5 us** | go-json | 78.3 us | **2.27x** |
+| Unicode strings | **15.6 us** | go-json | 22.3 us | **1.43x** |
+| Synthea FHIR | **4.400 ms** | jsoniter | 6.927 ms | **1.57x** |
+| Twitter status | **1.382 ms** | go-json | 2.109 ms | **1.53x** |
 
 ### Strict validation
 
@@ -98,13 +98,13 @@ input.
 
 | Corpus | simdjson | Rival | Rival time | Lead |
 |---|---:|---|---:|---:|
-| Canada geometry | **121.7 us** | fastjson | 195.6 us | **1.61x** |
-| CITM catalog | **615.9 us** | fastjson | 800.8 us | **1.30x** |
-| Go source | **910.0 us** | Segment | 1.153 ms | **1.27x** |
-| Escaped strings | **4.3 us** | Segment | 61.2 us | **14.28x** |
-| Unicode strings | **3.2 us** | fastjson | 6.7 us | **2.10x** |
-| Synthea FHIR | **740.2 us** | fastjson | 1.210 ms | **1.64x** |
-| Twitter status | **218.8 us** | fastjson | 380.1 us | **1.74x** |
+| Canada geometry | **131.3 us** | fastjson | 217.8 us | **1.66x** |
+| CITM catalog | **642.0 us** | fastjson | 859.8 us | **1.34x** |
+| Go source | **940.8 us** | Segment | 1.201 ms | **1.28x** |
+| Escaped strings | **4.4 us** | Segment | 59.3 us | **13.50x** |
+| Unicode strings | **3.3 us** | fastjson | 7.1 us | **2.17x** |
+| Synthea FHIR | **777.7 us** | fastjson | 1.305 ms | **1.68x** |
+| Twitter status | **226.7 us** | fastjson | 394.4 us | **1.74x** |
 
 ### Encode
 
@@ -113,13 +113,13 @@ caller-owned buffer and removes the output allocation.
 
 | Corpus | stdlib | simdjson owned | Compiled reuse | Rival | Rival time |
 |---|---:|---:|---:|---|---:|
-| Canada geometry | 651.9 us | 369.5 us | **298.9 us** | Segment | 501.2 us |
-| CITM catalog | 994.0 us | 403.0 us | **234.9 us** | Segment | 368.6 us |
-| Go source | 3.216 ms | 1.330 ms | **710.1 us** | Segment | 1.390 ms |
-| Escaped strings | 19.6 us | 6.4 us | **3.6 us** | jsoniter | 21.2 us |
-| Unicode strings | 19.8 us | 6.3 us | **3.5 us** | jsoniter | 21.1 us |
-| Synthea FHIR | 5.948 ms | 2.373 ms | **1.331 ms** | Segment | 2.022 ms |
-| Twitter status | 698.0 us | 324.8 us | **183.5 us** | go-json | 334.3 us |
+| Canada geometry | 677.6 us | 381.0 us | **307.5 us** | Segment | 513.5 us |
+| CITM catalog | 1.012 ms | 397.7 us | **240.5 us** | go-json | 396.8 us |
+| Go source | 3.283 ms | 1.305 ms | **696.6 us** | Segment | 1.389 ms |
+| Escaped strings | 21.3 us | 6.9 us | **3.7 us** | jsoniter | 22.8 us |
+| Unicode strings | 21.5 us | 6.6 us | **3.7 us** | jsoniter | 23.1 us |
+| Synthea FHIR | 6.066 ms | 2.257 ms | **1.237 ms** | Segment | 2.142 ms |
+| Twitter status | 742.6 us | 336.3 us | **184.4 us** | Segment | 354.7 us |
 
 ### SIMD versus pure Go
 
@@ -128,13 +128,13 @@ selected once during initialization; short runs may remain scalar or SWAR.
 
 | simdjson path | SIMD wins | Geomean SIMD uplift |
 |---|---:|---:|
-| Validation | 7/7 | **1.406x** |
-| Dynamic owned | 6/7 | **1.079x** |
-| Dynamic source-backed | 5/7 | **1.090x** |
-| Typed owned | 6/7 | **1.116x** |
-| Typed source-backed | 5/7 | **1.132x** |
-| Encode owned | 6/7 | **1.522x** |
-| Encode compiled reuse | 6/7 | **1.782x** |
+| Validation | 6/7 | **1.385x** |
+| Dynamic owned | 5/7 | **1.067x** |
+| Dynamic source-backed | 5/7 | **1.073x** |
+| Typed owned | 5/7 | **1.093x** |
+| Typed source-backed | 4/7 | **1.113x** |
+| Encode owned | 7/7 | **1.550x** |
+| Encode compiled reuse | 6/7 | **1.800x** |
 
 ### Native Sonic context
 

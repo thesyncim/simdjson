@@ -167,11 +167,11 @@ speedup across all seven payloads.
 
 | Operation | Contract | vs stdlib | vs fastest rival | SIMD vs pure Go |
 |---|---|---:|---:|---:|
-| Validate | Strict JSON + UTF-8 | **2.36x** | **2.17x** | **1.406x** |
-| Typed decode | Owned strings | **3.50x** | **1.56x** | **1.116x** |
-| Dynamic decode | Owned `any` tree | **3.37x** | **1.73x** | **1.079x** |
-| Encode | Owned output | **2.46x** | **1.44x** | **1.522x** |
-| Encode | Reused output buffer | **4.16x** | **2.43x** | **1.782x** |
+| Validate | Strict JSON + UTF-8 | **2.35x** | **2.19x** | **1.385x** |
+| Typed decode | Owned strings | **3.48x** | **1.57x** | **1.093x** |
+| Dynamic decode | Owned `any` tree | **3.30x** | **1.74x** | **1.067x** |
+| Encode | Owned output | **2.53x** | **1.49x** | **1.550x** |
+| Encode | Reused output buffer | **4.35x** | **2.56x** | **1.800x** |
 
 Every stdlib row wins all seven payloads. Every rival row wins all seven except
 owned encode, which wins five. Comparisons use the same Go tip compiler and do
