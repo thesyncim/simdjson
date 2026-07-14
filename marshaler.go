@@ -5,50 +5,9 @@ import (
 	"encoding/json"
 	"reflect"
 	"runtime"
-	"sync"
 	"time"
 	"unsafe"
 )
-
-type encoderMarshalerScratch struct {
-	value reflect.Value
-	boxed any
-}
-
-type encoderScratch struct {
-	marshalers []encoderMarshalerScratch
-	// mapEntries, mapKeyArena, and mapIter are reused by encodeMap so
-	// sorted map encoding does not allocate per map. Ownership transfers
-	// to one encodeMap call at a time; nested maps fall back to fresh
-	// allocations.
-	mapEntries  []mapEncodeEntry
-	mapKeyArena []byte
-	mapIter     *reflect.MapIter
-}
-
-func (s *encoderScratch) reset() {
-	for i := range s.marshalers {
-		s.marshalers[i].value.SetZero()
-	}
-	// Entries hold key strings and reflect values from the encoded maps;
-	// drop those references before the scratch returns to the pool.
-	clear(s.mapEntries[:cap(s.mapEntries)])
-}
-
-func newEncoderScratchPool(types []reflect.Type, hasMap bool) *sync.Pool {
-	if len(types) == 0 && !hasMap {
-		return nil
-	}
-	types = append([]reflect.Type(nil), types...)
-	return &sync.Pool{New: func() any {
-		scratch := &encoderScratch{marshalers: make([]encoderMarshalerScratch, len(types))}
-		for i, typ := range types {
-			value := reflect.New(typ)
-			scratch.marshalers[i] = encoderMarshalerScratch{value: value.Elem(), boxed: value.Interface()}
-		}
-		return scratch
-	}}
-}
 
 // valueInterfaceAt copies T into an interface. Calling a value-receiver method
 // on that interface cannot expose p to user code.

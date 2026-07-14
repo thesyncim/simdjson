@@ -50,16 +50,6 @@ func (v Value) AppendJSON(dst []byte) []byte {
 	}
 }
 
-// Compact validates src and returns compact JSON.
-func Compact(src []byte) ([]byte, error) {
-	return AppendCompact(nil, src)
-}
-
-// AppendCompact validates src and appends compact JSON to dst.
-func AppendCompact(dst, src []byte) ([]byte, error) {
-	return appendCompact(dst, src, defaultMaxDepth)
-}
-
 // Indent parses src and returns pretty JSON using prefix and indent.
 func Indent(src []byte, prefix, indent string) ([]byte, error) {
 	return AppendIndent(nil, src, prefix, indent)

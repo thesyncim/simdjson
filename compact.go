@@ -1,5 +1,21 @@
 package simdjson
 
+// Compaction walks a document with a validating recursive-descent parser and
+// re-emits it with all insignificant whitespace removed. It shares the scanner
+// helpers with the main parser but writes each accepted token straight through
+// to the destination, so a valid input is compacted in a single pass and an
+// invalid one leaves the destination unchanged in length.
+
+// Compact validates src and returns compact JSON.
+func Compact(src []byte) ([]byte, error) {
+	return AppendCompact(nil, src)
+}
+
+// AppendCompact validates src and appends compact JSON to dst.
+func AppendCompact(dst, src []byte) ([]byte, error) {
+	return appendCompact(dst, src, defaultMaxDepth)
+}
+
 type compactParser struct {
 	src      []byte
 	dst      []byte
