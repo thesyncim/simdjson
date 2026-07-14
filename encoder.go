@@ -172,8 +172,12 @@ func prependEncodePathIndex(err error, index int) error {
 }
 
 type encodeState struct {
-	dst        []byte
-	depth      int
+	dst   []byte
+	depth int
+	// ptrRun counts pointer hops along the current path with its own
+	// budget, so a pure pointer cycle still terminates while pointers no
+	// longer double-count against the container depth limit.
+	ptrRun     int
 	escapeHTML bool
 	scratch    *encoderScratch
 	timeCache  simdkernels.TimeCache
@@ -260,12 +264,16 @@ func (e *encodeState) encodeKind(node *typedNode, src unsafe.Pointer, kind typed
 			e.dst = append(e.dst, "null"...)
 			return nil
 		}
-		if e.depth >= defaultMaxDepth {
+		// Pointers indirect without nesting: the decoder counts only
+		// containers toward the depth limit, and matching it here keeps
+		// documents this package decodes re-encodable.
+		run := e.ptrRun
+		if run >= defaultMaxDepth {
 			return &EncodeError{Reason: "maximum nesting depth exceeded"}
 		}
-		e.depth++
+		e.ptrRun = run + 1
 		err := e.encode(node.elem, pointer)
-		e.depth--
+		e.ptrRun = run
 		return err
 	default:
 		return &EncodeError{Reason: "invalid compiled operation"}
@@ -1033,6 +1041,11 @@ type mapEncodeEntry struct {
 // then base 10 integers.
 func mapKeyName(node *typedNode, key reflect.Value) (string, error) {
 	if node.mapKeyTextEncode {
+		// encoding/json renders a nil pointer key as the empty name
+		// instead of calling its method.
+		if key.Kind() == reflect.Pointer && key.IsNil() {
+			return "", nil
+		}
 		marshaler := key.Interface().(encoding.TextMarshaler)
 		text, err := marshaler.MarshalText()
 		if err != nil {
@@ -1208,6 +1221,8 @@ func typedValueIsEmpty(node *typedNode, src unsafe.Pointer) bool {
 		return *(*float64)(src) == 0
 	case typedSlice, typedBytes:
 		return (*typedSliceHeader)(src).len == 0
+	case typedArray:
+		return node.length == 0
 	case typedPointer:
 		return *(*unsafe.Pointer)(src) == nil
 	case typedMap:

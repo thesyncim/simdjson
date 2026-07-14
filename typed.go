@@ -234,6 +234,8 @@ func prependDecodePathIndex(err error, index int) error {
 	return err
 }
 
+// typedKind classifies a compiled node. Order is load-bearing: dispatch
+// ranges over contiguous runs of these values, so new kinds go at the end.
 type typedKind uint8
 
 const (
@@ -259,6 +261,9 @@ const (
 	typedTime
 )
 
+// typedOp selects a struct field's decode operation. Order is load-bearing:
+// the scalar run (typedOpBool through typedOpFloat64) is range-checked when
+// retagging errors, so new scalar ops belong inside it and containers after.
 type typedOp uint8
 
 const (
@@ -332,17 +337,25 @@ type typedNode struct {
 	encMapElem    int32
 }
 
+// typedField is one struct member of a compiled decode plan. The key fields
+// implement the packed-name fast match: key holds the first eight bytes the
+// decoder expects after the opening quote — for names of six bytes or fewer
+// that word also packs the closing quote and the colon, so one masked
+// eight-byte compare matches name, terminator, and separator at once.
+// keyMask selects the significant bytes, and keyFold holds the ASCII case
+// bits of the name's letters so the case-insensitive retry is one more mask.
+// Longer names compare their first eight bytes here and the rest by memcmp.
 type typedField struct {
 	name    string
 	offset  uintptr
 	node    *typedNode
-	seen    uint64
-	key     uint64
-	keyMask uint64
-	keyFold uint64
-	pos     int32
-	hop     int16
-	keyLen  uint8
+	seen    uint64 // single bit identifying this field in the struct's set
+	key     uint64 // expected first source word, packed as described above
+	keyMask uint64 // significant bytes of key; zero disables the fast match
+	keyFold uint64 // 0x20 at each letter position, for case-folded compares
+	pos     int32  // declaration position, resumes expected-order matching
+	hop     int16  // index into fieldHops for embedded fields, or -1
+	keyLen  uint8  // name length in bytes
 	op      typedOp
 }
 
@@ -479,6 +492,17 @@ type typedCompiler struct {
 var jsonNumberReflectType = reflect.TypeFor[json.Number]()
 var timeReflectType = reflect.TypeFor[time.Time]()
 
+// typedElemHasCustomMethods reports whether values or pointers of typ
+// implement any of the JSON or text marshaling interfaces, which takes
+// precedence over the byte-slice base64 form.
+func typedElemHasCustomMethods(typ reflect.Type) bool {
+	ptr := reflect.PointerTo(typ)
+	return typ.Implements(jsonMarshalerReflectType) || ptr.Implements(jsonMarshalerReflectType) ||
+		typ.Implements(textMarshalerReflectType) || ptr.Implements(textMarshalerReflectType) ||
+		typ.Implements(jsonUnmarshalerReflectType) || ptr.Implements(jsonUnmarshalerReflectType) ||
+		typ.Implements(textUnmarshalerReflectType) || ptr.Implements(textUnmarshalerReflectType)
+}
+
 func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, error) {
 	if node := c.nodes[typ]; node != nil {
 		return node, nil
@@ -568,7 +592,10 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 		}
 		node.elem = elem
 	case reflect.Slice:
-		if typ.Elem().Kind() == reflect.Uint8 {
+		if elem := typ.Elem(); elem.Kind() == reflect.Uint8 &&
+			!typedElemHasCustomMethods(elem) {
+			// encoding/json only treats a byte slice as base64 when the
+			// element type brings no marshaling methods of its own.
 			node.kind = typedBytes
 			node.op = typedOpBytes
 			break
@@ -668,8 +695,15 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 				}
 				switch quotedNode.baseKind {
 				case typedBool, typedString, typedNumber, typedInt, typedUint, typedFloat:
-					compiledField.op = typedOpQuoted
-					encField.encOp = typedOpQuoted
+					// encoding/json sets the quoted flag by kind but its
+					// marshaler and unmarshaler paths ignore it, so custom
+					// methods keep their own dispatch on each side.
+					if compiledField.op != typedOpUnmarshaler {
+						compiledField.op = typedOpQuoted
+					}
+					if encField.encOp != typedOpMarshaler {
+						encField.encOp = typedOpQuoted
+					}
 				}
 			}
 			node.encFields = append(node.encFields, encField)
@@ -1012,6 +1046,9 @@ func (c *typedCompiler) unsupported(typ reflect.Type, path, reason string) error
 	return &UnsupportedTypeError{Type: typ, Path: path, Reason: reason}
 }
 
+// typedSliceHeader mirrors the runtime's slice layout so compiled decoders
+// can manage destination slices without reflection on the hot path. Field
+// order and sizes must match the runtime exactly.
 type typedSliceHeader struct {
 	data unsafe.Pointer
 	len  int
@@ -1157,6 +1194,8 @@ func growTypedSlice(node *typedNode, dst unsafe.Pointer, capacity int) {
 		len:  currentHeader.len,
 		cap:  capacity,
 	}
+	// The store above published only raw pointers; KeepAlive pins the
+	// backing array until the header write is visible to the collector.
 	runtime.KeepAlive(next)
 }
 
