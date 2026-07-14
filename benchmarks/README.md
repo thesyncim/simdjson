@@ -153,6 +153,18 @@ invalid UTF-8.
 | Synthea FHIR | 3.456 ms | 5.635 ms | 8.988 ms | 867.0 us |
 | Twitter status | 768.7 us | 1.230 ms | 611.9 us | 235.8 us |
 
+## Cross-language context
+
+[crosslang/](crosslang/) benchmarks C++ simdjson and Rust
+serde_json/simd-json over the same seven payloads on the same machine, with
+contract notes for each row. Headlines from the 2026-07-14 snapshot: C++
+simdjson's tape parse reaches 4.2-4.8 GB/s on object-dense payloads (ahead
+of our validation scan) but falls behind it on number- and escape-dense
+input; our typed decode beats serde_json's dynamic tree on all seven
+payloads; and our compiled encoder leads every serializer measured except
+on the date-saturated FHIR payload, where C++ replays pre-parsed strings
+while we format native `time.Time` values.
+
 ## SIMD kernel snapshot
 
 These Apple M4 Max medians use eight 500 ms samples and guarded public APIs.

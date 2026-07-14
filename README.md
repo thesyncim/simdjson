@@ -183,7 +183,10 @@ also enforces UTF-8, and it has no reused-buffer `Marshal` counterpart. The
 SIMD column compares the same code, compiler, and corpus with and without
 `GOEXPERIMENT=simd`.
 
-[Full per-corpus results, allocations, SIMD uplift, versions, and exact commands](benchmarks/README.md#published-corpus-snapshot)
+[Full per-corpus results, allocations, SIMD uplift, versions, and exact commands](benchmarks/README.md#published-corpus-snapshot).
+For context beyond Go — C++ simdjson and Rust serde_json/simd-json on the
+same corpus and machine — see the
+[cross-language benchmarks](benchmarks/README.md#cross-language-context).
 
 ## SIMD Package
 

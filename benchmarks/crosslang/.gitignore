@@ -1,0 +1,6 @@
+simdjson.h
+simdjson.cpp
+bench_simdjson
+corpus/
+rustbench/target/
+rustbench/Cargo.lock
