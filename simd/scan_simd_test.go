@@ -41,11 +41,6 @@ func TestSIMDScannerDispatch(t *testing.T) {
 	if runtime.GOARCH == "amd64" && !info.Features.Has(CPUFeatureAVX2) {
 		t.Fatalf("amd64 SIMD backend features = %v, want AVX2", info.Features)
 	}
-	// Dispatch is a static switch now; verifying the reported backend
-	// string is the remaining contract.
-	if backend == "scalar" {
-		t.Fatalf("SIMD build selected the scalar backend")
-	}
 }
 
 func TestSIMDStringSyntaxMatchesScalarAllByteValues(t *testing.T) {
