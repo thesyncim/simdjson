@@ -280,7 +280,7 @@ func (cursor *decoderCursor) matchObjectFieldExpected(first bool, expected *type
 func (cursor *decoderCursor) nextObjectFieldExpectedSlow(first bool, expected *typedField) (key string, matched, ok bool, err error) {
 	i := cursor.i
 	if i < len(cursor.src) && cursor.src[i] <= ' ' {
-		i = skipSpace(cursor.src, i)
+		i = skipSpaceIndent(cursor.src, i)
 	}
 	if i >= len(cursor.src) {
 		key, ok, err = cursor.NextObjectField(first)
@@ -305,7 +305,7 @@ func (cursor *decoderCursor) nextObjectFieldExpectedSlow(first bool, expected *t
 		case ',':
 			i++
 			if i < len(cursor.src) && cursor.src[i] <= ' ' {
-				i = skipSpace(cursor.src, i)
+				i = skipSpaceIndent(cursor.src, i)
 			}
 			if i >= len(cursor.src) || cursor.src[i] != '"' {
 				key, ok, err = cursor.NextObjectField(first)
@@ -624,7 +624,7 @@ func decodeCompiledFloatArray[T floatValue](cursor *decoderCursor, node *typedNo
 		// element is accepted, so every partial match falls through cleanly.
 		i := cursor.i
 		if i < len(src) && src[i] <= ' ' {
-			i = skipSpace(src, i)
+			i = skipSpaceIndent(src, i)
 		}
 		if i < len(src) && index < node.length {
 			c := src[i]
@@ -642,7 +642,7 @@ func decodeCompiledFloatArray[T floatValue](cursor *decoderCursor, node *typedNo
 				}
 				i++
 				if i < len(src) && src[i] <= ' ' {
-					i = skipSpace(src, i)
+					i = skipSpaceIndent(src, i)
 				}
 			}
 			if i < len(src) && (src[i] == '-' || isDigit(src[i])) {

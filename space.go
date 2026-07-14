@@ -27,6 +27,32 @@ func skipSpace(src []byte, i int) int {
 	return i
 }
 
+// skipSpaceIndent is skipSpace with one extra four-space step after a line
+// feed, covering indentation shallower than the eight-space word run. The
+// extra nodes make it too costly to inline everywhere skipSpace goes, so it
+// serves only call sites that already branched on seeing whitespace —
+// pretty-printed member and element boundaries — where the run is long
+// enough to amortize it.
+func skipSpaceIndent(src []byte, i int) int {
+	for uint(i) < uint(len(src)) {
+		c := src[i]
+		if c > ' ' {
+			return i
+		}
+		if c != ' ' && c != '\n' && c != '\r' && c != '\t' {
+			return i
+		}
+		i++
+		for i+8 <= len(src) && binary.LittleEndian.Uint64(src[i:]) == 0x2020202020202020 {
+			i += 8
+		}
+		if c == '\n' && i+4 <= len(src) && binary.LittleEndian.Uint32(src[i:]) == 0x20202020 {
+			i += 4
+		}
+	}
+	return i
+}
+
 func matchStringAt(src []byte, i int, s string) bool {
 	if len(src)-i < len(s) {
 		return false

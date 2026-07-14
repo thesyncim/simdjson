@@ -328,7 +328,7 @@ func (c *decoderCursor) NextArrayElement(first bool) (bool, error) {
 
 //go:noinline
 func (c *decoderCursor) nextArrayElementSlow(first bool) (bool, error) {
-	c.skipSpace()
+	c.i = skipSpaceIndent(c.src, c.i)
 	if c.i >= len(c.src) {
 		return false, c.err(c.i, "unterminated array")
 	}
