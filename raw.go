@@ -157,15 +157,19 @@ func (r RawValue) ScanCompiled(pointer CompiledPointer) (RawValue, bool, error) 
 	return pointer.ScanRaw(r.src)
 }
 
-// GetRaw validates src and returns the JSON Pointer target as a raw source slice.
+// GetRaw validates src and returns the JSON Pointer target as a raw source
+// slice. Duplicate object keys resolve to the last occurrence, like
+// encoding/json.
 func GetRaw(src []byte, pointer string) (RawValue, bool, error) {
 	return GetRawOptions(src, pointer, Options{})
 }
 
 // ScanRaw returns the JSON Pointer target as a raw source slice and stops as
 // soon as that target has been validated. It validates the traversed path and
-// skipped siblings before the target, but unlike GetRaw it does not validate the
-// remainder of the document after a match.
+// skipped siblings before the target, but unlike GetRaw it does not validate
+// the remainder of the document after a match, and each pointer token
+// resolves to the first matching member — an early-exit scanner never sees a
+// later duplicate. Use GetRaw for encoding/json's last-occurrence semantics.
 func ScanRaw(src []byte, pointer string) (RawValue, bool, error) {
 	return ScanRawOptions(src, pointer, Options{})
 }
@@ -209,8 +213,9 @@ func (p CompiledPointer) GetRawOptions(src []byte, opts Options) (RawValue, bool
 	return raw, ok, nil
 }
 
-// ScanRaw returns p's target as a raw source slice and stops as soon as that
-// target has been validated.
+// ScanRaw returns p's target as a raw source slice and stops as soon as
+// that target has been validated. Like the package-level ScanRaw, each
+// pointer token resolves to the first matching member.
 func (p CompiledPointer) ScanRaw(src []byte) (RawValue, bool, error) {
 	return p.ScanRawOptions(src, Options{})
 }

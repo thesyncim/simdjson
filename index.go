@@ -254,7 +254,9 @@ func (v Node) Index(index int) (Node, bool) {
 // Get returns the last object member with key.
 func (v Node) Get(key string) (Node, bool) {
 	count, ok := v.ObjectLen()
-	if !ok {
+	if !ok || count == 0 {
+		// The empty check also keeps the entry arithmetic below inside the
+		// tape: an empty object can be its final entry.
 		return Node{}, false
 	}
 	keyEntry := tapeEntryOffset(v.entry, 1)
