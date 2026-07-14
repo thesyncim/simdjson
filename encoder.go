@@ -649,34 +649,74 @@ func (e *encodeState) encodeSlice(node *typedNode, src unsafe.Pointer) error {
 		return e.encodeStructSlice(node, header)
 	}
 	e.depth++
-	e.dst = append(e.dst, '[')
-	for index := 0; index < header.len; index++ {
-		if index > 0 {
-			e.dst = append(e.dst, ',')
+	// The element operation is loop invariant, so the hot scalar kinds get
+	// dedicated loops. Integer elements also drop the first-element branch:
+	// every value is emitted comma-prefixed and the opening bracket then
+	// overwrites the leading comma in place.
+	switch node.elem.encOp {
+	case typedOpInt64:
+		start := len(e.dst)
+		for index := 0; index < header.len; index++ {
+			e.dst = appendCommaCompactInt(e.dst, *(*int64)(unsafe.Add(header.data, uintptr(index)*node.elem.size)))
 		}
-		element := unsafe.Add(header.data, uintptr(index)*node.elem.size)
-		var err error
-		switch node.elem.encOp {
-		case typedOpStruct:
-			err = e.encodeStruct(node.elem, element)
-		case typedOpSlice:
-			err = e.encodeSlice(node.elem, element)
-		case typedOpArray:
-			err = e.encodeArray(node.elem, element)
-		case typedOpString:
-			e.dst = appendEncodedJSONString(e.dst, *(*string)(element), e.escapeHTML)
-		case typedOpInt64:
-			e.dst = appendCompactInt(e.dst, *(*int64)(element))
-		case typedOpUint64:
-			e.dst = appendCompactUint(e.dst, *(*uint64)(element))
-		case typedOpFloat64:
-			err = e.encodeFloat(*(*float64)(element), 64)
-		default:
-			err = e.encode(node.elem, element)
+		if header.len == 0 {
+			e.dst = append(e.dst, '[')
+		} else {
+			e.dst[start] = '['
 		}
-		if err != nil {
-			e.depth--
-			return prependEncodePathIndex(err, index)
+	case typedOpUint64:
+		start := len(e.dst)
+		for index := 0; index < header.len; index++ {
+			e.dst = appendCommaCompactUint(e.dst, *(*uint64)(unsafe.Add(header.data, uintptr(index)*node.elem.size)))
+		}
+		if header.len == 0 {
+			e.dst = append(e.dst, '[')
+		} else {
+			e.dst[start] = '['
+		}
+	case typedOpString:
+		e.dst = append(e.dst, '[')
+		for index := 0; index < header.len; index++ {
+			if index > 0 {
+				e.dst = append(e.dst, ',')
+			}
+			e.dst = appendEncodedJSONString(e.dst, *(*string)(unsafe.Add(header.data, uintptr(index)*node.elem.size)), e.escapeHTML)
+		}
+	case typedOpFloat64:
+		e.dst = append(e.dst, '[')
+		for index := 0; index < header.len; index++ {
+			if index > 0 {
+				e.dst = append(e.dst, ',')
+			}
+			if err := e.encodeFloat(*(*float64)(unsafe.Add(header.data, uintptr(index)*node.elem.size)), 64); err != nil {
+				e.depth--
+				return prependEncodePathIndex(err, index)
+			}
+		}
+	default:
+		e.dst = append(e.dst, '[')
+		for index := 0; index < header.len; index++ {
+			if index > 0 {
+				e.dst = append(e.dst, ',')
+			}
+			element := unsafe.Add(header.data, uintptr(index)*node.elem.size)
+			var err error
+			switch node.elem.encOp {
+			case typedOpStruct:
+				err = e.encodeStruct(node.elem, element)
+			case typedOpSlice:
+				err = e.encodeSlice(node.elem, element)
+			case typedOpArray:
+				err = e.encodeArray(node.elem, element)
+			case typedOpFloat64:
+				err = e.encodeFloat(*(*float64)(element), 64)
+			default:
+				err = e.encode(node.elem, element)
+			}
+			if err != nil {
+				e.depth--
+				return prependEncodePathIndex(err, index)
+			}
 		}
 	}
 	e.dst = append(e.dst, ']')
@@ -686,7 +726,6 @@ func (e *encodeState) encodeSlice(node *typedNode, src unsafe.Pointer) error {
 
 func (e *encodeState) encodeStructSlice(node *typedNode, header *typedSliceHeader) error {
 	e.depth++
-	e.dst = append(e.dst, '[')
 	elem := node.elem
 	if elem.encSimple && header.len > 0 {
 		// The depth test and the simple-struct dispatch are the same for
@@ -698,22 +737,24 @@ func (e *encodeState) encodeStructSlice(node *typedNode, header *typedSliceHeade
 			e.depth--
 			return &EncodeError{Reason: "maximum nesting depth exceeded"}
 		}
+		// Every element opens with ",{" in one append and the bracket then
+		// overwrites the leading comma, removing the first-element branch.
+		start := len(e.dst)
 		for index := 0; index < header.len; index++ {
-			if index > 0 {
-				e.dst = append(e.dst, ',')
-			}
 			element := unsafe.Add(header.data, uintptr(index)*elem.size)
 			e.depth++
-			e.dst = append(e.dst, '{')
+			e.dst = append(e.dst, ',', '{')
 			if err := e.encodeSimpleStructPairs(elem, element); err != nil {
 				e.depth--
 				return prependEncodePathIndex(err, index)
 			}
 		}
+		e.dst[start] = '['
 		e.dst = append(e.dst, ']')
 		e.depth--
 		return nil
 	}
+	e.dst = append(e.dst, '[')
 	for index := 0; index < header.len; index++ {
 		if index > 0 {
 			e.dst = append(e.dst, ',')
@@ -1324,6 +1365,41 @@ func appendCompactInt(dst []byte, v int64) []byte {
 		return appendCompactUint(dst, uint64(-v))
 	}
 	return appendCompactUint(dst, uint64(v))
+}
+
+// appendCommaCompactUint emits ",digits" with one capacity check, so slice
+// loops pay no separate separator append per element.
+func appendCommaCompactUint(dst []byte, v uint64) []byte {
+	if v < 10 {
+		return append(dst, ',', byte('0'+v))
+	}
+	if v < 100 {
+		return append(dst, ',', encodeDigitPairs[v*2], encodeDigitPairs[v*2+1])
+	}
+	// The digit-count formula requires v >= 100, proved above.
+	digits := int((bits.Len64(v)*1233)>>12) + 1
+	if v < pow10Uint64[digits-1] {
+		digits--
+	}
+	if v >= 1e16 || cap(dst)-len(dst) < digits+1 {
+		dst = append(dst, ',')
+		return appendCompactUint(dst, v)
+	}
+	var block [16]byte
+	simdkernels.Store16Digits(&block, v)
+	start := len(dst)
+	dst = dst[:start+digits+1]
+	dst[start] = ','
+	copy(dst[start+1:], block[16-digits:])
+	return dst
+}
+
+func appendCommaCompactInt(dst []byte, v int64) []byte {
+	if v < 0 {
+		dst = append(dst, ',', '-')
+		return appendCompactUint(dst, uint64(-v))
+	}
+	return appendCommaCompactUint(dst, uint64(v))
 }
 
 // appendShortCleanJSONString quotes strings shorter than one vector when no
