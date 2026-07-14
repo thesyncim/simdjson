@@ -192,8 +192,10 @@ func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, k
 			return nil
 		}
 		boxed, shadow = copiedLoadedPointerReceiverAt(node.typ, pointer)
-	} else if (kind == typedMarshalerJSON && node.typ.Implements(jsonMarshalerReflectType)) ||
-		(kind == typedMarshalerText && node.typ.Implements(textMarshalerReflectType)) {
+	} else if node.encNonAddrKind == kind {
+		// The compiler set encNonAddrKind to this marshaler kind exactly
+		// when the value type itself implements the interface, so the
+		// per-call reflect.Implements probes compile down to this compare.
 		if e.scratch == nil || node.encScratch < 0 {
 			boxed = valueInterfaceAt(node.typ, src)
 		} else {
@@ -214,6 +216,10 @@ func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, k
 		copyMethodReceiverBack(node.typ, src, shadow)
 		if err != nil {
 			return &EncodeError{Reason: "MarshalJSON: " + err.Error()}
+		}
+		if out, ok := appendCleanMarshalerOutput(e.dst, data); ok {
+			e.dst = out
+			return nil
 		}
 		compacted, err := AppendCompact(e.dst, data)
 		if err != nil {
@@ -236,6 +242,33 @@ func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, k
 	}
 	e.dst = appendEncodedJSONString(e.dst, string(text), e.escapeHTML)
 	return nil
+}
+
+// marshalerPassthroughDeny flags bytes whose presence anywhere in a
+// MarshalJSON result forces the general compact-and-escape path: JSON
+// whitespace (the output might not be compact), the HTML escape set, and
+// the U+2028/U+2029 lead byte. The test is string-blind, so results whose
+// string values contain these bytes just take the general path.
+var marshalerPassthroughDeny = [4]uint64{
+	1<<'\t' | 1<<'\n' | 1<<'\r' | 1<<' ' | 1<<'&' | 1<<'<' | 1<<'>',
+	0,
+	0,
+	1 << (0xE2 - 192),
+}
+
+// appendCleanMarshalerOutput appends a MarshalJSON result verbatim when a
+// byte-set scan plus strict validation prove that the general path would
+// reproduce it unchanged. ok=false leaves dst untouched.
+func appendCleanMarshalerOutput(dst []byte, data []byte) ([]byte, bool) {
+	for _, c := range data {
+		if marshalerPassthroughDeny[c>>6]&(1<<(c&63)) != 0 {
+			return dst, false
+		}
+	}
+	if !Valid(data) {
+		return dst, false
+	}
+	return append(dst, data...), true
 }
 
 // escapeHTMLInPlaceTail rewrites buf[from:] escaping <, >, &, U+2028, and
