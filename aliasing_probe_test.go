@@ -1,0 +1,740 @@
+package simdjson
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"math/rand"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+// ---------------------------------------------------------------------------
+// Probe 1: owned-mode decodes must never alias caller src.
+// Decode every retaining kind with default (owned) options, scribble over the
+// source buffer, and verify the results byte for byte against encoding/json.
+// Field orders vary so each retaining kind gets to be the first ownSource
+// trigger.
+// ---------------------------------------------------------------------------
+
+type probeOwnedDoc struct {
+	S string            `json:"s"`
+	N json.Number       `json:"n"`
+	A any               `json:"a"`
+	M map[string]string `json:"m"`
+	Q int               `json:"q,string"`
+	B []byte            `json:"b"`
+}
+
+func TestProbeOwnedModeNeverAliasesCallerSrc(t *testing.T) {
+	bodies := []string{
+		// string first
+		`{"s":"hello world","n":123.456,"a":{"k":"va` + jsonUnicodeEscape("00e9") + `l","arr":[1,"two",null]},"m":{"k1":"v1","k` + jsonUnicodeEscape("0032") + `":"v2"},"q":"42","b":"aGVsbG8="}`,
+		// number first
+		`{"n":987654321012345678,"s":"later","a":"plain","m":{"x":"y"},"q":"7","b":"QQ=="}`,
+		// any first
+		`{"a":[1.5,"str",{"deep":"va` + jsonUnicodeEscape("0041") + `l"}],"s":"tail","n":1e10,"m":{"only":"one"},"q":"-3","b":""}`,
+		// map first
+		`{"m":{"first":"map","se` + jsonUnicodeEscape("0063") + `ond":"pair"},"a":true,"s":"x","n":0.5,"q":"0","b":"AA=="}`,
+		// quoted first
+		`{"q":"1234","m":{},"a":null,"s":"es` + jsonUnicodeEscape("0063") + `aped","n":2,"b":"aGk="}`,
+	}
+	for bi, body := range bodies {
+		src := []byte(body)
+		var want probeOwnedDoc
+		if err := json.Unmarshal(src, &want); err != nil {
+			t.Fatalf("body %d: reference: %v", bi, err)
+		}
+		var got probeOwnedDoc
+		if err := Unmarshal(src, &got); err != nil {
+			t.Fatalf("body %d: Unmarshal: %v", bi, err)
+		}
+		// Scribble the entire caller buffer.
+		for i := range src {
+			src[i] = 'Z'
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("body %d: after src scribble:\ngot  %#v\nwant %#v", bi, got, want)
+		}
+	}
+}
+
+// Top-level retaining shapes: any, map, slice-of-string.
+func TestProbeOwnedTopLevelShapes(t *testing.T) {
+	{
+		src := []byte(`{"k":"clean","e":"a` + jsonUnicodeEscape("0042") + `c","nested":[1,"two"]}`)
+		var want, got any
+		if err := json.Unmarshal(src, &want); err != nil {
+			t.Fatal(err)
+		}
+		if err := Unmarshal(src, &got); err != nil {
+			t.Fatal(err)
+		}
+		for i := range src {
+			src[i] = 0xEE
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("any: got %#v want %#v", got, want)
+		}
+	}
+	{
+		src := []byte(`{"alpha":"one","beta":"t` + jsonUnicodeEscape("0077") + `o"}`)
+		var want, got map[string]string
+		if err := json.Unmarshal(src, &want); err != nil {
+			t.Fatal(err)
+		}
+		if err := Unmarshal(src, &got); err != nil {
+			t.Fatal(err)
+		}
+		for i := range src {
+			src[i] = 0xEE
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("map: got %#v want %#v", got, want)
+		}
+	}
+	{
+		src := []byte(`["plain","es` + jsonUnicodeEscape("0063") + `aped","third"]`)
+		var want, got []string
+		if err := json.Unmarshal(src, &want); err != nil {
+			t.Fatal(err)
+		}
+		if err := Unmarshal(src, &got); err != nil {
+			t.Fatal(err)
+		}
+		for i := range src {
+			src[i] = 0xEE
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("slice: got %#v want %#v", got, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Probe 2: dynamic (any) values that materialize MANY escaped strings must
+// survive arena block switches inside the dynamic parse, and later escaped
+// typed strings must append after — not over — them.
+// ---------------------------------------------------------------------------
+
+func TestProbeAnyArenaBlockSwitch(t *testing.T) {
+	// One escaped string long enough to matter, repeated enough times inside
+	// the any value to cross several 2 KiB arena blocks (stringArenaSeed).
+	esc := strings.Repeat(jsonUnicodeEscape("00e9")+"unit", 30) // ~150 decoded bytes each
+	var b strings.Builder
+	b.WriteString(`{"pre":"p` + jsonUnicodeEscape("0050") + `p","dyn":{`)
+	const dynKeys = 64
+	for i := 0; i < dynKeys; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `"k%02d":"%s"`, i, esc)
+	}
+	b.WriteString(`},"post":[`)
+	const postStrings = 64
+	for i := 0; i < postStrings; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `"t%02d%s"`, i, esc)
+	}
+	b.WriteString(`]}`)
+	src := []byte(b.String())
+
+	type doc struct {
+		Pre  string   `json:"pre"`
+		Dyn  any      `json:"dyn"`
+		Post []string `json:"post"`
+	}
+	var want doc
+	if err := json.Unmarshal(src, &want); err != nil {
+		t.Fatal(err)
+	}
+	for _, opts := range []DecoderOptions{{}, {ZeroCopy: true}} {
+		dec, err := CompileDecoder[doc](opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got doc
+		if err := dec.Decode(src, &got); err != nil {
+			t.Fatalf("ZeroCopy=%v: %v", opts.ZeroCopy, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			// Locate the first mismatch precisely for the report.
+			gm := got.Dyn.(map[string]any)
+			wm := want.Dyn.(map[string]any)
+			for k, wv := range wm {
+				if gm[k] != wv {
+					t.Fatalf("ZeroCopy=%v: dyn[%q] = %.60q, want %.60q", opts.ZeroCopy, k, gm[k], wv)
+				}
+			}
+			for i := range want.Post {
+				if got.Post[i] != want.Post[i] {
+					t.Fatalf("ZeroCopy=%v: post[%d] = %.60q, want %.60q", opts.ZeroCopy, i, got.Post[i], want.Post[i])
+				}
+			}
+			t.Fatalf("ZeroCopy=%v: mismatch (pre=%q)", opts.ZeroCopy, got.Pre)
+		}
+	}
+}
+
+// Interleave typed escaped strings and any values so the arena alternates
+// between cursor-side and parser-side appends across block switches.
+func TestProbeInterleavedTypedAndDynamicEscapes(t *testing.T) {
+	type pair struct {
+		S string `json:"s"`
+		A any    `json:"a"`
+	}
+	esc := strings.Repeat(jsonUnicodeEscape("0041")+"b", 100) // 200 decoded bytes
+	var b strings.Builder
+	b.WriteByte('[')
+	const n = 48
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"s":"s%02d%s","a":"a%02d%s"}`, i, esc, i, esc)
+	}
+	b.WriteByte(']')
+	src := []byte(b.String())
+
+	var want []pair
+	if err := json.Unmarshal(src, &want); err != nil {
+		t.Fatal(err)
+	}
+	for _, opts := range []DecoderOptions{{}, {ZeroCopy: true}} {
+		dec, err := CompileDecoder[[]pair](opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []pair
+		if err := dec.Decode(src, &got); err != nil {
+			t.Fatalf("ZeroCopy=%v: %v", opts.ZeroCopy, err)
+		}
+		for i := range want {
+			if got[i].S != want[i].S {
+				t.Fatalf("ZeroCopy=%v: [%d].S = %.60q, want %.60q", opts.ZeroCopy, i, got[i].S, want[i].S)
+			}
+			if got[i].A != want[i].A {
+				t.Fatalf("ZeroCopy=%v: [%d].A = %.60q, want %.60q", opts.ZeroCopy, i, got[i].A, want[i].A)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Probe 3: escaped map keys are retained by the result map and must survive
+// later escaped strings (keys and values) appending to the arena.
+// ---------------------------------------------------------------------------
+
+func TestProbeEscapedMapKeysArena(t *testing.T) {
+	var b strings.Builder
+	b.WriteByte('{')
+	const n = 80
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		// Escaped key and escaped value, each unique.
+		fmt.Fprintf(&b, `"key%02d%s":"val%02d%s"`,
+			i, strings.Repeat(jsonUnicodeEscape("00e9"), 20),
+			i, strings.Repeat(jsonUnicodeEscape("00fc"), 20))
+	}
+	b.WriteByte('}')
+	src := []byte(b.String())
+
+	var want map[string]string
+	if err := json.Unmarshal(src, &want); err != nil {
+		t.Fatal(err)
+	}
+	for _, opts := range []DecoderOptions{{}, {ZeroCopy: true}} {
+		dec, err := CompileDecoder[map[string]string](opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]string
+		if err := dec.Decode(src, &got); err != nil {
+			t.Fatalf("ZeroCopy=%v: %v", opts.ZeroCopy, err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("ZeroCopy=%v: %d entries, want %d", opts.ZeroCopy, len(got), len(want))
+		}
+		for k, wv := range want {
+			gv, ok := got[k]
+			if !ok {
+				t.Fatalf("ZeroCopy=%v: missing key %.40q", opts.ZeroCopy, k)
+			}
+			if gv != wv {
+				t.Fatalf("ZeroCopy=%v: got[%.40q] = %.40q, want %.40q", opts.ZeroCopy, k, gv, wv)
+			}
+		}
+	}
+
+	// map[string]any: keys through typedKey, values through the dynamic parse.
+	var wantAny map[string]any
+	if err := json.Unmarshal(src, &wantAny); err != nil {
+		t.Fatal(err)
+	}
+	var gotAny map[string]any
+	if err := Unmarshal(src, &gotAny); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotAny, wantAny) {
+		t.Fatalf("map[string]any mismatch")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Probe 4: quoted (",string") fields whose inner content is escaped use a
+// transient arena region; the decoded result must not alias it once later
+// escaped strings reuse that region.
+// ---------------------------------------------------------------------------
+
+func TestProbeQuotedFieldTransientArena(t *testing.T) {
+	type doc struct {
+		Born string      `json:"born"` // escaped: creates the arena
+		Q    string      `json:"q,string"`
+		N    json.Number `json:"n,string"`
+		I    int         `json:"i,string"`
+		Tail string      `json:"tail"` // escaped: appends over transient bytes
+	}
+	// Q's inner JSON string is itself escaped twice over (outer layer consumed
+	// by stringToken, inner layer by the sub-decode).
+	src := []byte(`{"born":"b` + jsonUnicodeEscape("0042") + `b",` +
+		`"q":"\"inner` + `\\` + `u0041value\"",` +
+		`"n":"12` + jsonUnicodeEscape("0033") + `.5",` +
+		`"i":"4` + jsonUnicodeEscape("0032") + `",` +
+		`"tail":"t` + strings.Repeat(jsonUnicodeEscape("0054"), 40) + `t"}`)
+	var want doc
+	if err := json.Unmarshal(src, &want); err != nil {
+		t.Fatal(err)
+	}
+	for _, opts := range []DecoderOptions{{}, {ZeroCopy: true}} {
+		dec, err := CompileDecoder[doc](opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got doc
+		if err := dec.Decode(src, &got); err != nil {
+			t.Fatalf("ZeroCopy=%v: %v", opts.ZeroCopy, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("ZeroCopy=%v:\ngot  %#v\nwant %#v", opts.ZeroCopy, got, want)
+		}
+	}
+}
+
+// Escaped base64: the []byte result decodes out of the transient region and
+// must be a private copy.
+func TestProbeBytesFromEscapedBase64(t *testing.T) {
+	type doc struct {
+		Born string `json:"born"`
+		B    []byte `json:"b"`
+		Tail string `json:"tail"`
+	}
+	// "aGVsbG8=" with the '8' spelled as an escape lands on the arena path.
+	src := []byte(`{"born":"x` + jsonUnicodeEscape("0058") + `x",` +
+		`"b":"aGVsbG` + jsonUnicodeEscape("0038") + `=",` +
+		`"tail":"` + strings.Repeat(jsonUnicodeEscape("0059"), 40) + `"}`)
+	var want doc
+	if err := json.Unmarshal(src, &want); err != nil {
+		t.Fatal(err)
+	}
+	for _, opts := range []DecoderOptions{{}, {ZeroCopy: true}} {
+		dec, err := CompileDecoder[doc](opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got doc
+		if err := dec.Decode(src, &got); err != nil {
+			t.Fatalf("ZeroCopy=%v: %v", opts.ZeroCopy, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("ZeroCopy=%v:\ngot  %#v\nwant %#v", opts.ZeroCopy, got, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Probe 5: streaming Reader. Values split across arbitrarily small reads
+// exercise the retry + compaction + growth paths; every decoded value is
+// checked inside its validity window, and owned decodes are checked after it.
+// ---------------------------------------------------------------------------
+
+type probeChunkReader struct {
+	data  []byte
+	chunk int
+	pos   int
+}
+
+func (r *probeChunkReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := r.chunk
+	if n > len(p) {
+		n = len(p)
+	}
+	if r.pos+n > len(r.data) {
+		n = len(r.data) - r.pos
+	}
+	copy(p, r.data[r.pos:r.pos+n])
+	r.pos += n
+	return n, nil
+}
+
+type streamRec struct {
+	ID   int               `json:"id"`
+	Name string            `json:"name"`
+	Any  any               `json:"any"`
+	M    map[string]string `json:"m"`
+}
+
+func buildStreamDocs(t *testing.T, count int) ([]byte, []streamRec) {
+	t.Helper()
+	var b bytes.Buffer
+	var want []streamRec
+	for i := 0; i < count; i++ {
+		doc := fmt.Sprintf(
+			`{"id":%d,"name":"n%02d%sx","any":{"k":"a%02d%s"},"m":{"mk%s":"mv%02d"}}`,
+			i, i, strings.Repeat(jsonUnicodeEscape("00e9"), 8),
+			i, strings.Repeat(jsonUnicodeEscape("0041"), 8),
+			jsonUnicodeEscape("00fc"), i)
+		b.WriteString(doc)
+		b.WriteByte('\n')
+		var w streamRec
+		if err := json.Unmarshal([]byte(doc), &w); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, w)
+	}
+	return b.Bytes(), want
+}
+
+func TestProbeStreamDecodeNextSplitValues(t *testing.T) {
+	data, want := buildStreamDocs(t, 25)
+	for _, zeroCopy := range []bool{false, true} {
+		dec, err := CompileDecoder[streamRec](DecoderOptions{ZeroCopy: zeroCopy, Replace: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, chunk := range []int{1, 2, 3, 7, 64, len(data)} {
+			r := NewReaderSize(&probeChunkReader{data: data, chunk: chunk}, 512)
+			var got streamRec
+			i := 0
+			for DecodeNext(r, dec, &got) {
+				if i >= len(want) {
+					t.Fatalf("zeroCopy=%v chunk=%d: extra value %d", zeroCopy, chunk, i)
+				}
+				// Check within the validity window.
+				if !reflect.DeepEqual(got, want[i]) {
+					t.Fatalf("zeroCopy=%v chunk=%d: value %d\ngot  %#v\nwant %#v", zeroCopy, chunk, i, got, want[i])
+				}
+				i++
+			}
+			if err := r.Err(); err != nil {
+				t.Fatalf("zeroCopy=%v chunk=%d: %v", zeroCopy, chunk, err)
+			}
+			if i != len(want) {
+				t.Fatalf("zeroCopy=%v chunk=%d: %d values, want %d", zeroCopy, chunk, i, len(want))
+			}
+		}
+	}
+}
+
+// Owned decodes must survive subsequent Next/DecodeNext calls that rewrite
+// the rolling buffer.
+func TestProbeStreamOwnedRetentionAcrossNext(t *testing.T) {
+	data, want := buildStreamDocs(t, 25)
+	dec, err := CompileDecoder[streamRec](DecoderOptions{Replace: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewReaderSize(&probeChunkReader{data: data, chunk: 3}, 512)
+	var retained []streamRec
+	var cur streamRec
+	for DecodeNext(r, dec, &cur) {
+		retained = append(retained, cur) // shallow copy: strings/maps/any alias cur's decode
+		cur = streamRec{}                // do not let the next decode merge into retained maps
+	}
+	if err := r.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(retained) != len(want) {
+		t.Fatalf("%d values, want %d", len(retained), len(want))
+	}
+	for i := range want {
+		if !reflect.DeepEqual(retained[i], want[i]) {
+			t.Fatalf("retained value %d corrupted:\ngot  %#v\nwant %#v", i, retained[i], want[i])
+		}
+	}
+}
+
+// Bytes across buffer growth and compaction, checked inside the window.
+func TestProbeReaderBytesGrowAndCompact(t *testing.T) {
+	var docs [][]byte
+	var stream bytes.Buffer
+	for i := 0; i < 12; i++ {
+		doc := []byte(fmt.Sprintf(`{"i":%d,"pad":%q}`, i, strings.Repeat("p", 300+37*i)))
+		docs = append(docs, doc)
+		stream.Write(doc)
+		stream.WriteByte('\n')
+	}
+	for _, chunk := range []int{1, 5, 511, stream.Len()} {
+		r := NewReaderSize(&probeChunkReader{data: stream.Bytes(), chunk: chunk}, 512)
+		i := 0
+		for r.Next() {
+			if !bytes.Equal(r.Bytes(), docs[i]) {
+				t.Fatalf("chunk=%d: value %d Bytes mismatch:\ngot  %s\nwant %s", chunk, i, r.Bytes(), docs[i])
+			}
+			i++
+		}
+		if err := r.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if i != len(docs) {
+			t.Fatalf("chunk=%d: %d values, want %d", chunk, i, len(docs))
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Probe 6: ParseAny slab arena. Arrays with 1..10 elements exercise slab slot
+// handoff, append growth past the 4-element slot capacity, and slab
+// replacement; the whole tree is compared against encoding/json.
+// ---------------------------------------------------------------------------
+
+func TestProbeParseAnySlabIsolation(t *testing.T) {
+	rng := rand.New(rand.NewSource(7))
+	var build func(depth int) string
+	build = func(depth int) string {
+		if depth >= 4 {
+			return fmt.Sprintf("%d", rng.Intn(1000))
+		}
+		n := 1 + rng.Intn(10)
+		parts := make([]string, n)
+		for i := range parts {
+			switch rng.Intn(4) {
+			case 0:
+				parts[i] = build(depth + 1)
+			case 1:
+				parts[i] = fmt.Sprintf(`"s%d"`, rng.Intn(1000))
+			case 2:
+				parts[i] = fmt.Sprintf("%d.%d", rng.Intn(100), rng.Intn(100))
+			default:
+				parts[i] = "null"
+			}
+		}
+		return "[" + strings.Join(parts, ",") + "]"
+	}
+	for round := 0; round < 50; round++ {
+		src := []byte(build(0))
+		if len(src) <= 64 {
+			src = []byte("[" + string(src) + "," + string(src) + `,"padpadpadpadpadpadpadpadpadpadpadpadpadpadpad"]`)
+		}
+		var want, got any
+		if err := json.Unmarshal(src, &want); err != nil {
+			t.Fatal(err)
+		}
+		got, err := ParseAny(src)
+		if err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		if !reflect.DeepEqual(normalizeAnyNumbers(got), want) {
+			t.Fatalf("round %d mismatch:\nsrc  %s\ngot  %#v\nwant %#v", round, src, got, want)
+		}
+	}
+}
+
+// ParseAny yields float64 like encoding/json; nothing to normalize today, but
+// keep the hook in one place in case shapes diverge.
+func normalizeAnyNumbers(v any) any { return v }
+
+// ---------------------------------------------------------------------------
+// Probe 7: Parse AST retention. Values from earlier ParseOptions calls must
+// stay intact while the tape pool is reused by later parses and after the
+// original source is scribbled (owned mode).
+// ---------------------------------------------------------------------------
+
+func TestProbeParseValueRetentionAcrossPoolReuse(t *testing.T) {
+	src := []byte(`{"a":"alpha","e":"b` + jsonUnicodeEscape("00e9") + `ta","n":42.5,"arr":[1,"two",{"deep":"d"}]}`)
+	var wantJSON map[string]any
+	if err := json.Unmarshal(src, &wantJSON); err != nil {
+		t.Fatal(err)
+	}
+	v, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Scribble the source (owned mode must not alias it).
+	for i := range src {
+		src[i] = '!'
+	}
+	// Churn the tape pool with other documents.
+	for i := 0; i < 64; i++ {
+		other := []byte(fmt.Sprintf(`[{"x":"%d","y":[%d,%d,"%s"]},"filler%d"]`, i, i, i*2, strings.Repeat("f", i), i))
+		if _, err := Parse(other); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := v.Any()
+	// Value.Any yields json.Number; convert want accordingly via round trip.
+	gotJSON, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotBack map[string]any
+	if err := json.Unmarshal(gotJSON, &gotBack); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotBack, wantJSON) {
+		t.Fatalf("retained Value corrupted:\ngot  %#v\nwant %#v", gotBack, wantJSON)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Probe 8: encoder scratch. The numeric-key arena is pooled; an error Path
+// built from it must survive later encodes that rewrite the arena, and
+// concurrent encodes through one compiled encoder must not cross-talk.
+// ---------------------------------------------------------------------------
+
+func TestProbeEncodeMapErrorPathStability(t *testing.T) {
+	type doc struct {
+		M map[int]float64 `json:"m"`
+	}
+	enc, err := CompileEncoder[doc](EncoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := doc{M: map[int]float64{1234567: math.NaN()}}
+	_, err = enc.AppendJSON(nil, &bad)
+	if err == nil {
+		t.Fatal("want error for NaN map value")
+	}
+	encErr, ok := err.(*EncodeError)
+	if !ok {
+		t.Fatalf("want *EncodeError, got %T", err)
+	}
+	pathBefore := encErr.Path
+	// Rewrite the pooled key arena with different digits many times.
+	good := doc{M: map[int]float64{7654321: 1, 999: 2, 88: 3}}
+	for i := 0; i < 32; i++ {
+		if _, err := enc.AppendJSON(nil, &good); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if encErr.Path != pathBefore || !strings.Contains(pathBefore, "1234567") {
+		t.Fatalf("error path mutated by pooled arena reuse: before %q after %q", pathBefore, encErr.Path)
+	}
+}
+
+func TestProbeEncoderScratchConcurrency(t *testing.T) {
+	type doc struct {
+		M map[string]int  `json:"m"`
+		N map[int]string  `json:"n"`
+		A any             `json:"a"`
+		S staticMarshaler `json:"s"`
+	}
+	enc, err := CompileEncoder[doc](EncoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const workers = 8
+	done := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		go func(w int) {
+			v := doc{
+				M: map[string]int{fmt.Sprintf("k%d", w): w},
+				N: map[int]string{w * 1111: fmt.Sprintf("v%d", w)},
+				A: map[string]bool{fmt.Sprintf("a%d", w): true},
+				S: staticMarshaler{V: w},
+			}
+			want := fmt.Sprintf(`{"m":{"k%d":%d},"n":{"%d":"v%d"},"a":{"a%d":true},"s":"static"}`, w, w, w*1111, w, w)
+			for i := 0; i < 500; i++ {
+				out, err := enc.AppendJSON(nil, &v)
+				if err != nil {
+					done <- err
+					return
+				}
+				if string(out) != want {
+					done <- fmt.Errorf("worker %d: got %s want %s", w, out, want)
+					return
+				}
+			}
+			done <- nil
+		}(w)
+	}
+	for w := 0; w < workers; w++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Probe 9: differential fuzz battery over escape-dense documents decoded into
+// an any/map/string-bearing struct in both ownership modes.
+// ---------------------------------------------------------------------------
+
+func TestProbeDifferentialEscapeBattery(t *testing.T) {
+	type doc struct {
+		A string            `json:"a"`
+		B any               `json:"b"`
+		C map[string]string `json:"c"`
+		D []any             `json:"d"`
+		E string            `json:"e"`
+	}
+	rng := rand.New(rand.NewSource(1234))
+	escapes := []string{
+		jsonUnicodeEscape("0041"), jsonUnicodeEscape("00e9"), jsonUnicodeEscape("20ac"),
+		jsonUnicodeEscape("d834") + jsonUnicodeEscape("dd1e"),
+		`\n`, `\t`, `\\`, `\"`, `\/`,
+	}
+	randString := func() string {
+		var b strings.Builder
+		n := rng.Intn(12)
+		for i := 0; i < n; i++ {
+			if rng.Intn(2) == 0 {
+				b.WriteString(escapes[rng.Intn(len(escapes))])
+			} else {
+				b.WriteString("ab")
+			}
+		}
+		return b.String()
+	}
+	decOwned, err := CompileDecoder[doc](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decZero, err := CompileDecoder[doc](DecoderOptions{ZeroCopy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for round := 0; round < 400; round++ {
+		src := []byte(fmt.Sprintf(
+			`{"a":"%s","b":{"k%s":"%s","n":[1,"%s",2.5]},"c":{"%s":"%s","x":"%s"},"d":["%s",7,"%s"],"e":"%s"}`,
+			randString(), randString(), randString(), randString(),
+			"K"+randString(), randString(), randString(),
+			randString(), randString(), randString()))
+		var want doc
+		if err := json.Unmarshal(src, &want); err != nil {
+			continue // generator made something encoding/json rejects; skip
+		}
+		var gotOwned, gotZero doc
+		if err := decOwned.Decode(src, &gotOwned); err != nil {
+			t.Fatalf("round %d owned: %v\nsrc %s", round, err, src)
+		}
+		if err := decZero.Decode(src, &gotZero); err != nil {
+			t.Fatalf("round %d zerocopy: %v\nsrc %s", round, err, src)
+		}
+		if !reflect.DeepEqual(gotOwned, want) {
+			t.Fatalf("round %d owned mismatch:\nsrc  %s\ngot  %#v\nwant %#v", round, src, gotOwned, want)
+		}
+		if !reflect.DeepEqual(gotZero, want) {
+			t.Fatalf("round %d zerocopy mismatch:\nsrc  %s\ngot  %#v\nwant %#v", round, src, gotZero, want)
+		}
+	}
+}

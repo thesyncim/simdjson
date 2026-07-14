@@ -880,7 +880,7 @@ func decodeCompiledAny(cursor *decoderCursor, dst unsafe.Pointer) error {
 	// The dynamic tree retains any escaped strings it materialized in the
 	// arena; advancing the arena keeps later escaped strings from
 	// overwriting them.
-	cursor.setStringArenaLen(len(p.strings))
+	cursor.adoptStringArena(p.strings)
 	if err != nil {
 		return err
 	}
@@ -1034,6 +1034,11 @@ func decodeCompiledBytes(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 		return nil
 	}
 	i := cursor.i
+	if i < len(cursor.src) && cursor.src[i] == '[' {
+		// encoding/json also decodes a byte slice from an array of
+		// integers, one element per byte.
+		return decodeBytesArray(cursor, node, dst)
+	}
 	if i >= len(cursor.src) || cursor.src[i] != '"' {
 		return &DecodeError{Offset: i, Type: node.typ, Reason: "expected base64 string"}
 	}
@@ -1053,6 +1058,41 @@ func decodeCompiledBytes(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 		return &DecodeError{Offset: i, Type: node.typ, Reason: "invalid base64: " + err.Error()}
 	}
 	header.len = n
+	return nil
+}
+
+// decodeBytesArray decodes the array form of []byte accepted by
+// encoding/json: a JSON array of integers, one per byte, reusing destination
+// capacity like every other slice decode.
+func decodeBytesArray(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+	if err := cursor.BeginArray(node.name); err != nil {
+		return err
+	}
+	header := (*typedSliceHeader)(dst)
+	var buf []byte
+	if header.data != nil {
+		buf = unsafe.Slice((*byte)(header.data), header.cap)[:0]
+	}
+	for first := true; ; first = false {
+		more, err := cursor.NextArrayElement(first)
+		if err != nil {
+			return err
+		}
+		if !more {
+			break
+		}
+		var element uint8
+		if err := cursor.Uint(&element); err != nil {
+			return retagCompiledError(err, node.typ)
+		}
+		buf = append(buf, element)
+	}
+	if buf == nil {
+		buf = make([]byte, 0)
+	}
+	header.data = unsafe.Pointer(unsafe.SliceData(buf))
+	header.len = len(buf)
+	header.cap = cap(buf)
 	return nil
 }
 
