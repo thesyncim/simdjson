@@ -14,7 +14,7 @@ import (
 	"unsafe"
 )
 
-func decodeCompiled(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeCompiled(node *typedNode, dst unsafe.Pointer) error {
 	var err error
 	switch node.kind {
 	case typedBool:
@@ -52,25 +52,25 @@ func decodeCompiled(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) 
 			err = cursor.Float((*float64)(dst))
 		}
 	case typedStruct:
-		return decodeCompiledStruct(cursor, node, dst)
+		return cursor.decodeCompiledStruct(node, dst)
 	case typedSlice:
-		return decodeCompiledSlice(cursor, node, dst)
+		return cursor.decodeCompiledSlice(node, dst)
 	case typedArray:
-		return decodeCompiledArray(cursor, node, dst)
+		return cursor.decodeCompiledArray(node, dst)
 	case typedPointer:
-		return decodeCompiledPointer(cursor, node, dst)
+		return cursor.decodeCompiledPointer(node, dst)
 	case typedMap:
-		return decodeCompiledMap(cursor, node, dst)
+		return cursor.decodeCompiledMap(node, dst)
 	case typedAny:
-		return decodeCompiledAny(cursor, dst)
+		return cursor.decodeCompiledAny(dst)
 	case typedBytes:
-		return decodeCompiledBytes(cursor, node, dst)
+		return cursor.decodeCompiledBytes(node, dst)
 	case typedUnmarshalerJSON:
-		return decodeViaUnmarshaler(cursor, node, dst)
+		return cursor.decodeViaUnmarshaler(node, dst)
 	case typedUnmarshalerText:
-		return decodeViaTextUnmarshaler(cursor, node, dst)
+		return cursor.decodeViaTextUnmarshaler(node, dst)
 	case typedIface:
-		return decodeCompiledIface(cursor, node, dst)
+		return cursor.decodeCompiledIface(node, dst)
 	default:
 		return &DecodeError{Offset: cursor.i, Type: node.typ, Reason: "invalid compiled operation"}
 	}
@@ -80,7 +80,7 @@ func decodeCompiled(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) 
 	return retagCompiledError(err, node.typ)
 }
 
-func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeCompiledStruct(node *typedNode, dst unsafe.Pointer) error {
 	if i := cursor.i; i < len(cursor.src) && cursor.src[i] == '{' && cursor.depth < cursor.maxDepth {
 		cursor.depth++
 		cursor.i = i + 1
@@ -190,29 +190,29 @@ func decodeCompiledStruct(cursor *decoderCursor, node *typedNode, dst unsafe.Poi
 		case typedOpFloat64:
 			fieldErr = cursor.Float((*float64)(fieldDst))
 		case typedOpStruct:
-			fieldErr = decodeCompiledStruct(cursor, fieldNode, fieldDst)
+			fieldErr = cursor.decodeCompiledStruct(fieldNode, fieldDst)
 		case typedOpSlice:
-			fieldErr = decodeCompiledSlice(cursor, fieldNode, fieldDst)
+			fieldErr = cursor.decodeCompiledSlice(fieldNode, fieldDst)
 		case typedOpArray:
-			fieldErr = decodeCompiledArray(cursor, fieldNode, fieldDst)
+			fieldErr = cursor.decodeCompiledArray(fieldNode, fieldDst)
 		case typedOpPointer:
-			fieldErr = decodeCompiledPointer(cursor, fieldNode, fieldDst)
+			fieldErr = cursor.decodeCompiledPointer(fieldNode, fieldDst)
 		case typedOpMap:
-			fieldErr = decodeCompiledMap(cursor, fieldNode, fieldDst)
+			fieldErr = cursor.decodeCompiledMap(fieldNode, fieldDst)
 		case typedOpAny:
-			fieldErr = decodeCompiledAny(cursor, fieldDst)
+			fieldErr = cursor.decodeCompiledAny(fieldDst)
 		case typedOpBytes:
-			fieldErr = decodeCompiledBytes(cursor, fieldNode, fieldDst)
+			fieldErr = cursor.decodeCompiledBytes(fieldNode, fieldDst)
 		case typedOpQuoted:
-			fieldErr = decodeQuotedField(cursor, fieldNode, fieldDst)
+			fieldErr = cursor.decodeQuotedField(fieldNode, fieldDst)
 		case typedOpUnmarshaler:
 			if fieldNode.kind == typedUnmarshalerJSON {
-				fieldErr = decodeViaUnmarshaler(cursor, fieldNode, fieldDst)
+				fieldErr = cursor.decodeViaUnmarshaler(fieldNode, fieldDst)
 			} else {
-				fieldErr = decodeViaTextUnmarshaler(cursor, fieldNode, fieldDst)
+				fieldErr = cursor.decodeViaTextUnmarshaler(fieldNode, fieldDst)
 			}
 		case typedOpIface:
-			fieldErr = decodeCompiledIface(cursor, fieldNode, fieldDst)
+			fieldErr = cursor.decodeCompiledIface(fieldNode, fieldDst)
 		default:
 			fieldErr = &DecodeError{Offset: cursor.i, Type: fieldNode.typ, Reason: "invalid compiled operation"}
 		}
@@ -399,7 +399,7 @@ func resetMissingTypedFields(node *typedNode, dst unsafe.Pointer, seen uint64) {
 	}
 }
 
-func decodeCompiledSlice(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeCompiledSlice(node *typedNode, dst unsafe.Pointer) error {
 	if i := cursor.i; i < len(cursor.src) && cursor.src[i] == '[' && cursor.depth < cursor.maxDepth {
 		cursor.depth++
 		cursor.i = i + 1
@@ -451,17 +451,17 @@ func decodeCompiledSlice(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 		var elementErr error
 		switch node.elem.kind {
 		case typedStruct:
-			elementErr = decodeCompiledStruct(cursor, node.elem, element)
+			elementErr = cursor.decodeCompiledStruct(node.elem, element)
 		case typedSlice:
-			elementErr = decodeCompiledSlice(cursor, node.elem, element)
+			elementErr = cursor.decodeCompiledSlice(node.elem, element)
 		case typedArray:
-			elementErr = decodeCompiledArray(cursor, node.elem, element)
+			elementErr = cursor.decodeCompiledArray(node.elem, element)
 		case typedPointer:
-			elementErr = decodeCompiledPointer(cursor, node.elem, element)
+			elementErr = cursor.decodeCompiledPointer(node.elem, element)
 		case typedMap:
-			elementErr = decodeCompiledMap(cursor, node.elem, element)
+			elementErr = cursor.decodeCompiledMap(node.elem, element)
 		default:
-			elementErr = decodeCompiled(cursor, node.elem, element)
+			elementErr = cursor.decodeCompiled(node.elem, element)
 		}
 		if elementErr != nil {
 			return prependDecodePathIndex(elementErr, index)
@@ -469,7 +469,7 @@ func decodeCompiledSlice(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 	}
 }
 
-func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeCompiledArray(node *typedNode, dst unsafe.Pointer) error {
 	replace := cursor.flags&decoderReplace != 0
 	if i := cursor.i; i < len(cursor.src) && cursor.src[i] == '[' && cursor.depth < cursor.maxDepth {
 		cursor.depth++
@@ -562,25 +562,25 @@ func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 					elementErr = cursor.Float((*float64)(element))
 				}
 			case typedStruct:
-				elementErr = decodeCompiledStruct(cursor, node.elem, element)
+				elementErr = cursor.decodeCompiledStruct(node.elem, element)
 			case typedSlice:
-				elementErr = decodeCompiledSlice(cursor, node.elem, element)
+				elementErr = cursor.decodeCompiledSlice(node.elem, element)
 			case typedArray:
-				elementErr = decodeCompiledArray(cursor, node.elem, element)
+				elementErr = cursor.decodeCompiledArray(node.elem, element)
 			case typedPointer:
-				elementErr = decodeCompiledPointer(cursor, node.elem, element)
+				elementErr = cursor.decodeCompiledPointer(node.elem, element)
 			case typedMap:
-				elementErr = decodeCompiledMap(cursor, node.elem, element)
+				elementErr = cursor.decodeCompiledMap(node.elem, element)
 			case typedAny:
-				elementErr = decodeCompiledAny(cursor, element)
+				elementErr = cursor.decodeCompiledAny(element)
 			case typedBytes:
-				elementErr = decodeCompiledBytes(cursor, node.elem, element)
+				elementErr = cursor.decodeCompiledBytes(node.elem, element)
 			case typedUnmarshalerJSON:
-				elementErr = decodeViaUnmarshaler(cursor, node.elem, element)
+				elementErr = cursor.decodeViaUnmarshaler(node.elem, element)
 			case typedUnmarshalerText:
-				elementErr = decodeViaTextUnmarshaler(cursor, node.elem, element)
+				elementErr = cursor.decodeViaTextUnmarshaler(node.elem, element)
 			case typedIface:
-				elementErr = decodeCompiledIface(cursor, node.elem, element)
+				elementErr = cursor.decodeCompiledIface(node.elem, element)
 			default:
 				elementErr = &DecodeError{Offset: cursor.i, Type: node.elem.typ, Reason: "invalid compiled operation"}
 			}
@@ -699,7 +699,7 @@ func zeroTypedArrayTail(node *typedNode, dst unsafe.Pointer, from int) {
 	}
 }
 
-func decodeCompiledPointer(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeCompiledPointer(node *typedNode, dst unsafe.Pointer) error {
 	null := false
 	if !cursor.notNullFast() {
 		var err error
@@ -718,17 +718,17 @@ func decodeCompiledPointer(cursor *decoderCursor, node *typedNode, dst unsafe.Po
 	}
 	switch node.elem.kind {
 	case typedStruct:
-		return decodeCompiledStruct(cursor, node.elem, pointer)
+		return cursor.decodeCompiledStruct(node.elem, pointer)
 	case typedSlice:
-		return decodeCompiledSlice(cursor, node.elem, pointer)
+		return cursor.decodeCompiledSlice(node.elem, pointer)
 	case typedArray:
-		return decodeCompiledArray(cursor, node.elem, pointer)
+		return cursor.decodeCompiledArray(node.elem, pointer)
 	case typedPointer:
-		return decodeCompiledPointer(cursor, node.elem, pointer)
+		return cursor.decodeCompiledPointer(node.elem, pointer)
 	case typedMap:
-		return decodeCompiledMap(cursor, node.elem, pointer)
+		return cursor.decodeCompiledMap(node.elem, pointer)
 	default:
-		return decodeCompiled(cursor, node.elem, pointer)
+		return cursor.decodeCompiled(node.elem, pointer)
 	}
 }
 
@@ -737,7 +737,7 @@ func decodeCompiledPointer(cursor *decoderCursor, node *typedNode, dst unsafe.Po
 // merges into the existing entries. Entries decode through one reusable
 // element that is zeroed between entries, so nested slice capacity is never
 // shared between values.
-func decodeCompiledMap(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeCompiledMap(node *typedNode, dst unsafe.Pointer) error {
 	null := false
 	if !cursor.notNullFast() {
 		var err error
@@ -776,17 +776,17 @@ func decodeCompiledMap(cursor *decoderCursor, node *typedNode, dst unsafe.Pointe
 		var entryErr error
 		switch node.elem.kind {
 		case typedStruct:
-			entryErr = decodeCompiledStruct(cursor, node.elem, elementPtr)
+			entryErr = cursor.decodeCompiledStruct(node.elem, elementPtr)
 		case typedSlice:
-			entryErr = decodeCompiledSlice(cursor, node.elem, elementPtr)
+			entryErr = cursor.decodeCompiledSlice(node.elem, elementPtr)
 		case typedArray:
-			entryErr = decodeCompiledArray(cursor, node.elem, elementPtr)
+			entryErr = cursor.decodeCompiledArray(node.elem, elementPtr)
 		case typedPointer:
-			entryErr = decodeCompiledPointer(cursor, node.elem, elementPtr)
+			entryErr = cursor.decodeCompiledPointer(node.elem, elementPtr)
 		case typedMap:
-			entryErr = decodeCompiledMap(cursor, node.elem, elementPtr)
+			entryErr = cursor.decodeCompiledMap(node.elem, elementPtr)
 		default:
-			entryErr = decodeCompiled(cursor, node.elem, elementPtr)
+			entryErr = cursor.decodeCompiled(node.elem, elementPtr)
 		}
 		if entryErr != nil {
 			return prependDecodePathField(entryErr, key)
@@ -846,7 +846,7 @@ func mapKeyValue(node *typedNode, keyType reflect.Type, key string) (reflect.Val
 // nil. Like encoding/json, an interface already holding a non-nil pointer is
 // decoded into rather than replaced; anything else is replaced, and null
 // clears the interface.
-func decodeCompiledAny(cursor *decoderCursor, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeCompiledAny(dst unsafe.Pointer) error {
 	if existing := *(*any)(dst); existing != nil {
 		null := false
 		if !cursor.notNullFast() {
@@ -866,7 +866,7 @@ func decodeCompiledAny(cursor *decoderCursor, dst unsafe.Pointer) error {
 			if err != nil {
 				return &DecodeError{Offset: cursor.i, Type: existingValue.Type(), Reason: err.Error()}
 			}
-			return decodeCompiled(cursor, inner, existingValue.UnsafePointer())
+			return cursor.decodeCompiled(inner, existingValue.UnsafePointer())
 		}
 	}
 	// Dynamic strings are retained by the result, so owned decodes switch to
@@ -914,7 +914,7 @@ func dynamicDecodeNode(typ reflect.Type) (*typedNode, error) {
 // decodeCompiledIface decodes into a non-empty interface: null clears it,
 // and a held non-nil pointer is decoded into like encoding/json; any other
 // state cannot be decoded.
-func decodeCompiledIface(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeCompiledIface(node *typedNode, dst unsafe.Pointer) error {
 	null := false
 	if !cursor.notNullFast() {
 		var err error
@@ -935,7 +935,7 @@ func decodeCompiledIface(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 			if innerErr != nil {
 				return &DecodeError{Offset: cursor.i, Type: concrete.Type(), Reason: innerErr.Error()}
 			}
-			return decodeCompiled(cursor, inner, concrete.UnsafePointer())
+			return cursor.decodeCompiled(inner, concrete.UnsafePointer())
 		}
 	}
 	return &DecodeError{Offset: cursor.i, Type: node.typ, Reason: "cannot decode into a non-empty interface"}
@@ -945,7 +945,7 @@ func decodeCompiledIface(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 // value is a string whose contents are one scalar, parsed with encoding/json's
 // semantics. A bare null clears pointer fields and resets values only in
 // replace mode; anything but a string or null is rejected.
-func decodeQuotedField(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeQuotedField(node *typedNode, dst unsafe.Pointer) error {
 	null := false
 	if !cursor.notNullFast() {
 		var err error
@@ -986,7 +986,7 @@ func decodeQuotedField(cursor *decoderCursor, node *typedNode, dst unsafe.Pointe
 			return &DecodeError{Offset: i, Type: node.typ, Reason: "string-tagged field does not contain a JSON string"}
 		}
 	}
-	if err := decodeCompiled(&sub, node, dst); err != nil {
+	if err := sub.decodeCompiled(node, dst); err != nil {
 		if typed, ok := err.(*DecodeError); ok {
 			typed.Offset = i
 		}
@@ -1067,7 +1067,7 @@ func decodeQuotedNumber(node, scalar *typedNode, dst unsafe.Pointer, inner []byt
 
 // decodeCompiledBytes decodes a base64 JSON string into a byte slice,
 // reusing destination capacity when possible.
-func decodeCompiledBytes(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeCompiledBytes(node *typedNode, dst unsafe.Pointer) error {
 	null := false
 	if !cursor.notNullFast() {
 		var err error
@@ -1085,7 +1085,7 @@ func decodeCompiledBytes(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 	if i < len(cursor.src) && cursor.src[i] == '[' {
 		// encoding/json also decodes a byte slice from an array of
 		// integers, one element per byte.
-		return decodeBytesArray(cursor, node, dst)
+		return cursor.decodeBytesArray(node, dst)
 	}
 	if i >= len(cursor.src) || cursor.src[i] != '"' {
 		return &DecodeError{Offset: i, Type: node.typ, Reason: "expected base64 string"}
@@ -1112,7 +1112,7 @@ func decodeCompiledBytes(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 // decodeBytesArray decodes the array form of []byte accepted by
 // encoding/json: a JSON array of integers, one per byte, reusing destination
 // capacity like every other slice decode.
-func decodeBytesArray(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeBytesArray(node *typedNode, dst unsafe.Pointer) error {
 	if err := cursor.BeginArray(node.name); err != nil {
 		return err
 	}

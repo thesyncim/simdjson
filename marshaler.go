@@ -47,7 +47,7 @@ func copyMethodReceiverBack(typ reflect.Type, dst unsafe.Pointer, shadow reflect
 
 // decodeViaUnmarshaler feeds the raw bytes of the next JSON value to the
 // destination's UnmarshalJSON, exactly one validated value, null included.
-func decodeViaUnmarshaler(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeViaUnmarshaler(node *typedNode, dst unsafe.Pointer) error {
 	start := cursor.i
 	if err := cursor.Skip(); err != nil {
 		return err
@@ -99,7 +99,7 @@ func receiverAt(typ reflect.Type, dst unsafe.Pointer) (any, reflect.Value) {
 // decodeViaTextUnmarshaler decodes a JSON string through UnmarshalText.
 // Null leaves non-pointer values untouched and nils pointers, like
 // encoding/json.
-func decodeViaTextUnmarshaler(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeViaTextUnmarshaler(node *typedNode, dst unsafe.Pointer) error {
 	null, err := cursor.TryNull()
 	if err != nil {
 		return err

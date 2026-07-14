@@ -95,17 +95,17 @@ func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 	var err error
 	switch plan.root.kind {
 	case typedStruct:
-		err = decodeCompiledStruct(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledStruct(plan.root, unsafe.Pointer(dst))
 	case typedSlice:
-		err = decodeCompiledSlice(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledSlice(plan.root, unsafe.Pointer(dst))
 	case typedArray:
-		err = decodeCompiledArray(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledArray(plan.root, unsafe.Pointer(dst))
 	case typedPointer:
-		err = decodeCompiledPointer(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledPointer(plan.root, unsafe.Pointer(dst))
 	case typedMap:
-		err = decodeCompiledMap(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledMap(plan.root, unsafe.Pointer(dst))
 	default:
-		err = decodeCompiled(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiled(plan.root, unsafe.Pointer(dst))
 	}
 	if err != nil {
 		return err
@@ -130,17 +130,17 @@ func (plan Decoder[T]) DecodePrefix(src []byte, dst *T) (int, error) {
 	var err error
 	switch plan.root.kind {
 	case typedStruct:
-		err = decodeCompiledStruct(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledStruct(plan.root, unsafe.Pointer(dst))
 	case typedSlice:
-		err = decodeCompiledSlice(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledSlice(plan.root, unsafe.Pointer(dst))
 	case typedArray:
-		err = decodeCompiledArray(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledArray(plan.root, unsafe.Pointer(dst))
 	case typedPointer:
-		err = decodeCompiledPointer(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledPointer(plan.root, unsafe.Pointer(dst))
 	case typedMap:
-		err = decodeCompiledMap(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledMap(plan.root, unsafe.Pointer(dst))
 	default:
-		err = decodeCompiled(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiled(plan.root, unsafe.Pointer(dst))
 	}
 	if err != nil {
 		return cursor.i, err
@@ -156,7 +156,7 @@ func (plan Decoder[T]) DecodeArray(src []byte, dst []T) ([]T, error) {
 	}
 	cursor := newDecoderCursor(src, plan.options)
 	cursor.skipSpace()
-	if err := decodeCompiledSlice(&cursor, plan.rootSlice, unsafe.Pointer(&dst)); err != nil {
+	if err := cursor.decodeCompiledSlice(plan.rootSlice, unsafe.Pointer(&dst)); err != nil {
 		return dst, err
 	}
 	if err := cursor.Finish(); err != nil {
