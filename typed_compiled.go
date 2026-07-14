@@ -599,6 +599,25 @@ func decodeCompiledArray(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 func decodeCompiledFloatArray[T floatValue](cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
 	replace := cursor.flags&decoderReplace != 0
 	src := cursor.src
+	// Straight-line coordinate-pair path: once elements are known to run
+	// long, a compact [f,f] parses without the per-element loop machinery.
+	if node.length == 2 && unsafe.Sizeof(T(0)) == 8 && cursor.floatLong {
+		base := unsafe.Pointer(unsafe.SliceData(src))
+		if i := cursor.i; i < len(src) && (src[i] == '-' || isDigit(src[i])) {
+			end0, v0, exact0, ok0 := scanTypedFloat64(base, len(src), i)
+			if ok0 && exact0 && end0 < len(src) && src[end0] == ',' &&
+				end0+1 < len(src) && (src[end0+1] == '-' || isDigit(src[end0+1])) {
+				end1, v1, exact1, ok1 := scanTypedFloat64(base, len(src), end0+1)
+				if ok1 && exact1 && end1 < len(src) && src[end1] == ']' {
+					*(*T)(dst) = T(v0)
+					*(*T)(unsafe.Add(dst, node.elem.size)) = T(v1)
+					cursor.i = end1 + 1
+					cursor.depth--
+					return nil
+				}
+			}
+		}
+	}
 	for index, first := 0, true; ; index, first = index+1, false {
 		// Fused fast path: consume the delimiter and a short float without the
 		// general element iterator. cursor.i stays untouched until the whole
