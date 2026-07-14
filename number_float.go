@@ -427,7 +427,16 @@ func scanTypedTwoDigitFloat64(base unsafe.Pointer, n, start int) (end int, value
 			digits = 18
 			fractionDigits = 16
 			i += tailDigits
-			if c := fastByteAt(base, i); c != 'e' && c != 'E' {
+			// The eight-digit tail can end exactly at the buffer or run into
+			// further fraction digits; only a proven delimiter may take the
+			// fixed-scale exit.
+			if i == n {
+				value = scaleJSONFloat64Fixed(
+					mantissa, 0xe69594bec44de15c, 0xb3d141978676564c, 968, negative,
+				)
+				return i, value, true, true
+			}
+			if c := fastByteAt(base, i); c != 'e' && c != 'E' && !isDigit(c) {
 				value = scaleJSONFloat64Fixed(
 					mantissa, 0xe69594bec44de15c, 0xb3d141978676564c, 968, negative,
 				)
