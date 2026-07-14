@@ -8,8 +8,15 @@ import (
 
 // validFast is the bool-only validation path: a recursive descent machine
 // with an inline word-at-a-time fast path for short clean strings. Depth is
-// bounded like Validate.
+// bounded like Validate. Large indentation-heavy documents divert to the
+// stage-1 bitmap engine, which skips whitespace and string interiors in
+// 64-byte masks.
 func validFast(src []byte) bool {
+	if stage1ValidatorEnabled && len(src) >= validBitmapMinBytes {
+		if ok, decided := validBitmap(src); decided {
+			return ok
+		}
+	}
 	n := len(src)
 	base := unsafe.Pointer(unsafe.SliceData(src))
 	i, c := nextSignificantFast(base, n, 0)
