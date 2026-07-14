@@ -506,6 +506,20 @@ func (c *decoderCursor) Number[T stringValue](dst *T) error {
 		c.i += 4
 		return nil
 	}
+	if c.i < len(c.src) && c.src[c.i] == '"' {
+		// encoding/json also accepts a JSON string whose unquoted contents
+		// spell a valid JSON number; the string decode supplies the
+		// ownership rules for the retained spelling.
+		var content string
+		if err := c.String(&content); err != nil {
+			return err
+		}
+		if !ValidNumber(unsafe.Slice(unsafe.StringData(content), len(content))) {
+			return c.genericError[T](c.i, "string is not a valid number spelling")
+		}
+		*dst = T(content)
+		return nil
+	}
 	start, end, err := c.numberToken[T]()
 	if err != nil {
 		return err

@@ -999,6 +999,10 @@ func decodeQuotedField(cursor *decoderCursor, node *typedNode, dst unsafe.Pointe
 	if scalar.kind == typedPointer {
 		scalar = scalar.elem
 	}
+	switch scalar.kind {
+	case typedInt, typedUint, typedFloat:
+		return decodeQuotedNumber(node, scalar, dst, inner, i)
+	}
 	if scalar.kind == typedString {
 		// The contents must themselves be a JSON string.
 		if len(inner) == 0 || inner[0] != '"' {
@@ -1013,6 +1017,73 @@ func decodeQuotedField(cursor *decoderCursor, node *typedNode, dst unsafe.Pointe
 	}
 	if sub.i != len(inner) {
 		return &DecodeError{Offset: i, Type: node.typ, Reason: "string-tagged field contains trailing data"}
+	}
+	return nil
+}
+
+// decodeQuotedNumber stores a string-tagged number with encoding/json's
+// semantics: the quoted contents are handed to strconv verbatim, which
+// accepts spellings strict JSON does not (leading zeros, an explicit plus,
+// and strconv's float forms).
+func decodeQuotedNumber(node, scalar *typedNode, dst unsafe.Pointer, inner []byte, offset int) error {
+	text := unsafe.String(unsafe.SliceData(inner), len(inner))
+	if text == "null" {
+		// encoding/json treats a quoted null like the bare literal: value
+		// fields are left untouched and pointer fields are cleared.
+		if node.kind == typedPointer {
+			*(*unsafe.Pointer)(dst) = nil
+		}
+		return nil
+	}
+	scalarDst := dst
+	if node.kind == typedPointer {
+		pointer := *(*unsafe.Pointer)(dst)
+		if pointer == nil {
+			pointer = allocateTypedPointer(node, dst)
+		}
+		scalarDst = pointer
+	}
+	switch scalar.kind {
+	case typedInt:
+		value, err := strconv.ParseInt(text, 10, int(scalar.bits))
+		if err != nil {
+			return &DecodeError{Offset: offset, Type: node.typ, Reason: "cannot parse string-tagged integer " + strconv.Quote(text)}
+		}
+		switch scalar.bits {
+		case 8:
+			*(*int8)(scalarDst) = int8(value)
+		case 16:
+			*(*int16)(scalarDst) = int16(value)
+		case 32:
+			*(*int32)(scalarDst) = int32(value)
+		default:
+			*(*int64)(scalarDst) = value
+		}
+	case typedUint:
+		value, err := strconv.ParseUint(text, 10, int(scalar.bits))
+		if err != nil {
+			return &DecodeError{Offset: offset, Type: node.typ, Reason: "cannot parse string-tagged integer " + strconv.Quote(text)}
+		}
+		switch scalar.bits {
+		case 8:
+			*(*uint8)(scalarDst) = uint8(value)
+		case 16:
+			*(*uint16)(scalarDst) = uint16(value)
+		case 32:
+			*(*uint32)(scalarDst) = uint32(value)
+		default:
+			*(*uint64)(scalarDst) = value
+		}
+	default:
+		value, err := strconv.ParseFloat(text, int(scalar.bits))
+		if err != nil {
+			return &DecodeError{Offset: offset, Type: node.typ, Reason: "cannot parse string-tagged number " + strconv.Quote(text)}
+		}
+		if scalar.bits == 32 {
+			*(*float32)(scalarDst) = float32(value)
+		} else {
+			*(*float64)(scalarDst) = value
+		}
 	}
 	return nil
 }

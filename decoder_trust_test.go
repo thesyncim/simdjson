@@ -3,6 +3,7 @@ package simdjson
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -106,6 +107,23 @@ func FuzzDecodeTrust(f *testing.F) {
 				t.Fatalf("%s decode differs from encoding/json:\n got: %+v\nwant: %+v", name, got, want)
 			}
 		}
+		if !valid || wantErr != nil {
+			// The round trip only holds for strictly valid input: stdlib
+			// tolerates invalid UTF-8 inside RawMessage where this library's
+			// encoder rejects it by design.
+			return
+		}
+		// Close the loop through the encoder: marshaling the decoded values
+		// must reproduce encoding/json byte for byte, so encoder aliasing or
+		// escaping slips on fuzz-generated shapes surface here.
+		wantOut, wantOutErr := json.Marshal(&want)
+		gotOut, gotOutErr := Marshal(&want)
+		if (gotOutErr == nil) != (wantOutErr == nil) {
+			t.Fatalf("Marshal error = %v, encoding/json error = %v", gotOutErr, wantOutErr)
+		}
+		if gotOutErr == nil && !bytes.Equal(gotOut, wantOut) {
+			t.Fatalf("Marshal differs from encoding/json:\n got: %s\nwant: %s", gotOut, wantOut)
+		}
 	})
 }
 
@@ -208,6 +226,49 @@ func TestBytesArrayFormParity(t *testing.T) {
 			if err == nil && !reflect.DeepEqual(got.B, want.B) {
 				t.Fatalf("%s %s: B = %#v, want %#v", name, src, got.B, want.B)
 			}
+		}
+	}
+}
+
+// TestStringTaggedNumberParity pins the strconv semantics of string-tagged
+// numbers against encoding/json: leading zeros, explicit plus signs, float
+// spellings, range errors, and the null quirk must all behave identically.
+func TestStringTaggedNumberParity(t *testing.T) {
+	type tagged struct {
+		I int64    `json:"i,string"`
+		U uint8    `json:"u,string"`
+		F float64  `json:"f,string"`
+		P *int32   `json:"p,string"`
+		G *float32 `json:"g,string"`
+	}
+	dec, err := CompileDecoder[tagged](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, src := range []string{
+		`{"i":"000"}`, `{"i":"-000"}`, `{"i":"+5"}`, `{"i":"5"}`, `{"i":" 5"}`,
+		`{"i":"5.0"}`, `{"i":"1e2"}`, `{"i":""}`, `{"i":"null"}`, `{"i":null}`,
+		`{"i":"9223372036854775807"}`, `{"i":"9223372036854775808"}`,
+		`{"u":"255"}`, `{"u":"256"}`, `{"u":"-0"}`, `{"u":"+0"}`,
+		`{"f":"000.5"}`, `{"f":"+1.5"}`, `{"f":"1e2"}`, `{"f":"NaN"}`,
+		`{"f":"Inf"}`, `{"f":"-Inf"}`, `{"f":"0x1p3"}`, `{"f":"1e999"}`,
+		`{"f":"1_0"}`, `{"f":".5"}`, `{"f":"5."}`,
+		`{"p":"012"}`, `{"p":null}`, `{"g":"08.25"}`,
+	} {
+		var want tagged
+		wantErr := json.Unmarshal([]byte(src), &want)
+		var got tagged
+		gotErr := dec.Decode([]byte(src), &got)
+		if (gotErr == nil) != (wantErr == nil) {
+			t.Fatalf("%s: error = %v, encoding/json error = %v", src, gotErr, wantErr)
+		}
+		// DeepEqual rejects NaN == NaN, but the stdlib accepts "NaN"
+		// spellings for string-tagged floats; agreeing NaNs compare equal.
+		if gotErr == nil && math.IsNaN(got.F) && math.IsNaN(want.F) {
+			got.F, want.F = 0, 0
+		}
+		if gotErr == nil && !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s: got %+v, want %+v", src, got, want)
 		}
 	}
 }
