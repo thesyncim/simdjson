@@ -970,3 +970,49 @@ func (c *decoderCursor) genericError[T any](offset int, reason string) error {
 func (c *decoderCursor) expected(typeName, jsonType string) error {
 	return &DecodeError{Offset: c.i, TypeName: typeName, Reason: "expected " + jsonType}
 }
+
+// stringToken consumes a JSON string and returns its contents: unescaped
+// strings alias the source, escaped strings alias a transient buffer that
+// callers must not retain.
+func (c *decoderCursor) stringToken() ([]byte, error) {
+	i := c.i
+	if i >= len(c.src) || c.src[i] != '"' {
+		return nil, &DecodeError{Offset: i, Reason: "expected string"}
+	}
+	start := i + 1
+	end := scanStringSpecial(c.src, start)
+	if end < len(c.src) && c.src[end] == '"' {
+		c.i = end + 1
+		return c.src[start:end], nil
+	}
+	p := c.slowParser()
+	text, err := p.parseString()
+	c.i = p.i
+	if err != nil {
+		return nil, err
+	}
+	return unsafe.Slice(unsafe.StringData(text), len(text)), nil
+}
+
+func (p *parser) typedKey() (string, error) {
+	start := p.i + 1
+	end := scanStringSpecial(p.src, start)
+	if end < len(p.src) && p.src[end] == '"' {
+		p.i = end + 1
+		return unsafe.String(unsafe.SliceData(p.src[start:end]), end-start), nil
+	}
+	zeroCopy := p.zeroCopy
+	p.zeroCopy = true
+	key, err := p.parseString()
+	p.zeroCopy = zeroCopy
+	return key, err
+}
+
+func (p *parser) skipTypedValue(depth int) error {
+	value := validator{src: p.src, i: p.i, maxDepth: p.maxDepth}
+	if err := value.parseValue(depth); err != nil {
+		return err
+	}
+	p.i = value.i
+	return nil
+}

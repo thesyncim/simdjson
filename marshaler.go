@@ -5,50 +5,9 @@ import (
 	"encoding/json"
 	"reflect"
 	"runtime"
-	"sync"
 	"time"
 	"unsafe"
 )
-
-type encoderMarshalerScratch struct {
-	value reflect.Value
-	boxed any
-}
-
-type encoderScratch struct {
-	marshalers []encoderMarshalerScratch
-	// mapEntries, mapKeyArena, and mapIter are reused by encodeMap so
-	// sorted map encoding does not allocate per map. Ownership transfers
-	// to one encodeMap call at a time; nested maps fall back to fresh
-	// allocations.
-	mapEntries  []mapEncodeEntry
-	mapKeyArena []byte
-	mapIter     *reflect.MapIter
-}
-
-func (s *encoderScratch) reset() {
-	for i := range s.marshalers {
-		s.marshalers[i].value.SetZero()
-	}
-	// Entries hold key strings and reflect values from the encoded maps;
-	// drop those references before the scratch returns to the pool.
-	clear(s.mapEntries[:cap(s.mapEntries)])
-}
-
-func newEncoderScratchPool(types []reflect.Type, hasMap bool) *sync.Pool {
-	if len(types) == 0 && !hasMap {
-		return nil
-	}
-	types = append([]reflect.Type(nil), types...)
-	return &sync.Pool{New: func() any {
-		scratch := &encoderScratch{marshalers: make([]encoderMarshalerScratch, len(types))}
-		for i, typ := range types {
-			value := reflect.New(typ)
-			scratch.marshalers[i] = encoderMarshalerScratch{value: value.Elem(), boxed: value.Interface()}
-		}
-		return scratch
-	}}
-}
 
 // valueInterfaceAt copies T into an interface. Calling a value-receiver method
 // on that interface cannot expose p to user code.
@@ -88,7 +47,7 @@ func copyMethodReceiverBack(typ reflect.Type, dst unsafe.Pointer, shadow reflect
 
 // decodeViaUnmarshaler feeds the raw bytes of the next JSON value to the
 // destination's UnmarshalJSON, exactly one validated value, null included.
-func decodeViaUnmarshaler(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeViaUnmarshaler(node *typedNode, dst unsafe.Pointer) error {
 	start := cursor.i
 	if err := cursor.Skip(); err != nil {
 		return err
@@ -140,7 +99,7 @@ func receiverAt(typ reflect.Type, dst unsafe.Pointer) (any, reflect.Value) {
 // decodeViaTextUnmarshaler decodes a JSON string through UnmarshalText.
 // Null leaves non-pointer values untouched and nils pointers, like
 // encoding/json.
-func decodeViaTextUnmarshaler(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+func (cursor *decoderCursor) decodeViaTextUnmarshaler(node *typedNode, dst unsafe.Pointer) error {
 	null, err := cursor.TryNull()
 	if err != nil {
 		return err

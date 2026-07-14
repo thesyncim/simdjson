@@ -95,17 +95,17 @@ func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 	var err error
 	switch plan.root.kind {
 	case typedStruct:
-		err = decodeCompiledStruct(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledStruct(plan.root, unsafe.Pointer(dst))
 	case typedSlice:
-		err = decodeCompiledSlice(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledSlice(plan.root, unsafe.Pointer(dst))
 	case typedArray:
-		err = decodeCompiledArray(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledArray(plan.root, unsafe.Pointer(dst))
 	case typedPointer:
-		err = decodeCompiledPointer(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledPointer(plan.root, unsafe.Pointer(dst))
 	case typedMap:
-		err = decodeCompiledMap(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledMap(plan.root, unsafe.Pointer(dst))
 	default:
-		err = decodeCompiled(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiled(plan.root, unsafe.Pointer(dst))
 	}
 	if err != nil {
 		return err
@@ -130,17 +130,17 @@ func (plan Decoder[T]) DecodePrefix(src []byte, dst *T) (int, error) {
 	var err error
 	switch plan.root.kind {
 	case typedStruct:
-		err = decodeCompiledStruct(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledStruct(plan.root, unsafe.Pointer(dst))
 	case typedSlice:
-		err = decodeCompiledSlice(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledSlice(plan.root, unsafe.Pointer(dst))
 	case typedArray:
-		err = decodeCompiledArray(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledArray(plan.root, unsafe.Pointer(dst))
 	case typedPointer:
-		err = decodeCompiledPointer(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledPointer(plan.root, unsafe.Pointer(dst))
 	case typedMap:
-		err = decodeCompiledMap(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledMap(plan.root, unsafe.Pointer(dst))
 	default:
-		err = decodeCompiled(&cursor, plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiled(plan.root, unsafe.Pointer(dst))
 	}
 	if err != nil {
 		return cursor.i, err
@@ -156,7 +156,7 @@ func (plan Decoder[T]) DecodeArray(src []byte, dst []T) ([]T, error) {
 	}
 	cursor := newDecoderCursor(src, plan.options)
 	cursor.skipSpace()
-	if err := decodeCompiledSlice(&cursor, plan.rootSlice, unsafe.Pointer(&dst)); err != nil {
+	if err := cursor.decodeCompiledSlice(plan.rootSlice, unsafe.Pointer(&dst)); err != nil {
 		return dst, err
 	}
 	if err := cursor.Finish(); err != nil {
@@ -363,125 +363,6 @@ type typedField struct {
 	keyLen  uint8  // name length in bytes
 	op      typedOp
 }
-
-// typedEncField holds the complete encoder-only view of a struct field, so the
-// hot encode loop does not touch the larger decoder field record.
-type typedEncField struct {
-	encName      string
-	node         *typedNode
-	offset       uintptr
-	hop          int16
-	encNameBlock uint16
-	encOp        typedOp
-	pairOp       typedEncPairOp
-	encNameLen   uint8
-	omitEmpty    bool
-}
-
-// fuseEligible reports whether a struct-typed member should splice into
-// its parent: any unconditional simple struct qualifies.
-func fuseEligible(field *typedEncField) bool {
-	return field.encOp == typedOpStruct && field.node.encSimple
-}
-
-// fuseSimpleStructFields splices the members of directly nested simple
-// structs into the parent's encode field list at compile time: the child's
-// opening brace and first member name fuse into one literal, its remaining
-// members follow with composed offsets, and its closing brace attaches to
-// the next literal or to the parent's own close. The encoder then walks
-// one flat pair program with no recursion or depth bookkeeping for the
-// fused levels. Only unconditional members qualify: every field of a
-// simple node is hop-free and never omitted, and struct values cannot be
-// type-recursive without indirection, so nesting is finite.
-func fuseSimpleStructFields(node *typedNode) {
-	fusable := false
-	for i := range node.encFields {
-		field := &node.encFields[i]
-		if fuseEligible(field) {
-			fusable = true
-			break
-		}
-	}
-	node.encClose = []byte("}")
-	if !fusable {
-		return
-	}
-	fused := make([]typedEncField, 0, len(node.encFields)+8)
-	fusedPaths := make([]string, 0, len(node.encFields)+8)
-	pending := ""
-	var extra uint8
-	for i := range node.encFields {
-		field := node.encFields[i]
-		if !fuseEligible(&field) {
-			field.encName = pending + field.encName
-			pending = ""
-			fused = append(fused, field)
-			fusedPaths = append(fusedPaths, node.encPaths[i])
-			continue
-		}
-		child := field.node
-		if depth := child.encFusedExtra + 1; depth > extra {
-			extra = depth
-		}
-		if len(child.encFields) == 0 {
-			pending = pending + field.encName + "{" + string(child.encClose)
-			continue
-		}
-		for j := range child.encFields {
-			spliced := child.encFields[j]
-			spliced.offset += field.offset
-			spliced.encNameLen = 0
-			spliced.encNameBlock = 0
-			spliced.pairOp = typedEncPairFallback
-			if j == 0 {
-				// The child's first literal already lost its comma when the
-				// child compiled; the parent-side comma comes from this
-				// field's own literal.
-				spliced.encName = pending + field.encName + "{" + spliced.encName
-				pending = ""
-			}
-			fused = append(fused, spliced)
-			fusedPaths = append(fusedPaths, node.encPaths[i]+"."+child.encPaths[j])
-		}
-		pending = string(child.encClose)
-	}
-	node.encFields = fused
-	node.encPaths = fusedPaths
-	node.encClose = append([]byte(pending), '}')
-	node.encFusedExtra = extra
-}
-
-type typedEncPairOp uint8
-
-const (
-	typedEncPairFallback typedEncPairOp = iota
-	typedEncPairStringString
-	typedEncPairSliceString
-	typedEncPairSliceStruct
-	typedEncPairSliceSlice
-	typedEncPairStructStruct
-	typedEncPairMarshalerMarshaler
-	typedEncPairStructSlice
-	typedEncPairStringSlice
-	typedEncPairMarshalerStruct
-	typedEncPairMarshalerString
-	typedEncPairStructString
-	typedEncPairStringStruct
-	typedEncPairFloat64Int64
-	typedEncPairUint64Uint64
-	typedEncPairStringFloat64
-	typedEncPairStructInt64
-	typedEncPairInt64Int64
-	typedEncPairInt64String
-	typedEncPairStringInt64
-	typedEncPairInt64Slice
-	typedEncPairSliceInt64
-	typedEncPairSliceAny
-	typedEncPairAnySlice
-	typedEncPairAnyAny
-	typedEncPairAnyInt64
-	typedEncPairMapMap
-)
 
 type typedCompiler struct {
 	nodes           map[reflect.Type]*typedNode
@@ -828,87 +709,6 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 	return nil
 }
 
-func minimumTypedEncodedBytes(node *typedNode, op typedOp) int {
-	switch op {
-	case typedOpBool:
-		return 4
-	case typedOpString, typedOpQuoted:
-		return 2
-	case typedOpStruct, typedOpSlice, typedOpMap:
-		return 2
-	case typedOpArray:
-		if node.length == 0 {
-			return 2
-		}
-		element := minimumTypedEncodedBytes(node.elem, node.elem.encOp)
-		if element >= (int(^uint(0)>>1)-1)/node.length {
-			return 1
-		}
-		return 1 + node.length*(element+1)
-	default:
-		return 1
-	}
-}
-
-func classifyTypedEncPair(first, second typedOp) typedEncPairOp {
-	switch {
-	case first == typedOpString && second == typedOpString:
-		return typedEncPairStringString
-	case first == typedOpSlice && second == typedOpString:
-		return typedEncPairSliceString
-	case first == typedOpSlice && second == typedOpStruct:
-		return typedEncPairSliceStruct
-	case first == typedOpSlice && second == typedOpSlice:
-		return typedEncPairSliceSlice
-	case first == typedOpStruct && second == typedOpStruct:
-		return typedEncPairStructStruct
-	case first == typedOpMarshaler && second == typedOpMarshaler:
-		return typedEncPairMarshalerMarshaler
-	case first == typedOpStruct && second == typedOpSlice:
-		return typedEncPairStructSlice
-	case first == typedOpString && second == typedOpSlice:
-		return typedEncPairStringSlice
-	case first == typedOpMarshaler && second == typedOpStruct:
-		return typedEncPairMarshalerStruct
-	case first == typedOpMarshaler && second == typedOpString:
-		return typedEncPairMarshalerString
-	case first == typedOpStruct && second == typedOpString:
-		return typedEncPairStructString
-	case first == typedOpString && second == typedOpStruct:
-		return typedEncPairStringStruct
-	case first == typedOpFloat64 && second == typedOpInt64:
-		return typedEncPairFloat64Int64
-	case first == typedOpUint64 && second == typedOpUint64:
-		return typedEncPairUint64Uint64
-	case first == typedOpString && second == typedOpFloat64:
-		return typedEncPairStringFloat64
-	case first == typedOpStruct && second == typedOpInt64:
-		return typedEncPairStructInt64
-	case first == typedOpInt64 && second == typedOpInt64:
-		return typedEncPairInt64Int64
-	case first == typedOpInt64 && second == typedOpString:
-		return typedEncPairInt64String
-	case first == typedOpString && second == typedOpInt64:
-		return typedEncPairStringInt64
-	case first == typedOpInt64 && second == typedOpSlice:
-		return typedEncPairInt64Slice
-	case first == typedOpSlice && second == typedOpInt64:
-		return typedEncPairSliceInt64
-	case first == typedOpSlice && second == typedOpAny:
-		return typedEncPairSliceAny
-	case first == typedOpAny && second == typedOpSlice:
-		return typedEncPairAnySlice
-	case first == typedOpAny && second == typedOpAny:
-		return typedEncPairAnyAny
-	case first == typedOpAny && second == typedOpInt64:
-		return typedEncPairAnyInt64
-	case first == typedOpMap && second == typedOpMap:
-		return typedEncPairMapMap
-	default:
-		return typedEncPairFallback
-	}
-}
-
 // typedMapKeyKind classifies how map keys convert to and from JSON member
 // names, following encoding/json: text unmarshalers win on decode, string
 // kinds win on encode, and integer kinds round trip through base 10.
@@ -1060,29 +860,6 @@ type typedSliceHeader struct {
 	cap  int
 }
 
-func (p *parser) typedKey() (string, error) {
-	start := p.i + 1
-	end := scanStringSpecial(p.src, start)
-	if end < len(p.src) && p.src[end] == '"' {
-		p.i = end + 1
-		return unsafe.String(unsafe.SliceData(p.src[start:end]), end-start), nil
-	}
-	zeroCopy := p.zeroCopy
-	p.zeroCopy = true
-	key, err := p.parseString()
-	p.zeroCopy = zeroCopy
-	return key, err
-}
-
-func (p *parser) skipTypedValue(depth int) error {
-	value := validator{src: p.src, i: p.i, maxDepth: p.maxDepth}
-	if err := value.parseValue(depth); err != nil {
-		return err
-	}
-	p.i = value.i
-	return nil
-}
-
 // findFieldSlow resolves a key that missed the packed fast match: the hash
 // table when one was built, otherwise a linear scan with optional ASCII
 // case folding.
@@ -1138,59 +915,6 @@ func fieldNameHash(name string) uint32 {
 	head ^= uint64(len(name)) * 0x9e3779b97f4a7c15
 	head ^= head >> 33
 	return uint32(head ^ head>>32)
-}
-
-func resetTyped(node *typedNode, dst unsafe.Pointer) {
-	if node.ready {
-		applyTypedReset(node.reset, dst)
-		return
-	}
-	switch node.baseKind {
-	case typedBool:
-		*(*bool)(dst) = false
-	case typedString, typedNumber:
-		*(*string)(dst) = ""
-	case typedInt, typedUint:
-		switch node.bits {
-		case 8:
-			*(*uint8)(dst) = 0
-		case 16:
-			*(*uint16)(dst) = 0
-		case 32:
-			*(*uint32)(dst) = 0
-		case 64:
-			*(*uint64)(dst) = 0
-		}
-	case typedFloat:
-		if node.bits == 32 {
-			*(*float32)(dst) = 0
-		} else {
-			*(*float64)(dst) = 0
-		}
-	case typedStruct:
-		for i := range node.fields {
-			field := &node.fields[i]
-			if field.hop >= 0 {
-				continue
-			}
-			resetTyped(field.node, unsafe.Add(dst, field.offset))
-		}
-		for _, hopOffset := range node.hopResets {
-			*(*unsafe.Pointer)(unsafe.Add(dst, hopOffset)) = nil
-		}
-	case typedSlice, typedBytes:
-		(*typedSliceHeader)(dst).len = 0
-	case typedArray:
-		for i := 0; i < node.length; i++ {
-			resetTyped(node.elem, unsafe.Add(dst, uintptr(i)*node.elem.size))
-		}
-	case typedPointer:
-		*(*unsafe.Pointer)(dst) = nil
-	case typedMap, typedIface:
-		reflect.NewAt(node.typ, noescape(dst)).Elem().SetZero()
-	case typedAny:
-		*(*any)(dst) = nil
-	}
 }
 
 func growTypedSlice(node *typedNode, dst unsafe.Pointer, capacity int) {
