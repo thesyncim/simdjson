@@ -19,7 +19,9 @@ func All16Digits(digits *[16]byte) bool {
 		nonDigitMask8(binary.LittleEndian.Uint64(digits[8:])) == 0
 }
 
-// Parse8Digits reduces eight ASCII decimal digits without validating them.
+// Parse8Digits reduces eight ASCII decimal digits without validating them,
+// using the SWAR pairwise reduction from Lemire's "Quickly parsing eight
+// digits" (https://lemire.me/blog/2018/10/03/quickly-parsing-eight-digits/).
 // Call All8Digits first when the input is not already known to be digits.
 func Parse8Digits(digits *[8]byte) uint64 {
 	x := binary.LittleEndian.Uint64(digits[:])

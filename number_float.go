@@ -8,15 +8,19 @@ import (
 
 const maxJSONMantissaDigits = 19
 
+// jsonNumber accumulates a scanned number the way strconv's readFloat does:
+// a 19-digit mantissa window with truncation tracking, total and mantissa
+// digit counts, and the decimal point position, so the exact-conversion
+// envelope test below matches strconv's.
 type jsonNumber struct {
 	mantissa uint64
 	exponent int
 	negative bool
 
 	truncated bool
-	nd        int
-	ndMant    int
-	dp        int
+	nd        int // total significant digits scanned
+	ndMant    int // digits accumulated into mantissa
+	dp        int // decimal point position relative to the digits
 }
 
 // ParseFloat64 parses one strict JSON number with optional surrounding JSON
@@ -431,6 +435,8 @@ func scanTypedTwoDigitFloat64(base unsafe.Pointer, n, start int) (end int, value
 			// further fraction digits; only a proven delimiter may take the
 			// fixed-scale exit.
 			if i == n {
+				// The constants are jsonNegativePow10[6] (1e-16) with its
+				// precomputed binary exponent bias.
 				value = scaleJSONFloat64Fixed(
 					mantissa, 0xe69594bec44de15c, 0xb3d141978676564c, 968, negative,
 				)

@@ -8,6 +8,11 @@ import (
 	"unsafe"
 )
 
+// The utf8Lookup tables implement the three-lookup UTF-8 classification
+// from Keiser and Lemire, "Validating UTF-8 In Less Than One Instruction
+// Per Byte" (https://arxiv.org/abs/2010.03090): each nibble of a byte pair
+// selects an error bitset, and a nonzero AND of the three lookups marks an
+// invalid sequence.
 var utf8LookupFirstHigh = [16]uint8{
 	2, 2, 2, 2, 2, 2, 2, 2,
 	128, 128, 128, 128, 33, 1, 21, 73,

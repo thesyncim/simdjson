@@ -2,6 +2,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in LICENSE-GO.
 
+// This file holds the shortest-decimal float formatter: Go tip's unrounded
+// fixed-point scaling algorithm (see https://research.swtch.com/fp), the
+// same engine strconv uses, specialized for JSON spellings.
+
 package simd
 
 import (

@@ -118,7 +118,9 @@ func (t Index) PointerCompiled(pointer CompiledPointer) (Node, bool, error) {
 	return t.Root().PointerCompiled(pointer)
 }
 
-// Node is a lightweight handle into an Index.
+// Node is a lightweight handle into an Index. Like the Index, it aliases
+// the source document and the entry storage, and is valid only while both
+// stay alive and unmodified.
 type Node struct {
 	src   *byte
 	entry *IndexEntry
@@ -733,10 +735,18 @@ func (it *FlatObjectIter) NextRaw() (key, value RawValue, ok bool) {
 	return key, value, true
 }
 
+// tapeEntryOffset steps offset entries forward within one tape. Callers
+// must stay inside the entries built for this document: entry counts come
+// from the tape itself (count, next), so the arithmetic never leaves the
+// allocation as long as those fields are trusted and empty containers are
+// checked before stepping past their header.
 func tapeEntryOffset(entry *IndexEntry, offset uintptr) *IndexEntry {
 	return (*IndexEntry)(unsafe.Add(unsafe.Pointer(entry), offset*unsafe.Sizeof(IndexEntry{})))
 }
 
+// tapeSourceBytes reslices the document by tape coordinates. start and end
+// were produced by the builder from real token positions, so they are always
+// within the source that entry describes.
 func tapeSourceBytes(src *byte, start, end uint32) []byte {
 	return unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(src), uintptr(start))), int(end-start))
 }

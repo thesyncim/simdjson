@@ -1182,6 +1182,8 @@ func resolveDecodeHops(dst unsafe.Pointer, hops []typedFieldHop, offset int) (un
 			value := reflect.New(hop.pointee)
 			pointer = value.UnsafePointer()
 			*slot = pointer
+			// Only raw pointers were stored; pin the allocation until the
+			// slot write is visible to the collector.
 			runtime.KeepAlive(value)
 		}
 		dst = pointer

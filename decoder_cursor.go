@@ -34,6 +34,12 @@ type boolValue interface {
 	~bool
 }
 
+// decoderFlags carries the per-decode switches. The first five mirror
+// DecoderOptions; decoderSourceOwned records that ownSource already copied
+// the input, and decoderExpectedSlow latches after the first miss of the
+// packed-key fast match, routing the rest of the decode through the fused
+// slow matcher — order misses tend to repeat, so re-probing every member
+// would pay for nothing.
 type decoderFlags uint8
 
 const (
@@ -171,7 +177,9 @@ func (c *decoderCursor) beginObjectSlow(typeName string) error {
 }
 
 // NextObjectField returns the next decoded key. first must be true only for
-// the first call after BeginObject.
+// the first call after BeginObject. The key aliases the source (or the
+// string arena when escaped) — callers that retain it own the aliasing
+// rules of the current decode mode.
 func (c *decoderCursor) NextObjectField(first bool) (key string, ok bool, err error) {
 	i := c.i
 	if i >= len(c.src) {

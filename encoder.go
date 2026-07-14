@@ -120,6 +120,9 @@ func Marshal[T any](src *T) ([]byte, error) {
 	return out, nil
 }
 
+// newCachedEncoder stays out of line so Marshal's cache-hit path does not
+// carry compilation code in its frame.
+//
 //go:noinline
 func newCachedEncoder[T any]() any {
 	encoder, err := CompileEncoder[T](EncoderOptions{})
@@ -381,6 +384,11 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 	return nil
 }
 
+// encodeSimpleStructPairs runs a simple struct's pair program. The caller
+// has already appended the opening brace and the first member's name and
+// checked depth (including fused levels); this function emits the members
+// and the closing braces recorded in encClose, and owns the depth decrement
+// on every exit path.
 func (e *encodeState) encodeSimpleStructPairs(node *typedNode, src unsafe.Pointer) error {
 	fields := node.encFields
 	packedNames := node.encNameData
@@ -927,6 +935,9 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	// so sorted map encoding does not allocate per map. Ownership moves to
 	// this call while it runs; a nested map sees nil scratch slices and
 	// allocates its own.
+	// keyArena backs the rendered key names; entries alias it, so both are
+	// pooled and recycled together and nothing may retain a name past this
+	// call (error paths clone before storing one in an EncodeError).
 	var entries []mapEncodeEntry
 	var keyArena []byte
 	scratch := e.scratch
@@ -1272,6 +1283,9 @@ func appendCompactUint(dst []byte, v uint64) []byte {
 	if v >= 1e8 {
 		return appendCompactUint9(dst, v)
 	}
+	// (bits.Len64(v)*1233)>>12 approximates floor(log10(v)) via
+	// log10(2) ~= 1233/4096; callers' range guards absorb the boundary
+	// cases.
 	digits := int((bits.Len64(v)*1233)>>12) + 1
 	if v < pow10Uint64[digits-1] {
 		digits--
@@ -1322,6 +1336,10 @@ func appendCompactUint(dst []byte, v uint64) []byte {
 	return dst
 }
 
+// appendCompactUint9 stays out of line: appendCompactUint's hot widths
+// inline into every caller, and folding the rare widths back in would
+// push those callers over the inlining budget.
+//
 //go:noinline
 func appendCompactUint9(dst []byte, v uint64) []byte {
 	if cap(dst)-len(dst) < 9 {
@@ -1337,6 +1355,10 @@ func appendCompactUint9(dst []byte, v uint64) []byte {
 	return dst
 }
 
+// appendCompactUint10 stays out of line: appendCompactUint's hot widths
+// inline into every caller, and folding the rare widths back in would
+// push those callers over the inlining budget.
+//
 //go:noinline
 func appendCompactUint10(dst []byte, v uint64) []byte {
 	if cap(dst)-len(dst) < 10 {
@@ -1420,8 +1442,10 @@ func appendCommaCompactInt(dst []byte, v int64) []byte {
 
 // appendShortCleanJSONString quotes strings shorter than one vector when no
 // byte needs escaping, testing and copying word-at-a-time instead of
-// byte-at-a-time. ok reports whether it emitted; any flagged byte, or a dst
-// too full for its unconditional word stores, defers to the general path.
+// byte-at-a-time. The caller must guarantee 1 <= len(s) <= 16: an empty
+// string has no data pointer to load and a longer one would skip its middle
+// bytes. ok reports whether it emitted; any flagged byte, or a dst too full
+// for its unconditional word stores, defers to the general path.
 func appendShortCleanJSONString(dst []byte, s string, escapeHTML bool) ([]byte, bool) {
 	n := uint(len(s))
 	if cap(dst)-len(dst) < int(n)+10 {

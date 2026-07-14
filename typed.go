@@ -1078,6 +1078,9 @@ func (p *parser) skipTypedValue(depth int) error {
 	return nil
 }
 
+// findFieldSlow resolves a key that missed the packed fast match: the hash
+// table when one was built, otherwise a linear scan with optional ASCII
+// case folding.
 func (node *typedNode) findFieldSlow(key string, fold bool) *typedField {
 	if node.fieldTable != nil {
 		slot := fieldNameHash(key) & node.fieldTableMask
@@ -1115,6 +1118,9 @@ func (node *typedNode) findFieldFold(key string) *typedField {
 	return nil
 }
 
+// fieldNameHash mixes the name through one splitmix64 round (Steele et al.,
+// "Fast Splittable Pseudorandom Number Generators"), cheap and adequate for
+// the small power-of-two field tables.
 func fieldNameHash(name string) uint32 {
 	var head uint64
 	if len(name) >= 8 {

@@ -579,10 +579,10 @@ func TestProbeWriterTimeParity(t *testing.T) {
 	zone := time.FixedZone("probe", 5*3600+1800)
 	times := []time.Time{
 		base,
-		base,                          // same second: prefix cache path
-		base.Add(3 * time.Second),     // same day: date cache path
-		base.In(zone),                 // same absolute second, different zone
-		base.Add(26 * time.Hour),      // next day
+		base,                      // same second: prefix cache path
+		base.Add(3 * time.Second), // same day: date cache path
+		base.In(zone),             // same absolute second, different zone
+		base.Add(26 * time.Hour),  // next day
 		time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
 		time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC),
 	}
