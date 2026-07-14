@@ -20,9 +20,17 @@ type typedTestRecord struct {
 }
 
 func TestTypedDecoderCursorStaysCompact(t *testing.T) {
+	// 64 bytes is one cache line on the target architectures. The decode hot
+	// loop threads a decoderCursor by value through every recursive call, so
+	// keeping it within a single line avoids a straddling load per level of
+	// nesting. A field added past this cap must be justified against that cost,
+	// which is why the bound is asserted rather than left to drift.
 	if size := unsafe.Sizeof(decoderCursor{}); size > 64 {
 		t.Fatalf("typed decoder cursor size = %d bytes, want <= 64", size)
 	}
+	// typedEncField is stored one-per-field in the compiled encoder program and
+	// walked linearly while encoding; 40 bytes keeps the field table dense so
+	// the walk stays cache-friendly on wide structs.
 	if size := unsafe.Sizeof(typedEncField{}); size > 40 {
 		t.Fatalf("typed encoder field size = %d bytes, want <= 40", size)
 	}

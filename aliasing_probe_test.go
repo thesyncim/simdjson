@@ -12,14 +12,6 @@ import (
 	"testing"
 )
 
-// ---------------------------------------------------------------------------
-// Probe 1: owned-mode decodes must never alias caller src.
-// Decode every retaining kind with default (owned) options, scribble over the
-// source buffer, and verify the results byte for byte against encoding/json.
-// Field orders vary so each retaining kind gets to be the first ownSource
-// trigger.
-// ---------------------------------------------------------------------------
-
 type probeOwnedDoc struct {
 	S string            `json:"s"`
 	N json.Number       `json:"n"`
@@ -29,36 +21,41 @@ type probeOwnedDoc struct {
 	B []byte            `json:"b"`
 }
 
+// TestProbeOwnedModeNeverAliasesCallerSrc proves owned-mode decodes never
+// alias caller src. Each case decodes every retaining kind with default
+// (owned) options, scribbles the source buffer, and checks the result byte
+// for byte against encoding/json. The field order varies per case so each
+// retaining kind gets to be the first ownSource trigger.
 func TestProbeOwnedModeNeverAliasesCallerSrc(t *testing.T) {
-	bodies := []string{
-		// string first
-		`{"s":"hello world","n":123.456,"a":{"k":"va` + jsonUnicodeEscape("00e9") + `l","arr":[1,"two",null]},"m":{"k1":"v1","k` + jsonUnicodeEscape("0032") + `":"v2"},"q":"42","b":"aGVsbG8="}`,
-		// number first
-		`{"n":987654321012345678,"s":"later","a":"plain","m":{"x":"y"},"q":"7","b":"QQ=="}`,
-		// any first
-		`{"a":[1.5,"str",{"deep":"va` + jsonUnicodeEscape("0041") + `l"}],"s":"tail","n":1e10,"m":{"only":"one"},"q":"-3","b":""}`,
-		// map first
-		`{"m":{"first":"map","se` + jsonUnicodeEscape("0063") + `ond":"pair"},"a":true,"s":"x","n":0.5,"q":"0","b":"AA=="}`,
-		// quoted first
-		`{"q":"1234","m":{},"a":null,"s":"es` + jsonUnicodeEscape("0063") + `aped","n":2,"b":"aGk="}`,
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"string first", `{"s":"hello world","n":123.456,"a":{"k":"va` + jsonUnicodeEscape("00e9") + `l","arr":[1,"two",null]},"m":{"k1":"v1","k` + jsonUnicodeEscape("0032") + `":"v2"},"q":"42","b":"aGVsbG8="}`},
+		{"number first", `{"n":987654321012345678,"s":"later","a":"plain","m":{"x":"y"},"q":"7","b":"QQ=="}`},
+		{"any first", `{"a":[1.5,"str",{"deep":"va` + jsonUnicodeEscape("0041") + `l"}],"s":"tail","n":1e10,"m":{"only":"one"},"q":"-3","b":""}`},
+		{"map first", `{"m":{"first":"map","se` + jsonUnicodeEscape("0063") + `ond":"pair"},"a":true,"s":"x","n":0.5,"q":"0","b":"AA=="}`},
+		{"quoted first", `{"q":"1234","m":{},"a":null,"s":"es` + jsonUnicodeEscape("0063") + `aped","n":2,"b":"aGk="}`},
 	}
-	for bi, body := range bodies {
-		src := []byte(body)
-		var want probeOwnedDoc
-		if err := json.Unmarshal(src, &want); err != nil {
-			t.Fatalf("body %d: reference: %v", bi, err)
-		}
-		var got probeOwnedDoc
-		if err := Unmarshal(src, &got); err != nil {
-			t.Fatalf("body %d: Unmarshal: %v", bi, err)
-		}
-		// Scribble the entire caller buffer.
-		for i := range src {
-			src[i] = 'Z'
-		}
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("body %d: after src scribble:\ngot  %#v\nwant %#v", bi, got, want)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := []byte(tc.body)
+			var want probeOwnedDoc
+			if err := json.Unmarshal(src, &want); err != nil {
+				t.Fatalf("reference: %v", err)
+			}
+			var got probeOwnedDoc
+			if err := Unmarshal(src, &got); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			// Scribble the entire caller buffer.
+			for i := range src {
+				src[i] = 'Z'
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("after src scribble:\ngot  %#v\nwant %#v", got, want)
+			}
+		})
 	}
 }
 
@@ -114,12 +111,9 @@ func TestProbeOwnedTopLevelShapes(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Probe 2: dynamic (any) values that materialize MANY escaped strings must
-// survive arena block switches inside the dynamic parse, and later escaped
-// typed strings must append after — not over — them.
-// ---------------------------------------------------------------------------
-
+// TestProbeAnyArenaBlockSwitch proves dynamic (any) values that materialize
+// many escaped strings survive arena block switches inside the dynamic parse,
+// and that later escaped typed strings append after — not over — them.
 func TestProbeAnyArenaBlockSwitch(t *testing.T) {
 	// One escaped string long enough to matter, repeated enough times inside
 	// the any value to cross several 2 KiB arena blocks (stringArenaSeed).
@@ -225,11 +219,9 @@ func TestProbeInterleavedTypedAndDynamicEscapes(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Probe 3: escaped map keys are retained by the result map and must survive
-// later escaped strings (keys and values) appending to the arena.
-// ---------------------------------------------------------------------------
-
+// TestProbeEscapedMapKeysArena proves escaped map keys retained by the result
+// map survive later escaped strings — keys and values alike — appending to the
+// arena.
 func TestProbeEscapedMapKeysArena(t *testing.T) {
 	var b strings.Builder
 	b.WriteByte('{')
@@ -283,16 +275,14 @@ func TestProbeEscapedMapKeysArena(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(gotAny, wantAny) {
-		t.Fatalf("map[string]any mismatch")
+		t.Fatalf("map[string]any mismatch:\ngot  %#v\nwant %#v", gotAny, wantAny)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Probe 4: quoted (",string") fields whose inner content is escaped use a
-// transient arena region; the decoded result must not alias it once later
-// escaped strings reuse that region.
-// ---------------------------------------------------------------------------
-
+// TestProbeQuotedFieldTransientArena proves that quoted (",string") fields
+// whose inner content is escaped — which use a transient arena region — do not
+// leave the decoded result aliasing that region once later escaped strings
+// reuse it.
 func TestProbeQuotedFieldTransientArena(t *testing.T) {
 	type doc struct {
 		Born string      `json:"born"` // escaped: creates the arena
@@ -358,12 +348,8 @@ func TestProbeBytesFromEscapedBase64(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Probe 5: streaming Reader. Values split across arbitrarily small reads
-// exercise the retry + compaction + growth paths; every decoded value is
-// checked inside its validity window, and owned decodes are checked after it.
-// ---------------------------------------------------------------------------
-
+// probeChunkReader hands out src in fixed-size chunks so a streaming Reader
+// sees values split across arbitrarily small reads.
 type probeChunkReader struct {
 	data  []byte
 	chunk int
@@ -414,6 +400,9 @@ func buildStreamDocs(t *testing.T, count int) ([]byte, []streamRec) {
 	return b.Bytes(), want
 }
 
+// TestProbeStreamDecodeNextSplitValues drives the streaming Reader over values
+// split across arbitrarily small reads, exercising the retry, compaction, and
+// growth paths. Each decoded value is checked inside its validity window.
 func TestProbeStreamDecodeNextSplitValues(t *testing.T) {
 	data, want := buildStreamDocs(t, 25)
 	for _, zeroCopy := range []bool{false, true} {
@@ -501,12 +490,10 @@ func TestProbeReaderBytesGrowAndCompact(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Probe 6: ParseAny slab arena. Arrays with 1..10 elements exercise slab slot
-// handoff, append growth past the 4-element slot capacity, and slab
-// replacement; the whole tree is compared against encoding/json.
-// ---------------------------------------------------------------------------
-
+// TestProbeParseAnySlabIsolation exercises the ParseAny slab arena. Arrays
+// with 1..10 elements drive slab slot handoff, append growth past the
+// 4-element slot capacity, and slab replacement; the whole tree is compared
+// against encoding/json.
 func TestProbeParseAnySlabIsolation(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 	var build func(depth int) string
@@ -543,22 +530,18 @@ func TestProbeParseAnySlabIsolation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("round %d: %v", round, err)
 		}
-		if !reflect.DeepEqual(normalizeAnyNumbers(got), want) {
+		// ParseAny boxes numbers as float64, exactly like encoding/json, so the
+		// trees compare directly.
+		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("round %d mismatch:\nsrc  %s\ngot  %#v\nwant %#v", round, src, got, want)
 		}
 	}
 }
 
-// ParseAny yields float64 like encoding/json; nothing to normalize today, but
-// keep the hook in one place in case shapes diverge.
-func normalizeAnyNumbers(v any) any { return v }
-
-// ---------------------------------------------------------------------------
-// Probe 7: Parse AST retention. Values from earlier ParseOptions calls must
-// stay intact while the tape pool is reused by later parses and after the
-// original source is scribbled (owned mode).
-// ---------------------------------------------------------------------------
-
+// TestProbeParseValueRetentionAcrossPoolReuse proves Parse AST retention:
+// values from an earlier ParseOptions call stay intact while the tape pool is
+// reused by later parses and after the original source is scribbled (owned
+// mode).
 func TestProbeParseValueRetentionAcrossPoolReuse(t *testing.T) {
 	src := []byte(`{"a":"alpha","e":"b` + jsonUnicodeEscape("00e9") + `ta","n":42.5,"arr":[1,"two",{"deep":"d"}]}`)
 	var wantJSON map[string]any
@@ -595,12 +578,11 @@ func TestProbeParseValueRetentionAcrossPoolReuse(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Probe 8: encoder scratch. The numeric-key arena is pooled; an error Path
-// built from it must survive later encodes that rewrite the arena, and
-// concurrent encodes through one compiled encoder must not cross-talk.
-// ---------------------------------------------------------------------------
-
+// TestProbeEncodeMapErrorPathStability probes the pooled encoder scratch: an
+// error Path built from the pooled numeric-key arena must survive later
+// encodes that rewrite that arena. TestProbeEncoderScratchConcurrency covers
+// the companion property that concurrent encodes through one compiled encoder
+// do not cross-talk.
 func TestProbeEncodeMapErrorPathStability(t *testing.T) {
 	type doc struct {
 		M map[int]float64 `json:"m"`
@@ -674,11 +656,9 @@ func TestProbeEncoderScratchConcurrency(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Probe 9: differential fuzz battery over escape-dense documents decoded into
-// an any/map/string-bearing struct in both ownership modes.
-// ---------------------------------------------------------------------------
-
+// TestProbeDifferentialEscapeBattery is a differential battery over
+// escape-dense documents decoded into an any/map/string-bearing struct in both
+// ownership modes, compared against encoding/json.
 func TestProbeDifferentialEscapeBattery(t *testing.T) {
 	type doc struct {
 		A string            `json:"a"`

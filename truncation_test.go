@@ -98,6 +98,7 @@ func truncationTortureDocs() []struct {
 // document and of the torture documents, and a sampled set of prefixes of
 // large documents, through the whole API surface.
 func TestTruncationSweep(t *testing.T) {
+	t.Parallel() // pure differential: reads fixtures, decodes into locals, no globals
 	entries, err := os.ReadDir(jsonTestSuiteDir)
 	if err != nil {
 		t.Fatal(err)
@@ -179,6 +180,7 @@ var hostileMutationAlphabet = []byte{
 // benchmark-shaped document, plus every single-byte deletion, and checks the
 // full API agreement on each mutant.
 func TestMutationSweep(t *testing.T) {
+	t.Parallel() // pure differential: mutates a local buffer, decodes into locals
 	doc := benchRecordsJSON(8)
 	if testing.Short() {
 		doc = benchRecordsJSON(2)

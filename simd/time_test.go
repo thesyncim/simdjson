@@ -2,12 +2,28 @@ package simd
 
 import (
 	"bytes"
-	"math/rand/v2"
 	"testing"
 	"time"
 )
 
 var timeDigitsSink [20]byte
+
+// xorshift is the deterministic generator shared by these time tests: a
+// fixed-seed xorshift64 so a failing case reproduces on every run, matching the
+// pattern the package's other differential tests use.
+type xorshift struct{ state uint64 }
+
+func newXorshift() *xorshift { return &xorshift{state: 0x9e3779b97f4a7c15} }
+
+func (r *xorshift) next() uint64 {
+	r.state ^= r.state << 13
+	r.state ^= r.state >> 7
+	r.state ^= r.state << 17
+	return r.state
+}
+
+// intN returns a deterministic value in [0, n), mirroring rand.IntN.
+func (r *xorshift) intN(n int) int { return int(r.next() % uint64(n)) }
 
 func TestAppendTimeMatchesTime(t *testing.T) {
 	locations := []*time.Location{
@@ -19,15 +35,16 @@ func TestAppendTimeMatchesTime(t *testing.T) {
 		time.FixedZone("positive boundary", 24*60*60-1),
 		time.FixedZone("negative boundary", -24*60*60+1),
 	}
+	rng := newXorshift()
 	for _, location := range locations {
 		for range 100_000 {
-			year := rand.IntN(10_000)
-			month := time.Month(rand.IntN(12) + 1)
-			day := rand.IntN(28) + 1
-			hour := rand.IntN(24)
-			minute := rand.IntN(60)
-			second := rand.IntN(60)
-			nanosecond := rand.IntN(1_000_000_000)
+			year := rng.intN(10_000)
+			month := time.Month(rng.intN(12) + 1)
+			day := rng.intN(28) + 1
+			hour := rng.intN(24)
+			minute := rng.intN(60)
+			second := rng.intN(60)
+			nanosecond := rng.intN(1_000_000_000)
 			value := time.Date(year, month, day, hour, minute, second, nanosecond, location)
 
 			want := []byte{'"'}
@@ -59,6 +76,7 @@ func TestAppendTimeCachedMatchesTime(t *testing.T) {
 		time.FixedZone("east", 14*60*60+45*60),
 	}
 	var cache TimeCache
+	rng := newXorshift()
 	base := time.Date(2026, time.July, 14, 9, 30, 0, 0, time.UTC)
 	step := base
 	for i := range 200_000 {
@@ -67,23 +85,23 @@ func TestAppendTimeCachedMatchesTime(t *testing.T) {
 		case 0, 1:
 			value = step // repeated second, varying fraction below
 		case 2, 3:
-			step = step.Add(time.Duration(rand.IntN(90)) * time.Second)
+			step = step.Add(time.Duration(rng.intN(90)) * time.Second)
 			value = step
 		case 4:
-			step = step.Add(time.Duration(rand.IntN(48)) * time.Hour)
+			step = step.Add(time.Duration(rng.intN(48)) * time.Hour)
 			value = step
 		case 5:
-			value = step.In(locations[rand.IntN(len(locations))])
+			value = step.In(locations[rng.intN(len(locations))])
 		case 6:
-			value = time.Date(rand.IntN(10_000), time.Month(rand.IntN(12)+1), rand.IntN(28)+1,
-				rand.IntN(24), rand.IntN(60), rand.IntN(60), 0, locations[rand.IntN(len(locations))])
+			value = time.Date(rng.intN(10_000), time.Month(rng.intN(12)+1), rng.intN(28)+1,
+				rng.intN(24), rng.intN(60), rng.intN(60), 0, locations[rng.intN(len(locations))])
 		default:
 			// Out-of-range years must error identically and leave the
 			// cache consistent for the next valid append.
-			value = time.Date(-rand.IntN(3)-1, 1, 1, 0, 0, 0, 0, time.UTC)
+			value = time.Date(-rng.intN(3)-1, 1, 1, 0, 0, 0, 0, time.UTC)
 		}
-		if rand.IntN(2) == 0 {
-			value = value.Add(time.Duration(rand.IntN(1_000_000_000)) * time.Nanosecond)
+		if rng.intN(2) == 0 {
+			value = value.Add(time.Duration(rng.intN(1_000_000_000)) * time.Nanosecond)
 			step = value
 		}
 

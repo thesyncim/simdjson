@@ -100,14 +100,7 @@ func TestEncoderFloatFormats(t *testing.T) {
 	}
 	for _, f := range floats {
 		value := wrapper{F64: f, F32: float32(f)}
-		want, wantErr := stdlibCompactJSON(t, &value)
-		got, gotErr := Marshal(&value)
-		if (gotErr == nil) != (wantErr == nil) {
-			t.Fatalf("float %g: acceptance differs: simdjson=%v stdlib=%v", f, gotErr, wantErr)
-		}
-		if gotErr == nil && !bytes.Equal(got, want) {
-			t.Fatalf("float %g: simdjson %s, stdlib %s", f, got, want)
-		}
+		assertEncodesLikeStdlib(t, &value)
 	}
 }
 
@@ -520,14 +513,7 @@ func TestAnyEncodeConcreteTypes(t *testing.T) {
 		{Meta: [2]int{1, 2}},
 	}
 	for _, value := range values {
-		want, wantErr := stdlibCompactJSON(t, &value)
-		got, gotErr := Marshal(&value)
-		if (gotErr == nil) != (wantErr == nil) {
-			t.Fatalf("%#v: acceptance differs: simdjson=%v stdlib=%v", value, gotErr, wantErr)
-		}
-		if gotErr == nil && !bytes.Equal(got, want) {
-			t.Fatalf("%#v:\nsimdjson %s\nstdlib   %s", value, got, want)
-		}
+		assertEncodesLikeStdlib(t, &value)
 	}
 
 	unsupported := anyDocument{Meta: make(chan int)}
@@ -549,7 +535,6 @@ func TestByteSlicesMatchStdlib(t *testing.T) {
 	sources := []string{
 		`{"data":"aGVsbG8gd29ybGQ=","named":"AQID","map":{"k":"eA=="}}`,
 		`{"data":"","named":null}`,
-		`{"data":"aGk="}`,
 		`{"data":"aGk="}`,
 		`{"data":"!!!invalid!!!"}`,
 		`{"data":123}`,
@@ -615,14 +600,7 @@ func TestStringTagOptionMatchesStdlib(t *testing.T) {
 		{F: 1e21, S: ""},
 	}
 	for _, value := range values {
-		want, wantErr := stdlibCompactJSON(t, &value)
-		got, gotErr := Marshal(&value)
-		if (gotErr == nil) != (wantErr == nil) {
-			t.Fatalf("%#v: encode acceptance differs: simdjson=%v stdlib=%v", value, gotErr, wantErr)
-		}
-		if gotErr == nil && !bytes.Equal(got, want) {
-			t.Fatalf("%#v:\nsimdjson %s\nstdlib   %s", value, got, want)
-		}
+		assertEncodesLikeStdlib(t, &value)
 	}
 
 	// Decode side, including malformed corners.
@@ -754,53 +732,47 @@ type embMid struct {
 }
 
 func TestEmbeddedFieldsMatchStdlib(t *testing.T) {
-	type roundTrip func(src string) (gotErr, wantErr error, got, want any)
+	// Each embedding rule needs its own destination type, so a row is a named
+	// subtest closure that binds the type to its source. assertRoundTripsLikeStdlib
+	// runs the shared decode-then-re-encode comparison for that type.
 	cases := []struct {
 		name string
-		run  roundTrip
+		run  func(*testing.T)
 	}{
-		{"value embedding", differential[embMid](t, `{"id":1,"name":"n","mid":2}`)},
-		{"shadowing", differential[embShadow](t, `{"id":3,"name":"outer"}`)},
-		{"pointer embedding", differential[embPointer](t, `{"id":4,"name":"p","extra":"e"}`)},
-		{"pointer embedding absent", differential[embPointer](t, `{"extra":"only"}`)},
-		{"tagged anonymous", differential[embTagged](t, `{"base":{"id":5,"name":"tag"}}`)},
-		{"same depth conflict", differential[embConflict](t, `{"Same":9,"z":1}`)},
-		{"embedded scalar", differential[embNonStruct](t, `{"embInt":7,"v":8}`)},
-		{"unexported embedded struct", differential[embUnexported](t, `{"inner":"i","top":9}`)},
-		{"deep nesting", differential[embDeep](t, `{"id":1,"name":"d","mid":2,"own":3}`)},
+		{"value embedding", func(t *testing.T) { assertRoundTripsLikeStdlib[embMid](t, `{"id":1,"name":"n","mid":2}`) }},
+		{"shadowing", func(t *testing.T) { assertRoundTripsLikeStdlib[embShadow](t, `{"id":3,"name":"outer"}`) }},
+		{"pointer embedding", func(t *testing.T) { assertRoundTripsLikeStdlib[embPointer](t, `{"id":4,"name":"p","extra":"e"}`) }},
+		{"pointer embedding absent", func(t *testing.T) { assertRoundTripsLikeStdlib[embPointer](t, `{"extra":"only"}`) }},
+		{"tagged anonymous", func(t *testing.T) { assertRoundTripsLikeStdlib[embTagged](t, `{"base":{"id":5,"name":"tag"}}`) }},
+		{"same depth conflict", func(t *testing.T) { assertRoundTripsLikeStdlib[embConflict](t, `{"Same":9,"z":1}`) }},
+		{"embedded scalar", func(t *testing.T) { assertRoundTripsLikeStdlib[embNonStruct](t, `{"embInt":7,"v":8}`) }},
+		{"unexported embedded struct", func(t *testing.T) { assertRoundTripsLikeStdlib[embUnexported](t, `{"inner":"i","top":9}`) }},
+		{"deep nesting", func(t *testing.T) { assertRoundTripsLikeStdlib[embDeep](t, `{"id":1,"name":"d","mid":2,"own":3}`) }},
 	}
 	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			gotErr, wantErr, got, want := testCase.run("")
-			if (gotErr == nil) != (wantErr == nil) {
-				t.Fatalf("acceptance differs: simdjson=%v stdlib=%v", gotErr, wantErr)
-			}
-			if gotErr == nil && !reflect.DeepEqual(got, want) {
-				t.Fatalf("decoded differs:\nsimdjson %#v\nstdlib   %#v", got, want)
-			}
-		})
+		t.Run(testCase.name, testCase.run)
 	}
 }
 
-// differential returns a closure decoding src into T with both libraries and
-// then re-encoding, comparing bytes.
-func differential[T any](t *testing.T, src string) func(string) (error, error, any, any) {
-	return func(string) (error, error, any, any) {
-		var got, want T
-		gotErr := Unmarshal([]byte(src), &got)
-		wantErr := json.Unmarshal([]byte(src), &want)
-		if gotErr == nil && wantErr == nil {
-			gotJSON, gotEncErr := Marshal(&got)
-			wantJSON, wantEncErr := stdlibCompactJSON(t, &want)
-			if (gotEncErr == nil) != (wantEncErr == nil) {
-				t.Fatalf("%s: encode acceptance differs: simdjson=%v stdlib=%v", src, gotEncErr, wantEncErr)
-			}
-			if gotEncErr == nil && !bytes.Equal(gotJSON, wantJSON) {
-				t.Fatalf("%s:\nsimdjson %s\nstdlib   %s", src, gotJSON, wantJSON)
-			}
-		}
-		return gotErr, wantErr, got, want
+// assertRoundTripsLikeStdlib decodes src into T with both libraries, requires
+// the same acceptance decision and decoded value, and — when both accept —
+// re-encodes and requires the same bytes. It proves a destination type both
+// decodes and re-encodes identically to encoding/json.
+func assertRoundTripsLikeStdlib[T any](t *testing.T, src string) {
+	t.Helper()
+	var got, want T
+	gotErr := Unmarshal([]byte(src), &got)
+	wantErr := json.Unmarshal([]byte(src), &want)
+	if (gotErr == nil) != (wantErr == nil) {
+		t.Fatalf("%s: decode acceptance differs: simdjson=%v stdlib=%v", src, gotErr, wantErr)
 	}
+	if gotErr != nil {
+		return
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("%s: decoded differs:\nsimdjson %#v\nstdlib   %#v", src, got, want)
+	}
+	assertEncodesLikeStdlib(t, &got)
 }
 
 func TestEmbeddedPointerEncodeNil(t *testing.T) {
@@ -907,14 +879,7 @@ func TestNonEmptyInterfacesMatchStdlib(t *testing.T) {
 		{},
 	}
 	for _, value := range values {
-		want, wantErr := stdlibCompactJSON(t, &value)
-		got, gotErr := Marshal(&value)
-		if (gotErr == nil) != (wantErr == nil) {
-			t.Fatalf("%#v: encode acceptance differs: simdjson=%v stdlib=%v", value, gotErr, wantErr)
-		}
-		if gotErr == nil && !bytes.Equal(got, want) {
-			t.Fatalf("%#v:\nsimdjson %s\nstdlib   %s", value, got, want)
-		}
+		assertEncodesLikeStdlib(t, &value)
 	}
 
 	// Decode: null clears; a held non-nil pointer is decoded into; anything

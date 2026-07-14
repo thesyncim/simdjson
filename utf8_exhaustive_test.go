@@ -31,6 +31,7 @@ func quotedWithPad(dst []byte, prefix int, seq []byte) []byte {
 // is accepted inside a JSON string, both as a short token and straddling the
 // 64-byte SIMD block boundary.
 func TestUTF8AllCodePointsValid(t *testing.T) {
+	t.Parallel() // pure differential: only local scratch and read-only fixtures
 	buf := make([]byte, 0, 160)
 	var enc [4]byte
 	for r := rune(0x20); r <= 0x10FFFF; r++ {
@@ -52,6 +53,7 @@ func TestUTF8AllCodePointsValid(t *testing.T) {
 // This covers every malformed continuation, overlong two-byte form, truncated
 // lead byte, and escape/control interaction in the two-byte space.
 func TestUTF8TwoByteExhaustive(t *testing.T) {
+	t.Parallel() // pure differential: only local scratch and read-only fixtures
 	prefixes := []int{0, 1, 15, 16, 31, 32, 63, 64, 65}
 	if testing.Short() {
 		prefixes = []int{0, 63}
@@ -93,6 +95,7 @@ func TestUTF8TwoByteExhaustive(t *testing.T) {
 // overlong three-byte form, every UTF-16 surrogate encoding, and every
 // continuation-byte error combination.
 func TestUTF8ThreeByteExhaustive(t *testing.T) {
+	t.Parallel() // pure differential: only local scratch and read-only fixtures
 	stride := 1
 	if testing.Short() {
 		stride = 7
@@ -128,6 +131,7 @@ var utf8ClassAlphabet = []byte{
 // TestUTF8FourByteClassSweep enumerates every four-byte combination of the
 // class alphabet at a short and a block-straddling prefix.
 func TestUTF8FourByteClassSweep(t *testing.T) {
+	t.Parallel() // pure differential: only local scratch and read-only fixtures
 	prefixes := []int{0, 61}
 	if testing.Short() {
 		prefixes = []int{61}
