@@ -310,14 +310,26 @@ type typedNode struct {
 	fieldTableMask   uint32
 	encFields        []typedEncField
 	encNameData      []byte
-	fieldHops        [][]typedFieldHop
-	hopResets        []uintptr
-	reset            []typedResetOp
-	ready            bool
-	encSimple        bool
-	allSet           uint64
-	encScratch       int32
-	encMapElem       int32
+	// encClose is what the pair encoder appends after the last member:
+	// a single brace normally, more when fused children close here too.
+	encClose []byte
+	// encPaths names each encode field for error paths, parallel to
+	// encFields: fusion splices child members in, so the encode list no
+	// longer parallels node.fields. Kept off typedEncField to preserve its
+	// cache-line budget.
+	encPaths []string
+	// encFusedExtra counts the static struct levels fused into this
+	// node's pair program, so depth checks preserve the exact limit the
+	// unfused recursion enforced.
+	encFusedExtra  uint8
+	fieldHops      [][]typedFieldHop
+	hopResets      []uintptr
+	reset          []typedResetOp
+	ready          bool
+	encSimple      bool
+	allSet         uint64
+	encScratch     int32
+	encMapElem     int32
 }
 
 type typedField struct {
@@ -346,6 +358,79 @@ type typedEncField struct {
 	pairOp       typedEncPairOp
 	encNameLen   uint8
 	omitEmpty    bool
+}
+
+// fuseEligible reports whether a struct-typed member should splice into
+// its parent: any unconditional simple struct qualifies.
+func fuseEligible(field *typedEncField) bool {
+	return field.encOp == typedOpStruct && field.node.encSimple
+}
+
+// fuseSimpleStructFields splices the members of directly nested simple
+// structs into the parent's encode field list at compile time: the child's
+// opening brace and first member name fuse into one literal, its remaining
+// members follow with composed offsets, and its closing brace attaches to
+// the next literal or to the parent's own close. The encoder then walks
+// one flat pair program with no recursion or depth bookkeeping for the
+// fused levels. Only unconditional members qualify: every field of a
+// simple node is hop-free and never omitted, and struct values cannot be
+// type-recursive without indirection, so nesting is finite.
+func fuseSimpleStructFields(node *typedNode) {
+	fusable := false
+	for i := range node.encFields {
+		field := &node.encFields[i]
+		if fuseEligible(field) {
+			fusable = true
+			break
+		}
+	}
+	node.encClose = []byte("}")
+	if !fusable {
+		return
+	}
+	fused := make([]typedEncField, 0, len(node.encFields)+8)
+	fusedPaths := make([]string, 0, len(node.encFields)+8)
+	pending := ""
+	var extra uint8
+	for i := range node.encFields {
+		field := node.encFields[i]
+		if !fuseEligible(&field) {
+			field.encName = pending + field.encName
+			pending = ""
+			fused = append(fused, field)
+			fusedPaths = append(fusedPaths, node.encPaths[i])
+			continue
+		}
+		child := field.node
+		if depth := child.encFusedExtra + 1; depth > extra {
+			extra = depth
+		}
+		if len(child.encFields) == 0 {
+			pending = pending + field.encName + "{" + string(child.encClose)
+			continue
+		}
+		for j := range child.encFields {
+			spliced := child.encFields[j]
+			spliced.offset += field.offset
+			spliced.encNameLen = 0
+			spliced.encNameBlock = 0
+			spliced.pairOp = typedEncPairFallback
+			if j == 0 {
+				// The child's first literal already lost its comma when the
+				// child compiled; the parent-side comma comes from this
+				// field's own literal.
+				spliced.encName = pending + field.encName + "{" + spliced.encName
+				pending = ""
+			}
+			fused = append(fused, spliced)
+			fusedPaths = append(fusedPaths, node.encPaths[i]+"."+child.encPaths[j])
+		}
+		pending = string(child.encClose)
+	}
+	node.encFields = fused
+	node.encPaths = fusedPaths
+	node.encClose = append([]byte(pending), '}')
+	node.encFusedExtra = extra
 }
 
 type typedEncPairOp uint8
@@ -588,6 +673,7 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 				}
 			}
 			node.encFields = append(node.encFields, encField)
+			node.encPaths = append(node.encPaths, resolved.name)
 			if fieldIndex < 64 {
 				compiledField.seen = uint64(1) << fieldIndex
 			}
@@ -622,6 +708,7 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 			node.fields = append(node.fields, compiledField)
 		}
 		if node.encSimple {
+			fuseSimpleStructFields(node)
 			for i := 0; i+1 < len(node.encFields); i += 2 {
 				node.encFields[i].pairOp = classifyTypedEncPair(node.encFields[i].encOp, node.encFields[i+1].encOp)
 			}

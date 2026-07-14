@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"strings"
 	"testing"
+	"unsafe"
 )
 
 type encoderPackedNames struct {
@@ -66,6 +68,10 @@ func TestEncoderPackedNamesDoNotWritePastResult(t *testing.T) {
 
 type encoderPairLeaf struct {
 	N int64 `json:"n"`
+	// The omitempty member keeps this leaf outside nested-struct fusion so
+	// the matrix still exercises the Struct pair opcodes; the zero value
+	// is omitted by simdjson and encoding/json alike.
+	Z int64 `json:"z,omitempty"`
 }
 
 type encoderPairMarshaler string
@@ -276,5 +282,118 @@ func requireEncoderErrorPath[T any](t *testing.T, value *T, want string) {
 	}
 	if encodeErr.Path != want {
 		t.Fatalf("AppendJSON error path = %q, want %q (%v)", encodeErr.Path, want, err)
+	}
+}
+
+type fusionInner struct {
+	A int64  `json:"a"`
+	B string `json:"b"`
+}
+
+type fusionEmpty struct{}
+
+type fusionMid struct {
+	Name  string      `json:"name"`
+	In    fusionInner `json:"in"`
+	Empty fusionEmpty `json:"empty"`
+	Tail  fusionInner `json:"tail"`
+}
+
+type fusionOuter struct {
+	First fusionInner `json:"first"` // fused child in first position
+	Mid   fusionMid   `json:"mid"`   // two levels of fusion
+	N     int64       `json:"n"`
+	Last  fusionInner `json:"last"` // fused child in last position
+}
+
+func TestNestedStructFusionMatchesStdlib(t *testing.T) {
+	enc, err := CompileEncoder[fusionOuter](EncoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The plan must actually be flat: no struct-typed entries survive for
+	// fusable children, and the close carries the fused braces.
+	for i := range enc.root.encFields {
+		if enc.root.encFields[i].encOp == typedOpStruct {
+			t.Fatalf("field %d still struct-typed after fusion", i)
+		}
+	}
+	if string(enc.root.encClose) != "}}" {
+		t.Fatalf("encClose = %q", enc.root.encClose)
+	}
+
+	v := fusionOuter{
+		First: fusionInner{A: 1, B: "one <&> \"quoted\""},
+		Mid: fusionMid{
+			Name: "mid",
+			In:   fusionInner{A: -2, B: "two"},
+			Tail: fusionInner{A: 3, B: "three"},
+		},
+		N:    42,
+		Last: fusionInner{A: 4, B: "four"},
+	}
+	got, err := enc.AppendJSON(nil, &v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("fused output differs\n got %s\nwant %s", got, want)
+	}
+
+	// Errors inside fused children must report dotted paths.
+	type withBad struct {
+		In struct {
+			F float64 `json:"f"`
+		} `json:"in"`
+	}
+	bad := withBad{}
+	bad.In.F = math.Inf(1)
+	if _, err := Marshal(&bad); err == nil || !strings.Contains(err.Error(), "in.f") {
+		t.Fatalf("fused error path = %v", err)
+	}
+
+	// Slices of fused structs run through the hoisted pair loop.
+	rows := []fusionOuter{v, v, v}
+	gotRows, err := Marshal(&rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRows, _ := json.Marshal(rows)
+	if string(gotRows) != string(wantRows) {
+		t.Fatalf("fused slice output differs\n got %s\nwant %s", gotRows, wantRows)
+	}
+}
+
+func TestNestedStructFusionDepthLimit(t *testing.T) {
+	// A fused static level still counts against the depth limit exactly as
+	// the recursive walk counted it: wrapping a two-level fused struct in
+	// slices up to the limit must fail at the same nesting as before.
+	type leaf struct {
+		N int64 `json:"n"`
+	}
+	type box struct {
+		L leaf `json:"l"`
+	}
+	enc, err := CompileEncoder[box](EncoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enc.root.encFusedExtra != 1 {
+		t.Fatalf("encFusedExtra = %d, want 1", enc.root.encFusedExtra)
+	}
+	var v box
+	e := encodeState{dst: nil, escapeHTML: true}
+	e.depth = defaultMaxDepth - 1
+	if err := e.encodeStruct(enc.root, unsafe.Pointer(&v)); err == nil {
+		t.Fatal("expected depth error: box at max-1 puts leaf past the limit")
+	}
+	e = encodeState{dst: nil, escapeHTML: true}
+	e.depth = defaultMaxDepth - 2
+	if err := e.encodeStruct(enc.root, unsafe.Pointer(&v)); err != nil {
+		t.Fatalf("box at max-2 must fit exactly as the recursive walk did: %v", err)
 	}
 }

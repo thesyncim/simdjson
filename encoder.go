@@ -282,7 +282,9 @@ func (e *encodeState) encodeTime(src unsafe.Pointer) error {
 }
 
 func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
-	if e.depth >= defaultMaxDepth {
+	// encFusedExtra preserves the exact depth limit across fused static
+	// levels that no longer recurse.
+	if e.depth+int(node.encFusedExtra) >= defaultMaxDepth {
 		return &EncodeError{Reason: "maximum nesting depth exceeded"}
 	}
 	e.depth++
@@ -545,7 +547,7 @@ func (e *encodeState) encodeSimpleStructPairs(node *typedNode, src unsafe.Pointe
 		}
 		if err != nil {
 			e.depth--
-			return prependEncodePathField(err, node.fields[errorIndex].name)
+			return prependEncodePathField(err, node.encPaths[errorIndex])
 		}
 	}
 	if i < len(fields) {
@@ -553,10 +555,16 @@ func (e *encodeState) encodeSimpleStructPairs(node *typedNode, src unsafe.Pointe
 		e.dst = appendSimpleFieldName(e.dst, field, packedNames)
 		if err := e.encodeStructFieldValue(field, unsafe.Add(src, field.offset)); err != nil {
 			e.depth--
-			return prependEncodePathField(err, node.fields[i].name)
+			return prependEncodePathField(err, node.encPaths[i])
 		}
 	}
-	e.dst = append(e.dst, '}')
+	if len(node.encClose) == 1 {
+		// The overwhelmingly common close stays an inlined single-byte
+		// append; the slice form costs a memmove call per struct.
+		e.dst = append(e.dst, '}')
+	} else {
+		e.dst = append(e.dst, node.encClose...)
+	}
 	e.depth--
 	return nil
 }
@@ -684,8 +692,9 @@ func (e *encodeState) encodeStructSlice(node *typedNode, header *typedSliceHeade
 		// The depth test and the simple-struct dispatch are the same for
 		// every element; run them once and drive the pair encoder
 		// directly. An empty slice keeps succeeding at the depth limit,
-		// exactly as the per-element check behaved.
-		if e.depth >= defaultMaxDepth {
+		// exactly as the per-element check behaved, and encFusedExtra
+		// accounts for static levels fused into the element's pairs.
+		if e.depth+int(elem.encFusedExtra) >= defaultMaxDepth {
 			e.depth--
 			return &EncodeError{Reason: "maximum nesting depth exceeded"}
 		}
