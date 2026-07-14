@@ -53,7 +53,11 @@ type decoderCursor struct {
 	maxDepth int
 	depth    int
 	flags    decoderFlags
-	strings  unsafe.Pointer
+	// floatLong is the sticky element-shape hint for fused float array
+	// loops: while set, elements skip the short-form probe that uniformly
+	// long values (geographic coordinates) always fail.
+	floatLong bool
+	strings   unsafe.Pointer
 }
 
 // newDecoderCursor starts decoding src with opts.

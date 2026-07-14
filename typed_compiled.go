@@ -627,10 +627,16 @@ func decodeCompiledFloatArray[T floatValue](cursor *decoderCursor, node *typedNo
 				}
 			}
 			if i < len(src) && (src[i] == '-' || isDigit(src[i])) {
-				if value, end, ok := shortTypedFloatAt(src, i); ok {
-					*(*T)(unsafe.Add(dst, uintptr(index)*node.elem.size)) = T(value)
-					cursor.i = end
-					continue
+				if !cursor.floatLong {
+					if value, end, ok := shortTypedFloatAt(src, i); ok {
+						*(*T)(unsafe.Add(dst, uintptr(index)*node.elem.size)) = T(value)
+						cursor.i = end
+						continue
+					}
+					// Short probes fail on every element of uniformly long
+					// arrays; stop paying for them until a short element
+					// reappears.
+					cursor.floatLong = true
 				}
 				if unsafe.Sizeof(T(0)) == 8 {
 					base := unsafe.Pointer(unsafe.SliceData(src))
@@ -638,6 +644,7 @@ func decodeCompiledFloatArray[T floatValue](cursor *decoderCursor, node *typedNo
 					if ok && exact {
 						*(*T)(unsafe.Add(dst, uintptr(index)*node.elem.size)) = T(value)
 						cursor.i = end
+						cursor.floatLong = end-i >= 6
 						continue
 					}
 				}
