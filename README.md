@@ -2,6 +2,13 @@
 
 [![ci](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml/badge.svg)](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml)
 
+Strict, high-performance JSON for Go, written entirely in Go. `Unmarshal` and
+`Marshal` are drop-in replacements for their `encoding/json` counterparts;
+compiled per-type codecs, structural indexes, and vector kernels built on Go's
+experimental `simd/archsimd` package supply the speed. The root module has no
+third-party dependencies, generated codecs, assembly, C, `go:linkname`, or
+runtime map-layout assumptions.
+
 > [!IMPORTANT]
 > **Go tip is required.** simdjson does not currently build with a stable Go
 > release. Any current Go tip toolchain can be used; the exact Go commit shown
@@ -9,16 +16,9 @@
 > `GOEXPERIMENT=simd` to enable the Go-native SIMD kernels. The same Go tip
 > compiler builds portable fallbacks when the experiment is omitted.
 
-Strict, high-performance JSON for Go, written entirely in Go.
+[Install](#install) | [Quick start](#quick-start) | [Usage](#usage) | [Performance](#performance) | [Contracts](#compatibility-and-contracts) | [SIMD package](#simd-package) | [Reproduce](#reproduce-benchmarks)
 
-simdjson combines compiled typed codecs, dynamic parsing, structural indexes,
-JSON Pointer lookup, strict validation, transforms, and reusable SIMD kernels.
-The root module has no third-party dependencies, generated codecs, assembly,
-C, `go:linkname`, or runtime map-layout assumptions.
-
-[Quick start](#quick-start) | [Choose an API](#choose-an-api) | [Performance](#performance) | [SIMD package](#simd-package) | [Safety](#safety-and-correctness) | [Reproduce](#reproduce-benchmarks)
-
-## Quick Start
+## Install
 
 Install any current Go tip toolchain. `gotip` is the simplest option:
 
@@ -33,131 +33,351 @@ Then, from your module:
 gotip get github.com/thesyncim/simdjson@latest
 ```
 
-Use the cached convenience API for ordinary calls:
+Enable the SIMD kernels when building or testing:
+
+```sh
+GOEXPERIMENT=simd gotip build ./...
+```
+
+Without `GOEXPERIMENT=simd`, simdjson keeps the same API and behavior while
+using its portable Go implementations. To build the exact pinned compiler used
+for published benchmarks, run `./scripts/bootstrap-gotip.sh "$HOME/sdk/simdjson-gotip"`.
+
+## Quick start
 
 ```go
 import "github.com/thesyncim/simdjson"
 
 type Event struct {
-	ID      int       `json:"id"`
-	Name    string    `json:"name"`
-	Scores  []float64 `json:"scores"`
-	Enabled bool      `json:"enabled"`
+	ID   int      `json:"id"`
+	Name string   `json:"name"`
+	Tags []string `json:"tags"`
 }
 
 var event Event
-if err := simdjson.Unmarshal(payload, &event); err != nil {
+if err := simdjson.Unmarshal(data, &event); err != nil {
 	return err
 }
 
-encoded, err := simdjson.Marshal(&event)
+out, err := simdjson.Marshal(&event)
 ```
 
-Compile a plan once on hot paths. Plans are immutable and safe for concurrent
-use; destinations and output buffers remain caller-owned.
+Both functions behave like `encoding/json` — same tags, same merge semantics,
+same output bytes — and cache one compiled plan per type for the life of the
+process. Everything below is opt-in.
+
+## Usage
+
+Expand the task you care about. Every snippet compiles against the current API.
+
+<details>
+<summary><b>Decode into structs, compiled once</b></summary>
+
+Hot paths should compile the decoder once and reuse it; a `Decoder` is
+immutable and safe for concurrent use. Options select strictness, ownership,
+and merge-versus-replace semantics.
 
 ```go
 decoder, err := simdjson.CompileDecoder[Event](simdjson.DecoderOptions{
-	ZeroCopy:      true,
-	CaseSensitive: true,
+	DisallowUnknownFields: true, // reject keys the struct does not declare
+	CaseSensitive:         true, // skip the case-insensitive field fallback
 })
 if err != nil {
 	return err
 }
 
 var event Event
-if err := decoder.Decode(payload, &event); err != nil {
+if err := decoder.Decode(data, &event); err != nil {
+	var decodeErr *simdjson.DecodeError
+	if errors.As(err, &decodeErr) {
+		fmt.Println(decodeErr.Path, decodeErr.Offset) // e.g. "items[3].id" 42
+	}
 	return err
 }
+```
 
-encoder, err := simdjson.CompileEncoder[Event](simdjson.EncoderOptions{})
+`DecodeError` carries the byte offset and a typed path such as
+`items[3].scores[1]`; the path is built only when an error unwinds, so
+successful decodes pay nothing for it. `DecoderOptions.Replace` resets
+destination state the document does not mention — the right mode for
+destinations reused across decodes; the default merges like `encoding/json`.
+`Decoder.DecodeArray` decodes a top-level array while reusing caller-provided
+slice capacity, and `Decoder.DecodePrefix` decodes one value from the front of
+a larger buffer.
+
+</details>
+
+<details>
+<summary><b>Zero-copy decode</b></summary>
+
+`ZeroCopy` aliases unescaped strings directly into the source buffer instead
+of copying them.
+
+```go
+decoder, err := simdjson.CompileDecoder[Event](simdjson.DecoderOptions{
+	ZeroCopy: true,
+})
 if err != nil {
 	return err
 }
-buf, err = encoder.AppendJSON(buf[:0], &event)
+
+var event Event
+if err := decoder.Decode(src, &event); err != nil {
+	return err
+}
+// event's strings alias src: keep src alive and unmodified
+// for as long as event is in use.
 ```
 
-Enable SIMD when building or testing:
+Without `ZeroCopy`, results are independent of `src`: decoded strings alias at
+most one private copy of the input, so retaining any decoded string retains
+that copy. `Options.ZeroCopy` and `AnyOptions.ZeroCopy` offer the same choice
+for the dynamic APIs.
 
-```sh
-GOEXPERIMENT=simd gotip test ./...
-```
+</details>
 
-Without `GOEXPERIMENT=simd`, simdjson keeps the same API and behavior while
-using its portable Go implementations.
+<details>
+<summary><b>Dynamic values: <code>any</code> trees and ordered trees</b></summary>
 
-## Choose an API
-
-| Job | API | Ownership |
-|---|---|---|
-| Stdlib-style typed decode | `Unmarshal[T]` | Owned strings; cached plan |
-| Repeated typed decode | `CompileDecoder[T]` | Owned or source-backed strings |
-| Stdlib-style typed encode | `Marshal[T]` | Owned output; cached plan |
-| Reused-buffer encode | `CompileEncoder[T]`, `AppendJSON` | Caller-owned output |
-| Conventional dynamic tree | `ParseAny` | Owned by default |
-| Ordered value tree | `Parse`, `Value` | Owned by default |
-| Structural traversal | `BuildIndex`, `Index`, `Node` | Aliases source and workspace |
-| JSON Pointer | `GetRaw`, `ScanRaw`, `CompilePointer` | Aliases source |
-| Strict validation | `Valid`, `Validate` | No result allocation |
-| Transforms | `AppendCompact`, `AppendIndent`, `AppendCanonicalize` | Caller-owned output |
-| Streaming write | `NewWriter`, `EncodeTo`, token methods | One reused buffer |
-| Streaming read | `NewReader`, `Next`, `DecodeTo`, `DecodeNext` | Rolling buffer; values alias until `Next` |
-| Both directions bundled | `CompileCodec[T]` | Per-codec size hint; reused buffers |
-| Reusable byte kernels | `simd` subpackage | Caller-provided storage |
-
-### Ownership
-
-| Decode mode | Unescaped strings | Caller obligation |
-|---|---|---|
-| Default | Alias one private copy of input | None; result is independent of `src` |
-| `ZeroCopy: true` | Alias caller input | Keep `src` alive and immutable |
-| Escaped string | Decode into owned storage | None |
-
-`RawValue`, `Index`, and `Node` always alias input. `Index` and `Node` also
-alias the caller-provided `IndexEntry` workspace.
-
-`DecoderOptions.Replace` resets destination state not mentioned by the next
-document. The default merges like `encoding/json`: absent members retain their
-current values, while `null` clears pointers, maps, slices, and interfaces.
-
-`DecodeArray` decodes a top-level array while reusing caller-provided slice
-capacity. Decode and encode errors include a typed path assembled only on
-failure.
-
-`AppendJSON` requires its destination backing storage to be disjoint from
-storage reachable through the source value. On error it returns the original
-destination length, but unused capacity may contain partial output.
-
-### Streaming
-
-`Writer` streams NDJSON or concatenated values through one reused buffer,
-either from compiled encoders or through token methods that track container
-state and refuse to emit malformed JSON. `Reader` iterates top-level values
-from any `io.Reader`; each `Next` validates one complete value, values alias
-the rolling buffer only until the following `Next`, and a value split across
-reads costs one compacting copy. `DecodeNext` fuses iteration and typed
-decoding into one pass — the decoder itself finds the value boundary — and
-is the fastest way through a typed stream. Steady-state streaming in both
-directions performs no per-value allocations. `CompileCodec` bundles both
-directions with a per-codec size hint.
+`ParseAny` produces the standard Go JSON shapes without an intermediate tree;
+`Parse` produces an ordered AST of `Value` nodes when member order matters.
 
 ```go
-codec, _ := simdjson.CompileCodec[Event](simdjson.CodecOptions{})
+value, err := simdjson.ParseAny(src)
+if err != nil {
+	return err
+}
+object := value.(map[string]any)
+fmt.Println(object["scores"].([]any)[1]) // 2.5
+
+// json.Number instead of float64:
+value, err = simdjson.ParseAnyOptions(src, simdjson.AnyOptions{UseNumber: true})
+if err != nil {
+	return err
+}
+
+// Ordered tree that preserves member order:
+root, err := simdjson.Parse(src)
+if err != nil {
+	return err
+}
+user, _ := root.Get("user")
+name, _ := user.Get("name")
+text, _ := name.Text()
+fmt.Println(text) // ada
+```
+
+</details>
+
+<details>
+<summary><b>Stream NDJSON in both directions</b></summary>
+
+`Writer` streams NDJSON or concatenated values through one reused buffer.
+`Reader` iterates validated top-level values from any `io.Reader`;
+`DecodeNext` fuses iteration and typed decoding into one pass — the decoder
+itself finds the value boundary — and is the fastest way through a typed
+stream. Steady-state streaming in both directions performs no per-value
+allocations.
+
+```go
+codec, err := simdjson.CompileCodec[Event](simdjson.CodecOptions{})
+if err != nil {
+	return err
+}
 
 w := simdjson.NewWriter(out)
-for _, event := range events {
-    codec.EncodeTo(w, &event)
-    w.Newline()
+for i := range events {
+	codec.EncodeTo(w, &events[i])
+	w.Newline()
 }
-w.Close()
+if err := w.Close(); err != nil {
+	return err
+}
 
 r := simdjson.NewReader(in)
 var event Event
 for simdjson.DecodeNext(r, codec.Decoder(), &event) {
-    // use event
+	// use event
 }
-err := r.Err()
+return r.Err()
 ```
+
+`CompileCodec` bundles both directions for one type plus a per-codec output
+size hint. For hand-built documents, `Writer` exposes token methods that track
+container state and refuse to emit malformed JSON:
+
+```go
+w := simdjson.NewWriter(out)
+w.BeginObject()
+w.Key("id")
+w.Int(7)
+w.Key("ok")
+w.Bool(true)
+w.EndObject()
+return w.Close()
+```
+
+`Reader.Bytes` and zero-copy decodes of the current value alias the rolling
+buffer and stay valid only until the next `Next`; `SetMaxValueBytes` bounds
+buffer growth on untrusted input.
+
+</details>
+
+<details>
+<summary><b>Encode into a reused buffer</b></summary>
+
+`AppendJSON` appends to a caller-owned buffer, so steady-state encoding does
+not allocate. An `Encoder` is immutable and safe for concurrent use.
+
+```go
+encoder, err := simdjson.CompileEncoder[Event](simdjson.EncoderOptions{})
+if err != nil {
+	return err
+}
+
+buf := make([]byte, 0, 4096)
+for i := range events {
+	buf, err = encoder.AppendJSON(buf[:0], &events[i])
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(buf)) // use buf before the next iteration reuses it
+}
+```
+
+Output matches `encoding/json` byte for byte: compact, HTML-escaped (opt out
+with `DisableHTMLEscaping`), U+2028/U+2029 escaped, invalid UTF-8 replaced.
+`omitempty` and `string` tag options, `json.Marshaler`, `encoding.TextMarshaler`,
+and `time.Time` are supported. Unrepresentable values (NaN, infinities,
+malformed `json.Number`) return an `EncodeError` with a typed path.
+
+</details>
+
+<details>
+<summary><b>Validate without decoding</b></summary>
+
+`Valid` and `Validate` check strict JSON syntax and full UTF-8 validity
+without building any representation.
+
+```go
+fmt.Println(simdjson.Valid([]byte(`{"strict":true}`))) // true
+
+err := simdjson.Validate([]byte(`{"trailing":1,}`))
+fmt.Println(err)
+// json syntax error at byte 14, line 1, column 15: expected object key string
+```
+
+`ValidNumber`, `ValidString`, and their `Validate` forms check single JSON
+number and string literals.
+
+</details>
+
+<details>
+<summary><b>Extract one value with a JSON Pointer</b></summary>
+
+`GetRaw` resolves an RFC 6901 pointer to a raw source slice while validating
+the whole document. `ScanRaw` validates only up to and including the target
+and stops — the fast choice for plucking one field from a large document.
+
+```go
+price, ok, err := simdjson.GetRaw(src, "/items/0/price")
+if err != nil || !ok {
+	return err
+}
+v, _ := price.Float64()
+fmt.Println(v) // 9.99
+
+// ScanRaw stops as soon as the target has been validated; compile
+// the pointer once on hot paths.
+pointer := simdjson.MustCompilePointer("/items/0/sku")
+sku, ok, err := pointer.ScanRaw(src)
+if err != nil || !ok {
+	return err
+}
+text, _, _ := sku.Text()
+fmt.Println(text) // a-1
+```
+
+For repeated traversal of one document, `BuildIndex` validates the input once
+and lays out a navigable structural index in caller-provided storage, which
+`Node` and the iterators walk without allocating (`RequiredIndexEntries`
+reports the exact storage needed):
+
+```go
+var storage [16]simdjson.IndexEntry
+index, err := simdjson.BuildIndex(src, storage[:])
+if err != nil {
+	return err
+}
+
+items, ok, err := index.Pointer("/items")
+if err != nil || !ok {
+	return err
+}
+iter, _ := items.ArrayIter()
+for item, ok := iter.Next(); ok; item, ok = iter.Next() {
+	sku, _ := item.Get("sku")
+	raw, _ := sku.StringBytes() // aliases src; nothing allocates
+	fmt.Println(string(raw))
+}
+```
+
+</details>
+
+<details>
+<summary><b>Transform documents: compact, indent, canonicalize</b></summary>
+
+All three validate their input and append to caller-owned buffers;
+`Compact`, `Indent`, and `Canonicalize` are the allocating conveniences.
+
+```go
+compact, err := simdjson.AppendCompact(nil, src)
+if err != nil {
+	return err
+}
+fmt.Println(string(compact)) // {"b":1,"a":[1,2]}
+
+canonical, err := simdjson.AppendCanonicalize(nil, src)
+if err != nil {
+	return err
+}
+fmt.Println(string(canonical)) // members sorted: {"a":[1,2],"b":1}
+
+pretty, err := simdjson.AppendIndent(nil, src, "", "  ")
+if err != nil {
+	return err
+}
+fmt.Println(string(pretty)) // reindented, like json.Indent
+```
+
+</details>
+
+<details>
+<summary><b>Use the SIMD kernels directly</b></summary>
+
+`github.com/thesyncim/simdjson/simd` is independently importable and adds no
+module dependencies. The fixed-array digit API makes load and store widths
+explicit:
+
+```go
+import "github.com/thesyncim/simdjson/simd"
+
+if len(src) >= 16 {
+	digits := (*[16]byte)(src)
+	if simd.All16Digits(digits) {
+		value := simd.Parse16Digits(digits)
+		_ = value
+	}
+}
+
+info := simd.Current()
+_ = info.Enabled // true when built with GOEXPERIMENT=simd on a supported CPU
+```
+
+See the [SIMD package](#simd-package) section for the full kernel inventory
+and runtime dispatch.
+
+</details>
 
 ## Performance
 
@@ -188,43 +408,51 @@ For context beyond Go — C++ simdjson and Rust serde_json/simd-json on the
 same corpus and machine — see the
 [cross-language benchmarks](benchmarks/README.md#cross-language-context).
 
-## SIMD Package
+## Compatibility and contracts
+
+**Strictness.** Parsing, decoding, validation, and transforms enforce RFC
+8259 syntax, full UTF-8 validity, and correct `\uXXXX` escapes including
+surrogate pairing, and reject trailing data after the top-level value
+(`ScanRaw` deliberately stops validating once its target is found; `Reader`
+frames multiple top-level values by design). Where `encoding/json` silently
+replaces invalid UTF-8 during decode, simdjson rejects the document with a
+positioned error. Depth is limited (default 10000, configurable through the
+`MaxDepth` options).
+
+**encoding/json parity.** Encoded output matches `encoding/json` byte for
+byte. Decoding follows stdlib semantics: struct tags, case-insensitive field
+fallback (disable with `CaseSensitive`), merge-into-existing destinations
+(switch with `Replace`), `json.Unmarshaler`/`json.Marshaler`,
+`encoding.TextUnmarshaler`/`encoding.TextMarshaler`, and `time.Time`. Typed
+and dynamic differential tests run against `encoding/json`.
+
+**Ownership.** Default decodes return owned results that are independent of
+the source. `ZeroCopy` decodes alias the source: keep it alive and unmodified
+while results are in use. `RawValue`, `Index`, and `Node` always alias the
+source; `Index` and `Node` also alias the caller-provided `IndexEntry`
+workspace. `AppendJSON` requires destination storage disjoint from storage
+reachable through the source value; on error it returns the original
+destination length, but unused capacity may contain partial output.
+
+**Concurrency.** Compiled `Decoder`, `Encoder`, `Codec`, and
+`CompiledPointer` values are immutable and safe for concurrent use, as are
+the package-level functions backed by cached plans. A `Reader` or `Writer`
+belongs to one goroutine.
+
+## SIMD package
 
 `github.com/thesyncim/simdjson/simd` owns every architecture-specific kernel,
-runtime feature probe, and dispatch decision. It can be imported independently
-and adds no module dependencies.
+runtime feature probe, and dispatch decision. It provides fixed-width decimal
+parsing and formatting, `encoding/json`-compatible float formatting, quoted
+RFC3339Nano time formatting, JSON and HTML-safe string scans with fused
+prefix copies, strict UTF-8 / U+2028-U+2029 / contiguous `\uXXXX` kernels,
+safe public scanners plus an explicit precondition-based `simd.Unchecked`
+surface, and `Current`, which reports selected backends, vector widths, and
+CPU features.
 
-The fixed-array digit API makes load and store widths explicit:
-
-```go
-if len(src) >= 16 {
-	digits := (*[16]byte)(src)
-	if simd.All16Digits(digits) {
-		value := simd.Parse16Digits(digits)
-		_ = value
-	}
-}
-```
-
-The package includes:
-
-- fixed-width decimal parsing and formatting;
-- `encoding/json`-compatible float formatting;
-- quoted RFC3339Nano time formatting;
-- JSON and HTML-safe string scans and fused prefix copies;
-- strict UTF-8, U+2028/U+2029, and contiguous `\uXXXX` kernels;
-- safe public scanners plus an explicit precondition-based `simd.Unchecked`
-  surface; and
-- `Current`, which reports selected backends, vector widths, and CPU features.
-
-All APIs have portable fallbacks. [Kernel benchmark results](benchmarks/README.md#simd-kernel-snapshot)
-use guarded public APIs and report zero allocations.
-
-### Runtime Dispatch
-
-`GOEXPERIMENT=simd` enables the vector implementations. Runtime capabilities
-are read once, and implementation choices are fixed during package
-initialization.
+All APIs have portable fallbacks; every vector load is length-guarded.
+Runtime capabilities are read once and implementation choices are fixed
+during package initialization:
 
 | Runtime | String scanning | Decimal parse | Decimal and time format |
 |---|---|---|---|
@@ -233,45 +461,33 @@ initialization.
 | amd64 with AVX2 | 32-byte AVX2 | AVX 16-digit reduction | Scalar SWAR |
 | Other build or CPU | Scalar Go | Scalar Go | Scalar SWAR |
 
-Other vector paths include strict UTF-8 validation, contiguous `\uXXXX`
-validation, U+2028/U+2029 detection, string encoding scans, common
-shortest-float placement, and typed decimal formatting. Every vector load is
-length-guarded.
+[Kernel benchmark results](benchmarks/README.md#simd-kernel-snapshot) use
+guarded public APIs and report zero allocations.
 
-## Safety and Correctness
+## Correctness and safety
 
-Unsafe code is restricted to measured internal paths:
+Unsafe code is restricted to measured internal paths: complete guarded blocks
+around vector loads and stores, clamped public scanners with a documented
+`simd.Unchecked` precondition surface, size-proven float and integer stores,
+and typed offsets taken from public `reflect` metadata — never runtime layout
+assumptions. Source-backed APIs require immutable input, and pointer-receiver
+custom methods use GC-safe heap-backed shadows.
 
-- vector loads and stores require a complete guarded block;
-- public scanners clamp offsets, while `simd.Unchecked` documents its bounds
-  precondition;
-- fused-copy kernels reject short or overlapping destinations;
-- packed field-name stores use compiler-owned blocks and cannot extend past a
-  successful result;
-- float and integer stores prove output size and table bounds first;
-- typed offsets and strides come from public `reflect` metadata;
-- maps use public reflection APIs and never assume runtime layout;
-- source-backed APIs require immutable input; and
-- pointer-receiver custom methods use GC-safe heap-backed shadows.
-
-The test suite covers:
-
-- all 318 Nicolas Seriot JSONTestSuite parsing cases;
-- all seven pinned Go tip high-level payloads and exact concrete models;
-- typed and dynamic differentials against `encoding/json`;
-- fields, tags, merge behavior, duplicate names, number boundaries, UTF-8,
-  escapes, custom methods, map keys, depth, and error paths;
-- 500,000 randomized float spellings and 700,000 randomized or boundary
-  timestamps;
-- randomized scalar/SIMD differentials across lengths and alignments; and
-- validation, transform, typed decode, encode, number, and SIMD fuzzers.
+The test suite covers all 318 JSONTestSuite parsing cases, the seven pinned
+Go tip payloads with exact concrete models, typed and dynamic differentials
+against `encoding/json`, 500,000 randomized float spellings, 700,000
+randomized or boundary timestamps, randomized scalar/SIMD differentials
+across lengths and alignments, and fuzzers for validation, transforms, typed
+decode, encode, numbers, and the SIMD kernels.
 
 Correctness fixes that touch a hot path require before-and-after benchmarks.
 A regression is optimized back before merge; correctness is never traded away
 to recover it.
 
-The local release gate uses the pinned compiler only so results are exactly
-reproducible:
+<details>
+<summary><b>Local release gate</b></summary>
+
+The gate uses the pinned compiler only so results are exactly reproducible:
 
 ```sh
 ./scripts/bootstrap-gotip.sh "$HOME/sdk/simdjson-gotip"
@@ -288,9 +504,12 @@ GOEXPERIMENT=simd "$TIP_GO" test -gcflags='all=-d=checkptr=2' \
 ```
 
 Vet's `unsafeptr` analyzer is disabled only for the documented runtime-style
-pointer-hiding helper in `noescape.go`; all other vet analyzers remain enabled.
+pointer-hiding helper in `noescape.go`; all other vet analyzers remain
+enabled.
 
-## Reproduce Benchmarks
+</details>
+
+## Reproduce benchmarks
 
 Comparison libraries live in nested modules and never enter the root module.
 The complete suite builds the pinned Go tip compiler, verifies the copied
@@ -302,3 +521,7 @@ TIP_GO="$HOME/sdk/simdjson-gotip/bin/go" ./benchmarks/run-comparison.sh
 ```
 
 [Benchmark methodology and individual commands](benchmarks/README.md)
+
+## Status
+
+simdjson is pre-release. The API may change until the first tagged release.
