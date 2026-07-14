@@ -105,10 +105,16 @@ func (cursor *decoderCursor) decodeCompiledStruct(node *typedNode, dst unsafe.Po
 		}
 	}
 	var seen uint64
-	if cursor.flags&decoderReplace != 0 && node.allSet == 0 && len(node.fields) > 0 {
+	if cursor.flags&decoderReplace != 0 && (node.inlineMap != nil || (node.allSet == 0 && len(node.fields) > 0)) {
+		// The catch-all breaks the allSet shortcut: even when every declared
+		// field is overwritten, stale unknown members must be cleared, so an
+		// inline map forces the reset.
 		resetTyped(node, dst)
 	}
 	position, first := 0, true
+	// inlineDec stays nil until the first unknown member of a struct that
+	// declares a catch-all, so structs without one add only this word.
+	var inlineDec *inlineDecoder
 	for {
 		var field *typedField
 		var key string
@@ -140,6 +146,17 @@ func (cursor *decoderCursor) decodeCompiledStruct(node *typedNode, dst unsafe.Po
 		} else {
 			field = node.findFieldSlow(key, !cursor.CaseSensitive())
 			if field == nil {
+				if node.inlineMap != nil {
+					// The catch-all consumes the member, so it is never
+					// "unknown" and DisallowUnknownFields does not apply.
+					if inlineDec == nil {
+						inlineDec = newInlineDecoder(node.inlineMap)
+					}
+					if err := inlineDec.decodeEntry(cursor, node.inlineMap, dst, key); err != nil {
+						return prependDecodePathField(err, key)
+					}
+					continue
+				}
 				if err := cursor.Unknown(node.name, key); err != nil {
 					return err
 				}
@@ -730,6 +747,69 @@ func (cursor *decoderCursor) decodeCompiledPointer(node *typedNode, dst unsafe.P
 	default:
 		return cursor.decodeCompiled(node.elem, pointer)
 	}
+}
+
+// inlineDecoder decodes a run of unknown members into one struct's ",inline"
+// catch-all map. It mirrors decodeCompiledMap: a single element and a single
+// key value are allocated once and reused for every member, so a document with
+// N unknown members costs one element allocation rather than N.
+//
+// The reused values are heap backed (reflect.New), never pointers into the
+// destination struct, so this decoder is safe to keep on the heap while the
+// destination lives on a stack that may move. The map header is re-derived from
+// structPtr on each call as a stack local for the same reason.
+type inlineDecoder struct {
+	keyValue     reflect.Value
+	elementValue reflect.Value
+	elementPtr   unsafe.Pointer
+}
+
+// newInlineDecoder builds the reusable state for a catch-all map. It is called
+// at most once per struct decode, on the first unknown member.
+func newInlineDecoder(inline *typedInlineMap) *inlineDecoder {
+	element := reflect.New(inline.elem.typ)
+	return &inlineDecoder{
+		keyValue:     reflect.New(inline.mapType.Key()).Elem(),
+		elementValue: element.Elem(),
+		elementPtr:   element.UnsafePointer(),
+	}
+}
+
+// decodeEntry decodes one member into the catch-all, allocating the map on
+// first use. The member name becomes the key, cloned in owned mode so the
+// retained key does not alias the source; the value follows the cursor's
+// ownership rules like any other decode. SetMapIndex copies both key and value
+// into the map, so reusing the source values across members is safe.
+func (d *inlineDecoder) decodeEntry(cursor *decoderCursor, inline *typedInlineMap, structPtr unsafe.Pointer, key string) error {
+	mapValue := reflect.NewAt(inline.mapType, noescape(unsafe.Add(structPtr, inline.offset))).Elem()
+	if mapValue.IsNil() {
+		mapValue.Set(reflect.MakeMap(inline.mapType))
+	}
+	d.elementValue.SetZero()
+	var err error
+	switch inline.elem.kind {
+	case typedStruct:
+		err = cursor.decodeCompiledStruct(inline.elem, d.elementPtr)
+	case typedSlice:
+		err = cursor.decodeCompiledSlice(inline.elem, d.elementPtr)
+	case typedArray:
+		err = cursor.decodeCompiledArray(inline.elem, d.elementPtr)
+	case typedPointer:
+		err = cursor.decodeCompiledPointer(inline.elem, d.elementPtr)
+	case typedMap:
+		err = cursor.decodeCompiledMap(inline.elem, d.elementPtr)
+	default:
+		err = cursor.decodeCompiled(inline.elem, d.elementPtr)
+	}
+	if err != nil {
+		return err
+	}
+	if cursor.flags&decoderZeroCopy == 0 {
+		key = strings.Clone(key)
+	}
+	d.keyValue.SetString(key)
+	mapValue.SetMapIndex(d.keyValue, d.elementValue)
+	return nil
 }
 
 // decodeCompiledMap decodes a JSON object into a map with string keys. Like

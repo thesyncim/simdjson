@@ -254,6 +254,32 @@ malformed `json.Number`) return an `EncodeError` with a typed path.
 </details>
 
 <details>
+<summary><b>Capture unknown members with an <code>,inline</code> catch-all</b></summary>
+
+An opt-in extension routes object members that match no declared field into a
+`map[string]T` tagged `json:",inline"`, and re-emits them at the object's own
+level. The tag is inert unless you enable it, so types that do not use it
+compile to the identical plan and pay nothing.
+
+```go
+type Event struct {
+	ID    int                        `json:"id"`
+	Extra map[string]json.RawMessage `json:",inline"` // unknown members land here
+}
+
+decoder, _ := simdjson.CompileDecoder[Event](simdjson.DecoderOptions{InlineFields: true})
+encoder, _ := simdjson.CompileEncoder[Event](simdjson.EncoderOptions{InlineFields: true})
+```
+
+The catch-all consumes members that `DisallowUnknownFields` would otherwise
+reject. On encode the map's members follow the declared fields, sorted by name
+for deterministic output (`EncoderOptions.UnsortedInlineFields` emits them in
+map order instead). With `DecoderOptions.Replace`, a reused destination's map is
+cleared before decoding, like any other field; the default merges.
+
+</details>
+
+<details>
 <summary><b>Validate without decoding</b></summary>
 
 `Valid` and `Validate` check strict JSON syntax and full UTF-8 validity

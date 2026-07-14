@@ -38,6 +38,14 @@ type DecoderOptions struct {
 	// null as a no-op for scalars, strings, structs, and arrays. Replace is
 	// the right mode for destinations reused across decodes.
 	Replace bool
+
+	// InlineFields activates the ",inline" struct-tag extension: a
+	// map[string]T field tagged `json:",inline"` becomes the catch-all for
+	// object members that match no declared field, decoded into the map. The
+	// option is opt-in so the tag is inert by default; a struct that does not
+	// use it compiles to the identical plan and pays nothing. See [Encoder]
+	// for the matching re-emission at encode time.
+	InlineFields bool
 }
 
 // Decoder is an immutable decoder for one concrete Go type. Compile it
@@ -54,7 +62,10 @@ type Decoder[T any] struct {
 // growing dynamic slices, and inserting map entries.
 func CompileDecoder[T any](opts DecoderOptions) (Decoder[T], error) {
 	typ := reflect.TypeFor[T]()
-	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode)}
+	compiler := typedCompiler{
+		nodes:        make(map[reflect.Type]*typedNode),
+		inlineFields: opts.InlineFields,
+	}
 	root, err := compiler.compile(typ, typ.String())
 	if err != nil {
 		return Decoder[T]{}, err
@@ -337,9 +348,27 @@ type typedNode struct {
 	// pointer, slice, or map. Only these pay the non-addressable flag when
 	// encoded as a map value or interface content.
 	encHasPtrMarshaler bool
-	allSet             uint64
-	encScratch         int32
-	encMapElem         int32
+	// inlineMap is the ",inline" catch-all for a struct: unknown members
+	// decode into it and its entries re-emit at the struct's own level. It
+	// is nil for every struct without one, so structs pay nothing for the
+	// feature they do not use.
+	inlineMap  *typedInlineMap
+	allSet     uint64
+	encScratch int32
+	encMapElem int32
+}
+
+// typedInlineMap describes a struct's ",inline" map[string]T catch-all: where
+// the map lives in the struct and how one entry value is decoded and encoded.
+type typedInlineMap struct {
+	offset  uintptr
+	mapType reflect.Type
+	elem    *typedNode
+	sorted  bool // emit entries in sorted key order
+	// encElem indexes a reserved encoder-scratch box of the value type, so
+	// encoding reuses one addressable element per struct type instead of
+	// allocating per call. It is -1 when no scratch is reserved.
+	encElem int32
 }
 
 // typedField is one struct member of a compiled decode plan. The key fields
@@ -373,6 +402,50 @@ type typedCompiler struct {
 	// Their nodes run against whatever static plan is executing, so they
 	// must never carry indexes into that plan's scratch slots.
 	dynamic bool
+	// inlineUnsorted emits ",inline" members in map iteration order instead
+	// of sorted; the zero value keeps the deterministic sorted default.
+	inlineUnsorted bool
+	// inlineFields activates the ",inline" catch-all extension. When false the
+	// tag is inert and a ",inline" map compiles as an ordinary named field, so
+	// the feature is opt-in and free for every type that does not request it.
+	inlineFields bool
+}
+
+// compileInlineMap records a struct's ",inline" catch-all. The field must be a
+// map with a string key and no pointer indirection to reach it, matching
+// encoding/json/v2; its presence moves the struct off the packed encode path
+// so the trailing member splice has somewhere to run.
+func (c *typedCompiler) compileInlineMap(node *typedNode, structType reflect.Type, resolved resolvedField, path string) error {
+	mapType := resolved.typ
+	if mapType.Kind() != reflect.Map || mapType.Key().Kind() != reflect.String {
+		return &UnsupportedTypeError{Type: mapType, Path: path, Reason: `",inline" requires a map with a string key`}
+	}
+	if node.inlineMap != nil {
+		return &UnsupportedTypeError{Type: structType, Path: path, Reason: `a struct may declare only one ",inline" field`}
+	}
+	offset, hops, err := c.fieldHops(structType, resolved.index, path+"."+resolved.name)
+	if err != nil {
+		return err
+	}
+	if hops != nil {
+		return &UnsupportedTypeError{Type: mapType, Path: path, Reason: `",inline" field must not sit behind an embedded pointer`}
+	}
+	elem, err := c.compile(mapType.Elem(), path+"[inline]")
+	if err != nil {
+		return err
+	}
+	inline := &typedInlineMap{offset: offset, mapType: mapType, elem: elem, sorted: !c.inlineUnsorted, encElem: -1}
+	// Reuse the same pooled scratch as encodeMap: one addressable element box
+	// and one map iterator per struct type, so a populated catch-all encodes
+	// without per-call allocation.
+	c.encHasMap = true
+	if !c.dynamic {
+		inline.encElem = int32(len(c.encScratchTypes))
+		c.encScratchTypes = append(c.encScratchTypes, mapType.Elem())
+	}
+	node.inlineMap = inline
+	node.encSimple = false
+	return nil
 }
 
 var jsonNumberReflectType = reflect.TypeFor[json.Number]()
@@ -538,6 +611,12 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 		node.op = typedOpStruct
 		node.encSimple = true
 		for _, resolved := range resolveStructFields(typ) {
+			if resolved.inline && c.inlineFields {
+				if err := c.compileInlineMap(node, typ, resolved, path); err != nil {
+					return err
+				}
+				continue
+			}
 			fieldNode, err := c.compile(resolved.typ, path+"."+resolved.name)
 			if err != nil {
 				return err

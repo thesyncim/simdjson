@@ -43,6 +43,12 @@ func resetTyped(node *typedNode, dst unsafe.Pointer) {
 		for _, hopOffset := range node.hopResets {
 			*(*unsafe.Pointer)(unsafe.Add(dst, hopOffset)) = nil
 		}
+		if node.inlineMap != nil {
+			// The catch-all is not a declared field, so the loop above never
+			// reaches it; clear the map header so a reused destination starts
+			// empty instead of merging stale unknown members.
+			*(*unsafe.Pointer)(unsafe.Add(dst, node.inlineMap.offset)) = nil
+		}
 	case typedSlice, typedBytes:
 		(*typedSliceHeader)(dst).len = 0
 	case typedArray:
@@ -91,6 +97,9 @@ func prepareTypedResets(node *typedNode, seen map[*typedNode]bool) {
 	for i := range node.fields {
 		prepareTypedResets(node.fields[i].node, seen)
 	}
+	if node.inlineMap != nil {
+		prepareTypedResets(node.inlineMap.elem, seen)
+	}
 }
 
 func appendTypedReset(ops []typedResetOp, node *typedNode, offset uintptr) []typedResetOp {
@@ -115,6 +124,9 @@ func appendTypedReset(ops []typedResetOp, node *typedNode, offset uintptr) []typ
 		}
 		for _, hopOffset := range node.hopResets {
 			ops = append(ops, typedResetOp{offset: offset + hopOffset, kind: typedResetPointer})
+		}
+		if node.inlineMap != nil {
+			ops = append(ops, typedResetOp{offset: offset + node.inlineMap.offset, kind: typedResetPointer})
 		}
 		return ops
 	case typedArray:

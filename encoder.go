@@ -23,6 +23,19 @@ type EncoderOptions struct {
 	// json.Encoder.SetEscapeHTML(false). The zero value matches
 	// encoding/json.Marshal, which escapes them.
 	DisableHTMLEscaping bool
+
+	// InlineFields activates the ",inline" struct-tag extension: a
+	// map[string]T field tagged `json:",inline"` re-emits its members at the
+	// enclosing object's own level, after the declared fields. It mirrors
+	// DecoderOptions.InlineFields and is opt-in so the tag stays inert, and
+	// free, for every type that does not request it.
+	InlineFields bool
+
+	// UnsortedInlineFields emits a ",inline" catch-all map's members in map
+	// iteration order rather than sorted by name. The zero value sorts, for
+	// deterministic output; unsorted trades that for skipping the sort. It has
+	// no effect unless InlineFields is set.
+	UnsortedInlineFields bool
 }
 
 // Encoder is an immutable encoder for one concrete Go type. Compile it once
@@ -40,7 +53,12 @@ type Encoder[T any] struct {
 func CompileEncoder[T any](opts EncoderOptions) (Encoder[T], error) {
 	typ := reflect.TypeFor[T]()
 	escapeHTML := !opts.DisableHTMLEscaping
-	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode), escapeHTML: escapeHTML}
+	compiler := typedCompiler{
+		nodes:          make(map[reflect.Type]*typedNode),
+		escapeHTML:     escapeHTML,
+		inlineFields:   opts.InlineFields,
+		inlineUnsorted: opts.UnsortedInlineFields,
+	}
 	root, err := compiler.compile(typ, typ.String())
 	if err != nil {
 		return Encoder[T]{}, err
@@ -390,8 +408,94 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 			return prependEncodePathField(err, node.fields[i].name)
 		}
 	}
+	if node.inlineMap != nil {
+		if err := e.encodeInlineMembers(node.inlineMap, src, &first); err != nil {
+			e.depth--
+			return err
+		}
+	}
 	e.dst = append(e.dst, '}')
 	e.depth--
+	return nil
+}
+
+// encodeInlineMembers splices a ",inline" catch-all map's entries into the
+// enclosing object after its declared fields, sharing the comma bookkeeping
+// through first. An empty or nil map emits nothing, so a struct that declares
+// a catch-all pays only a length check when it holds no unknown members.
+//
+// A populated catch-all reuses encodeMap's pooled scratch: one entry slice,
+// one iterator, and one addressable element box, so repeated encodes allocate
+// nothing after warmup. String map keys alias the map's own storage, which
+// outlives the call, so names need no arena or cloning.
+func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsafe.Pointer, first *bool) error {
+	mapValue := reflect.NewAt(inline.mapType, noescape(unsafe.Add(structPtr, inline.offset))).Elem()
+	if mapValue.IsNil() || mapValue.Len() == 0 {
+		return nil
+	}
+	elem := inline.elem
+	mapLen := mapValue.Len()
+
+	var entries []mapEncodeEntry
+	var keyArena []byte
+	var iterator *reflect.MapIter
+	scratch := e.scratch
+	if scratch != nil {
+		entries = scratch.mapEntries[:0]
+		keyArena = scratch.mapKeyArena[:0]
+		iterator = scratch.mapIter
+		scratch.mapEntries = nil
+		scratch.mapKeyArena = nil
+		scratch.mapIter = nil
+	}
+	if cap(entries) < mapLen {
+		entries = make([]mapEncodeEntry, 0, mapLen)
+	}
+	if iterator == nil {
+		iterator = mapValue.MapRange()
+	} else {
+		iterator.Reset(mapValue)
+	}
+	for iterator.Next() {
+		entries = append(entries, mapEncodeEntry{name: iterator.Key().String(), value: iterator.Value()})
+	}
+	if inline.sorted {
+		slices.SortFunc(entries, func(a, b mapEncodeEntry) int { return strings.Compare(a.name, b.name) })
+	}
+
+	var elementValue reflect.Value
+	if scratch != nil && inline.encElem >= 0 {
+		elementValue = scratch.marshalers[inline.encElem].value
+	} else {
+		elementValue = reflect.New(elem.typ).Elem()
+	}
+	elementPtr := elementValue.Addr().UnsafePointer()
+	elemHasMarshaler := elem.encHasPtrMarshaler
+
+	for i := range entries {
+		if *first {
+			*first = false
+		} else {
+			e.dst = append(e.dst, ',')
+		}
+		e.dst = appendEncodedJSONString(e.dst, entries[i].name, e.escapeHTML)
+		e.dst = append(e.dst, ':')
+		elementValue.Set(entries[i].value)
+		var err error
+		if elemHasMarshaler {
+			err = e.encodeNonAddressableMarshaler(elem, elementPtr)
+		} else {
+			err = e.encodeKind(elem, elementPtr, elem.encNonAddrKind)
+		}
+		if err != nil {
+			// String keys alias the live source map, not keyArena, so the
+			// name stays valid after the scratch is released.
+			name := entries[i].name
+			e.releaseMapScratch(entries, keyArena, iterator)
+			return prependEncodePathField(err, name)
+		}
+	}
+	e.releaseMapScratch(entries, keyArena, iterator)
 	return nil
 }
 
