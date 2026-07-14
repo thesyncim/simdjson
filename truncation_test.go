@@ -1,0 +1,203 @@
+package simdjson
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// checkAPIAgreement asserts one input receives a consistent verdict from
+// every entry point: the full validation/index/parse/transform consistency
+// battery, the float64-boxing dynamic parser against encoding/json's
+// range-rejection policy, and the typed decoder battery, which must reject
+// anything invalid and never panic.
+func checkAPIAgreement(t *testing.T, src []byte) {
+	t.Helper()
+	want := strictJSONValid(src)
+	checkValidationConsistency(t, src, want)
+
+	_, anyErr := ParseAny(src)
+	if !want {
+		if anyErr == nil {
+			t.Fatalf("ParseAny accepted invalid input (length %d)", len(src))
+		}
+	} else {
+		var std any
+		stdErr := json.Unmarshal(src, &std)
+		if (anyErr == nil) != (stdErr == nil) {
+			t.Fatalf("ParseAny error = %v, encoding/json error = %v (length %d)", anyErr, stdErr, len(src))
+		}
+	}
+
+	var typed benchDocument
+	if err := Unmarshal(src, &typed); !want && err == nil {
+		t.Fatalf("Unmarshal into struct accepted invalid input (length %d)", len(src))
+	}
+	var tree map[string]any
+	if err := Unmarshal(src, &tree); !want && err == nil {
+		t.Fatalf("Unmarshal into map accepted invalid input (length %d)", len(src))
+	}
+	var list []any
+	if err := Unmarshal(src, &list); !want && err == nil {
+		t.Fatalf("Unmarshal into slice accepted invalid input (length %d)", len(src))
+	}
+}
+
+// truncationTortureDocs are generated documents whose prefixes cut through
+// the scanners' hardest states: container depth at the limit, every escape
+// form, multi-byte characters, and boundary numbers.
+func truncationTortureDocs() []struct {
+	name string
+	doc  []byte
+} {
+	return []struct {
+		name string
+		doc  []byte
+	}{
+		{
+			"depth limit",
+			[]byte(strings.Repeat("[", defaultMaxDepth) + "0" + strings.Repeat("]", defaultMaxDepth)),
+		},
+		{
+			"escapes and multibyte",
+			[]byte(`{"escapes":"A𝄞\n\t\\\" and \/ \b\f\r","text":"é日本語𝄞 plain","empty":""}`),
+		},
+		{
+			"boundary numbers",
+			[]byte(`[0,-0,0.0,1e308,5e-324,2.2250738585072011e-308,9007199254740993,` +
+				`1.5e+9999,123e-10000000,-123.4567890123456789e-12,1234567890123456.7890123456789012]`),
+		},
+		{
+			"literals and structure",
+			[]byte(`[true,false,null,{"a":[]},{"b":{}},[[[["deep"]]]],"tail"]`),
+		},
+	}
+}
+
+// TestTruncationSweep validates every prefix of every small JSONTestSuite
+// document and of the torture documents, and a sampled set of prefixes of
+// large documents, through the whole API surface.
+func TestTruncationSweep(t *testing.T) {
+	entries, err := os.ReadDir(jsonTestSuiteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Size() > 2<<10 {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(jsonTestSuiteDir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range data {
+			checkAPIAgreement(t, data[:i])
+		}
+	}
+
+	for _, torture := range truncationTortureDocs() {
+		t.Run(torture.name, func(t *testing.T) {
+			sweepPrefixes(t, torture.doc)
+		})
+	}
+
+	t.Run("large indented", func(t *testing.T) {
+		indented, err := Indent(benchRecordsJSON(512), "", "    ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sweepPrefixes(t, indented)
+	})
+}
+
+// sweepPrefixes checks every prefix of small documents; for large ones it
+// checks the head and tail densely and strides through the middle.
+func sweepPrefixes(t *testing.T, doc []byte) {
+	t.Helper()
+	if len(doc) <= 2<<10 {
+		for i := 0; i <= len(doc); i++ {
+			checkAPIAgreement(t, doc[:i])
+		}
+		return
+	}
+	stride := 197
+	if len(doc) > 32<<10 {
+		stride = 613
+	}
+	if testing.Short() {
+		stride *= 4
+	}
+	for i := 0; i <= 256; i++ {
+		checkAPIAgreement(t, doc[:i])
+	}
+	for i := 256; i < len(doc)-256; i += stride {
+		checkAPIAgreement(t, doc[:i])
+	}
+	for i := len(doc) - 256; i <= len(doc); i++ {
+		checkAPIAgreement(t, doc[:i])
+	}
+}
+
+// hostileMutationAlphabet holds the bytes most likely to flip a scanner into
+// a wrong state: structural characters, escape and literal starters, number
+// syntax, controls, and UTF-8 lead and continuation bytes.
+var hostileMutationAlphabet = []byte{
+	'"', '\\', '{', '}', '[', ']', ':', ',',
+	'0', '9', 'x', 'e', 'E', 't', 'f', 'n', '.', '+', '-',
+	' ', '\t', '\n', '\r',
+	0x00, 0x1F, 0x7F, 0x80, 0xC2, 0xE2, 0xED, 0xF4, 0xFF,
+}
+
+// TestMutationSweep applies every hostile byte at every position of a
+// benchmark-shaped document, plus every single-byte deletion, and checks the
+// full API agreement on each mutant.
+func TestMutationSweep(t *testing.T) {
+	doc := benchRecordsJSON(8)
+	if testing.Short() {
+		doc = benchRecordsJSON(2)
+	}
+	mutant := make([]byte, len(doc))
+	for i := range doc {
+		for _, b := range hostileMutationAlphabet {
+			if doc[i] == b {
+				continue
+			}
+			copy(mutant, doc)
+			mutant[i] = b
+			checkAPIAgreement(t, mutant)
+		}
+	}
+
+	deleted := make([]byte, 0, len(doc))
+	for i := range doc {
+		deleted = append(append(deleted[:0], doc[:i]...), doc[i+1:]...)
+		checkAPIAgreement(t, deleted)
+	}
+}
+
+// FuzzAPIConsistency drives arbitrary bytes through every entry point,
+// asserting the strict oracle verdict everywhere and panic-freedom in the
+// typed decoders.
+func FuzzAPIConsistency(f *testing.F) {
+	addJSONTestSuiteSeeds(f)
+	for _, torture := range truncationTortureDocs() {
+		f.Add(torture.doc)
+		f.Add(torture.doc[:len(torture.doc)/2])
+	}
+	f.Add(benchRecordsJSON(2))
+	f.Fuzz(func(t *testing.T, src []byte) {
+		if len(src) > 1<<16 {
+			t.Skip()
+		}
+		checkAPIAgreement(t, src)
+	})
+}

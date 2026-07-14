@@ -276,7 +276,10 @@ func (p *parser) parseAnyNumberArray(depth int, useNumber bool) (any, error) {
 			negative = true
 			digitStart++
 		}
-		if !useNumber && digitStart <= len(p.src)-16 && all16Digits(unsafe.Add(base, digitStart)) {
+		// A sixteen-digit run starting with '0' always has a leading zero and
+		// must fall through to the checked scanner for rejection.
+		if !useNumber && digitStart <= len(p.src)-16 && fastByteAt(base, digitStart) != '0' &&
+			all16Digits(unsafe.Add(base, digitStart)) {
 			end := digitStart + 16
 			if end == len(p.src) || isAnyArrayNumberEnd(fastByteAt(base, end)) {
 				integer := parse16Digits(unsafe.Add(base, digitStart))
