@@ -56,13 +56,13 @@ unescaped strings into immutable input and has a different lifetime contract.
 
 | Corpus | `encoding/json` | simdjson owned | Source-backed | Rival | Rival time |
 |---|---:|---:|---:|---|---:|
-| Canada geometry | 1.307 ms | **266.9 us** | 230.1 us | Segment | 791.0 us |
-| CITM catalog | 2.627 ms | **1.137 ms** | 951.2 us | go-json | 1.354 ms |
-| Go source | 6.448 ms | **1.377 ms** | 1.026 ms | Segment | 2.315 ms |
-| Escaped strings | 207.3 us | **40.9 us** | 32.0 us | go-json | 68.6 us |
-| Unicode strings | 44.2 us | **10.6 us** | 7.3 us | go-json | 14.4 us |
-| Synthea FHIR | 3.842 ms | **1.996 ms** | 1.690 ms | go-json | 2.202 ms |
-| Twitter status | 1.427 ms | **524.2 us** | 435.3 us | go-json | 726.6 us |
+| Canada geometry | 1.203 ms | **160.3 us** | 148.8 us | go-json | 710.5 us |
+| CITM catalog | 2.499 ms | **747.5 us** | 643.1 us | go-json | 1.015 ms |
+| Go source | 6.043 ms | **1.040 ms** | 987.6 us | go-json | 2.132 ms |
+| Escaped strings | 186.3 us | **26.7 us** | 24.5 us | go-json | 61.8 us |
+| Unicode strings | 39.2 us | **5.4 us** | 4.6 us | go-json | 10.8 us |
+| Synthea FHIR | 3.781 ms | **1.410 ms** | 1.285 ms | go-json | 1.654 ms |
+| Twitter status | 1.319 ms | **365.8 us** | 331.5 us | go-json | 588.9 us |
 
 Source-backed refers only to unescaped string ownership. Slices, maps,
 pointers, escaped text, and custom method receivers may still allocate.
@@ -83,13 +83,13 @@ These rows fully materialize an owned `any` tree.
 
 | Corpus | simdjson | Rival | Rival time | Lead |
 |---|---:|---|---:|---:|
-| Canada geometry | **946.5 us** | go-json | 1.908 ms | **2.02x** |
-| CITM catalog | **2.919 ms** | jsoniter | 4.588 ms | **1.57x** |
-| Go source | **5.005 ms** | go-json | 9.948 ms | **1.99x** |
-| Escaped strings | **35.2 us** | go-json | 77.9 us | **2.21x** |
-| Unicode strings | **16.2 us** | go-json | 22.2 us | **1.38x** |
-| Synthea FHIR | **4.650 ms** | jsoniter | 7.002 ms | **1.51x** |
-| Twitter status | **1.437 ms** | go-json | 2.126 ms | **1.48x** |
+| Canada geometry | **681.4 us** | go-json | 1.418 ms | **2.08x** |
+| CITM catalog | **1.660 ms** | jsoniter | 3.184 ms | **1.92x** |
+| Go source | **3.154 ms** | jsoniter | 7.243 ms | **2.30x** |
+| Escaped strings | **25.9 us** | go-json | 64.1 us | **2.47x** |
+| Unicode strings | **8.5 us** | go-json | 15.9 us | **1.87x** |
+| Synthea FHIR | **2.465 ms** | go-json | 4.256 ms | **1.73x** |
+| Twitter status | **849.2 us** | go-json | 1.366 ms | **1.61x** |
 
 ### Strict validation
 
@@ -113,13 +113,13 @@ caller-owned buffer and removes the output allocation.
 
 | Corpus | stdlib | simdjson owned | Compiled reuse | Rival | Rival time |
 |---|---:|---:|---:|---|---:|
-| Canada geometry | 689.7 us | 393.7 us | **312.8 us** | Segment | 524.9 us |
-| CITM catalog | 1.084 ms | 396.1 us | **232.3 us** | Segment | 403.1 us |
-| Go source | 3.340 ms | 1.371 ms | **694.9 us** | Segment | 1.440 ms |
-| Escaped strings | 21.7 us | 7.1 us | **3.7 us** | jsoniter | 23.5 us |
-| Unicode strings | 21.5 us | 7.0 us | **3.8 us** | Segment | 23.3 us |
-| Synthea FHIR | 6.210 ms | 2.198 ms | **1.069 ms** | Segment | 2.149 ms |
-| Twitter status | 743.5 us | 338.9 us | **179.8 us** | go-json | 361.0 us |
+| Canada geometry | 580.4 us | 310.8 us | **301.6 us** | Segment | 465.6 us |
+| CITM catalog | 773.1 us | 221.6 us | **205.4 us** | Segment | 309.2 us |
+| Go source | 2.626 ms | 735.1 us | **674.3 us** | Segment | 1.148 ms |
+| Escaped strings | 17.3 us | 4.2 us | **3.6 us** | jsoniter | 20.1 us |
+| Unicode strings | 17.0 us | 4.1 us | **3.6 us** | jsoniter | 19.7 us |
+| Synthea FHIR | 5.064 ms | 1.111 ms | **1.015 ms** | Segment | 1.710 ms |
+| Twitter status | 561.7 us | 197.6 us | **172.3 us** | go-json | 272.2 us |
 
 ### SIMD versus pure Go
 
@@ -129,12 +129,12 @@ selected once during initialization; short runs may remain scalar or SWAR.
 | simdjson path | SIMD wins | Geomean SIMD uplift |
 |---|---:|---:|
 | Validation | 7/7 | **1.436x** |
-| Dynamic owned | 6/7 | **1.066x** |
-| Dynamic source-backed | 7/7 | **1.083x** |
-| Typed owned | 5/7 | **1.092x** |
-| Typed source-backed | 5/7 | **1.120x** |
-| Encode owned | 7/7 | **1.510x** |
-| Encode compiled reuse | 7/7 | **1.780x** |
+| Dynamic owned | 4/7 | **1.092x** |
+| Dynamic source-backed | 4/7 | **1.123x** |
+| Typed owned | 5/7 | **1.150x** |
+| Typed source-backed | 6/7 | **1.176x** |
+| Encode owned | 7/7 | **1.720x** |
+| Encode compiled reuse | 7/7 | **1.791x** |
 
 ### Native Sonic context
 
@@ -145,25 +145,25 @@ invalid UTF-8.
 
 | Corpus | Typed owned | Dynamic owned | Encode owned | Syntax-only `Valid` |
 |---|---:|---:|---:|---:|
-| Canada geometry | 438.9 us | 809.6 us | 794.8 us | 188.8 us |
-| CITM catalog | 1.685 ms | 3.254 ms | 975.8 us | 784.7 us |
-| Go source | 4.318 ms | 6.918 ms | 4.627 ms | 1.551 ms |
-| Escaped strings | 33.2 us | 33.9 us | 20.9 us | 3.4 us |
-| Unicode strings | 12.2 us | 14.3 us | 20.9 us | 1.7 us |
-| Synthea FHIR | 3.456 ms | 5.635 ms | 8.988 ms | 867.0 us |
-| Twitter status | 768.7 us | 1.230 ms | 611.9 us | 235.8 us |
+| Canada geometry | 421.6 us | 709.3 us | 742.1 us | 185.9 us |
+| CITM catalog | 1.362 ms | 2.454 ms | 814.3 us | 764.9 us |
+| Go source | 3.100 ms | 5.253 ms | 3.538 ms | 1.502 ms |
+| Escaped strings | 29.3 us | 31.1 us | 18.4 us | 3.2 us |
+| Unicode strings | 10.6 us | 11.9 us | 18.6 us | 1.7 us |
+| Synthea FHIR | 2.379 ms | 4.134 ms | 6.702 ms | 834.0 us |
+| Twitter status | 672.6 us | 944.5 us | 542.7 us | 227.9 us |
 
 ## Cross-language context
 
 [crosslang/](crosslang/) benchmarks C++ simdjson and Rust
 serde_json/simd-json over the same seven payloads on the same machine, with
 contract notes for each row. Headlines from the 2026-07-14 snapshot: C++
-simdjson's tape parse reaches 4.2-4.8 GB/s on object-dense payloads (ahead
+simdjson's tape parse reaches 4.4-5.0 GB/s on object-dense payloads (ahead
 of our validation scan) but falls behind it on number- and escape-dense
-input; our typed decode beats serde_json's dynamic tree on all seven
-payloads; and our compiled encoder leads every serializer measured except
-on the date-saturated FHIR payload, where C++ replays pre-parsed strings
-while we format native `time.Time` values.
+input; our typed decode beats serde_json's dynamic tree and simd-json
+borrowed on all seven payloads; and our compiled encoder leads every
+serializer measured except on the date-saturated FHIR payload, where C++
+replays pre-parsed strings while we format native `time.Time` values.
 
 ## SIMD kernel snapshot
 

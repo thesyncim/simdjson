@@ -31,21 +31,22 @@ dagger since the parse-only and validate-only columns do less work per byte.
 
 | Corpus | C++ DOM parse | simd-json borrowed | serde_json `Value` | Go dynamic `any` | Go typed owned | Go strict validate |
 |---|---:|---:|---:|---:|---:|---:|
-| Canada geometry | 1.53 | 0.53 | 0.54† | 0.30 | 1.02 | **2.14** |
-| CITM catalog | **4.81** | 1.34† | 0.81 | 0.63 | 1.64 | 2.83 |
-| Go source | 1.90 | 0.71† | 0.36 | 0.40 | 1.49 | **2.07** |
-| Escaped strings | 0.83 | 0.57 | 0.90 | 1.23† | 1.07 | **9.74** |
-| Unicode strings | 4.66 | 2.82† | 1.27 | 1.18 | 1.93 | **5.63** |
-| Synthea FHIR | **4.75** | 1.23† | 0.54 | 0.48 | 1.08 | 3.14 |
-| Twitter status | **4.23** | 1.35† | 0.55 | 0.48 | 1.30 | 2.78 |
+| Canada geometry | 1.60 | 0.56 | 0.56† | 0.40 | 1.69 | **2.14** |
+| CITM catalog | **4.94** | 1.41† | 0.86 | 1.04 | 2.31 | 2.83 |
+| Go source | 1.96 | 0.75† | 0.39 | 0.62 | 1.87 | **2.07** |
+| Escaped strings | 0.88 | 0.60 | 0.93 | 1.62† | 1.57 | **9.74** |
+| Unicode strings | 4.84 | 2.93† | 1.33 | 2.12 | 3.38 | **5.63** |
+| Synthea FHIR | **5.00** | 1.28† | 0.58 | 0.81 | 1.42 | 3.14 |
+| Twitter status | **4.37** | 1.42† | 0.57 | 0.74 | 1.73 | 2.78 |
 
 - C++ simdjson's two-stage tape parse is the fastest JSON front-end measured
-  here: 4.2–4.8 GB/s on object-dense payloads, ahead of even our
+  here: 4.4–5.0 GB/s on object-dense payloads, ahead of even our
   validation-only scan. Its lead inverts on number-dense and escape-dense
-  input, where our validate runs 1.4–12x ahead of its parse.
+  input, where our validate runs 1.3–11x ahead of its parse.
 - Our typed decode — which fills real Go structs, a step no other row
-  performs — beats serde_json's dynamic `Value` on every payload and
-  simd-json borrowed on five of seven.
+  performs — beats serde_json's dynamic `Value` and simd-json borrowed on
+  every payload, and outruns even the C++ tape parse on number-dense
+  geometry.
 - The Go dynamic rows trail the Rust dynamic rows mostly because Go boxes
   every scalar in an `any`; the typed and source-backed APIs are the fast
   paths in this library.
@@ -58,10 +59,10 @@ times and floats from their binary form.
 
 | Corpus | C++ `to_string` | serde_json `to_writer` | Go compiled reuse |
 |---|---:|---:|---:|
-| CITM catalog | 1.25 | 1.36 | **2.24** |
-| Twitter status | 1.54 | 1.71 | **2.72** |
-| Synthea FHIR | **1.61** | 1.25 | 1.05 |
-| Go source | 0.95 | 1.17 | **2.86** |
+| CITM catalog | 1.31 | 1.52 | **2.53** |
+| Twitter status | 1.58 | 1.77 | **2.84** |
+| Synthea FHIR | **1.65** | 1.42 | 1.11 |
+| Go source | 0.98 | 1.23 | **2.96** |
 
 Go leads except Synthea, where the C++ row replays pre-parsed date strings
 from its tape while the Go row formats 2,191 `time.Time` values from native
