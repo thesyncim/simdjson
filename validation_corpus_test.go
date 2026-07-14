@@ -200,9 +200,13 @@ func strictJSONStringEnd(src []byte, quote int) (int, bool) {
 			if i >= len(src) {
 				return i, false
 			}
-			if src[i] != 'u' {
+			switch src[i] {
+			case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
 				i++
 				continue
+			case 'u':
+			default:
+				return i, false
 			}
 			u, ok := testHex4(src, i+1)
 			if !ok {
