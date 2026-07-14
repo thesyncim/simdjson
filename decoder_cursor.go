@@ -57,7 +57,18 @@ type decoderCursor struct {
 	// loops: while set, elements skip the short-form probe that uniformly
 	// long values (geographic coordinates) always fail.
 	floatLong bool
-	strings   unsafe.Pointer
+	// strings is the escaped-string arena, allocated on the first escaped
+	// string. Keeping the bookkeeping behind one pointer holds the cursor
+	// to a cache line.
+	strings *stringArenaState
+}
+
+// stringArenaState carries the escaped-string arena between parser round
+// trips: buf's length is the retained prefix, and appends past its capacity
+// relocate the block, which is safe because strings already handed out keep
+// aliasing the old one.
+type stringArenaState struct {
+	buf []byte
 }
 
 // newDecoderCursor starts decoding src with opts.
@@ -475,7 +486,7 @@ func (c *decoderCursor) stringSlow[T stringValue](dst *T) error {
 	p := c.slowParser()
 	text, err := p.parseString()
 	c.i = p.i
-	c.setStringArenaLen(len(p.strings))
+	c.adoptStringArena(p.strings)
 	if err != nil {
 		return err
 	}
@@ -879,34 +890,51 @@ func (c *decoderCursor) typedKey() (string, error) {
 	p := c.slowParser()
 	key, err := p.typedKey()
 	c.i = p.i
-	c.setStringArenaLen(len(p.strings))
+	c.adoptStringArena(p.strings)
 	return key, err
 }
+
+// stringArenaSeed sizes the first arena block; stringArenaHeadroom is the
+// free space below which the parser starts a fresh block of twice the size
+// instead of letting append copy retained content. Real documents carry
+// little escaped content, so the arena starts small; escape-dense documents
+// pay a handful of block allocations but never re-copy a written byte.
+const (
+	stringArenaSeed     = 2048
+	stringArenaHeadroom = 2048
+)
 
 func (c *decoderCursor) ensureStringArena() {
 	if c.strings != nil {
 		return
 	}
-	const headerSize = 8
-	storage := make([]byte, headerSize+len(c.src))
-	c.strings = unsafe.Pointer(unsafe.SliceData(storage))
+	capacity := stringArenaSeed
+	if capacity > len(c.src) {
+		capacity = len(c.src) + 1
+	}
+	c.strings = &stringArenaState{buf: make([]byte, 0, capacity)}
 }
 
 func (c *decoderCursor) stringArena() []byte {
 	if c.strings == nil {
 		return nil
 	}
-	const headerSize = 8
-	header := unsafe.Slice((*byte)(c.strings), headerSize)
-	used := int(binary.LittleEndian.Uint64(header))
-	return unsafe.Slice((*byte)(unsafe.Add(c.strings, headerSize)), len(c.src))[:used]
+	return c.strings.buf
 }
 
-func (c *decoderCursor) setStringArenaLen(used int) {
-	if c.strings != nil {
-		header := unsafe.Slice((*byte)(c.strings), 8)
-		binary.LittleEndian.PutUint64(header, uint64(used))
+// adoptStringArena records the arena state after a parser round trip,
+// following the block if appends relocated it. A parser that started with no
+// arena grew a private block; adopting it lets the rest of the decode reuse
+// that storage.
+func (c *decoderCursor) adoptStringArena(arena []byte) {
+	if c.strings == nil {
+		if cap(arena) == 0 {
+			return
+		}
+		c.strings = &stringArenaState{buf: arena}
+		return
 	}
+	c.strings.buf = arena
 }
 
 func (c *decoderCursor) genericExpected[T any](jsonType string) error {

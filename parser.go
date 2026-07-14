@@ -190,6 +190,24 @@ func (p *parser) skipSpace() {
 	p.i = skipSpace(p.src, p.i)
 }
 
+// arenaBlock returns the string arena positioned for a new escaped string,
+// starting a fresh block of twice the size when the current one is nearly
+// full. Blocks are never copied: strings already handed out keep their block
+// alive, so unescaped content is written exactly once regardless of how much
+// of the document is escaped.
+func (p *parser) arenaBlock() []byte {
+	if p.strings == nil {
+		capacity := stringArenaSeed
+		if capacity > len(p.src) {
+			capacity = len(p.src) + 1
+		}
+		p.strings = make([]byte, 0, capacity)
+	} else if cap(p.strings)-len(p.strings) < stringArenaHeadroom {
+		p.strings = make([]byte, 0, 2*cap(p.strings))
+	}
+	return p.strings
+}
+
 func (p *parser) parseString() (string, error) {
 	p.i++
 	start := p.i
@@ -200,11 +218,8 @@ func (p *parser) parseString() (string, error) {
 	for {
 		if p.i+6 <= len(p.src) && p.src[p.i] == '\\' && p.src[p.i+1] == 'u' {
 			if outStart < 0 {
-				if p.strings == nil {
-					p.strings = make([]byte, 0, len(p.src))
-				}
-				outStart = len(p.strings)
-				out = p.strings
+				out = p.arenaBlock()
+				outStart = len(out)
 			}
 			out = append(out, p.src[chunkStart:p.i]...)
 			for p.i+6 <= len(p.src) && p.src[p.i] == '\\' && p.src[p.i+1] == 'u' {
@@ -256,11 +271,8 @@ func (p *parser) parseString() (string, error) {
 			return ownedBytesString(out[outStart:]), nil
 		case c == '\\':
 			if outStart < 0 {
-				if p.strings == nil {
-					p.strings = make([]byte, 0, len(p.src))
-				}
-				outStart = len(p.strings)
-				out = p.strings
+				out = p.arenaBlock()
+				outStart = len(out)
 			}
 			out = append(out, p.src[chunkStart:p.i]...)
 			p.i++
