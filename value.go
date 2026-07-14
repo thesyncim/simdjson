@@ -9,13 +9,13 @@ import (
 type Kind uint8
 
 const (
-	Invalid Kind = iota
-	Null
-	Bool
-	Number
-	String
-	Array
-	Object
+	Invalid Kind = iota // zero Value or absent lookup result
+	Null                // JSON null
+	Bool                // true or false
+	Number              // number, original spelling preserved
+	String              // string
+	Array               // array
+	Object              // object
 )
 
 func (k Kind) String() string {

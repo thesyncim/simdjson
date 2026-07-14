@@ -106,10 +106,12 @@ func (r RawValue) Float64() (float64, bool) {
 	return n, err == nil
 }
 
-// Text returns r as an unquoted JSON string.
+// Text returns r as an unquoted JSON string. The boolean reports whether r
+// is a string at all — it stays true when a malformed string returns an
+// error — so callers can distinguish wrong kind from bad content.
 //
-// Unescaped strings return a string aliasing the input. Escaped strings allocate
-// only for the unescaped output.
+// Unescaped strings return a string aliasing the input. Escaped strings
+// allocate only for the unescaped output.
 func (r RawValue) Text() (string, bool, error) {
 	if len(r.src) == 0 || r.src[0] != '"' {
 		return "", false, nil

@@ -75,15 +75,15 @@ func (f CPUFeatures) AppendNames(dst []string) []string {
 
 // Info describes the implementations selected once during package initialization.
 type Info struct {
-	Enabled           bool
-	StringBackend     string
-	ParseBackend      string
-	FormatBackend     string
-	StringVectorBytes int
-	ParseVectorBytes  int
-	FormatVectorBytes int
-	StringMinBytes    int
-	Features          CPUFeatures
+	Enabled           bool        // kernels compiled in and selected
+	StringBackend     string      // string scanning implementation name
+	ParseBackend      string      // digit parsing implementation name
+	FormatBackend     string      // digit formatting implementation name
+	StringVectorBytes int         // string kernel vector width, 0 when scalar
+	ParseVectorBytes  int         // parse kernel vector width, 0 when scalar
+	FormatVectorBytes int         // format kernel vector width, 0 when scalar
+	StringMinBytes    int         // shortest input the string kernels accept
+	Features          CPUFeatures // CPU capabilities detected at startup
 }
 
 // Current reports the runtime-selected string, decimal, and CPU backends.
