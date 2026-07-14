@@ -101,7 +101,8 @@ using its portable Go implementations.
 | Strict validation | `Valid`, `Validate` | No result allocation |
 | Transforms | `AppendCompact`, `AppendIndent`, `AppendCanonicalize` | Caller-owned output |
 | Streaming write | `NewWriter`, `EncodeTo`, token methods | One reused buffer |
-| Streaming read | `NewReader`, `Next`, `DecodeTo` | Rolling buffer; values alias until `Next` |
+| Streaming read | `NewReader`, `Next`, `DecodeTo`, `DecodeNext` | Rolling buffer; values alias until `Next` |
+| Both directions bundled | `CompileCodec[T]` | Per-codec size hint; reused buffers |
 | Reusable byte kernels | `simd` subpackage | Caller-provided storage |
 
 ### Ownership
@@ -134,21 +135,26 @@ either from compiled encoders or through token methods that track container
 state and refuse to emit malformed JSON. `Reader` iterates top-level values
 from any `io.Reader`; each `Next` validates one complete value, values alias
 the rolling buffer only until the following `Next`, and a value split across
-reads costs one compacting copy. Steady-state streaming in both directions
-performs no per-value allocations.
+reads costs one compacting copy. `DecodeNext` fuses iteration and typed
+decoding into one pass — the decoder itself finds the value boundary — and
+is the fastest way through a typed stream. Steady-state streaming in both
+directions performs no per-value allocations. `CompileCodec` bundles both
+directions with a per-codec size hint.
 
 ```go
+codec, _ := simdjson.CompileCodec[Event](simdjson.CodecOptions{})
+
 w := simdjson.NewWriter(out)
 for _, event := range events {
-    simdjson.EncodeTo(w, enc, &event) // enc from CompileEncoder
+    codec.EncodeTo(w, &event)
     w.Newline()
 }
 w.Close()
 
 r := simdjson.NewReader(in)
-for r.Next() {
-    var event Event
-    simdjson.DecodeTo(r, dec, &event) // dec from CompileDecoder
+var event Event
+for simdjson.DecodeNext(r, codec.Decoder(), &event) {
+    // use event
 }
 err := r.Err()
 ```

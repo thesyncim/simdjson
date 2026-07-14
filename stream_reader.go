@@ -94,6 +94,73 @@ func DecodeTo[T any](r *Reader, dec Decoder[T], dst *T) error {
 	return dec.Decode(r.buf[r.valStart:r.valEnd], dst)
 }
 
+// DecodeNext advances to the next value and decodes it in one pass,
+// combining Next and DecodeTo without the separate boundary scan: the
+// decoder itself finds where the value ends. It returns false at the end
+// of the stream or on error; Err distinguishes the two.
+//
+// Retried attempts on values that arrive split across reads re-decode the
+// same document prefix into dst, so merge semantics are preserved; custom
+// unmarshalers may observe such repeated partial calls. After a true
+// result, Bytes and InputOffset describe the decoded value.
+func DecodeNext[T any](r *Reader, dec Decoder[T], dst *T) bool {
+	if r.err != nil {
+		return false
+	}
+	r.hasValue = false
+	i := r.pos
+	for {
+		i = skipSpace(r.buf[:r.end], i)
+		if i == r.end {
+			r.pos = i
+			if !r.fill(&i) {
+				return false
+			}
+			continue
+		}
+
+		n, err := dec.DecodePrefix(r.buf[i:r.end], dst)
+		end := i + n
+		if err == nil && (end < r.end || r.eof) {
+			// A value ending exactly at the window edge may continue in
+			// unread input; see Next.
+			r.valStart, r.valEnd = i, end
+			r.pos = end
+			r.hasValue = true
+			return true
+		}
+
+		// The failure may only mean the value is still arriving. If the
+		// window already holds one complete value, the error is real and
+		// is reported now; otherwise read more and decode again.
+		if err != nil {
+			window := r.buf[:r.end]
+			base := unsafe.Pointer(unsafe.SliceData(window))
+			if valEnd, ok := validValueFast(window, base, r.end, i, window[i], 0); ok && (valEnd < r.end || r.eof) {
+				r.err = fmt.Errorf("simdjson: value at input offset %d: %w", r.consumed+int64(i), err)
+				return false
+			}
+		}
+		if !r.eof {
+			r.pos = i
+			if !r.fill(&i) {
+				if r.err != nil {
+					return false
+				}
+				continue
+			}
+			continue
+		}
+
+		err = Validate(r.buf[i:r.end])
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		r.err = fmt.Errorf("simdjson: invalid value at input offset %d: %w", r.consumed+int64(i), err)
+		return false
+	}
+}
+
 // Next advances to the next value in the stream. It returns false at the
 // end of the stream or on error; Err distinguishes the two.
 func (r *Reader) Next() bool {

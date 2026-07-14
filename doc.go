@@ -66,7 +66,9 @@
 // methods that track container state so malformed output is impossible.
 // [Reader] iterates validated top-level values from an io.Reader with a
 // rolling buffer; [DecodeTo] decodes the current value, which aliases the
-// buffer only until the next [Reader.Next].
+// buffer only until the next [Reader.Next], and [DecodeNext] fuses
+// iteration and typed decoding into a single pass. [CompileCodec] bundles
+// a compiled encoder and decoder for one type behind one options struct.
 //
 // # Toolchain
 //

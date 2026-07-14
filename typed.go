@@ -113,6 +113,41 @@ func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 	return cursor.Finish()
 }
 
+// DecodePrefix decodes one JSON value from the front of src into dst and
+// returns the number of bytes consumed, leaving any following data
+// unexamined. It is the building block for reading concatenated values;
+// the streaming Reader uses it to decode without a separate boundary scan.
+// Decoding semantics match Decode.
+func (plan Decoder[T]) DecodePrefix(src []byte, dst *T) (int, error) {
+	if plan.root == nil {
+		return 0, fmt.Errorf("simdjson: zero Decoder")
+	}
+	if dst == nil {
+		return 0, fmt.Errorf("simdjson: typed Decode destination is nil")
+	}
+	cursor := newDecoderCursor(src, plan.options)
+	cursor.skipSpace()
+	var err error
+	switch plan.root.kind {
+	case typedStruct:
+		err = decodeCompiledStruct(&cursor, plan.root, unsafe.Pointer(dst))
+	case typedSlice:
+		err = decodeCompiledSlice(&cursor, plan.root, unsafe.Pointer(dst))
+	case typedArray:
+		err = decodeCompiledArray(&cursor, plan.root, unsafe.Pointer(dst))
+	case typedPointer:
+		err = decodeCompiledPointer(&cursor, plan.root, unsafe.Pointer(dst))
+	case typedMap:
+		err = decodeCompiledMap(&cursor, plan.root, unsafe.Pointer(dst))
+	default:
+		err = decodeCompiled(&cursor, plan.root, unsafe.Pointer(dst))
+	}
+	if err != nil {
+		return cursor.i, err
+	}
+	return cursor.i, nil
+}
+
 // DecodeArray decodes a top-level JSON array into dst, reusing its capacity.
 // The returned slice is always the authoritative result.
 func (plan Decoder[T]) DecodeArray(src []byte, dst []T) ([]T, error) {
