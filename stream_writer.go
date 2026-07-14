@@ -84,7 +84,9 @@ func (w *Writer) Err() error {
 
 // EncodeTo appends one complete top-level value to w through a compiled
 // encoder. On error the buffered output is unchanged. It is an error to
-// call EncodeTo while a token-built value is unfinished.
+// call EncodeTo while a token-built value is unfinished, and consecutive
+// top-level values need Newline between them, exactly as with token values —
+// without a separator, adjacent numbers would merge into one.
 func EncodeTo[T any](w *Writer, enc Encoder[T], src *T) error {
 	if w.err != nil {
 		return w.err
@@ -92,12 +94,15 @@ func EncodeTo[T any](w *Writer, enc Encoder[T], src *T) error {
 	if len(w.stack) != 0 {
 		return w.fail(errors.New("simdjson: Encode inside an unfinished token value"))
 	}
+	if w.started {
+		return w.fail(errors.New("simdjson: second top-level value without Newline"))
+	}
 	dst, err := enc.AppendJSON(w.buf, src)
 	if err != nil {
 		return w.fail(err)
 	}
 	w.buf = dst
-	w.started = false
+	w.started = true
 	return w.maybeFlush()
 }
 
@@ -290,7 +295,7 @@ func (w *Writer) beforeValue() bool {
 	top := len(w.stack) - 1
 	if top < 0 {
 		if w.started {
-			w.fail(errors.New("simdjson: second top-level token value without Newline or Flush"))
+			w.fail(errors.New("simdjson: second top-level token value without Newline"))
 			return false
 		}
 		w.started = true

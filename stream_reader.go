@@ -28,6 +28,10 @@ type Reader struct {
 
 	valStart int // current value extent
 	valEnd   int
+	// readErr is a non-EOF source error, held until the bytes that arrived
+	// with or before it have been scanned; io.Reader delivers data and
+	// error together and the data comes first.
+	readErr error
 
 	consumed int64 // bytes discarded before buf[0], for error offsets
 	maxValue int
@@ -114,6 +118,9 @@ func DecodeNext[T any](r *Reader, dec Decoder[T], dst *T) bool {
 		if i == r.end {
 			r.pos = i
 			if !r.fill(&i) {
+				if r.err == nil {
+					r.err = r.readErr
+				}
 				return false
 			}
 			continue
@@ -124,6 +131,10 @@ func DecodeNext[T any](r *Reader, dec Decoder[T], dst *T) bool {
 		if err == nil && (end < r.end || r.eof) {
 			// A value ending exactly at the window edge may continue in
 			// unread input; see Next.
+			if r.maxValue > 0 && end-i > r.maxValue {
+				r.err = fmt.Errorf("simdjson: value at input offset %d exceeds the %d byte limit", r.consumed+int64(i), r.maxValue)
+				return false
+			}
 			r.valStart, r.valEnd = i, end
 			r.pos = end
 			r.hasValue = true
@@ -156,6 +167,9 @@ func DecodeNext[T any](r *Reader, dec Decoder[T], dst *T) bool {
 		if err == nil {
 			err = io.ErrUnexpectedEOF
 		}
+		if r.readErr != nil {
+			err = r.readErr
+		}
 		r.err = fmt.Errorf("simdjson: invalid value at input offset %d: %w", r.consumed+int64(i), err)
 		return false
 	}
@@ -175,6 +189,9 @@ func (r *Reader) Next() bool {
 		if i == r.end {
 			r.pos = i
 			if !r.fill(&i) {
+				if r.err == nil {
+					r.err = r.readErr
+				}
 				return false
 			}
 			continue
@@ -187,6 +204,10 @@ func (r *Reader) Next() bool {
 			// A value ending exactly at the window edge may continue in
 			// unread input (numbers and literals are not self-delimiting),
 			// so it only counts once a byte follows it or the input ended.
+			if r.maxValue > 0 && end-i > r.maxValue {
+				r.err = fmt.Errorf("simdjson: value at input offset %d exceeds the %d byte limit", r.consumed+int64(i), r.maxValue)
+				return false
+			}
 			r.valStart, r.valEnd = i, end
 			r.pos = end
 			r.hasValue = true
@@ -209,6 +230,9 @@ func (r *Reader) Next() bool {
 		if err == nil {
 			err = io.ErrUnexpectedEOF
 		}
+		if r.readErr != nil {
+			err = r.readErr
+		}
 		r.err = fmt.Errorf("simdjson: invalid value at input offset %d: %w", r.consumed+int64(i), err)
 		return false
 	}
@@ -222,16 +246,21 @@ func (r *Reader) fill(keep *int) bool {
 		return false
 	}
 	if r.end == len(r.buf) {
+		if r.maxValue > 0 && r.end-*keep > r.maxValue {
+			r.err = fmt.Errorf("simdjson: value at input offset %d exceeds the %d byte limit", r.consumed+int64(*keep), r.maxValue)
+			return false
+		}
 		if *keep > 0 {
-			// Drop everything before the candidate value.
+			// Drop everything before the candidate value, keeping the
+			// last delivered value's offsets pointing at the same input
+			// positions.
 			n := copy(r.buf, r.buf[*keep:r.end])
 			r.consumed += int64(*keep)
 			r.end = n
 			r.pos -= *keep
+			r.valStart -= *keep
+			r.valEnd -= *keep
 			*keep = 0
-		} else if r.maxValue > 0 && len(r.buf) >= r.maxValue {
-			r.err = fmt.Errorf("simdjson: value at input offset %d exceeds the %d byte limit", r.consumed, r.maxValue)
-			return false
 		} else {
 			grown := make([]byte, len(r.buf)*2)
 			copy(grown, r.buf[:r.end])
@@ -246,8 +275,9 @@ func (r *Reader) fill(keep *int) bool {
 			r.eof = true
 			return n > 0
 		case err != nil:
-			r.err = err
-			return false
+			r.eof = true
+			r.readErr = err
+			return n > 0
 		case n > 0:
 			return true
 		}
