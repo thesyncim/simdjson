@@ -1326,6 +1326,66 @@ func appendCompactInt(dst []byte, v int64) []byte {
 	return appendCompactUint(dst, uint64(v))
 }
 
+// appendShortCleanJSONString quotes strings shorter than one vector when no
+// byte needs escaping, testing and copying word-at-a-time instead of
+// byte-at-a-time. ok reports whether it emitted; any flagged byte, or a dst
+// too full for its unconditional word stores, defers to the general path.
+func appendShortCleanJSONString(dst []byte, s string, escapeHTML bool) ([]byte, bool) {
+	n := uint(len(s))
+	if cap(dst)-len(dst) < int(n)+10 {
+		return dst, false
+	}
+	p := unsafe.Pointer(unsafe.StringData(s))
+	if n >= 8 {
+		w0 := loadUint64LE(p)
+		w1 := loadUint64LE(unsafe.Add(p, n-8))
+		var mask uint64
+		if escapeHTML {
+			mask = simdkernels.HTMLStringSpecialMask64(w0) | simdkernels.HTMLStringSpecialMask64(w1)
+		} else {
+			mask = simdkernels.StringSpecialMask64(w0) | simdkernels.StringSpecialMask64(w1)
+		}
+		if mask != 0 {
+			return dst, false
+		}
+		start := len(dst)
+		dst = dst[:start+int(n)+2]
+		dst[start] = '"'
+		base := unsafe.Pointer(unsafe.SliceData(dst))
+		storeUint64LE(unsafe.Add(base, start+1), w0)
+		storeUint64LE(unsafe.Add(base, start+1+int(n)-8), w1)
+		dst[start+1+int(n)] = '"'
+		return dst, true
+	}
+	// Overlapped halves build the exact zero-padded word image of s, so one
+	// mask probe and one store cover any length; the padding lanes are
+	// discarded from the mask and overwritten by the closing quote.
+	var w uint64
+	switch {
+	case n >= 4:
+		w = uint64(loadUint32LE(p)) | uint64(loadUint32LE(unsafe.Add(p, n-4)))<<((n-4)*8)
+	case n >= 2:
+		w = uint64(loadUint16LE(p)) | uint64(loadUint16LE(unsafe.Add(p, n-2)))<<((n-2)*8)
+	default:
+		w = uint64(*(*byte)(p))
+	}
+	var mask uint64
+	if escapeHTML {
+		mask = simdkernels.HTMLStringSpecialMask64(w)
+	} else {
+		mask = simdkernels.StringSpecialMask64(w)
+	}
+	if mask&(uint64(1)<<(8*n)-1) != 0 {
+		return dst, false
+	}
+	start := len(dst)
+	dst = dst[:start+int(n)+2]
+	dst[start] = '"'
+	storeUint64LE(unsafe.Add(unsafe.Pointer(unsafe.SliceData(dst)), start+1), w)
+	dst[start+1+int(n)] = '"'
+	return dst, true
+}
+
 // appendEncodedJSONString appends s as a quoted JSON string, matching encoding/json
 // with HTML escaping disabled: control bytes, quotes, and backslashes are
 // escaped, invalid UTF-8 becomes �, and U+2028/U+2029 are escaped.
@@ -1334,6 +1394,11 @@ func appendEncodedJSONString(dst []byte, s string, escapeHTML bool) []byte {
 
 	if len(s) == 0 {
 		return append(dst, '"', '"')
+	}
+	if len(s) < fusedCopyMinBytes {
+		if out, ok := appendShortCleanJSONString(dst, s, escapeHTML); ok {
+			return out
+		}
 	}
 	if len(s) >= fusedCopyMinBytes {
 		dst = slices.Grow(dst, len(s)+2)

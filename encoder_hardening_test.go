@@ -285,6 +285,65 @@ func requireEncoderErrorPath[T any](t *testing.T, value *T, want string) {
 	}
 }
 
+// TestShortStringWordPathMatchesStdlib walks every string length the
+// word-at-a-time fast path handles, with every flagged byte at every
+// position, plus the clean case, in both HTML modes and at buffer
+// capacities that force and skip the fast path. Failures here point at
+// appendShortCleanJSONString's overlapped loads, padding mask, or
+// unconditional word stores.
+func TestShortStringWordPathMatchesStdlib(t *testing.T) {
+	specials := []byte{'"', '\\', 0x00, 0x1F, '\n', '<', '>', '&', 0x80, 0xE2}
+	var cases []string
+	for n := 1; n <= 16; n++ {
+		clean := strings.Repeat("x", n)
+		cases = append(cases, clean)
+		for pos := 0; pos < n; pos++ {
+			for _, c := range specials {
+				b := []byte(clean)
+				b[pos] = c
+				cases = append(cases, string(b))
+			}
+		}
+	}
+	cases = append(cases, "", "héllo", "日本語", "a b")
+	for _, escapeHTML := range []bool{true, false} {
+		for _, s := range cases {
+			var want []byte
+			if escapeHTML {
+				buf, err := json.Marshal(s)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want = buf
+			} else {
+				var sb bytes.Buffer
+				enc := json.NewEncoder(&sb)
+				enc.SetEscapeHTML(false)
+				if err := enc.Encode(s); err != nil {
+					t.Fatal(err)
+				}
+				want = bytes.TrimSuffix(sb.Bytes(), []byte("\n"))
+			}
+			roomy := appendEncodedJSONString(make([]byte, 0, 64), s, escapeHTML)
+			if string(roomy) != string(want) {
+				t.Fatalf("appendEncodedJSONString(%q, html=%v) = %q, want %q", s, escapeHTML, roomy, want)
+			}
+			tight := appendEncodedJSONString(nil, s, escapeHTML)
+			if string(tight) != string(want) {
+				t.Fatalf("tight appendEncodedJSONString(%q, html=%v) = %q, want %q", s, escapeHTML, tight, want)
+			}
+			// The fast path stores whole words into slack; bytes past the
+			// returned length must not disturb previously written content.
+			prefix := []byte(`{"k":`)
+			padded := append(make([]byte, 0, 64), prefix...)
+			padded = appendEncodedJSONString(padded, s, escapeHTML)
+			if string(padded[:len(prefix)]) != string(prefix) || string(padded[len(prefix):]) != string(want) {
+				t.Fatalf("prefixed appendEncodedJSONString(%q, html=%v) = %q", s, escapeHTML, padded)
+			}
+		}
+	}
+}
+
 type fusionInner struct {
 	A int64  `json:"a"`
 	B string `json:"b"`

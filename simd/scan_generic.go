@@ -161,6 +161,14 @@ func stringSyntaxMask(x uint64) uint64 {
 		((x - 0x2020202020202020) & ^x & highBits)
 }
 
+func htmlStringSpecialMask(x uint64) uint64 {
+	// Setting bit 1 folds '<' (0x3C) onto '>' (0x3E), so one equality probe
+	// covers both angle brackets; no other byte maps onto 0x3E that way.
+	return stringSpecialMask(x) |
+		byteEqMask(x, '&') |
+		byteEqMask(x|0x0202020202020202, '>')
+}
+
 func hasByte(x uint64, b byte) bool {
 	return byteEqMask(x, b) != 0
 }

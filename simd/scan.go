@@ -122,6 +122,12 @@ func StringSyntaxMask64(word uint64) uint64 {
 	return stringSyntaxMask(word)
 }
 
+// HTMLStringSpecialMask64 is StringSpecialMask64 with '<', '>', and '&' added
+// to the flagged set used by HTML-safe JSON encoders.
+func HTMLStringSpecialMask64(word uint64) uint64 {
+	return htmlStringSpecialMask(word)
+}
+
 // ByteEqualMask64 returns a high-bit byte mask for bytes equal to value in a
 // little-endian eight-byte word.
 func ByteEqualMask64(word uint64, value byte) uint64 {

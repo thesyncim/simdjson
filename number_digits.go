@@ -61,6 +61,10 @@ func loadUint64LE(base unsafe.Pointer) uint64 {
 	return binary.LittleEndian.Uint64((*[8]byte)(base)[:])
 }
 
+func storeUint64LE(base unsafe.Pointer, v uint64) {
+	binary.LittleEndian.PutUint64((*[8]byte)(base)[:], v)
+}
+
 func loadUint32LE(base unsafe.Pointer) uint32 {
 	return binary.LittleEndian.Uint32((*[4]byte)(base)[:])
 }
