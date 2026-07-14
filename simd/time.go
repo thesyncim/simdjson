@@ -14,12 +14,18 @@ var (
 // AppendTime appends value in the RFC 3339 form used by time.Time.AppendText.
 // Its fixed-width date and clock digits use the selected SIMD digit kernel.
 func AppendTime(dst []byte, value time.Time) ([]byte, error) {
-	year, month, day := value.Date()
+	// One zone lookup feeds every calendar field. Calling Date, Clock, and
+	// Zone instead repeats the location lookup and epoch shift three times.
+	_, offset := value.Zone()
+	abs := uint64(value.Unix() + int64(offset) + unixToAbsolute)
+	year, month, day := absDaysToDate(abs / secondsPerDay)
 	if uint(year) >= 10_000 {
 		return dst, errTimeYear
 	}
-	hour, minute, second := value.Clock()
-	_, offset := value.Zone()
+	clock := uint32(abs % secondsPerDay)
+	hour := clock / 3600
+	minute := clock / 60 % 60
+	second := clock % 60
 	zoneMinutes := offset / 60
 	if zoneMinutes <= -24*60 || zoneMinutes >= 24*60 {
 		return dst, errTimeZone
@@ -53,7 +59,7 @@ func AppendTime(dst []byte, value time.Time) ([]byte, error) {
 	dst = dst[:start+maxTimeBytes]
 	out := dst[start:]
 
-	storeDateTimeParts((*[20]byte)(out), uint32(year), uint32(month), uint32(day), uint32(hour), uint32(minute), uint32(second))
+	storeDateTimeParts((*[20]byte)(out), uint32(year), month, day, hour, minute, second)
 
 	i := dateTimeBytes
 	if fractionDigits != 0 {

@@ -48,6 +48,26 @@ func TestAppendTimeMatchesTime(t *testing.T) {
 	}
 }
 
+// TestAbsDaysToDateExhaustive checks the ported civil-date computation
+// against the standard library for every day AppendTime can emit, plus the
+// rejected years bordering the supported range.
+func TestAbsDaysToDateExhaustive(t *testing.T) {
+	start := time.Date(-1, time.January, 1, 12, 0, 0, 0, time.UTC)
+	for day := range (10_001 + 2) * 366 {
+		value := start.AddDate(0, 0, day)
+		wantYear, wantMonth, wantDay := value.Date()
+		if wantYear > 10_000 {
+			break
+		}
+		abs := uint64(value.Unix() + unixToAbsolute)
+		year, month, mday := absDaysToDate(abs / secondsPerDay)
+		if year != wantYear || time.Month(month) != wantMonth || int(mday) != wantDay {
+			t.Fatalf("absDaysToDate(day %d) = %d-%d-%d, want %d-%d-%d",
+				day, year, month, mday, wantYear, int(wantMonth), wantDay)
+		}
+	}
+}
+
 func TestAppendTimeErrorsDoNotChangeDestination(t *testing.T) {
 	for _, value := range []time.Time{
 		time.Date(-1, 1, 1, 0, 0, 0, 0, time.UTC),
