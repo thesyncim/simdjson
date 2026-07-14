@@ -98,13 +98,13 @@ input.
 
 | Corpus | simdjson | Rival | Rival time | Lead |
 |---|---:|---|---:|---:|
-| Canada geometry | **135.1 us** | Segment | 224.3 us | **1.66x** |
-| CITM catalog | **645.2 us** | fastjson | 868.8 us | **1.35x** |
-| Go source | **957.2 us** | Segment | 1.218 ms | **1.27x** |
-| Escaped strings | **4.4 us** | Segment | 60.3 us | **13.65x** |
-| Unicode strings | **3.3 us** | fastjson | 7.2 us | **2.19x** |
-| Synthea FHIR | **726.9 us** | fastjson | 1.292 ms | **1.78x** |
-| Twitter status | **230.3 us** | fastjson | 400.0 us | **1.74x** |
+| Canada geometry | **126.5 us** | fastjson | 203.7 us | **1.61x** |
+| CITM catalog | **610.6 us** | fastjson | 807.3 us | **1.32x** |
+| Go source | **936.8 us** | Segment | 1.172 ms | **1.25x** |
+| Escaped strings | **4.3 us** | Segment | 59.8 us | **13.84x** |
+| Unicode strings | **3.2 us** | fastjson | 6.9 us | **2.15x** |
+| Synthea FHIR | **639.6 us** | fastjson | 1.267 ms | **1.98x** |
+| Twitter status | **226.8 us** | fastjson | 385.4 us | **1.70x** |
 
 ### Encode
 
@@ -128,7 +128,7 @@ selected once during initialization; short runs may remain scalar or SWAR.
 
 | simdjson path | SIMD wins | Geomean SIMD uplift |
 |---|---:|---:|
-| Validation | 5/7 | **1.383x** |
+| Validation | 7/7 | **1.436x** |
 | Dynamic owned | 6/7 | **1.066x** |
 | Dynamic source-backed | 7/7 | **1.083x** |
 | Typed owned | 5/7 | **1.092x** |

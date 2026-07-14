@@ -167,7 +167,7 @@ speedup across all seven payloads.
 
 | Operation | Contract | vs stdlib | vs fastest rival | vs native Sonic | SIMD vs pure Go |
 |---|---|---:|---:|---:|---:|
-| Validate | Strict JSON + UTF-8 | **2.39x** | **2.22x** | **1.04x** | **1.383x** |
+| Validate | Strict JSON + UTF-8 | **2.40x** | **2.22x** | **1.09x** | **1.436x** |
 | Typed decode | Owned strings | **3.46x** | **1.54x** | **1.51x** | **1.092x** |
 | Dynamic decode | Owned `any` tree | **3.29x** | **1.71x** | **1.02x** | **1.066x** |
 | Encode | Owned output | **2.54x** | **1.49x** | **2.72x** | **1.510x** |
