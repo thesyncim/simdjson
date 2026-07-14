@@ -165,19 +165,22 @@ Apple M4 Max, one CPU, six 300 ms samples, exact 6.33 MiB Go
 `encoding/json` corpus. Lower time is better; the table reports geometric-mean
 speedup across all seven payloads.
 
-| Operation | Contract | vs stdlib | vs fastest rival | SIMD vs pure Go |
-|---|---|---:|---:|---:|
-| Validate | Strict JSON + UTF-8 | **2.34x** | **2.17x** | **1.399x** |
-| Typed decode | Owned strings | **3.50x** | **1.57x** | **1.099x** |
-| Dynamic decode | Owned `any` tree | **3.30x** | **1.75x** | **1.069x** |
-| Encode | Owned output | **2.56x** | **1.48x** | **1.536x** |
-| Encode | Reused output buffer | **4.47x** | **2.60x** | **1.822x** |
+| Operation | Contract | vs stdlib | vs fastest rival | vs native Sonic | SIMD vs pure Go |
+|---|---|---:|---:|---:|---:|
+| Validate | Strict JSON + UTF-8 | **2.34x** | **2.17x** | **1.06x** | **1.399x** |
+| Typed decode | Owned strings | **3.50x** | **1.57x** | **1.61x** | **1.099x** |
+| Dynamic decode | Owned `any` tree | **3.30x** | **1.75x** | **1.08x** | **1.069x** |
+| Encode | Owned output | **2.56x** | **1.48x** | **2.86x** | **1.536x** |
+| Encode | Reused output buffer | **4.47x** | **2.60x** | — | **1.822x** |
 
 Every stdlib row wins all seven payloads. Every rival row wins all seven except
 owned encode, which wins five. Comparisons use the same Go tip compiler and do
-not mix owned and source-backed results. Native Sonic uses Go 1.26.4, so it is
-reported separately and excluded from headline speedups. The SIMD column
-compares the same code, compiler, and corpus with and without
+not mix owned and source-backed results. The Sonic column compares against
+native Sonic v1.15.2 compiled with the previous stable Go (1.26.4) in an
+isolated module, because Sonic falls back to `encoding/json` on Go tip; it is
+excluded from the fastest-rival column, its `Valid` is syntax-only where ours
+also enforces UTF-8, and it has no reused-buffer `Marshal` counterpart. The
+SIMD column compares the same code, compiler, and corpus with and without
 `GOEXPERIMENT=simd`.
 
 [Full per-corpus results, allocations, SIMD uplift, versions, and exact commands](benchmarks/README.md#published-corpus-snapshot)
