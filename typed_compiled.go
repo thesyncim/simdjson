@@ -844,6 +844,14 @@ func (cursor *decoderCursor) decodeCompiledMap(node *typedNode, dst unsafe.Point
 	element := reflect.New(node.elem.typ)
 	elementPtr := element.UnsafePointer()
 	elementValue := element.Elem()
+	// One reusable key box serves every entry: SetMapIndex copies the key into
+	// the map, so the box is reset per entry instead of allocating one each
+	// time. The text unmarshaler, when present, is bound to the box once.
+	keyValue := reflect.New(keyType).Elem()
+	var keyUnmarshaler encoding.TextUnmarshaler
+	if node.mapKeyTextDecode {
+		keyUnmarshaler = keyValue.Addr().Interface().(encoding.TextUnmarshaler)
+	}
 	for first := true; ; first = false {
 		key, ok, err := cursor.NextObjectField(first)
 		if err != nil {
@@ -871,53 +879,43 @@ func (cursor *decoderCursor) decodeCompiledMap(node *typedNode, dst unsafe.Point
 		if entryErr != nil {
 			return prependDecodePathField(entryErr, key)
 		}
-		keyValue, keyErr := mapKeyValue(node, keyType, key)
-		if keyErr != nil {
+		if keyErr := setMapKeyValue(keyValue, keyUnmarshaler, node, keyType, key); keyErr != nil {
 			return prependDecodePathField(&DecodeError{Offset: cursor.i, Type: keyType, Reason: keyErr.Error()}, key)
 		}
 		mapValue.SetMapIndex(keyValue, elementValue)
 	}
 }
 
-// mapKeyValue converts a decoded member name into the map's key type,
+// setMapKeyValue decodes a member name into the reused key box in place,
 // following encoding/json: text unmarshalers first, then string kinds, then
-// base-10 integers with range checks.
-func mapKeyValue(node *typedNode, keyType reflect.Type, key string) (reflect.Value, error) {
+// base-10 integers with range checks. The box is copied into the map by
+// SetMapIndex, so it may be reused across entries; the text path zeroes it
+// first to match a freshly allocated key.
+func setMapKeyValue(keyValue reflect.Value, unmarshaler encoding.TextUnmarshaler, node *typedNode, keyType reflect.Type, key string) error {
 	if node.mapKeyTextDecode {
-		boxed := reflect.New(keyType)
-		unmarshaler := boxed.Interface().(encoding.TextUnmarshaler)
-		if err := unmarshaler.UnmarshalText([]byte(key)); err != nil {
-			return reflect.Value{}, err
-		}
-		return boxed.Elem(), nil
+		keyValue.SetZero()
+		return unmarshaler.UnmarshalText([]byte(key))
 	}
 	switch node.mapKeyKind {
 	case mapKeyString:
-		keyValue := reflect.ValueOf(key)
-		if keyType != keyValue.Type() {
-			keyValue = keyValue.Convert(keyType)
-		}
-		return keyValue, nil
-	case mapKeyText:
-		return reflect.Value{}, errors.New("map key type " + keyType.String() + " cannot be decoded")
+		keyValue.SetString(key)
+		return nil
 	case mapKeyInt:
 		parsed, err := strconv.ParseInt(key, 10, 64)
-		if err != nil || reflect.Zero(keyType).OverflowInt(parsed) {
-			return reflect.Value{}, errors.New("cannot parse map key as " + keyType.String())
+		if err != nil || keyValue.OverflowInt(parsed) {
+			return errors.New("cannot parse map key as " + keyType.String())
 		}
-		keyValue := reflect.New(keyType).Elem()
 		keyValue.SetInt(parsed)
-		return keyValue, nil
+		return nil
 	case mapKeyUint:
 		parsed, err := strconv.ParseUint(key, 10, 64)
-		if err != nil || reflect.Zero(keyType).OverflowUint(parsed) {
-			return reflect.Value{}, errors.New("cannot parse map key as " + keyType.String())
+		if err != nil || keyValue.OverflowUint(parsed) {
+			return errors.New("cannot parse map key as " + keyType.String())
 		}
-		keyValue := reflect.New(keyType).Elem()
 		keyValue.SetUint(parsed)
-		return keyValue, nil
+		return nil
 	default:
-		return reflect.Value{}, errors.New("map key type " + keyType.String() + " cannot be decoded")
+		return errors.New("map key type " + keyType.String() + " cannot be decoded")
 	}
 }
 
