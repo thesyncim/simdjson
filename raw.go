@@ -137,23 +137,23 @@ func (r RawValue) Text() (string, bool, error) {
 }
 
 // Get returns a strict raw JSON Pointer target within r.
-func (r RawValue) Get(pointer string) (RawValue, bool, error) {
+func (r RawValue) Pointer(pointer string) (RawValue, bool, error) {
 	return GetRaw(r.src, pointer)
 }
 
 // Scan returns a raw JSON Pointer target within r and stops after validating
 // the target. It does not validate bytes after the match.
-func (r RawValue) Scan(pointer string) (RawValue, bool, error) {
+func (r RawValue) ScanPointer(pointer string) (RawValue, bool, error) {
 	return ScanRaw(r.src, pointer)
 }
 
 // GetCompiled returns a strict precompiled JSON Pointer target within r.
-func (r RawValue) GetCompiled(pointer CompiledPointer) (RawValue, bool, error) {
+func (r RawValue) PointerCompiled(pointer CompiledPointer) (RawValue, bool, error) {
 	return pointer.GetRaw(r.src)
 }
 
 // ScanCompiled is Scan with a precompiled pointer.
-func (r RawValue) ScanCompiled(pointer CompiledPointer) (RawValue, bool, error) {
+func (r RawValue) ScanPointerCompiled(pointer CompiledPointer) (RawValue, bool, error) {
 	return pointer.ScanRaw(r.src)
 }
 

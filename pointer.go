@@ -84,21 +84,9 @@ func (p CompiledPointer) String() string {
 	return p.pointer
 }
 
-// Get returns pointer's target within v.
-func (p CompiledPointer) Get(v Value) (Value, bool, error) {
-	return v.PointerCompiled(p)
-}
-
 // Get parses src and returns the JSON Pointer target.
 func Get(src []byte, pointer string) (Value, bool, error) {
 	return GetOptions(src, pointer, Options{})
-}
-
-// GetZeroCopy parses src and returns the JSON Pointer target while aliasing
-// unescaped strings and numbers into src. Callers must not mutate src for as
-// long as the returned Value is used.
-func GetZeroCopy(src []byte, pointer string) (Value, bool, error) {
-	return GetOptions(src, pointer, Options{ZeroCopy: true})
 }
 
 // GetOptions parses src using opts and returns the JSON Pointer target.

@@ -1138,7 +1138,7 @@ func TestCompiledPointer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, ok, err := ptr.Get(v)
+	got, ok, err := v.PointerCompiled(ptr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1181,7 +1181,7 @@ func TestRawValueAccessors(t *testing.T) {
 		t.Fatalf("root = %v, %v", ok, err)
 	}
 
-	raw, ok, err := root.Get("/s")
+	raw, ok, err := root.Pointer("/s")
 	if err != nil || !ok {
 		t.Fatalf("string = %v, %v", ok, err)
 	}
@@ -1190,7 +1190,7 @@ func TestRawValueAccessors(t *testing.T) {
 		t.Fatalf("text = %q, %v, %v", text, ok, err)
 	}
 
-	raw, ok, err = root.Get("/esc")
+	raw, ok, err = root.Pointer("/esc")
 	if err != nil || !ok {
 		t.Fatalf("escaped string = %v, %v", ok, err)
 	}
@@ -1199,7 +1199,7 @@ func TestRawValueAccessors(t *testing.T) {
 		t.Fatalf("escaped text = %q, %v, %v", text, ok, err)
 	}
 
-	raw, ok, err = root.Get("/n")
+	raw, ok, err = root.Pointer("/n")
 	if err != nil || !ok {
 		t.Fatalf("number = %v, %v", ok, err)
 	}
@@ -1210,7 +1210,7 @@ func TestRawValueAccessors(t *testing.T) {
 		t.Fatalf("number text = %q, %v", s, ok)
 	}
 
-	raw, ok, err = root.Get("/f")
+	raw, ok, err = root.Pointer("/f")
 	if err != nil || !ok {
 		t.Fatalf("float = %v, %v", ok, err)
 	}
@@ -1218,7 +1218,7 @@ func TestRawValueAccessors(t *testing.T) {
 		t.Fatalf("float = %f, %v", f, ok)
 	}
 
-	raw, ok, err = root.Get("/b")
+	raw, ok, err = root.Pointer("/b")
 	if err != nil || !ok {
 		t.Fatalf("bool = %v, %v", ok, err)
 	}
@@ -1226,13 +1226,13 @@ func TestRawValueAccessors(t *testing.T) {
 		t.Fatalf("bool = %v, %v", b, ok)
 	}
 
-	raw, ok, err = root.Get("/z")
+	raw, ok, err = root.Pointer("/z")
 	if err != nil || !ok || !raw.IsNull() {
 		t.Fatalf("null = %v, %v, %v", raw.IsNull(), ok, err)
 	}
 
 	ptr := MustCompilePointer("/nested/x")
-	raw, ok, err = root.ScanCompiled(ptr)
+	raw, ok, err = root.ScanPointerCompiled(ptr)
 	if err != nil || !ok {
 		t.Fatalf("compiled nested = %v, %v", ok, err)
 	}
@@ -2283,7 +2283,7 @@ func BenchmarkPointerZeroCopy(b *testing.B) {
 	src := benchmarkJSON()
 	b.SetBytes(int64(len(src)))
 	for i := 0; i < b.N; i++ {
-		v, ok, err := GetZeroCopy(src, "/items/2/message")
+		v, ok, err := GetOptions(src, "/items/2/message", Options{ZeroCopy: true})
 		if err != nil || !ok || v.kind != String {
 			b.Fatal(v, ok, err)
 		}

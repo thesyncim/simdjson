@@ -912,7 +912,7 @@ func TestProbeRawSpans(t *testing.T) {
 	}
 
 	// Nested Get on a RawValue re-anchors pointers relative to the target.
-	inner, ok, err := raw.Get("/1")
+	inner, ok, err := raw.Pointer("/1")
 	if err != nil || !ok || string(inner.Bytes()) != "2" {
 		t.Errorf("RawValue.Get(/1) = %q, %v, %v", inner.Bytes(), ok, err)
 	}
