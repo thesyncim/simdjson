@@ -97,9 +97,9 @@ func TestLongUnicodeRunReportsExactInvalidByte(t *testing.T) {
 	prefix := []byte(`{"s":"` + strings.Repeat("こんにちは", 64))
 	src := append(append(append([]byte(nil), prefix...), 0xff), '"', '}')
 	err := Validate(src)
-	var syntaxErr *Error
+	var syntaxErr *SyntaxError
 	if !errors.As(err, &syntaxErr) {
-		t.Fatalf("Validate() error = %v, want *Error", err)
+		t.Fatalf("Validate() error = %v, want *SyntaxError", err)
 	}
 	if syntaxErr.Offset != len(prefix) {
 		t.Fatalf("invalid UTF-8 offset = %d, want %d", syntaxErr.Offset, len(prefix))

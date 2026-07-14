@@ -20,7 +20,6 @@ type Stage1Masks struct {
 type Stage1Carry struct {
 	Escaped  uint64
 	InString uint64
-	Follows  uint64
 }
 
 // Stage1Block is unreachable in scalar builds.

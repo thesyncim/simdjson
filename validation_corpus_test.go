@@ -159,9 +159,9 @@ func checkValidationConsistency(t *testing.T, src []byte, want bool) {
 
 func assertSyntaxErrorPosition(t *testing.T, err error, sourceLen int) {
 	t.Helper()
-	jsonErr, ok := err.(*Error)
+	jsonErr, ok := err.(*SyntaxError)
 	if !ok {
-		t.Fatalf("syntax error type = %T, want *simdjson.Error", err)
+		t.Fatalf("syntax error type = %T, want *simdjson.SyntaxError", err)
 	}
 	if jsonErr.Offset < 0 || jsonErr.Offset > sourceLen || jsonErr.Line < 1 || jsonErr.Column < 1 || jsonErr.Message == "" {
 		t.Fatalf("invalid syntax error position: %+v for source length %d", jsonErr, sourceLen)

@@ -29,10 +29,10 @@ type recursiveMap map[string]recursiveMap
 
 func TestEncodeMapScratchReuse(t *testing.T) {
 	type doc struct {
-		M recursiveMap      `json:"m"`
-		N map[string]int    `json:"n"`
-		O map[int]string    `json:"o"`
-		P any               `json:"p"`
+		M recursiveMap   `json:"m"`
+		N map[string]int `json:"n"`
+		O map[int]string `json:"o"`
+		P any            `json:"p"`
 	}
 	v := doc{
 		M: recursiveMap{"a": recursiveMap{"b": recursiveMap{"c": nil}}, "z": nil},

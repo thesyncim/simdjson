@@ -73,8 +73,8 @@ func (f CPUFeatures) AppendNames(dst []string) []string {
 	return dst
 }
 
-// SIMDInfo describes the implementations selected once during package initialization.
-type SIMDInfo struct {
+// Info describes the implementations selected once during package initialization.
+type Info struct {
 	Enabled           bool
 	StringBackend     string
 	ParseBackend      string
@@ -87,6 +87,6 @@ type SIMDInfo struct {
 }
 
 // Current reports the runtime-selected string, decimal, and CPU backends.
-func Current() SIMDInfo {
+func Current() Info {
 	return simdInfo()
 }

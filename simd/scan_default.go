@@ -52,8 +52,8 @@ func copyHTMLStringPrefix(dst, src []byte) int {
 	return end
 }
 
-func simdInfo() SIMDInfo {
-	return SIMDInfo{
+func simdInfo() Info {
+	return Info{
 		Enabled:           parseBackend() != "scalar" || formatBackend() != "scalar",
 		StringBackend:     "scalar",
 		ParseBackend:      parseBackend(),

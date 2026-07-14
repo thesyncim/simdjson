@@ -843,11 +843,10 @@ func mapKeyValue(node *typedNode, keyType reflect.Type, key string) (reflect.Val
 
 // decodeCompiledAny decodes one JSON value into an empty interface using the
 // standard dynamic shapes: map[string]any, []any, string, float64, bool, and
-// nil. The destination is always replaced; unlike encoding/json, a pointer
-// already stored in the interface is not decoded into.
+// nil. Like encoding/json, an interface already holding a non-nil pointer is
+// decoded into rather than replaced; anything else is replaced, and null
+// clears the interface.
 func decodeCompiledAny(cursor *decoderCursor, dst unsafe.Pointer) error {
-	// Like encoding/json, an interface already holding a non-nil pointer is
-	// decoded into rather than replaced, except by null.
 	if existing := *(*any)(dst); existing != nil {
 		null := false
 		if !cursor.notNullFast() {
@@ -942,9 +941,6 @@ func decodeCompiledIface(cursor *decoderCursor, node *typedNode, dst unsafe.Poin
 	return &DecodeError{Offset: cursor.i, Type: node.typ, Reason: "cannot decode into a non-empty interface"}
 }
 
-// decodeQuotedField decodes a scalar tagged with the string option: the JSON
-// value is a string whose contents are one JSON scalar. Bare null resets the
-// field like encoding/json; anything but a string is rejected.
 // stringToken consumes a JSON string and returns its contents: unescaped
 // strings alias the source, escaped strings alias a transient buffer that
 // callers must not retain.
@@ -968,6 +964,10 @@ func (c *decoderCursor) stringToken() ([]byte, error) {
 	return unsafe.Slice(unsafe.StringData(text), len(text)), nil
 }
 
+// decodeQuotedField decodes a scalar tagged with the string option: the JSON
+// value is a string whose contents are one scalar, parsed with encoding/json's
+// semantics. A bare null clears pointer fields and resets values only in
+// replace mode; anything but a string or null is rejected.
 func decodeQuotedField(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
 	null := false
 	if !cursor.notNullFast() {

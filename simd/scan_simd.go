@@ -53,10 +53,10 @@ func init() {
 	initStringScanner()
 }
 
-func simdInfo() SIMDInfo {
+func simdInfo() Info {
 	parse := parseBackend()
 	format := formatBackend()
-	return SIMDInfo{
+	return Info{
 		Enabled:           scanStringSpecialBackend != "scalar" || parse != "scalar" || format != "scalar",
 		StringBackend:     scanStringSpecialBackend,
 		ParseBackend:      parse,

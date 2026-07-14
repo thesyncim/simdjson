@@ -82,8 +82,8 @@ func (plan Encoder[T]) AppendJSON(dst []byte, src *T) ([]byte, error) {
 	return e.dst, nil
 }
 
-// unmarshalEncoders caches one encoder per source type for Marshal.
-var unmarshalEncoders sync.Map
+// marshalEncoders caches one encoder per source type for Marshal.
+var marshalEncoders sync.Map
 
 type cachedEncoder[T any] struct {
 	encoder  Encoder[T]
@@ -98,7 +98,7 @@ type cachedEncoder[T any] struct {
 // CompileEncoder once and reuse the returned Encoder with AppendJSON to
 // recycle output buffers.
 func Marshal[T any](src *T) ([]byte, error) {
-	entry, ok := unmarshalEncoders.Load(reflect.TypeFor[T]())
+	entry, ok := marshalEncoders.Load(reflect.TypeFor[T]())
 	if !ok {
 		entry = newCachedEncoder[T]()
 	}
@@ -123,7 +123,7 @@ func Marshal[T any](src *T) ([]byte, error) {
 //go:noinline
 func newCachedEncoder[T any]() any {
 	encoder, err := CompileEncoder[T](EncoderOptions{})
-	entry, _ := unmarshalEncoders.LoadOrStore(reflect.TypeFor[T](), &cachedEncoder[T]{encoder: encoder, err: err})
+	entry, _ := marshalEncoders.LoadOrStore(reflect.TypeFor[T](), &cachedEncoder[T]{encoder: encoder, err: err})
 	return entry
 }
 
@@ -1132,8 +1132,8 @@ func appendJSONFloat(dst []byte, value float64, bits int) ([]byte, error) {
 	return dst, nil
 }
 
-// appendScaledDecimal6 writes an exactly recoverable fixed decimal with up to
-// six fractional digits. encodeFloat only calls it below 1e9, where adjacent
+// appendScaledDecimal6 writes an exactly recoverable fixed decimal with up
+// to six fractional digits. Callers only reach it below 1e9, where adjacent
 // 1e-6 grid points are wider than a float64 rounding interval.
 func appendScaledDecimal6(dst []byte, value, scaled float64) []byte {
 	if math.Signbit(value) {
@@ -1463,9 +1463,10 @@ func appendShortCleanJSONString(dst []byte, s string, escapeHTML bool) ([]byte, 
 	return dst, true
 }
 
-// appendEncodedJSONString appends s as a quoted JSON string, matching encoding/json
-// with HTML escaping disabled: control bytes, quotes, and backslashes are
-// escaped, invalid UTF-8 becomes �, and U+2028/U+2029 are escaped.
+// appendEncodedJSONString appends s as a quoted JSON string with
+// encoding/json's spelling: control bytes, quotes, and backslashes are
+// escaped, invalid UTF-8 becomes �, U+2028/U+2029 are escaped, and
+// escapeHTML additionally escapes '<', '>', and '&'.
 func appendEncodedJSONString(dst []byte, s string, escapeHTML bool) []byte {
 	const fusedCopyMinBytes = 16
 

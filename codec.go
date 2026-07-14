@@ -51,9 +51,9 @@ func (c Codec[T]) DecodeArray(src []byte, dst []T) ([]T, error) {
 	return c.dec.DecodeArray(src, dst)
 }
 
-// Append appends src encoded as compact JSON to dst, under the same
+// AppendJSON appends src encoded as compact JSON to dst, under the same
 // contract as Encoder.AppendJSON.
-func (c Codec[T]) Append(dst []byte, src *T) ([]byte, error) {
+func (c Codec[T]) AppendJSON(dst []byte, src *T) ([]byte, error) {
 	return c.enc.AppendJSON(dst, src)
 }
 

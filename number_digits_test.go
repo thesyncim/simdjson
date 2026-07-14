@@ -255,6 +255,16 @@ func FuzzParse16Digits(f *testing.F) {
 	})
 }
 
+// parse16DigitsScalar is the portable reference the kernel is checked
+// against; it lives with its only callers.
+func parse16DigitsScalar(base unsafe.Pointer) uint64 {
+	var value uint64
+	for i := 0; i < 16; i++ {
+		value = value*10 + uint64(fastByteAt(base, i)-'0')
+	}
+	return value
+}
+
 func checkParse16Digits(t testing.TB, digits []byte) {
 	t.Helper()
 	base := unsafe.Pointer(unsafe.SliceData(digits))

@@ -321,15 +321,15 @@ type typedNode struct {
 	// encFusedExtra counts the static struct levels fused into this
 	// node's pair program, so depth checks preserve the exact limit the
 	// unfused recursion enforced.
-	encFusedExtra  uint8
-	fieldHops      [][]typedFieldHop
-	hopResets      []uintptr
-	reset          []typedResetOp
-	ready          bool
-	encSimple      bool
-	allSet         uint64
-	encScratch     int32
-	encMapElem     int32
+	encFusedExtra uint8
+	fieldHops     [][]typedFieldHop
+	hopResets     []uintptr
+	reset         []typedResetOp
+	ready         bool
+	encSimple     bool
+	allSet        uint64
+	encScratch    int32
+	encMapElem    int32
 }
 
 type typedField struct {

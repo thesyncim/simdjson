@@ -363,11 +363,3 @@ func skipSpaceFast(base unsafe.Pointer, n, i int) int {
 func fastByteAt(base unsafe.Pointer, index int) byte {
 	return *(*byte)(unsafe.Add(base, uintptr(index)))
 }
-
-func fastStateAt(base unsafe.Pointer, index int) uint8 {
-	return *(*uint8)(unsafe.Add(base, uintptr(index)))
-}
-
-func fastStateSet(base unsafe.Pointer, index int, state uint8) {
-	*(*uint8)(unsafe.Add(base, uintptr(index))) = state
-}

@@ -97,10 +97,7 @@ func literalFalseAt(src []byte, i int) bool {
 		loadUint32LE(unsafe.Add(unsafe.Pointer(unsafe.SliceData(src)), i+1)) == wordAlseLE
 }
 
-func parse16DigitsScalar(base unsafe.Pointer) uint64 {
-	var value uint64
-	for i := 0; i < 16; i++ {
-		value = value*10 + uint64(fastByteAt(base, i)-'0')
-	}
-	return value
+// parse16Digits parses sixteen ASCII digits through the selected kernel.
+func parse16Digits(base unsafe.Pointer) uint64 {
+	return simdkernels.Parse16Digits((*[16]byte)(base))
 }

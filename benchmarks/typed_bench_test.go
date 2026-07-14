@@ -256,8 +256,8 @@ func benchmarkTypedDocument(b *testing.B, src []byte) {
 }
 
 var (
-	typedDocEncoder  = mustTypedEncoder[TypedDocument]()
-	encodeOutSink    []byte
+	typedDocEncoder = mustTypedEncoder[TypedDocument]()
+	encodeOutSink   []byte
 )
 
 func mustTypedEncoder[T any]() simdjson.Encoder[T] {

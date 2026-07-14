@@ -142,10 +142,6 @@ func scanStringUnicodeRun(src []byte, i int) (next, bad int) {
 	return next, invalidUTF8Index(src, i, next)
 }
 
-func stringChunkHasSpecial(x uint64) bool {
-	return stringSpecialMask(x) != 0
-}
-
 func stringSpecialMask(x uint64) uint64 {
 	const highBits = 0x8080808080808080
 	return byteEqMask(x, '"') |
@@ -167,10 +163,6 @@ func htmlStringSpecialMask(x uint64) uint64 {
 	return stringSpecialMask(x) |
 		byteEqMask(x, '&') |
 		byteEqMask(x|0x0202020202020202, '>')
-}
-
-func hasByte(x uint64, b byte) bool {
-	return byteEqMask(x, b) != 0
 }
 
 func byteEqMask(x uint64, b byte) uint64 {

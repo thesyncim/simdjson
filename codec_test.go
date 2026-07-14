@@ -30,7 +30,7 @@ func TestCodecRoundTrip(t *testing.T) {
 	}
 
 	buf := make([]byte, 0, 256)
-	appended, err := codec.Append(buf, &v)
+	appended, err := codec.AppendJSON(buf, &v)
 	if err != nil || string(appended) != string(want) {
 		t.Fatalf("Append = %s, %v", appended, err)
 	}

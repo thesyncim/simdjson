@@ -2,19 +2,20 @@ package simdjson
 
 import "fmt"
 
-// Error describes a JSON syntax error with byte, line, and column positions.
-type Error struct {
+// SyntaxError describes a JSON syntax error with byte, line, and column
+// positions.
+type SyntaxError struct {
 	Offset  int
 	Line    int
 	Column  int
 	Message string
 }
 
-func (e *Error) Error() string {
+func (e *SyntaxError) Error() string {
 	return fmt.Sprintf("json syntax error at byte %d, line %d, column %d: %s", e.Offset, e.Line, e.Column, e.Message)
 }
 
-func syntaxError(src []byte, off int, msg string) *Error {
+func syntaxError(src []byte, off int, msg string) *SyntaxError {
 	if off < 0 {
 		off = 0
 	}
@@ -30,5 +31,5 @@ func syntaxError(src []byte, off int, msg string) *Error {
 		}
 		col++
 	}
-	return &Error{Offset: off, Line: line, Column: col, Message: msg}
+	return &SyntaxError{Offset: off, Line: line, Column: col, Message: msg}
 }
