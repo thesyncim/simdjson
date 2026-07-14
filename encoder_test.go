@@ -421,6 +421,9 @@ func TestMapKeyKindsMatchStdlib(t *testing.T) {
 // SetIterKey/SetIterValue rewrite: a reused encoder emits a populated map
 // without allocating once its pooled scratch has warmed.
 func TestMapEncodeAllocationFree(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector instruments allocation and disables pool reuse")
+	}
 	type doc struct {
 		M map[string]int `json:"m"`
 	}

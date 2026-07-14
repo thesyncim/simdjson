@@ -453,11 +453,6 @@ func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsa
 	if cap(entries) < mapLen {
 		entries = make([]mapEncodeEntry, 0, mapLen)
 	}
-	if iterator == nil {
-		iterator = mapValue.MapRange()
-	} else {
-		iterator.Reset(mapValue)
-	}
 
 	var keyBox reflect.Value
 	if scratch != nil && inline.encKey >= 0 {
@@ -466,6 +461,15 @@ func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsa
 		keyBox = reflect.New(inline.mapType.Key()).Elem()
 	}
 	backing := e.takeValueBacking(elem.typ, mapLen)
+
+	// Bind the iterator last, after every setup allocation: MakeSlice above can
+	// grow the goroutine stack and move the map header mapValue reads through
+	// its noescape'd source pointer. See encodeMap for the same ordering.
+	if iterator == nil {
+		iterator = mapValue.MapRange()
+	} else {
+		iterator.Reset(mapValue)
+	}
 
 	for slot := 0; iterator.Next(); slot++ {
 		valueSlot := backing.Index(slot)
@@ -1140,11 +1144,6 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	if numericKeys && cap(keyArena) < mapLen*20 && mapLen <= int(^uint(0)>>1)/20 {
 		keyArena = make([]byte, 0, mapLen*20)
 	}
-	if iterator == nil {
-		iterator = mapValue.MapRange()
-	} else {
-		iterator.Reset(mapValue)
-	}
 
 	// Copy each key into a reserved box with SetIterKey and each value into its
 	// own backing slot with SetIterValue, so neither MapIter.Key nor
@@ -1157,6 +1156,16 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		keyBox = reflect.New(node.typ.Key()).Elem()
 	}
 	backing := e.takeValueBacking(node.elem.typ, mapLen)
+
+	// Bind the iterator last, after every setup allocation. MakeSlice above can
+	// grow the goroutine stack, which would move the map header that mapValue
+	// reads through its noescape'd source pointer; binding afterward keeps the
+	// iterator reading a stable location.
+	if iterator == nil {
+		iterator = mapValue.MapRange()
+	} else {
+		iterator.Reset(mapValue)
+	}
 
 	for slot := 0; iterator.Next(); slot++ {
 		keyBox.SetIterKey(iterator)
