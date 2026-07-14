@@ -1177,6 +1177,9 @@ func appendCompactUint(dst []byte, v uint64) []byte {
 	if v >= 1e9 {
 		return appendCompactUint10(dst, v)
 	}
+	if v >= 1e8 {
+		return appendCompactUint9(dst, v)
+	}
 	digits := int((bits.Len64(v)*1233)>>12) + 1
 	if v < pow10Uint64[digits-1] {
 		digits--
@@ -1224,6 +1227,21 @@ func appendCompactUint(dst []byte, v uint64) []byte {
 		i--
 		dst[i] = byte('0' + v)
 	}
+	return dst
+}
+
+//go:noinline
+func appendCompactUint9(dst []byte, v uint64) []byte {
+	if cap(dst)-len(dst) < 9 {
+		return strconv.AppendUint(dst, v, 10)
+	}
+	hi := v / 1e8
+	lo := v - hi*1e8
+	start := len(dst)
+	dst = dst[:start+9]
+	base := unsafe.Pointer(unsafe.SliceData(dst))
+	*(*byte)(unsafe.Add(base, start)) = byte('0' + hi)
+	simdkernels.Store8Digits((*[8]byte)(unsafe.Add(base, start+1)), lo)
 	return dst
 }
 
