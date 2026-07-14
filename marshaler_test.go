@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -300,14 +299,7 @@ func TestMarshalersMatchStdlib(t *testing.T) {
 		{Box: rawJSONBox{Raw: `"html <&> and   separators"`}},
 	}
 	for _, value := range values {
-		want, wantErr := stdlibCompactJSON(t, &value)
-		got, gotErr := Marshal(&value)
-		if (gotErr == nil) != (wantErr == nil) {
-			t.Fatalf("%#v: encode acceptance differs: simdjson=%v stdlib=%v", value, gotErr, wantErr)
-		}
-		if gotErr == nil && !bytes.Equal(got, want) {
-			t.Fatalf("%#v:\nsimdjson %s\nstdlib   %s", value, got, want)
-		}
+		assertEncodesLikeStdlib(t, &value)
 	}
 
 	sources := []string{
@@ -317,23 +309,15 @@ func TestMarshalersMatchStdlib(t *testing.T) {
 		`{"point":"bad"}`,
 		`{"point":17}`,
 	}
+	for _, src := range sources {
+		assertDecodesLikeStdlib[marshalerDocument](t, []byte(src))
+	}
+
+	// Round trip through both libraries.
 	decoder, err := CompileDecoder[marshalerDocument](DecoderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, src := range sources {
-		var got, want marshalerDocument
-		gotErr := decoder.Decode([]byte(src), &got)
-		wantErr := json.Unmarshal([]byte(src), &want)
-		if (gotErr == nil) != (wantErr == nil) {
-			t.Fatalf("%s: acceptance differs: simdjson=%v stdlib=%v", src, gotErr, wantErr)
-		}
-		if gotErr == nil && !reflect.DeepEqual(got, want) {
-			t.Fatalf("%s:\nsimdjson %#v\nstdlib   %#v", src, got, want)
-		}
-	}
-
-	// Round trip through both libraries.
 	original := marshalerDocument{When: when.Truncate(time.Second), Point: textPoint{X: 9, Y: 9}, Box: rawJSONBox{Raw: `[true]`}}
 	encoded, err := Marshal(&original)
 	if err != nil {
