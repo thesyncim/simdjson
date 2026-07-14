@@ -274,8 +274,10 @@ encoder, _ := simdjson.CompileEncoder[Event](simdjson.EncoderOptions{InlineField
 The catch-all consumes members that `DisallowUnknownFields` would otherwise
 reject. On encode the map's members follow the declared fields, sorted by name
 for deterministic output (`EncoderOptions.UnsortedInlineFields` emits them in
-map order instead). With `DecoderOptions.Replace`, a reused destination's map is
-cleared before decoding, like any other field; the default merges.
+map order instead); a populated catch-all encodes without allocating once the
+encoder's pooled scratch has warmed. With `DecoderOptions.Replace`, a reused
+destination's map is cleared before decoding, like any other field; the default
+merges.
 
 </details>
 

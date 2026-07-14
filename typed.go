@@ -365,10 +365,12 @@ type typedInlineMap struct {
 	mapType reflect.Type
 	elem    *typedNode
 	sorted  bool // emit entries in sorted key order
-	// encElem indexes a reserved encoder-scratch box of the value type, so
-	// encoding reuses one addressable element per struct type instead of
-	// allocating per call. It is -1 when no scratch is reserved.
-	encElem int32
+	// encKey indexes a reserved encoder-scratch box of the key type. Encoding
+	// copies each member name into it with SetIterKey, avoiding a reflect
+	// allocation per member; values collect into a pooled backing slice so each
+	// gets independent storage. It is -1 when no scratch is reserved (dynamic
+	// interface plans).
+	encKey int32
 }
 
 // typedField is one struct member of a compiled decode plan. The key fields
@@ -434,14 +436,14 @@ func (c *typedCompiler) compileInlineMap(node *typedNode, structType reflect.Typ
 	if err != nil {
 		return err
 	}
-	inline := &typedInlineMap{offset: offset, mapType: mapType, elem: elem, sorted: !c.inlineUnsorted, encElem: -1}
-	// Reuse the same pooled scratch as encodeMap: one addressable element box
-	// and one map iterator per struct type, so a populated catch-all encodes
-	// without per-call allocation.
+	inline := &typedInlineMap{offset: offset, mapType: mapType, elem: elem, sorted: !c.inlineUnsorted, encKey: -1}
+	// Reuse the same pooled scratch as encodeMap: one map iterator and entry
+	// slice per encode, plus a reserved key box and a pooled value backing, so
+	// a populated catch-all encodes without per-member allocation.
 	c.encHasMap = true
 	if !c.dynamic {
-		inline.encElem = int32(len(c.encScratchTypes))
-		c.encScratchTypes = append(c.encScratchTypes, mapType.Elem())
+		inline.encKey = int32(len(c.encScratchTypes))
+		c.encScratchTypes = append(c.encScratchTypes, mapType.Key())
 	}
 	node.inlineMap = inline
 	node.encSimple = false

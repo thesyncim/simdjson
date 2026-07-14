@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -225,6 +226,108 @@ func TestInlineReplaceClearsStale(t *testing.T) {
 	if len(v.Extra) != 1 || string(v.Extra["d"]) != "4" {
 		t.Fatalf("replace did not clear stale members: %v", v.Extra)
 	}
+}
+
+// recNode is a catch-all whose value type is itself, exercising the encoder's
+// promise that each member gets independent backing storage: an outer member's
+// slot must survive while encoding it recurses into the same catch-all.
+type recNode struct {
+	V   int                `json:"v"`
+	Sub map[string]recNode `json:",inline"`
+}
+
+// TestInlineRecursiveType round-trips a self-referential catch-all. If the
+// encoder shared one element box across recursion levels, an outer value would
+// be clobbered while its own sub-map encoded.
+func TestInlineRecursiveType(t *testing.T) {
+	dec, err := CompileDecoder[recNode](DecoderOptions{InlineFields: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := CompileEncoder[recNode](EncoderOptions{InlineFields: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := []byte(`{"v":1,"a":{"v":2,"b":{"v":3}},"c":{"v":4}}`)
+	var v recNode
+	if err := dec.Decode(src, &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.V != 1 || v.Sub["a"].V != 2 || v.Sub["a"].Sub["b"].V != 3 || v.Sub["c"].V != 4 {
+		t.Fatalf("recursive decode lost structure: %#v", v)
+	}
+	out, err := enc.AppendJSON(nil, &v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != `{"v":1,"a":{"v":2,"b":{"v":3}},"c":{"v":4}}` {
+		t.Fatalf("recursive encode = %s", out)
+	}
+}
+
+// TestInlineNestedDifferentTypes nests catch-alls of different value types so
+// the pooled backing must re-type between the outer and inner encode.
+func TestInlineNestedDifferentTypes(t *testing.T) {
+	type inner struct {
+		Extra map[string]json.RawMessage `json:",inline"`
+	}
+	type outer struct {
+		ID   int              `json:"id"`
+		Kids map[string]inner `json:",inline"`
+	}
+	enc, err := CompileEncoder[outer](EncoderOptions{InlineFields: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := CompileDecoder[outer](DecoderOptions{InlineFields: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := []byte(`{"id":1,"x":{"a":true,"b":2},"y":{"c":"z"}}`)
+	var v outer
+	if err := dec.Decode(src, &v); err != nil {
+		t.Fatal(err)
+	}
+	out, err := enc.AppendJSON(nil, &v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != `{"id":1,"x":{"a":true,"b":2},"y":{"c":"z"}}` {
+		t.Fatalf("nested encode = %s", out)
+	}
+}
+
+// TestInlineConcurrentEncode hammers one encoder from many goroutines: the
+// pooled backing must stay private to each AppendJSON call.
+func TestInlineConcurrentEncode(t *testing.T) {
+	enc, err := CompileEncoder[inlineRaw](EncoderOptions{InlineFields: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := inlineRaw{ID: 9, Name: "n", Extra: map[string]json.RawMessage{
+		"alpha": json.RawMessage("1"), "beta": json.RawMessage(`"two"`),
+		"gamma": json.RawMessage("[3,3,3]"), "delta": json.RawMessage("true"),
+	}}
+	const want = `{"id":9,"name":"n","alpha":1,"beta":"two","delta":true,"gamma":[3,3,3]}`
+	var wg sync.WaitGroup
+	for g := 0; g < 16; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 2000; i++ {
+				out, err := enc.AppendJSON(nil, &v)
+				if err != nil {
+					t.Errorf("encode: %v", err)
+					return
+				}
+				if string(out) != want {
+					t.Errorf("concurrent encode = %s", out)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // BenchmarkInlineEncode measures a populated catch-all with a reused encoder:

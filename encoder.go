@@ -424,10 +424,12 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 // through first. An empty or nil map emits nothing, so a struct that declares
 // a catch-all pays only a length check when it holds no unknown members.
 //
-// A populated catch-all reuses encodeMap's pooled scratch: one entry slice,
-// one iterator, and one addressable element box, so repeated encodes allocate
-// nothing after warmup. String map keys alias the map's own storage, which
-// outlives the call, so names need no arena or cloning.
+// A populated catch-all is allocation-free after warmup: it borrows the pooled
+// entry slice and map iterator, copies each member name into a reserved key box
+// with SetIterKey, and copies each value into its own slot of a pooled backing
+// slice with SetIterValue. Independent slots (rather than one shared box) keep
+// the encode correct even when a value recurses into the same catch-all type.
+// String keys alias the live map's own storage, so names need no arena.
 func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsafe.Pointer, first *bool) error {
 	mapValue := reflect.NewAt(inline.mapType, noescape(unsafe.Add(structPtr, inline.offset))).Elem()
 	if mapValue.IsNil() || mapValue.Len() == 0 {
@@ -456,22 +458,28 @@ func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsa
 	} else {
 		iterator.Reset(mapValue)
 	}
-	for iterator.Next() {
-		entries = append(entries, mapEncodeEntry{name: iterator.Key().String(), value: iterator.Value()})
+
+	var keyBox reflect.Value
+	if scratch != nil && inline.encKey >= 0 {
+		keyBox = scratch.marshalers[inline.encKey].value
+	} else {
+		keyBox = reflect.New(inline.mapType.Key()).Elem()
 	}
+	backing := e.takeInlineBacking(elem.typ, mapLen)
+
+	for slot := 0; iterator.Next(); slot++ {
+		valueSlot := backing.Index(slot)
+		valueSlot.SetIterValue(iterator)
+		keyBox.SetIterKey(iterator)
+		entries = append(entries, mapEncodeEntry{name: keyBox.String(), value: valueSlot})
+	}
+	usedSlots := len(entries)
 	if inline.sorted {
 		slices.SortFunc(entries, func(a, b mapEncodeEntry) int { return strings.Compare(a.name, b.name) })
 	}
 
-	var elementValue reflect.Value
-	if scratch != nil && inline.encElem >= 0 {
-		elementValue = scratch.marshalers[inline.encElem].value
-	} else {
-		elementValue = reflect.New(elem.typ).Elem()
-	}
-	elementPtr := elementValue.Addr().UnsafePointer()
 	elemHasMarshaler := elem.encHasPtrMarshaler
-
+	var retErr error
 	for i := range entries {
 		if *first {
 			*first = false
@@ -480,23 +488,59 @@ func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsa
 		}
 		e.dst = appendEncodedJSONString(e.dst, entries[i].name, e.escapeHTML)
 		e.dst = append(e.dst, ':')
-		elementValue.Set(entries[i].value)
+		valuePtr := entries[i].value.Addr().UnsafePointer()
 		var err error
 		if elemHasMarshaler {
-			err = e.encodeNonAddressableMarshaler(elem, elementPtr)
+			err = e.encodeNonAddressableMarshaler(elem, valuePtr)
 		} else {
-			err = e.encodeKind(elem, elementPtr, elem.encNonAddrKind)
+			err = e.encodeKind(elem, valuePtr, elem.encNonAddrKind)
 		}
 		if err != nil {
-			// String keys alias the live source map, not keyArena, so the
-			// name stays valid after the scratch is released.
-			name := entries[i].name
-			e.releaseMapScratch(entries, keyArena, iterator)
-			return prependEncodePathField(err, name)
+			retErr = prependEncodePathField(err, entries[i].name)
+			break
 		}
 	}
+	e.releaseInlineBacking(backing, elem.typ, usedSlots)
 	e.releaseMapScratch(entries, keyArena, iterator)
-	return nil
+	return retErr
+}
+
+// takeInlineBacking borrows the scratch's reused value backing with room for at
+// least n elements, growing or re-typing the slice as needed. The returned
+// slice keeps its full length, so the caller indexes slots [0, n) directly and
+// never reslices (Value.Slice would allocate a fresh header). A nested catch-
+// all sees the backing already taken and allocates its own; the reserved backing
+// is restored by releaseInlineBacking.
+func (e *encodeState) takeInlineBacking(elemType reflect.Type, n int) reflect.Value {
+	scratch := e.scratch
+	if scratch != nil && scratch.inlineElem == elemType && scratch.inlineBacking.IsValid() && scratch.inlineBacking.Len() >= n {
+		backing := scratch.inlineBacking
+		scratch.inlineBacking = reflect.Value{}
+		scratch.inlineElem = nil
+		return backing
+	}
+	if scratch != nil {
+		scratch.inlineBacking = reflect.Value{}
+		scratch.inlineElem = nil
+	}
+	return reflect.MakeSlice(reflect.SliceOf(elemType), n, n)
+}
+
+// releaseInlineBacking clears the used slots, so the pool never pins the last
+// map's values, then returns the backing for reuse with its grown length. The
+// tail past used stays zero across calls, so clearing only [0, used) is enough;
+// zeroing the element bytes is a valid nil state for any type.
+func (e *encodeState) releaseInlineBacking(backing reflect.Value, elemType reflect.Type, used int) {
+	if used > 0 {
+		base := backing.Index(0).Addr().UnsafePointer()
+		clear(unsafe.Slice((*byte)(base), uintptr(used)*elemType.Size()))
+	}
+	scratch := e.scratch
+	if scratch == nil || scratch.inlineElem != nil {
+		return // a nested catch-all already restored a backing; drop this one
+	}
+	scratch.inlineBacking = backing
+	scratch.inlineElem = elemType
 }
 
 // encodeSimpleStructPairs runs a simple struct's pair program. The caller
