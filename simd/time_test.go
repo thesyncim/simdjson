@@ -48,6 +48,59 @@ func TestAppendTimeMatchesTime(t *testing.T) {
 	}
 }
 
+// TestAppendTimeCachedMatchesTime drives one shared cache through clustered
+// sequences — repeated seconds, same-day steps, day rollovers, zone flips,
+// varied fractions, and interleaved errors — and checks every append against
+// AppendText plus the cache-off path.
+func TestAppendTimeCachedMatchesTime(t *testing.T) {
+	locations := []*time.Location{
+		time.UTC,
+		time.FixedZone("west", -5*60*60-30*60),
+		time.FixedZone("east", 14*60*60+45*60),
+	}
+	var cache TimeCache
+	base := time.Date(2026, time.July, 14, 9, 30, 0, 0, time.UTC)
+	step := base
+	for i := range 200_000 {
+		var value time.Time
+		switch i % 8 {
+		case 0, 1:
+			value = step // repeated second, varying fraction below
+		case 2, 3:
+			step = step.Add(time.Duration(rand.IntN(90)) * time.Second)
+			value = step
+		case 4:
+			step = step.Add(time.Duration(rand.IntN(48)) * time.Hour)
+			value = step
+		case 5:
+			value = step.In(locations[rand.IntN(len(locations))])
+		case 6:
+			value = time.Date(rand.IntN(10_000), time.Month(rand.IntN(12)+1), rand.IntN(28)+1,
+				rand.IntN(24), rand.IntN(60), rand.IntN(60), 0, locations[rand.IntN(len(locations))])
+		default:
+			// Out-of-range years must error identically and leave the
+			// cache consistent for the next valid append.
+			value = time.Date(-rand.IntN(3)-1, 1, 1, 0, 0, 0, 0, time.UTC)
+		}
+		if rand.IntN(2) == 0 {
+			value = value.Add(time.Duration(rand.IntN(1_000_000_000)) * time.Nanosecond)
+			step = value
+		}
+
+		want, wantErr := AppendTime([]byte("p"), value)
+		got, gotErr := AppendTimeCached([]byte("p"), value, &cache)
+		if (wantErr != nil) != (gotErr != nil) {
+			t.Fatalf("step %d: AppendTimeCached(%v) err = %v, want %v", i, value, gotErr, wantErr)
+		}
+		if wantErr != nil {
+			continue
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("step %d: AppendTimeCached(%v) = %q, want %q", i, value, got, want)
+		}
+	}
+}
+
 // TestAbsDaysToDateExhaustive checks the ported civil-date computation
 // against the standard library for every day AppendTime can emit, plus the
 // rejected years bordering the supported range.

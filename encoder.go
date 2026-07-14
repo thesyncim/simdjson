@@ -176,6 +176,7 @@ type encodeState struct {
 	depth      int
 	escapeHTML bool
 	scratch    *encoderScratch
+	timeCache  simdkernels.TimeCache
 }
 
 func (e *encodeState) encode(node *typedNode, src unsafe.Pointer) error {
@@ -274,7 +275,7 @@ func (e *encodeState) encodeKind(node *typedNode, src unsafe.Pointer, kind typed
 
 func (e *encodeState) encodeTime(src unsafe.Pointer) error {
 	var err error
-	e.dst, err = simdkernels.AppendTime(e.dst, *(*time.Time)(src))
+	e.dst, err = simdkernels.AppendTimeCached(e.dst, *(*time.Time)(src), &e.timeCache)
 	if err != nil {
 		return &EncodeError{Reason: "MarshalJSON: Time.MarshalJSON: " + strings.TrimPrefix(err.Error(), "Time.AppendText: ")}
 	}

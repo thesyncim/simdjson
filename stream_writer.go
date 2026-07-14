@@ -27,6 +27,7 @@ type Writer struct {
 	flushAt    int
 	err        error
 	escapeHTML bool
+	timeCache  simdkernels.TimeCache
 
 	// Container state for the token layer. Each level records the kind of
 	// open container, whether it has members, and — inside objects —
@@ -256,7 +257,7 @@ func (w *Writer) Time(t time.Time) error {
 	if !w.beforeValue() {
 		return w.err
 	}
-	dst, err := simdkernels.AppendTime(w.buf, t)
+	dst, err := simdkernels.AppendTimeCached(w.buf, t, &w.timeCache)
 	if err != nil {
 		return w.fail(err)
 	}
