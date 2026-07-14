@@ -33,7 +33,10 @@ const (
 	// off when whitespace outside strings dominates AND grammar emits stay
 	// sparse: a skipped whitespace byte saves about a nanosecond while an
 	// emitted position costs several, so commitment requires at least 25%
-	// outside whitespace and a ws:emit ratio above 4.5 (2ws >= 9emits).
+	// outside whitespace and a ws:emit ratio above 3.5 (2ws >= 7emits).
+	// The ratio was retuned from 4.5 after the ADDP mask kernels cut the
+	// per-block cost by about thirty percent; citm-shaped documents at a
+	// ratio near 3.8 now win with the engine.
 	validBitmapSampleBlocks = 32
 	validBitmapSampleMinWs  = 512
 )
@@ -149,7 +152,7 @@ func validBitmap(src []byte) (valid, decided bool) {
 			wsSample += bits.OnesCount64(m.Whitespace & outside)
 			emitSample += bits.OnesCount64(emit)
 			if block == validBitmapSampleBlocks-1 &&
-				(wsSample < validBitmapSampleMinWs || wsSample*2 < emitSample*9) {
+				(wsSample < validBitmapSampleMinWs || wsSample*2 < emitSample*7) {
 				return false, false
 			}
 		}

@@ -7,18 +7,32 @@ import (
 	"unsafe"
 )
 
-// stage1Weights carries one distinct bit per lane within each eight-byte
-// half; the pairwise-add tree in stage1Movemask64 folds four compare
-// vectors into one 64-bit mask.
-var stage1Weights = [16]uint8{1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128}
+// stage1ZipIndex interleaves a vector's halves: lane 2i takes byte i and
+// lane 2i+1 takes byte 8+i. All classification below runs on interleaved
+// lanes; with the paired weights the 16-bit pairwise-add tree in
+// stage1Movemask64 emits mask bits back in source order. One table lookup
+// per vector buys each of the five reductions a four-instruction ADDP tree
+// in place of the three-instruction concat-add idiom per level.
+var stage1ZipIndex = [16]uint8{0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15}
+
+// stage1Weights carries one distinct bit per interleaved lane pair: even
+// lanes accumulate into the low byte of each 16-bit sum and odd lanes into
+// the high byte, so the tree reassembles source order.
+var stage1Weights = [16]uint8{1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 32, 32, 64, 64, 128, 128}
 
 // Stage1Block classifies one full 64-byte block starting at p.
 func Stage1Block(p *[64]byte, m *Stage1Masks) {
 	base := unsafe.Pointer(p)
-	v0 := archsimd.LoadUint8x16Array((*[16]uint8)(base))
-	v1 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, 16)))
-	v2 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, 32)))
-	v3 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, 48)))
+	r0 := archsimd.LoadUint8x16Array((*[16]uint8)(base))
+	r1 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, 16)))
+	r2 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, 32)))
+	r3 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(base, 48)))
+
+	zip := archsimd.LoadUint8x16Array(&stage1ZipIndex)
+	v0 := r0.LookupOrZero(zip)
+	v1 := r1.LookupOrZero(zip)
+	v2 := r2.LookupOrZero(zip)
+	v3 := r3.LookupOrZero(zip)
 
 	weights := archsimd.LoadUint8x16Array(&stage1Weights)
 	quote := archsimd.BroadcastUint8x16('"')
@@ -37,38 +51,38 @@ func Stage1Block(p *[64]byte, m *Stage1Masks) {
 	c3 := loTable.LookupOrZero(v3.And(lowNibble)).And(hiTable.LookupOrZero(v3.ShiftAllRight(4)))
 
 	m.Whitespace = stage1Movemask64(
-		c0.And(wsBits).NotEqual(zero),
-		c1.And(wsBits).NotEqual(zero),
-		c2.And(wsBits).NotEqual(zero),
-		c3.And(wsBits).NotEqual(zero),
+		c0.And(wsBits).Greater(zero),
+		c1.And(wsBits).Greater(zero),
+		c2.And(wsBits).Greater(zero),
+		c3.And(wsBits).Greater(zero),
 		weights,
 	)
 	m.Structural = stage1Movemask64(
-		c0.And(structBits).NotEqual(zero),
-		c1.And(structBits).NotEqual(zero),
-		c2.And(structBits).NotEqual(zero),
-		c3.And(structBits).NotEqual(zero),
+		c0.And(structBits).Greater(zero),
+		c1.And(structBits).Greater(zero),
+		c2.And(structBits).Greater(zero),
+		c3.And(structBits).Greater(zero),
 		weights,
 	)
 	m.Quote = stage1Movemask64(v0.Equal(quote), v1.Equal(quote), v2.Equal(quote), v3.Equal(quote), weights)
 	m.Backslash = stage1Movemask64(v0.Equal(slash), v1.Equal(slash), v2.Equal(slash), v3.Equal(slash), weights)
 	m.Control = stage1Movemask64(v0.Less(ctrl), v1.Less(ctrl), v2.Less(ctrl), v3.Less(ctrl), weights)
-	m.NonASCII = v0.Or(v1).Or(v2).Or(v3).ReduceMax() >= 0x80
+	m.NonASCII = r0.Or(r1).Or(r2).Or(r3).ReduceMax() >= 0x80
 }
 
-// stage1Movemask64 folds four 16-lane compare masks into one 64-bit mask,
-// one bit per byte. Each lane is weighted with a distinct bit within its
-// eight-byte half and a three-level pairwise-add tree (UZP1/UZP2 plus ADD,
-// the ADDP idiom) accumulates the weights; the lanes are disjoint so
-// addition acts as OR.
+// stage1Movemask64 folds four 16-lane compare masks over interleaved lanes
+// into one source-order 64-bit mask: weighting gives every lane a distinct
+// bit within its half-and-parity group, and four pairwise adds (ADDP on
+// 16-bit lanes, which never carry across the byte boundary because the
+// weights are disjoint) accumulate each group into its result byte.
 func stage1Movemask64(m0, m1, m2, m3 archsimd.Mask8x16, weights archsimd.Uint8x16) uint64 {
-	b0 := m0.ToInt8x16().ToBits().And(weights)
-	b1 := m1.ToInt8x16().ToBits().And(weights)
-	b2 := m2.ToInt8x16().ToBits().And(weights)
-	b3 := m3.ToInt8x16().ToBits().And(weights)
-	s01 := b0.ConcatEven(b1).Add(b0.ConcatOdd(b1))
-	s23 := b2.ConcatEven(b3).Add(b2.ConcatOdd(b3))
-	s := s01.ConcatEven(s23).Add(s01.ConcatOdd(s23))
-	t := s.ConcatEven(s).Add(s.ConcatOdd(s))
+	b0 := m0.ToInt8x16().ToBits().And(weights).ReshapeToUint16s()
+	b1 := m1.ToInt8x16().ToBits().And(weights).ReshapeToUint16s()
+	b2 := m2.ToInt8x16().ToBits().And(weights).ReshapeToUint16s()
+	b3 := m3.ToInt8x16().ToBits().And(weights).ReshapeToUint16s()
+	s01 := b0.ConcatAddPairs(b1)
+	s23 := b2.ConcatAddPairs(b3)
+	s := s01.ConcatAddPairs(s23)
+	t := s.ConcatAddPairs(s)
 	return t.ReshapeToUint64s().GetElem(0)
 }

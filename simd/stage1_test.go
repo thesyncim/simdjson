@@ -31,25 +31,34 @@ func stage1RefMasks(block *[64]byte) Stage1Masks {
 }
 
 func TestStage1BlockAllByteValues(t *testing.T) {
+	// Every byte value at every lane position, one at a time, so any lane
+	// permutation inside the kernel is fully exercised.
 	for b := 0; b <= 0xff; b++ {
 		var block [64]byte
 		for i := range block {
 			block[i] = 'a'
 		}
-		// Place the probe byte at several lane positions, including both
-		// halves of every vector.
-		for _, at := range []int{0, 7, 8, 15, 16, 31, 32, 47, 48, 63} {
+		for at := 0; at < 64; at++ {
 			block[at] = byte(b)
-		}
-		var got Stage1Masks
-		Stage1Block(&block, &got)
-		want := stage1RefMasks(&block)
-		if got != want {
-			t.Fatalf("Stage1Block(byte=0x%02x) = %+v, want %+v", b, got, want)
-		}
-		for _, at := range []int{0, 7, 8, 15, 16, 31, 32, 47, 48, 63} {
+			var got Stage1Masks
+			Stage1Block(&block, &got)
+			want := stage1RefMasks(&block)
+			if got != want {
+				t.Fatalf("Stage1Block(byte=0x%02x at %d) = %+v, want %+v", b, at, got, want)
+			}
 			block[at] = 'a'
 		}
+	}
+}
+
+var stage1BenchSink Stage1Masks
+
+func BenchmarkStage1Block(b *testing.B) {
+	var block [64]byte
+	copy(block[:], `{"key": "value", "n": 12345, "flag": true, "arr": [1,2,3]}   `)
+	b.SetBytes(64)
+	for i := 0; i < b.N; i++ {
+		Stage1Block(&block, &stage1BenchSink)
 	}
 }
 
