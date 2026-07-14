@@ -31,13 +31,13 @@ dagger since the parse-only and validate-only columns do less work per byte.
 
 | Corpus | C++ DOM parse | simd-json borrowed | serde_json `Value` | Go dynamic `any` | Go typed owned | Go strict validate |
 |---|---:|---:|---:|---:|---:|---:|
-| Canada geometry | 1.60 | 0.56 | 0.56† | 0.40 | 1.69 | **2.14** |
-| CITM catalog | **4.94** | 1.41† | 0.86 | 1.04 | 2.31 | 2.83 |
-| Go source | 1.96 | 0.75† | 0.39 | 0.62 | 1.87 | **2.07** |
-| Escaped strings | 0.88 | 0.60 | 0.93 | 1.62† | 1.57 | **9.74** |
-| Unicode strings | 4.84 | 2.93† | 1.33 | 2.12 | 3.38 | **5.63** |
-| Synthea FHIR | **5.00** | 1.28† | 0.58 | 0.81 | 1.42 | 3.14 |
-| Twitter status | **4.37** | 1.42† | 0.57 | 0.74 | 1.73 | 2.78 |
+| Canada geometry | 1.60 | 0.56 | 0.56† | 0.39 | 1.57 | **2.14** |
+| CITM catalog | **4.94** | 1.41† | 0.86 | 1.02 | 2.77 | 2.83 |
+| Go source | 1.96 | 0.75† | 0.39 | 0.59 | 1.80 | **2.07** |
+| Escaped strings | 0.88 | 0.60 | 0.93 | 1.61† | 1.49 | **9.74** |
+| Unicode strings | 4.84 | 2.93† | 1.33 | 2.08 | 3.22 | **5.63** |
+| Synthea FHIR | **5.00** | 1.28† | 0.58 | 0.80 | 1.54 | 3.14 |
+| Twitter status | **4.37** | 1.42† | 0.57 | 0.72 | 1.80 | 2.78 |
 
 - C++ simdjson's two-stage tape parse is the fastest JSON front-end measured
   here: 4.4–5.0 GB/s on object-dense payloads, ahead of even our

@@ -56,26 +56,26 @@ unescaped strings into immutable input and has a different lifetime contract.
 
 | Corpus | `encoding/json` | simdjson owned | Source-backed | Rival | Rival time |
 |---|---:|---:|---:|---|---:|
-| Canada geometry | 1.203 ms | **160.3 us** | 148.8 us | go-json | 710.5 us |
-| CITM catalog | 2.499 ms | **747.5 us** | 643.1 us | go-json | 1.015 ms |
-| Go source | 6.043 ms | **1.040 ms** | 987.6 us | go-json | 2.132 ms |
-| Escaped strings | 186.3 us | **26.7 us** | 24.5 us | go-json | 61.8 us |
-| Unicode strings | 39.2 us | **5.4 us** | 4.6 us | go-json | 10.8 us |
-| Synthea FHIR | 3.781 ms | **1.410 ms** | 1.285 ms | go-json | 1.654 ms |
-| Twitter status | 1.319 ms | **365.8 us** | 331.5 us | go-json | 588.9 us |
+| Canada geometry | 1.246 ms | **171.8 us** | 160.6 us | go-json | 746.1 us |
+| CITM catalog | 2.556 ms | **623.7 us** | 558.5 us | go-json | 1.060 ms |
+| Go source | 6.234 ms | **1.078 ms** | 1.002 ms | Segment | 2.172 ms |
+| Escaped strings | 189.3 us | **28.2 us** | 25.5 us | go-json | 62.3 us |
+| Unicode strings | 39.1 us | **5.6 us** | 4.7 us | go-json | 12.0 us |
+| Synthea FHIR | 3.744 ms | **1.307 ms** | 1.240 ms | go-json | 1.708 ms |
+| Twitter status | 1.359 ms | **350.1 us** | 323.8 us | go-json | 608.1 us |
 
 Source-backed refers only to unescaped string ownership. Slices, maps,
 pointers, escaped text, and custom method receivers may still allocate.
 
 | Corpus | Source-backed bytes/op | Source-backed allocs/op |
 |---|---:|---:|
-| Canada geometry | 267 B | 0 |
-| CITM catalog | 1.677 MiB | 1,224 |
-| Go source | 9.2 KiB | 42 |
-| Escaped strings | 48.0 KiB | 1 |
-| Unicode strings | 18.0 KiB | 1 |
-| Synthea FHIR | 1.945 MiB | 347 |
-| Twitter status | 631.1 KiB | 139 |
+| Canada geometry | 189 B | 0 |
+| CITM catalog | 29.9 KiB | 1,209 |
+| Go source | 8.9 KiB | 41 |
+| Escaped strings | 30.0 KiB | 5 |
+| Unicode strings | 6.0 KiB | 3 |
+| Synthea FHIR | 25.1 KiB | 334 |
+| Twitter status | 68.7 KiB | 144 |
 
 ### Dynamic decode
 
@@ -83,13 +83,13 @@ These rows fully materialize an owned `any` tree.
 
 | Corpus | simdjson | Rival | Rival time | Lead |
 |---|---:|---|---:|---:|
-| Canada geometry | **681.4 us** | go-json | 1.418 ms | **2.08x** |
-| CITM catalog | **1.660 ms** | jsoniter | 3.184 ms | **1.92x** |
-| Go source | **3.154 ms** | jsoniter | 7.243 ms | **2.30x** |
-| Escaped strings | **25.9 us** | go-json | 64.1 us | **2.47x** |
-| Unicode strings | **8.5 us** | go-json | 15.9 us | **1.87x** |
-| Synthea FHIR | **2.465 ms** | go-json | 4.256 ms | **1.73x** |
-| Twitter status | **849.2 us** | go-json | 1.366 ms | **1.61x** |
+| Canada geometry | **686.8 us** | go-json | 1.456 ms | **2.12x** |
+| CITM catalog | **1.689 ms** | go-json | 3.291 ms | **1.95x** |
+| Go source | **3.262 ms** | jsoniter | 7.344 ms | **2.25x** |
+| Escaped strings | **26.1 us** | go-json | 68.5 us | **2.62x** |
+| Unicode strings | **8.7 us** | go-json | 16.3 us | **1.87x** |
+| Synthea FHIR | **2.499 ms** | go-json | 4.436 ms | **1.78x** |
+| Twitter status | **882.7 us** | go-json | 1.419 ms | **1.61x** |
 
 ### Strict validation
 
@@ -129,10 +129,10 @@ selected once during initialization; short runs may remain scalar or SWAR.
 | simdjson path | SIMD wins | Geomean SIMD uplift |
 |---|---:|---:|
 | Validation | 7/7 | **1.436x** |
-| Dynamic owned | 4/7 | **1.092x** |
-| Dynamic source-backed | 4/7 | **1.123x** |
-| Typed owned | 5/7 | **1.150x** |
-| Typed source-backed | 6/7 | **1.176x** |
+| Dynamic owned | 7/7 | **1.121x** |
+| Dynamic source-backed | 7/7 | **1.124x** |
+| Typed owned | 6/7 | **1.159x** |
+| Typed source-backed | 6/7 | **1.191x** |
 | Encode owned | 7/7 | **1.720x** |
 | Encode compiled reuse | 7/7 | **1.791x** |
 
@@ -145,13 +145,31 @@ invalid UTF-8.
 
 | Corpus | Typed owned | Dynamic owned | Encode owned | Syntax-only `Valid` |
 |---|---:|---:|---:|---:|
-| Canada geometry | 421.6 us | 709.3 us | 742.1 us | 185.9 us |
-| CITM catalog | 1.362 ms | 2.454 ms | 814.3 us | 764.9 us |
-| Go source | 3.100 ms | 5.253 ms | 3.538 ms | 1.502 ms |
-| Escaped strings | 29.3 us | 31.1 us | 18.4 us | 3.2 us |
-| Unicode strings | 10.6 us | 11.9 us | 18.6 us | 1.7 us |
-| Synthea FHIR | 2.379 ms | 4.134 ms | 6.702 ms | 834.0 us |
-| Twitter status | 672.6 us | 944.5 us | 542.7 us | 227.9 us |
+| Canada geometry | 443.3 us | 742.7 us | 742.1 us | 185.9 us |
+| CITM catalog | 1.429 ms | 2.589 ms | 814.3 us | 764.9 us |
+| Go source | 3.431 ms | 5.633 ms | 3.538 ms | 1.502 ms |
+| Escaped strings | 31.8 us | 33.2 us | 18.4 us | 3.2 us |
+| Unicode strings | 11.0 us | 12.8 us | 18.6 us | 1.7 us |
+| Synthea FHIR | 2.627 ms | 4.320 ms | 6.702 ms | 834.0 us |
+| Twitter status | 715.6 us | 1.005 ms | 542.7 us | 227.9 us |
+
+### encoding/json/v2
+
+`encoding/json/v2` (Go tip, built with `GOEXPERIMENT=jsonv2`) is measured by
+`BenchmarkStdlibCorpusJSONV2` over the same corpus, models, and contracts,
+in the same session as the decode tables above. Geometric means over the
+seven payloads: our typed owned decode leads v2 by **3.92x**, dynamic owned
+by **2.50x**, and owned `Marshal` by **3.34x**.
+
+| Corpus | v2 typed | v2 dynamic `any` | v2 `Marshal` |
+|---|---:|---:|---:|
+| Canada geometry | 1.120 ms | 1.407 ms | 613.4 us |
+| CITM catalog | 2.070 ms | 3.576 ms | 789.9 us |
+| Go source | 5.359 ms | 8.220 ms | 2.689 ms |
+| Escaped strings | 138.5 us | 143.2 us | 18.6 us |
+| Unicode strings | 21.7 us | 26.8 us | 18.4 us |
+| Synthea FHIR | 3.176 ms | 4.530 ms | 5.171 ms |
+| Twitter status | 997.0 us | 1.593 ms | 581.5 us |
 
 ## Cross-language context
 

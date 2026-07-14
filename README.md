@@ -388,8 +388,8 @@ speedup across all seven payloads.
 | Operation | Contract | vs stdlib | vs fastest rival | vs native Sonic | SIMD vs pure Go |
 |---|---|---:|---:|---:|---:|
 | Validate | Strict JSON + UTF-8 | **2.40x** | **2.22x** | **1.06x** | **1.436x** |
-| Typed decode | Owned strings | **4.94x** | **1.95x** | **1.92x** | **1.150x** |
-| Dynamic decode | Owned `any` tree | **4.36x** | **1.97x** | **1.35x** | **1.092x** |
+| Typed decode | Owned strings | **5.10x** | **2.06x** | **2.08x** | **1.159x** |
+| Dynamic decode | Owned `any` tree | **4.48x** | **2.01x** | **1.40x** | **1.121x** |
 | Encode | Owned output | **3.39x** | **2.06x** | **3.91x** | **1.720x** |
 | Encode | Reused output buffer | **3.76x** | **2.29x** | — | **1.791x** |
 
@@ -402,6 +402,10 @@ excluded from the fastest-rival column, its `Valid` is syntax-only where ours
 also enforces UTF-8, and it has no reused-buffer `Marshal` counterpart. The
 SIMD column compares the same code, compiler, and corpus with and without
 `GOEXPERIMENT=simd`.
+
+The upcoming `encoding/json/v2` (`GOEXPERIMENT=jsonv2`) trails on the same
+corpus by 3.9x on typed decode, 2.5x on dynamic decode, and 3.3x on owned
+`Marshal` — see [the v2 table](benchmarks/README.md#encodingjsonv2).
 
 [Full per-corpus results, allocations, SIMD uplift, versions, and exact commands](benchmarks/README.md#published-corpus-snapshot).
 For context beyond Go — C++ simdjson and Rust serde_json/simd-json on the
