@@ -877,6 +877,10 @@ func decodeCompiledAny(cursor *decoderCursor, dst unsafe.Pointer) error {
 	p.skipSpace()
 	value, err := p.parseAnyValue(cursor.depth, false)
 	cursor.i = p.i
+	// The dynamic tree retains any escaped strings it materialized in the
+	// arena; advancing the arena keeps later escaped strings from
+	// overwriting them.
+	cursor.setStringArenaLen(len(p.strings))
 	if err != nil {
 		return err
 	}

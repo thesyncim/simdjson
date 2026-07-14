@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -34,6 +35,23 @@ func checkAPIAgreement(t *testing.T, src []byte) {
 	var typed benchDocument
 	if err := Unmarshal(src, &typed); !want && err == nil {
 		t.Fatalf("Unmarshal into struct accepted invalid input (length %d)", len(src))
+	}
+	// The any-bearing struct exercises the shared string arena: dynamic
+	// values must retain their unescaped strings across later fields, so on
+	// acceptance the result must match encoding/json exactly.
+	type anyFieldProbe struct {
+		B string `json:"b"`
+		A any    `json:"a"`
+		C string `json:"c"`
+	}
+	var probe anyFieldProbe
+	if err := Unmarshal(src, &probe); !want && err == nil {
+		t.Fatalf("Unmarshal into any-bearing struct accepted invalid input (length %d)", len(src))
+	} else if err == nil {
+		var std anyFieldProbe
+		if json.Unmarshal(src, &std) == nil && !reflect.DeepEqual(probe, std) {
+			t.Fatalf("any-bearing decode differs from encoding/json: %+v vs %+v", probe, std)
+		}
 	}
 	var tree map[string]any
 	if err := Unmarshal(src, &tree); !want && err == nil {
@@ -194,6 +212,7 @@ func FuzzAPIConsistency(f *testing.F) {
 		f.Add(torture.doc[:len(torture.doc)/2])
 	}
 	f.Add(benchRecordsJSON(2))
+	f.Add([]byte(`{"b":"p` + jsonUnicodeEscape("0042") + `q","a":"x` + jsonUnicodeEscape("0041") + `y","c":"r` + jsonUnicodeEscape("0043") + `s"}`))
 	f.Fuzz(func(t *testing.T, src []byte) {
 		if len(src) > 1<<16 {
 			t.Skip()
