@@ -596,3 +596,60 @@ func BenchmarkStreamReadNDJSONStdlib(b *testing.B) {
 		}
 	}
 }
+
+// fixedChunkReader delivers data in fixed-size pieces, modeling a value that
+// arrives across many small network reads.
+type fixedChunkReader struct {
+	data  []byte
+	pos   int
+	chunk int
+}
+
+func (r *fixedChunkReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := r.chunk
+	if n > len(p) {
+		n = len(p)
+	}
+	if r.pos+n > len(r.data) {
+		n = len(r.data) - r.pos
+	}
+	copy(p, r.data[r.pos:r.pos+n])
+	r.pos += n
+	return n, nil
+}
+
+// TestStreamReaderLinearOnChunkedValue guards against the O(N^2) re-scan that
+// re-framed a large value from its start on every refill. A 16 MiB value split
+// into small chunks is scanned once now; the old quadratic path took multiple
+// seconds, so a generous time bound cleanly catches a regression without being
+// flaky on the linear path (which completes in tens of milliseconds).
+func TestStreamReaderLinearOnChunkedValue(t *testing.T) {
+	const size = 16 << 20
+	str := `"` + strings.Repeat("a", size) + `"`
+	obj := "[" + strings.Repeat("1,", size/2) + "1]"
+
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{"string", str},
+		{"array", obj},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Now()
+			r := NewReader(&fixedChunkReader{data: []byte(tc.data), chunk: 512})
+			if !r.Next() || r.Err() != nil {
+				t.Fatalf("Next failed: ok=%v err=%v", r.hasValue, r.Err())
+			}
+			if len(r.Bytes()) != len(tc.data) {
+				t.Fatalf("framed %d bytes, want %d", len(r.Bytes()), len(tc.data))
+			}
+			if elapsed := time.Since(start); elapsed > 3*time.Second {
+				t.Fatalf("framing a %d-byte value in 512-byte chunks took %v; expected linear (sub-second)", len(tc.data), elapsed)
+			}
+		})
+	}
+}
