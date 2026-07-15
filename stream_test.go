@@ -623,9 +623,11 @@ func (r *fixedChunkReader) Read(p []byte) (int, error) {
 
 // TestStreamReaderLinearOnChunkedValue guards against the O(N^2) re-scan that
 // re-framed a large value from its start on every refill. A 16 MiB value split
-// into small chunks is scanned once now; the old quadratic path took multiple
-// seconds, so a generous time bound cleanly catches a regression without being
-// flaky on the linear path (which completes in tens of milliseconds).
+// into 512-byte chunks is scanned once now (tens of milliseconds); the old
+// quadratic path re-scans ~2.7e11 bytes, minutes of work. The bound is set far
+// above the linear time yet far below the quadratic one so it stays a clean
+// regression signal even under -race (which slows the run roughly tenfold) on a
+// loaded machine, rather than a flaky wall-clock assertion.
 func TestStreamReaderLinearOnChunkedValue(t *testing.T) {
 	const size = 16 << 20
 	str := `"` + strings.Repeat("a", size) + `"`
@@ -647,8 +649,8 @@ func TestStreamReaderLinearOnChunkedValue(t *testing.T) {
 			if len(r.Bytes()) != len(tc.data) {
 				t.Fatalf("framed %d bytes, want %d", len(r.Bytes()), len(tc.data))
 			}
-			if elapsed := time.Since(start); elapsed > 3*time.Second {
-				t.Fatalf("framing a %d-byte value in 512-byte chunks took %v; expected linear (sub-second)", len(tc.data), elapsed)
+			if elapsed := time.Since(start); elapsed > 30*time.Second {
+				t.Fatalf("framing a %d-byte value in 512-byte chunks took %v; the quadratic re-scan regressed", len(tc.data), elapsed)
 			}
 		})
 	}
