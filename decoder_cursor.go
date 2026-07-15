@@ -750,20 +750,26 @@ func (c *decoderCursor) floatSlow[T floatValue](dst *T) error {
 	base := unsafe.Pointer(unsafe.SliceData(c.src))
 	bits := int(unsafe.Sizeof(*dst)) * 8
 	if bits == 64 {
-		// scanTypedFloat64 validates the digits and fast-paths the values that
-		// convert with one exact multiply. Its end and ok drive validation and
-		// cursor advance exactly as before.
-		end, value, exact, ok := scanTypedFloat64(base, len(c.src), start)
+		// scanTypedFloat64Number validates the digits and fast-paths the values
+		// that convert with one exact multiply. Its end and ok drive validation
+		// and cursor advance exactly as before, and on the inexact path it hands
+		// back the mantissa and exponent it already recovered.
+		end, value, exact, number, haveNumber, ok := scanTypedFloat64Number(base, len(c.src), start)
 		if !ok {
 			_, message := scanNumber(c.src, start)
 			return c.err(start, message)
 		}
 		if !exact {
 			// Outside the exact-multiply envelope, round with Eisel-Lemire from
-			// the mantissa and exponent the SIMD scanner recovers, and reserve
-			// the scalar strconv path for the truncated or tie-ambiguous inputs
-			// it defers on.
-			if _, number, ok := scanJSONNumber(base, len(c.src), start); ok && !number.truncated {
+			// the mantissa and exponent the scanner already recovered, and
+			// reserve the scalar strconv path for the truncated or tie-ambiguous
+			// inputs it defers on. Only wide mantissas re-scan for truncation
+			// tracking.
+			if !haveNumber {
+				_, number, haveNumber = scanJSONNumber(base, len(c.src), start)
+				haveNumber = haveNumber && !number.truncated
+			}
+			if haveNumber {
 				if v, exactLemire := eiselLemire64(number.mantissa, number.exponent, number.negative); exactLemire {
 					*dst = T(v)
 					c.i = end
