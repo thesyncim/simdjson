@@ -661,14 +661,9 @@ func validatePointerSyntax(pointer string) error {
 	return nil
 }
 
+// bytesEqualString compares without allocating: the conversion inside the
+// comparison does not escape, so it compiles to a length check plus memequal
+// rather than a byte loop — object-key lookups sit on this.
 func bytesEqualString(b []byte, s string) bool {
-	if len(b) != len(s) {
-		return false
-	}
-	for i := range b {
-		if b[i] != s[i] {
-			return false
-		}
-	}
-	return true
+	return string(b) == s
 }
