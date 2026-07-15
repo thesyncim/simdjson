@@ -439,6 +439,26 @@ func (cursor *decoderCursor) decodeCompiledSlice(node *typedNode, dst unsafe.Poi
 	}
 	header := (*typedSliceHeader)(dst)
 	header.len = 0
+	// Homogeneous scalar slices ([]int64, []float64, ...) run a fused loop that
+	// hoists the element-kind dispatch out of the per-element path and parses
+	// each number straight into the backing array, replacing the generic
+	// double-switch below. The element kind is loop-invariant, so the choice is
+	// made once here; each branch matches the exact 64-bit width so a named
+	// alias type is written through storage of the right size.
+	switch elem := node.elem; elem.kind {
+	case typedInt:
+		if elem.bits == 64 && elem.size == 8 {
+			return decodeCompiledInt64Slice(cursor, node, dst)
+		}
+	case typedUint:
+		if elem.bits == 64 && elem.size == 8 {
+			return decodeCompiledUint64Slice(cursor, node, dst)
+		}
+	case typedFloat:
+		if elem.bits == 64 && elem.size == 8 {
+			return decodeCompiledFloat64Slice(cursor, node, dst)
+		}
+	}
 	for index, first := 0, true; ; index, first = index+1, false {
 		more, err := cursor.NextArrayElement(first)
 		if err != nil {
@@ -488,6 +508,125 @@ func (cursor *decoderCursor) decodeCompiledSlice(node *typedNode, dst unsafe.Poi
 			return prependDecodePathIndex(elementErr, index)
 		}
 	}
+}
+
+// The fused scalar-slice decoders below (int64 / uint64 / float64) each replace
+// the generic loop in decodeCompiledSlice for a homogeneous slice of that 64-bit
+// scalar. The header has already been opened and its length zeroed by the
+// caller; grow, empty-array, and error semantics are identical to the generic
+// path. The gain is structural: the loop-invariant element kind is resolved
+// once, so every element parses straight through the number method without the
+// generic double-switch, and the common "value then comma" delimiter step is
+// consumed inline so a full array of numbers never re-enters NextArrayElement.
+//
+// The delimiter-and-grow prologue is intentionally duplicated across the three
+// rather than factored behind a helper that returns the element pointer: such a
+// helper would trace the returned pointer back to dst and leak the whole
+// destination to the heap, defeating the on-stack decode the generic path
+// preserves. Keeping the element address a local of each loop matches the
+// generic loop's escape profile exactly.
+
+func decodeCompiledInt64Slice(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+	header := (*typedSliceHeader)(dst)
+	for index, first := 0, true; ; index, first = index+1, false {
+		if !scalarSliceAdvance(cursor, first) {
+			more, err := cursor.NextArrayElement(first)
+			if err != nil {
+				return err
+			}
+			if !more {
+				if index == 0 {
+					setTypedEmptySlice(node, dst)
+				}
+				return nil
+			}
+		}
+		if index == header.cap {
+			growTypedSlice(node, dst, nextTypedSliceCapacity(header.cap, index+1))
+			header = (*typedSliceHeader)(dst)
+		}
+		header.len = index + 1
+		element := (*int64)(unsafe.Add(header.data, uintptr(index)*node.elem.size))
+		if err := cursor.Int(element); err != nil {
+			return prependDecodePathIndex(retagCompiledError(err, node.elem.typ), index)
+		}
+	}
+}
+
+func decodeCompiledUint64Slice(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+	header := (*typedSliceHeader)(dst)
+	for index, first := 0, true; ; index, first = index+1, false {
+		if !scalarSliceAdvance(cursor, first) {
+			more, err := cursor.NextArrayElement(first)
+			if err != nil {
+				return err
+			}
+			if !more {
+				if index == 0 {
+					setTypedEmptySlice(node, dst)
+				}
+				return nil
+			}
+		}
+		if index == header.cap {
+			growTypedSlice(node, dst, nextTypedSliceCapacity(header.cap, index+1))
+			header = (*typedSliceHeader)(dst)
+		}
+		header.len = index + 1
+		element := (*uint64)(unsafe.Add(header.data, uintptr(index)*node.elem.size))
+		if err := cursor.Uint(element); err != nil {
+			return prependDecodePathIndex(retagCompiledError(err, node.elem.typ), index)
+		}
+	}
+}
+
+func decodeCompiledFloat64Slice(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
+	header := (*typedSliceHeader)(dst)
+	for index, first := 0, true; ; index, first = index+1, false {
+		if !scalarSliceAdvance(cursor, first) {
+			more, err := cursor.NextArrayElement(first)
+			if err != nil {
+				return err
+			}
+			if !more {
+				if index == 0 {
+					setTypedEmptySlice(node, dst)
+				}
+				return nil
+			}
+		}
+		if index == header.cap {
+			growTypedSlice(node, dst, nextTypedSliceCapacity(header.cap, index+1))
+			header = (*typedSliceHeader)(dst)
+		}
+		header.len = index + 1
+		element := (*float64)(unsafe.Add(header.data, uintptr(index)*node.elem.size))
+		if err := cursor.Float(element); err != nil {
+			return prependDecodePathIndex(retagCompiledError(err, node.elem.typ), index)
+		}
+	}
+}
+
+// scalarSliceAdvance consumes the inline delimiter between two scalar elements:
+// after the first element a comma advances to the next value. It reports whether
+// it recognized and consumed a fast-path delimiter; the first element, a closing
+// bracket, whitespace, and every malformed case return false so the caller
+// re-enters NextArrayElement, which owns the slow scan and every error message.
+// It takes no pointer into the destination, so it adds nothing to the decode's
+// escape profile.
+func scalarSliceAdvance(cursor *decoderCursor, first bool) bool {
+	if first {
+		return false
+	}
+	i := cursor.i
+	if i >= len(cursor.src) || cursor.src[i] != ',' {
+		return false
+	}
+	cursor.i = i + 1
+	if cursor.i < len(cursor.src) && cursor.src[cursor.i] <= ' ' {
+		cursor.skipSpace()
+	}
+	return true
 }
 
 func (cursor *decoderCursor) decodeCompiledArray(node *typedNode, dst unsafe.Pointer) error {
