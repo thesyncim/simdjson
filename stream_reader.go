@@ -86,6 +86,40 @@ func (f *valueFrame) init(c byte) {
 	}
 }
 
+// scanStringBody advances i over string content in src[:n], using the SIMD
+// special-byte scanner to skip runs of ordinary content in vector-width strides
+// rather than one byte at a time. It resumes across chunk boundaries through
+// f.esc (a pending escape) and returns the index just past the closing quote
+// with done=true when the string closes within [i,n); otherwise it returns n
+// and done=false, carrying f.esc for the next chunk. The scanner also halts on
+// control and non-ASCII bytes, which are plain content for framing and are
+// skipped; only the quote and backslash change structural state, so the framed
+// extent is identical to a byte-by-byte scan. Bounding the scan with src[:n]
+// keeps it inside the buffered bytes and away from the unread tail.
+func (f *valueFrame) scanStringBody(src []byte, i, n int) (int, bool) {
+	for i < n {
+		if f.esc {
+			f.esc = false
+			i++
+			continue
+		}
+		j := scanStringSpecial(src[:n], i)
+		if j >= n {
+			return n, false
+		}
+		switch src[j] {
+		case '"':
+			return j + 1, true
+		case '\\':
+			f.esc = true
+			i = j + 1
+		default: // control or non-ASCII string content
+			i = j + 1
+		}
+	}
+	return i, false
+}
+
 // scan advances the frame over src[start+framed : n], resuming its state. It
 // returns true once the value is structurally complete: the closing bracket or
 // quote is consumed, a fixed-length literal is filled, or (for a number) a
@@ -95,21 +129,9 @@ func (f *valueFrame) scan(src []byte, start, n int) bool {
 	i := start + f.framed
 	switch f.mode {
 	case frameString:
-		for i < n {
-			c := src[i]
-			i++
-			if f.esc {
-				f.esc = false
-				continue
-			}
-			switch c {
-			case '\\':
-				f.esc = true
-			case '"':
-				f.framed = i - start
-				return true
-			}
-		}
+		end, done := f.scanStringBody(src, i, n)
+		f.framed = end - start
+		return done
 	case frameNumber:
 		for i < n {
 			c := src[i]
@@ -139,21 +161,16 @@ func (f *valueFrame) scan(src []byte, start, n int) bool {
 		return f.litLeft == 0
 	default: // frameContainer
 		for i < n {
-			c := src[i]
-			i++
 			if f.inStr {
-				if f.esc {
-					f.esc = false
-					continue
-				}
-				switch c {
-				case '\\':
-					f.esc = true
-				case '"':
+				var done bool
+				i, done = f.scanStringBody(src, i, n)
+				if done {
 					f.inStr = false
 				}
 				continue
 			}
+			c := src[i]
+			i++
 			switch c {
 			case '"':
 				f.inStr = true
