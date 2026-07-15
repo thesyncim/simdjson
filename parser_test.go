@@ -458,13 +458,14 @@ func TestBuildIndexAllocs(t *testing.T) {
 }
 
 func TestIndexStorageIsCompact(t *testing.T) {
-	// 20 bytes is the tape's memory contract: callers size their IndexEntry
+	// 16 bytes is the tape's memory contract: callers size their IndexEntry
 	// storage from RequiredIndexEntries, so the per-entry footprint is part of
-	// the API's memory cost. A silent grow (e.g. padding from a new field)
-	// would inflate every caller's tape allocation, so it must be a deliberate,
-	// reviewed change rather than a drift.
-	if size := unsafe.Sizeof(IndexEntry{}); size != 20 {
-		t.Fatalf("IndexEntry size = %d, want 20", size)
+	// the API's memory cost. kind, flags, and count share one packed info word
+	// to hold four uint32 words with no padding. A silent grow (e.g. padding
+	// from a new field) would inflate every caller's tape allocation, so it
+	// must be a deliberate, reviewed change rather than a drift.
+	if size := unsafe.Sizeof(IndexEntry{}); size != 16 {
+		t.Fatalf("IndexEntry size = %d, want 16", size)
 	}
 	pointerSize := unsafe.Sizeof(uintptr(0))
 	if size, want := unsafe.Sizeof(Node{}), 2*pointerSize; size != want {

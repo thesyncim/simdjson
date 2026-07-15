@@ -24,7 +24,7 @@ func (v Node) Kind() Kind {
 	if !v.valid() {
 		return Invalid
 	}
-	return v.entry.kind
+	return v.entry.Kind()
 }
 
 // Raw returns v's exact source range.
@@ -94,7 +94,7 @@ func (v Node) StringBytes() ([]byte, bool) {
 		return nil, false
 	}
 	e := v.entry
-	if e.flags&tapeFlagEscaped != 0 {
+	if e.Flags()&tapeFlagEscaped != 0 {
 		return nil, false
 	}
 	return tapeSourceBytes(v.src, e.start+1, e.end-1), true
@@ -107,7 +107,7 @@ func (v Node) AppendString(dst []byte) ([]byte, bool) {
 	}
 	e := v.entry
 	raw := tapeSourceBytes(v.src, e.start+1, e.end-1)
-	if e.flags&tapeFlagEscaped == 0 {
+	if e.Flags()&tapeFlagEscaped == 0 {
 		return append(dst, raw...), true
 	}
 	return appendDecodedJSONString(dst, raw), true
@@ -118,7 +118,7 @@ func (v Node) ArrayLen() (int, bool) {
 	if v.Kind() != Array {
 		return 0, false
 	}
-	return int(v.entry.count), true
+	return int(v.entry.Count()), true
 }
 
 // ObjectLen returns the number of object members.
@@ -126,7 +126,7 @@ func (v Node) ObjectLen() (int, bool) {
 	if v.Kind() != Object {
 		return 0, false
 	}
-	return int(v.entry.count), true
+	return int(v.entry.Count()), true
 }
 
 // Index returns the ith array element.
@@ -154,7 +154,7 @@ func (v Node) Get(key string) (Node, bool) {
 	var found *IndexEntry
 	for member := 0; member < count; member++ {
 		valueEntry := tapeEntryOffset(keyEntry, 1)
-		if tapeKeyEqual(tapeSourceBytes(v.src, keyEntry.start, keyEntry.end), keyEntry.flags, key) {
+		if tapeKeyEqual(tapeSourceBytes(v.src, keyEntry.start, keyEntry.end), keyEntry.Flags(), key) {
 			found = valueEntry
 		}
 		if member+1 < count {

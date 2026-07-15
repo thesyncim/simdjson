@@ -18,15 +18,67 @@ const (
 	tapeFlagKey
 )
 
+// The info word packs a container's direct element count together with the
+// entry's kind and flags, so an entry stays four uint32 words (16 bytes) with
+// no padding. count occupies the low 27 bits; kind the next 3; flags the top 2.
+// count is meaningful only for containers, where it holds the number of direct
+// members; scalars leave it zero. Its 27-bit width caps a single container at
+// infoMaxCount direct members. The builders reject any input that would exceed
+// that (see ErrIndexTooLarge); reaching the cap needs a source larger than
+// 256 MiB packed entirely into one container, so it never arises in practice.
+const (
+	infoCountBits          = 27
+	infoKindBits           = 3
+	infoCountMask   uint32 = 1<<infoCountBits - 1
+	infoKindShift          = infoCountBits
+	infoKindMask    uint32 = (1<<infoKindBits - 1) << infoKindShift
+	infoFlagsShift         = infoCountBits + infoKindBits
+	infoMaxCount    uint32 = infoCountMask
+)
+
 // IndexEntry is one compact structural entry in an Index. Its fields are private
-// so callers can provide reusable storage without being coupled to the layout.
+// so callers can provide reusable storage without being coupled to the layout;
+// kind, flags, and count share one packed word behind accessor methods, so the
+// layout can change without touching every reader.
 type IndexEntry struct {
 	start uint32
 	end   uint32
 	next  uint32
-	count uint32
-	kind  Kind
-	flags uint8
+	info  uint32
+}
+
+// Kind returns the entry's JSON kind.
+func (e *IndexEntry) Kind() Kind {
+	return Kind((e.info & infoKindMask) >> infoKindShift)
+}
+
+// Flags returns the entry's tape flags (escaped, key).
+func (e *IndexEntry) Flags() uint8 {
+	return uint8(e.info >> infoFlagsShift)
+}
+
+// Count returns a container's direct element count. It is meaningful only for
+// arrays and objects; other kinds report zero.
+func (e *IndexEntry) Count() uint32 {
+	return e.info & infoCountMask
+}
+
+// packInfo composes an info word from its parts. The caller guarantees count
+// fits in infoCountBits; the builders check this before an entry is written.
+func packInfo(count uint32, kind Kind, flags uint8) uint32 {
+	return count&infoCountMask | uint32(kind)<<infoKindShift | uint32(flags)<<infoFlagsShift
+}
+
+// setCount replaces the entry's element count, preserving kind and flags.
+func (e *IndexEntry) setCount(count uint32) {
+	e.info = e.info&^infoCountMask | count&infoCountMask
+}
+
+// bumpCount adds one to the entry's element count in place. count occupies the
+// low bits of info, so an increment cannot disturb kind or flags unless it
+// overflows the count field, which the builders prevent.
+func (e *IndexEntry) bumpCount() {
+	e.info++
 }
 
 // IndexOptions controls zero-copy structural indexing.
@@ -165,7 +217,7 @@ func (b *tapeBuilder) stringFast(start int, flags uint8) tapeParseStatus {
 				}
 				entry := len(b.entries)
 				b.entries = b.entries[:entry+1]
-				b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(j + 1), next: 1, kind: String, flags: flags}
+				b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(j + 1), next: 1, info: packInfo(0, String, flags)}
 				b.i = j + 1
 				return tapeParseOK
 			}
@@ -186,7 +238,7 @@ func (b *tapeBuilder) stringFast(start int, flags uint8) tapeParseStatus {
 	}
 	entry := len(b.entries)
 	b.entries = b.entries[:entry+1]
-	b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(end), next: 1, kind: String, flags: flags}
+	b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(end), next: 1, info: packInfo(0, String, flags)}
 	b.i = end
 	return tapeParseOK
 }
@@ -205,7 +257,7 @@ func (b *tapeBuilder) valueFast(depth int) tapeParseStatus {
 		}
 		entry := len(b.entries)
 		b.entries = b.entries[:entry+1]
-		b.entries[entry] = IndexEntry{start: uint32(start), kind: Object}
+		b.entries[entry] = IndexEntry{start: uint32(start), info: packInfo(0, Object, 0)}
 		i, c := nextSignificantFast(base, n, start+1)
 		if i >= n {
 			return tapeParseInvalid
@@ -252,10 +304,13 @@ func (b *tapeBuilder) valueFast(depth int) tapeParseStatus {
 			if c != '}' {
 				return tapeParseInvalid
 			}
+			if count > infoMaxCount {
+				return tapeParseInvalid
+			}
 			b.i = i + 1
 			finished := &b.entries[entry]
 			finished.end = uint32(b.i)
-			finished.count = count
+			finished.setCount(count)
 			finished.next = uint32(len(b.entries) - entry)
 			return tapeParseOK
 		}
@@ -268,7 +323,7 @@ func (b *tapeBuilder) valueFast(depth int) tapeParseStatus {
 		}
 		entry := len(b.entries)
 		b.entries = b.entries[:entry+1]
-		b.entries[entry] = IndexEntry{start: uint32(start), kind: Array}
+		b.entries[entry] = IndexEntry{start: uint32(start), info: packInfo(0, Array, 0)}
 		i, c := nextSignificantFast(base, n, start+1)
 		if i >= n {
 			return tapeParseInvalid
@@ -301,10 +356,13 @@ func (b *tapeBuilder) valueFast(depth int) tapeParseStatus {
 			if c != ']' {
 				return tapeParseInvalid
 			}
+			if count > infoMaxCount {
+				return tapeParseInvalid
+			}
 			b.i = i + 1
 			finished := &b.entries[entry]
 			finished.end = uint32(b.i)
-			finished.count = count
+			finished.setCount(count)
 			finished.next = uint32(len(b.entries) - entry)
 			return tapeParseOK
 		}
@@ -348,7 +406,7 @@ func (b *tapeBuilder) emitScalar(start int, kind Kind) tapeParseStatus {
 	}
 	entry := len(b.entries)
 	b.entries = b.entries[:entry+1]
-	b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(b.i), next: 1, kind: kind}
+	b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(b.i), next: 1, info: packInfo(0, kind, 0)}
 	return tapeParseOK
 }
 
@@ -397,15 +455,18 @@ func (b *tapeBuilder) parse() error {
 				return nil
 			}
 			frame := &b.entries[b.parent]
-			frame.count++
+			if frame.Count() == infoMaxCount {
+				return ErrIndexTooLarge
+			}
+			frame.bumpCount()
 			b.skipSpace()
 			if b.i >= len(b.src) {
-				if frame.kind == Array {
+				if frame.Kind() == Array {
 					return syntaxError(b.src, b.i, "unterminated array")
 				}
 				return syntaxError(b.src, b.i, "unterminated object")
 			}
-			if frame.kind == Array {
+			if frame.Kind() == Array {
 				switch b.src[b.i] {
 				case ',':
 					b.i++
@@ -472,11 +533,11 @@ func (b *tapeBuilder) value() (Kind, int, error) {
 		return b.scalarAt(String, start, end, flags)
 	case '[':
 		b.i++
-		entry, err := b.add(IndexEntry{start: uint32(start), kind: Array})
+		entry, err := b.add(IndexEntry{start: uint32(start), info: packInfo(0, Array, 0)})
 		return Array, entry, err
 	case '{':
 		b.i++
-		entry, err := b.add(IndexEntry{start: uint32(start), kind: Object})
+		entry, err := b.add(IndexEntry{start: uint32(start), info: packInfo(0, Object, 0)})
 		return Object, entry, err
 	default:
 		if fastByteAt(b.base, b.i) != '-' && !isDigit(fastByteAt(b.base, b.i)) {
@@ -497,7 +558,7 @@ func (b *tapeBuilder) scalar(kind Kind, start int, flags uint8) (Kind, int, erro
 }
 
 func (b *tapeBuilder) scalarAt(kind Kind, start, end int, flags uint8) (Kind, int, error) {
-	entry, err := b.add(IndexEntry{start: uint32(start), end: uint32(end), next: 1, kind: kind, flags: flags})
+	entry, err := b.add(IndexEntry{start: uint32(start), end: uint32(end), next: 1, info: packInfo(0, kind, flags)})
 	return kind, entry, err
 }
 
@@ -515,7 +576,7 @@ func (b *tapeBuilder) objectKey() error {
 	if escaped {
 		flags |= tapeFlagEscaped
 	}
-	if _, err := b.add(IndexEntry{start: uint32(start), end: uint32(end), next: 1, kind: String, flags: flags}); err != nil {
+	if _, err := b.add(IndexEntry{start: uint32(start), end: uint32(end), next: 1, info: packInfo(0, String, flags)}); err != nil {
 		return err
 	}
 	b.skipSpace()

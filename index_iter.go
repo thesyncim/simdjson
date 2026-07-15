@@ -38,7 +38,7 @@ func (it ArrayIter) CurrentKind() Kind {
 	if it.remaining == 0 {
 		return Invalid
 	}
-	return it.entry.kind
+	return it.entry.Kind()
 }
 
 // CurrentRaw returns the exact source slice at the cursor without advancing it.
@@ -93,7 +93,7 @@ func (it *ArrayIter) NextKind() (Kind, bool) {
 	} else {
 		it.entry = nil
 	}
-	return entry.kind, true
+	return entry.Kind(), true
 }
 
 // NextRaw advances the iterator and returns the next exact source slice.
@@ -122,14 +122,14 @@ type FlatArrayIter struct {
 // FlatArrayIter returns a fixed-stride iterator when every direct array element
 // is scalar or an empty container.
 func (v Node) FlatArrayIter() (FlatArrayIter, bool) {
-	if !v.valid() || v.entry.kind != Array || v.entry.next != v.entry.count+1 {
+	if !v.valid() || v.entry.Kind() != Array || v.entry.next != v.entry.Count()+1 {
 		return FlatArrayIter{}, false
 	}
 	entry := (*IndexEntry)(nil)
-	if v.entry.count != 0 {
+	if v.entry.Count() != 0 {
 		entry = tapeEntryOffset(v.entry, 1)
 	}
-	return FlatArrayIter{src: v.src, entry: entry, remaining: v.entry.count}, true
+	return FlatArrayIter{src: v.src, entry: entry, remaining: v.entry.Count()}, true
 }
 
 // Valid reports whether the cursor points at an array element.
@@ -150,7 +150,7 @@ func (it FlatArrayIter) CurrentKind() Kind {
 	if it.remaining == 0 {
 		return Invalid
 	}
-	return it.entry.kind
+	return it.entry.Kind()
 }
 
 // CurrentRaw returns the exact source slice at the cursor without advancing it.
@@ -204,7 +204,7 @@ func (it *FlatArrayIter) NextKind() (Kind, bool) {
 	} else {
 		it.entry = nil
 	}
-	return entry.kind, true
+	return entry.Kind(), true
 }
 
 // NextRaw advances the iterator and returns the next exact source slice.
@@ -332,14 +332,14 @@ type FlatObjectIter struct {
 // FlatObjectIter returns a fixed-stride iterator when every direct object value
 // is scalar or an empty container.
 func (v Node) FlatObjectIter() (FlatObjectIter, bool) {
-	if !v.valid() || v.entry.kind != Object || v.entry.next != 2*v.entry.count+1 {
+	if !v.valid() || v.entry.Kind() != Object || v.entry.next != 2*v.entry.Count()+1 {
 		return FlatObjectIter{}, false
 	}
 	entry := (*IndexEntry)(nil)
-	if v.entry.count != 0 {
+	if v.entry.Count() != 0 {
 		entry = tapeEntryOffset(v.entry, 1)
 	}
-	return FlatObjectIter{src: v.src, entry: entry, remaining: v.entry.count}, true
+	return FlatObjectIter{src: v.src, entry: entry, remaining: v.entry.Count()}, true
 }
 
 // Valid reports whether the cursor points at an object member.
