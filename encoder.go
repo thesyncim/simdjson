@@ -462,13 +462,14 @@ func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsa
 	}
 	backing := e.takeValueBacking(elem.typ, mapLen)
 
-	// Bind the iterator last, after every setup allocation: MakeSlice above can
-	// grow the goroutine stack and move the map header mapValue reads through
-	// its noescape'd source pointer. See encodeMap for the same ordering.
+	// A pooled iterator lives on the heap and must not hold mapValue's
+	// noescape'd pointer into the source struct on the stack; rebind onto a heap
+	// header word so a stack move mid-iteration cannot dangle it. See encodeMap
+	// and heapBoundMapValue.
 	if iterator == nil {
 		iterator = mapValue.MapRange()
 	} else {
-		iterator.Reset(mapValue)
+		iterator.Reset(e.heapBoundMapValue(inline.mapType, mapValue))
 	}
 
 	for slot := 0; iterator.Next(); slot++ {
@@ -1105,6 +1106,27 @@ func (e *encodeState) encodeNonAddressableMarshaler(node *typedNode, src unsafe.
 	return err
 }
 
+// heapBoundMapValue rebinds a map reflect.Value onto the pooled scratch's
+// heap-resident header word so the reused reflect.MapIter can hold it safely.
+//
+// mapValue is built from a noescape'd source pointer, so its internal pointer
+// aliases the source struct on the goroutine stack. reflect.MapIter.Reset
+// copies that value into the iterator, and the pooled iterator lives on the
+// heap. A heap object may not hold a pointer into a stack: when the stack later
+// moves — which a preemption or a GOMAXPROCS transition during the iteration
+// loop can force — the runtime rewrites stack-resident pointers but not the
+// iterator's copy, leaving it dangling and corrupting the heap. Copying the map
+// header (a single reference word that already points at heap map storage) into
+// the scratch's stable header word and rebuilding the value from there keeps
+// the iterator's reference heap-to-heap, stable across any stack move, without
+// allocating: the word lives in the pool alongside the iterator it feeds.
+// Callers that bind a stack-local iterator instead do not need this; the
+// iterator moves with the stack that holds mapValue.
+func (e *encodeState) heapBoundMapValue(mapType reflect.Type, mapValue reflect.Value) reflect.Value {
+	e.scratch.mapHeader = mapValue.UnsafePointer()
+	return reflect.NewAt(mapType, noescape(unsafe.Pointer(&e.scratch.mapHeader))).Elem()
+}
+
 // encodeMap writes a map with string keys as an object with byte-sorted
 // members, matching encoding/json. Values are copied into one reusable
 // addressable element before encoding.
@@ -1157,14 +1179,14 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	}
 	backing := e.takeValueBacking(node.elem.typ, mapLen)
 
-	// Bind the iterator last, after every setup allocation. MakeSlice above can
-	// grow the goroutine stack, which would move the map header that mapValue
-	// reads through its noescape'd source pointer; binding afterward keeps the
-	// iterator reading a stable location.
+	// A pooled iterator lives on the heap, so it must not hold mapValue's
+	// noescape'd pointer into the source struct on the stack; rebind it onto a
+	// heap header word that survives a stack move mid-iteration. A fresh
+	// iterator is stack-local and moves with mapValue, so it binds directly.
 	if iterator == nil {
 		iterator = mapValue.MapRange()
 	} else {
-		iterator.Reset(mapValue)
+		iterator.Reset(e.heapBoundMapValue(node.typ, mapValue))
 	}
 
 	for slot := 0; iterator.Next(); slot++ {

@@ -3,6 +3,7 @@ package simdjson
 import (
 	"reflect"
 	"sync"
+	"unsafe"
 )
 
 type encoderMarshalerScratch struct {
@@ -19,6 +20,13 @@ type encoderScratch struct {
 	mapEntries  []mapEncodeEntry
 	mapKeyArena []byte
 	mapIter     *reflect.MapIter
+	// mapHeader holds the map reference word that the reused mapIter binds to.
+	// Living in the pooled (heap) scratch, it gives the iterator a heap-to-heap
+	// reference to the current map, so a stack move during iteration cannot
+	// dangle the iterator's copy. It travels with mapIter: whichever encodeMap
+	// call owns the iterator owns this word, so a nested map — which allocates
+	// its own stack-local iterator — never contends for it. See heapBoundMapValue.
+	mapHeader unsafe.Pointer
 	// valueBacking is a reused addressable slice of a map's (or ",inline"
 	// catch-all's) value type. Encoding copies each value into its own slot
 	// with SetIterValue so the entries can be reordered without reflect
@@ -37,6 +45,9 @@ func (s *encoderScratch) reset() {
 	// Entries hold key strings and reflect values from the encoded maps;
 	// drop those references before the scratch returns to the pool.
 	clear(s.mapEntries[:cap(s.mapEntries)])
+	// mapHeader still points at the last map encoded; clear it so the pool
+	// never pins that map alive.
+	s.mapHeader = nil
 }
 
 func newEncoderScratchPool(types []reflect.Type, hasMap bool) *sync.Pool {
