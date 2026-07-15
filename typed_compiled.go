@@ -445,7 +445,11 @@ func (cursor *decoderCursor) decodeCompiledSlice(node *typedNode, dst unsafe.Poi
 			return err
 		}
 		if !more {
-			if index == 0 && header.data == nil {
+			if index == 0 {
+				// An empty array yields a fresh empty slice, dropping any
+				// reused backing, exactly like encoding/json's MakeSlice(T,0,0).
+				// Keeping the old array would leak stale elements when the same
+				// destination later decodes a longer array into the reused cap.
 				setTypedEmptySlice(node, dst)
 			}
 			return nil
@@ -837,6 +841,11 @@ func (cursor *decoderCursor) decodeCompiledMap(node *typedNode, dst unsafe.Point
 	// private input copy before the first key string is sliced.
 	cursor.ownSource()
 	mapValue := reflect.NewAt(node.typ, noescape(dst)).Elem()
+	if cursor.flags&decoderReplace != 0 && !mapValue.IsNil() {
+		// Replace decodes as if into a fresh destination, so a reused map drops
+		// keys the document does not set instead of merging into them.
+		mapValue.Clear()
+	}
 	if mapValue.IsNil() {
 		mapValue.Set(reflect.MakeMap(node.typ))
 	}

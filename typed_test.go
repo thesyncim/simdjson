@@ -138,7 +138,6 @@ func TestTypedDecoderReplacementAndFieldFallbacks(t *testing.T) {
 		Fixed:   [3]typedEdgeInt{9, 9, 9},
 		Next:    typedEdgePointer(&typedEdgeValue{ID: 99}),
 	}
-	valuesBase := unsafe.SliceData(dst.Values)
 	src := []byte(`{"long_field_name":"first","ID":7,"\u0065scaped":"escaped","fixed":[1,2],"id":8}`)
 	if err := decoder.Decode(src, &dst); err != nil {
 		t.Fatal(err)
@@ -149,11 +148,10 @@ func TestTypedDecoderReplacementAndFieldFallbacks(t *testing.T) {
 	if dst.Fixed != [3]typedEdgeInt{1, 2, 0} {
 		t.Fatalf("fixed array = %v, want [1 2 0]", dst.Fixed)
 	}
-	if dst.Values == nil || len(dst.Values) != 0 || cap(dst.Values) != 8 {
-		t.Fatalf("missing slice = %#v, want retained empty capacity", dst.Values)
-	}
-	if unsafe.SliceData(dst.Values) != valuesBase {
-		t.Fatal("missing slice did not retain its backing array")
+	if dst.Values != nil {
+		// Replace decodes as if into a fresh destination, so an absent slice
+		// field becomes its zero value (nil), not a retained empty slice.
+		t.Fatalf("missing slice = %#v, want nil", dst.Values)
 	}
 	if dst.Next != nil {
 		t.Fatalf("missing pointer = %#v, want nil", dst.Next)
@@ -704,4 +702,80 @@ func TestDecodeIntegerDigitRunSweep(t *testing.T) {
 			}
 		}
 	}
+}
+
+type reuseMapDoc struct {
+	E map[string]int `json:"e"`
+}
+
+type reuseSliceDoc struct {
+	D []int `json:"d"`
+	A int   `json:"a"`
+}
+
+type reuseMixedDoc struct {
+	M map[string]int `json:"m"`
+	S []string       `json:"s"`
+}
+
+type reuseElem struct {
+	X int    `json:"x"`
+	Y string `json:"y"`
+}
+
+// replaceEqualsFresh asserts that decoding a sequence of documents into one
+// reused destination under Replace yields exactly what decoding the last
+// document into a fresh destination does — the defining property of Replace.
+func replaceEqualsFresh[T any](t *testing.T, docs ...string) {
+	t.Helper()
+	dec, err := CompileDecoder[T](DecoderOptions{Replace: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reused T
+	for _, doc := range docs {
+		if err := dec.Decode([]byte(doc), &reused); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var fresh T
+	if err := dec.Decode([]byte(docs[len(docs)-1]), &fresh); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(reused, fresh) {
+		t.Fatalf("Replace reused != fresh for %v:\n reused %#v\n fresh  %#v", docs, reused, fresh)
+	}
+}
+
+// TestReusedDestinationSemantics pins the fixes for three reused-destination
+// bugs found by differential hunting: default merge must match encoding/json,
+// and Replace must decode a reused destination identically to a fresh one.
+func TestReusedDestinationSemantics(t *testing.T) {
+	// Default merge: an empty array drops the reused backing like
+	// encoding/json's MakeSlice(T,0,0); keeping it would expose stale elements
+	// when a later, longer array reused the retained capacity.
+	t.Run("merge empty array vs stdlib", func(t *testing.T) {
+		var got, want []reuseElem
+		for _, doc := range []string{`[{"x":1},{"y":"leak"}]`, `[]`, `[{"x":9},{"x":0}]`} {
+			if err := Unmarshal([]byte(doc), &got); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal([]byte(doc), &want); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("merge empty-array leaked stale data:\n simdjson %#v\n stdlib   %#v", got, want)
+		}
+	})
+
+	t.Run("replace map replaced not merged", func(t *testing.T) {
+		replaceEqualsFresh[reuseMapDoc](t, `{"e":{"a":1,"b":2}}`, `{"e":{"c":3}}`)
+	})
+	t.Run("replace absent slice becomes nil", func(t *testing.T) {
+		replaceEqualsFresh[reuseSliceDoc](t, `{"d":[1,2,3,4,5]}`, `{"a":2}`)
+	})
+	t.Run("replace shrinking map and slice", func(t *testing.T) {
+		replaceEqualsFresh[reuseMixedDoc](t, `{"m":{"a":1,"b":2,"c":3},"s":["x","y","z"]}`, `{"m":{"a":9},"s":["q"]}`)
+	})
 }

@@ -32,11 +32,14 @@ type DecoderOptions struct {
 	// fallback used after exact field-name matching.
 	CaseSensitive bool
 
-	// Replace resets destination state that the document does not mention:
-	// absent struct fields become zero and null always clears. The default
-	// matches encoding/json, which merges into existing values and treats
-	// null as a no-op for scalars, strings, structs, and arrays. Replace is
-	// the right mode for destinations reused across decodes.
+	// Replace decodes as if into a fresh zero destination, so a reused
+	// destination yields the same result as a new one: state the document
+	// does not mention is reset to its zero value. Absent struct fields become
+	// zero (nil slices, nil maps, nil pointers), null clears, and a present
+	// map is replaced rather than merged into. The default instead matches
+	// encoding/json, which merges into existing values and treats null as a
+	// no-op for scalars, strings, structs, and arrays. Replace is the right
+	// mode for destinations reused across decodes.
 	Replace bool
 
 	// InlineFields activates the ",inline" struct-tag extension: a

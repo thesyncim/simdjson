@@ -50,7 +50,10 @@ func resetTyped(node *typedNode, dst unsafe.Pointer) {
 			*(*unsafe.Pointer)(unsafe.Add(dst, node.inlineMap.offset)) = nil
 		}
 	case typedSlice, typedBytes:
-		(*typedSliceHeader)(dst).len = 0
+		// Reset to the true zero value (nil), so a reused destination under
+		// Replace reports an absent slice as nil rather than an empty non-nil
+		// slice; the latter marshals as [] instead of null and fails == nil.
+		*(*typedSliceHeader)(dst) = typedSliceHeader{}
 	case typedArray:
 		for i := 0; i < node.length; i++ {
 			resetTyped(node.elem, unsafe.Add(dst, uintptr(i)*node.elem.size))
@@ -184,7 +187,7 @@ func applyTypedReset(ops []typedResetOp, dst unsafe.Pointer) {
 		case typedResetString:
 			*(*string)(field) = ""
 		case typedResetSlice:
-			(*typedSliceHeader)(field).len = 0
+			*(*typedSliceHeader)(field) = typedSliceHeader{}
 		case typedResetPointer:
 			*(*unsafe.Pointer)(field) = nil
 		case typedResetInterface:
