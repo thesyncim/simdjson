@@ -171,10 +171,19 @@ func validValueFast(src []byte, base unsafe.Pointer, n, i int, c byte, depth int
 }
 
 func scanNumberFast(base unsafe.Pointer, n, i int) (int, bool) {
+	end, _, ok := scanNumberFastTagged(base, n, i)
+	return end, ok
+}
+
+// scanNumberFastTagged is scanNumberFast, additionally reporting whether the
+// number is a plain integer (optional minus, then digits only, no fraction or
+// exponent). The classification falls out of the branches the scan already
+// takes; the tape builders record it so integer reads skip re-inspection.
+func scanNumberFastTagged(base unsafe.Pointer, n, i int) (end int, integer, ok bool) {
 	if fastByteAt(base, i) == '-' {
 		i++
 		if i >= n {
-			return i, false
+			return i, false, false
 		}
 	}
 	if fastByteAt(base, i) == '0' {
@@ -186,12 +195,14 @@ func scanNumberFast(base unsafe.Pointer, n, i int) (int, bool) {
 		for i++; i < n && isDigit(fastByteAt(base, i)); i++ {
 		}
 	} else {
-		return i, false
+		return i, false, false
 	}
+	integer = true
 	if i < n && fastByteAt(base, i) == '.' {
+		integer = false
 		i++
 		if i >= n || !isDigit(fastByteAt(base, i)) {
-			return i, false
+			return i, false, false
 		}
 		if i+8 <= n && isDigit(fastByteAt(base, i+7)) {
 			i = scanDigitsFast(base, n, i)
@@ -201,17 +212,18 @@ func scanNumberFast(base unsafe.Pointer, n, i int) (int, bool) {
 		}
 	}
 	if i < n && (fastByteAt(base, i) == 'e' || fastByteAt(base, i) == 'E') {
+		integer = false
 		i++
 		if i < n && (fastByteAt(base, i) == '+' || fastByteAt(base, i) == '-') {
 			i++
 		}
 		if i >= n || !isDigit(fastByteAt(base, i)) {
-			return i, false
+			return i, false, false
 		}
 		for i++; i < n && isDigit(fastByteAt(base, i)); i++ {
 		}
 	}
-	return i, true
+	return i, integer, true
 }
 
 func scanJSONStringFast(src []byte, base unsafe.Pointer, i int, short bool) (int, bool, bool) {

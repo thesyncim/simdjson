@@ -487,6 +487,120 @@ func BenchmarkIndexFlatObjectCursor1024(b *testing.B) {
 	}
 }
 
+// BenchmarkIndexArrayIndexMid resolves a middle element of a large flat
+// array by position, the shape numeric JSON Pointer walks take.
+func BenchmarkIndexArrayIndexMid(b *testing.B) {
+	src := intArrayJSON(8192)
+	storage := make([]IndexEntry, 8193)
+	tape, err := BuildIndex(src, storage)
+	if err != nil {
+		b.Fatal(err)
+	}
+	root := tape.Root()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		value, ok := root.Index(4096)
+		if !ok {
+			b.Fatal("element missing")
+		}
+		indexBenchmarkSink = int(value.Kind())
+	}
+}
+
+// BenchmarkIndexObjectGet1024 resolves the last of 1024 duplicate keys, the
+// full-scan worst case for object lookup.
+func BenchmarkIndexObjectGet1024(b *testing.B) {
+	src := flatObject1024()
+	storage := make([]IndexEntry, 2049)
+	tape, err := BuildIndex(src, storage)
+	if err != nil {
+		b.Fatal(err)
+	}
+	root := tape.Root()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		value, ok := root.Get("a")
+		if !ok {
+			b.Fatal("key missing")
+		}
+		indexBenchmarkSink = int(value.Kind())
+	}
+}
+
+var indexBenchmarkSinkInt64 int64
+
+var indexBenchmarkSinkFloat64 float64
+
+// BenchmarkIndexArrayInt64Sum reads every element of a mixed-width integer
+// array through Node.Int64, the integer-heavy lazy read path.
+func BenchmarkIndexArrayInt64Sum(b *testing.B) {
+	src := intArrayJSON(8192)
+	storage := make([]IndexEntry, 8193)
+	tape, err := BuildIndex(src, storage)
+	if err != nil {
+		b.Fatal(err)
+	}
+	root := tape.Root()
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		iter, ok := root.ArrayIter()
+		if !ok {
+			b.Fatal("root is not array")
+		}
+		var total int64
+		for {
+			value, ok := iter.Next()
+			if !ok {
+				break
+			}
+			n, ok := value.Int64()
+			if !ok {
+				b.Fatal("element is not an integer")
+			}
+			total += n
+		}
+		indexBenchmarkSinkInt64 = total
+	}
+}
+
+// BenchmarkIndexArrayFloat64Sum reads the same integer array through
+// Node.Float64, the path lazy full traversals take for numbers.
+func BenchmarkIndexArrayFloat64Sum(b *testing.B) {
+	src := intArrayJSON(8192)
+	storage := make([]IndexEntry, 8193)
+	tape, err := BuildIndex(src, storage)
+	if err != nil {
+		b.Fatal(err)
+	}
+	root := tape.Root()
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		iter, ok := root.ArrayIter()
+		if !ok {
+			b.Fatal("root is not array")
+		}
+		var total float64
+		for {
+			value, ok := iter.Next()
+			if !ok {
+				break
+			}
+			f, ok := value.Float64()
+			if !ok {
+				b.Fatal("element is not a number")
+			}
+			total += f
+		}
+		indexBenchmarkSinkFloat64 = total
+	}
+}
+
 func BenchmarkParseOptionsZeroCopySmall(b *testing.B) {
 	src := smallJSON()
 	b.SetBytes(int64(len(src)))

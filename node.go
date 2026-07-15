@@ -69,20 +69,70 @@ func (v Node) NumberText() (string, bool) {
 
 // Int64 parses an integer value.
 func (v Node) Int64() (int64, bool) {
-	s, ok := v.NumberText()
-	if !ok {
+	if v.Kind() != Number {
 		return 0, false
 	}
+	e := v.entry
+	if e.Flags()&tapeFlagInt != 0 {
+		return tapeInt64(v.src, e.start, e.end)
+	}
+	// Fractional and exponent spellings reject the same way ParseInt does.
+	s := ownedBytesString(tapeSourceBytes(v.src, e.start, e.end))
 	n, err := strconv.ParseInt(s, 10, 64)
 	return n, err == nil
 }
 
-// Float64 parses a number value as float64.
-func (v Node) Float64() (float64, bool) {
-	s, ok := v.NumberText()
+// tapeInt64 parses a number the tape classified as a plain integer: an
+// optional minus sign, then digits. Values outside int64 report false, the
+// same verdict strconv.ParseInt reaches on them.
+func tapeInt64(src *byte, start, end uint32) (int64, bool) {
+	base := unsafe.Pointer(src)
+	i := int(start)
+	negative := fastByteAt(base, i) == '-'
+	if negative {
+		i++
+	}
+	value, ok := parseTapeDigitsUint64(base, i, int(end))
 	if !ok {
 		return 0, false
 	}
+	if negative {
+		if value > 1<<63 {
+			return 0, false
+		}
+		return -int64(value), true
+	}
+	if value > 1<<63-1 {
+		return 0, false
+	}
+	return int64(value), true
+}
+
+// Float64 parses a number value as float64.
+func (v Node) Float64() (float64, bool) {
+	if v.Kind() != Number {
+		return 0, false
+	}
+	e := v.entry
+	if e.Flags()&tapeFlagInt != 0 {
+		// A plain integer needs no fraction or exponent handling: parse the
+		// digits and let the conversion round once, exactly as ParseFloat
+		// rounds decimal input. Twenty digits or more fall through.
+		base := unsafe.Pointer(v.src)
+		i := int(e.start)
+		negative := fastByteAt(base, i) == '-'
+		if negative {
+			i++
+		}
+		if value, ok := parseTapeDigitsUint64(base, i, int(e.end)); ok {
+			f := float64(value)
+			if negative {
+				f = -f
+			}
+			return f, true
+		}
+	}
+	s := ownedBytesString(tapeSourceBytes(v.src, e.start, e.end))
 	n, err := strconv.ParseFloat(s, 64)
 	return n, err == nil
 }
@@ -135,6 +185,11 @@ func (v Node) Index(index int) (Node, bool) {
 	if !ok || index < 0 || index >= count {
 		return Node{}, false
 	}
+	if v.entry.next == uint32(count)+1 {
+		// Flat array: every element is one entry, so the ith sits at a
+		// fixed offset from the header.
+		return Node{src: v.src, entry: tapeEntryOffset(v.entry, uintptr(index)+1)}, true
+	}
 	entry := tapeEntryOffset(v.entry, 1)
 	for range index {
 		entry = tapeEntryOffset(entry, uintptr(entry.next))
@@ -149,6 +204,22 @@ func (v Node) Get(key string) (Node, bool) {
 		// The empty check also keeps the entry arithmetic below inside the
 		// tape: an empty object can be its final entry.
 		return Node{}, false
+	}
+	if v.entry.next == 2*uint32(count)+1 {
+		// Flat object: every value is one entry, so the keys sit at fixed
+		// offsets from the header and the scan needs no span chase. Later
+		// duplicates still win: the scan runs to the end.
+		var found *IndexEntry
+		for member := 0; member < count; member++ {
+			keyEntry := tapeEntryOffset(v.entry, uintptr(2*member)+1)
+			if tapeKeyEqual(tapeSourceBytes(v.src, keyEntry.start, keyEntry.end), keyEntry.Flags(), key) {
+				found = tapeEntryOffset(keyEntry, 1)
+			}
+		}
+		if found == nil {
+			return Node{}, false
+		}
+		return Node{src: v.src, entry: found}, true
 	}
 	keyEntry := tapeEntryOffset(v.entry, 1)
 	var found *IndexEntry

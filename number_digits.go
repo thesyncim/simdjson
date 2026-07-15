@@ -101,3 +101,49 @@ func literalFalseAt(src []byte, i int) bool {
 func parse16Digits(base unsafe.Pointer) uint64 {
 	return simdkernels.Parse16Digits((*[16]byte)(base))
 }
+
+// parseTrailingDigits parses the k digits held in the top k bytes of a
+// little-endian word, backfilling the low bytes with ASCII zeros so the
+// eight-digit kernel sees a full window. k must be in [1, 8].
+func parseTrailingDigits(word uint64, k int) uint64 {
+	s := uint(8-k) * 8
+	return parse8DigitsWord(word&(^uint64(0)<<s) | digitLower>>(64-s))
+}
+
+// parseTapeDigitsUint64 parses the validated digit run in [i, end): decimal
+// digits with no redundant leading zero, as the tape builders record for
+// plain-integer numbers. It reports false only past nineteen digits, where an
+// int64 read overflows regardless of the digits.
+//
+// The word kernels anchor every load at end-8, end-16, and end-24, so each
+// load ends inside the number and starts at or after the document's first
+// byte whenever end allows it; shorter documents take the scalar loop.
+func parseTapeDigitsUint64(base unsafe.Pointer, i, end int) (uint64, bool) {
+	d := end - i
+	switch {
+	case d <= 8:
+		if end >= 8 {
+			return parseTrailingDigits(loadUint64LE(unsafe.Add(base, end-8)), d), true
+		}
+	case d <= 16:
+		if end >= 16 {
+			hi := parseTrailingDigits(loadUint64LE(unsafe.Add(base, end-16)), d-8)
+			return hi*100_000_000 + parse8Digits(unsafe.Add(base, end-8)), true
+		}
+	case d <= 19:
+		if end >= 24 {
+			// Nineteen digits stay below 1e19, within uint64.
+			hi := parseTrailingDigits(loadUint64LE(unsafe.Add(base, end-24)), d-16)
+			return hi*10_000_000_000_000_000 + parse16Digits(unsafe.Add(base, end-16)), true
+		}
+	default:
+		return 0, false
+	}
+	// The document is too short to back the word loads above; the number is
+	// at most as long as the document, so this loop is as short.
+	value := uint64(0)
+	for ; i < end; i++ {
+		value = value*10 + uint64(fastByteAt(base, i)-'0')
+	}
+	return value, true
+}

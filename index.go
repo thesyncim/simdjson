@@ -13,27 +13,30 @@ var ErrIndexFull = errors.New("simdjson: index entry buffer is full")
 // address space.
 var ErrIndexTooLarge = errors.New("simdjson: indexed input exceeds 32-bit offsets")
 
+// Each flag qualifies one kind and is zero elsewhere: escaped and key apply to
+// strings, integer to numbers.
 const (
-	tapeFlagEscaped = 1 << iota
-	tapeFlagKey
+	tapeFlagEscaped = 1 << iota // string contains at least one escape sequence
+	tapeFlagKey                 // string is an object key
+	tapeFlagInt                 // number is a plain integer: optional minus, then digits only
 )
 
 // The info word packs a container's direct element count together with the
 // entry's kind and flags, so an entry stays four uint32 words (16 bytes) with
-// no padding. count occupies the low 27 bits; kind the next 3; flags the top 2.
+// no padding. count occupies the low 26 bits; kind the next 3; flags the top 3.
 // count is meaningful only for containers, where it holds the number of direct
-// members; scalars leave it zero. Its 27-bit width caps a single container at
+// members; scalars leave it zero. Its 26-bit width caps a single container at
 // infoMaxCount direct members. The builders reject any input that would exceed
 // that (see ErrIndexTooLarge); reaching the cap needs a source larger than
-// 256 MiB packed entirely into one container, so it never arises in practice.
+// 128 MiB packed entirely into one container, so it never arises in practice.
 const (
-	infoCountBits          = 27
-	infoKindBits           = 3
-	infoCountMask   uint32 = 1<<infoCountBits - 1
-	infoKindShift          = infoCountBits
-	infoKindMask    uint32 = (1<<infoKindBits - 1) << infoKindShift
-	infoFlagsShift         = infoCountBits + infoKindBits
-	infoMaxCount    uint32 = infoCountMask
+	infoCountBits         = 26
+	infoKindBits          = 3
+	infoCountMask  uint32 = 1<<infoCountBits - 1
+	infoKindShift         = infoCountBits
+	infoKindMask   uint32 = (1<<infoKindBits - 1) << infoKindShift
+	infoFlagsShift        = infoCountBits + infoKindBits
+	infoMaxCount   uint32 = infoCountMask
 )
 
 // IndexEntry is one compact structural entry in an Index. Its fields are private
@@ -52,7 +55,7 @@ func (e *IndexEntry) Kind() Kind {
 	return Kind((e.info & infoKindMask) >> infoKindShift)
 }
 
-// Flags returns the entry's tape flags (escaped, key).
+// Flags returns the entry's tape flags (escaped, key, integer).
 func (e *IndexEntry) Flags() uint8 {
 	return uint8(e.info >> infoFlagsShift)
 }
@@ -373,40 +376,49 @@ func (b *tapeBuilder) valueFast(depth int) tapeParseStatus {
 			return tapeParseInvalid
 		}
 		b.i = start + 4
-		return b.emitScalar(start, Bool)
+		return b.emitScalar(start, Bool, 0)
 	case 'f':
 		if start+5 > n || loadUint32LE(unsafe.Add(base, start+1)) != wordAlseLE {
 			return tapeParseInvalid
 		}
 		b.i = start + 5
-		return b.emitScalar(start, Bool)
+		return b.emitScalar(start, Bool, 0)
 	case 'n':
 		if start+4 > n || loadUint32LE(unsafe.Add(base, start)) != wordNullLE {
 			return tapeParseInvalid
 		}
 		b.i = start + 4
-		return b.emitScalar(start, Null)
+		return b.emitScalar(start, Null, 0)
 	default:
 		c := fastByteAt(base, start)
 		if c != '-' && !isDigit(c) {
 			return tapeParseInvalid
 		}
-		end, ok := scanNumberFast(base, n, start)
+		end, integer, ok := scanNumberFastTagged(base, n, start)
 		if !ok {
 			return tapeParseInvalid
 		}
 		b.i = end
-		return b.emitScalar(start, Number)
+		return b.emitScalar(start, Number, numberFlags(integer))
 	}
 }
 
-func (b *tapeBuilder) emitScalar(start int, kind Kind) tapeParseStatus {
+// numberFlags returns the tape flags for a number whose plain-integer
+// classification the scanner just reported.
+func numberFlags(integer bool) uint8 {
+	if integer {
+		return tapeFlagInt
+	}
+	return 0
+}
+
+func (b *tapeBuilder) emitScalar(start int, kind Kind, flags uint8) tapeParseStatus {
 	if len(b.entries) == cap(b.entries) {
 		return tapeParseFull
 	}
 	entry := len(b.entries)
 	b.entries = b.entries[:entry+1]
-	b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(b.i), next: 1, info: packInfo(0, kind, 0)}
+	b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(b.i), next: 1, info: packInfo(0, kind, flags)}
 	return tapeParseOK
 }
 
@@ -543,13 +555,13 @@ func (b *tapeBuilder) value() (Kind, int, error) {
 		if fastByteAt(b.base, b.i) != '-' && !isDigit(fastByteAt(b.base, b.i)) {
 			return Invalid, 0, syntaxError(b.src, b.i, "unexpected byte while parsing value")
 		}
-		end, ok := scanNumberFast(b.base, len(b.src), b.i)
+		end, integer, ok := scanNumberFastTagged(b.base, len(b.src), b.i)
 		if !ok {
 			_, msg := scanNumber(b.src, b.i)
 			return Invalid, 0, syntaxError(b.src, start, msg)
 		}
 		b.i = end
-		return b.scalar(Number, start, 0)
+		return b.scalar(Number, start, numberFlags(integer))
 	}
 }
 
