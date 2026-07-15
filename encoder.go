@@ -263,6 +263,8 @@ func (e *encodeState) encodeKind(node *typedNode, src unsafe.Pointer, kind typed
 		return e.encodeAny(src)
 	case typedMarshalerJSON, typedMarshalerText:
 		return e.encodeMarshalerKind(node, src, kind)
+	case typedMarshalerSimd:
+		return e.encodeMarshaler(node, src)
 	case typedTime:
 		return e.encodeTime(src)
 	case typedIface:

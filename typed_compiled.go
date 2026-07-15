@@ -69,6 +69,8 @@ func (cursor *decoderCursor) decodeCompiled(node *typedNode, dst unsafe.Pointer)
 		return cursor.decodeViaUnmarshaler(node, dst)
 	case typedUnmarshalerText:
 		return cursor.decodeViaTextUnmarshaler(node, dst)
+	case typedUnmarshalerSimd:
+		return cursor.decodeViaSimdHook(node, dst)
 	case typedIface:
 		return cursor.decodeCompiledIface(node, dst)
 	default:
@@ -223,9 +225,12 @@ func (cursor *decoderCursor) decodeCompiledStruct(node *typedNode, dst unsafe.Po
 		case typedOpQuoted:
 			fieldErr = cursor.decodeQuotedField(fieldNode, fieldDst)
 		case typedOpUnmarshaler:
-			if fieldNode.kind == typedUnmarshalerJSON {
+			switch fieldNode.kind {
+			case typedUnmarshalerJSON:
 				fieldErr = cursor.decodeViaUnmarshaler(fieldNode, fieldDst)
-			} else {
+			case typedUnmarshalerSimd:
+				fieldErr = cursor.decodeViaSimdHook(fieldNode, fieldDst)
+			default:
 				fieldErr = cursor.decodeViaTextUnmarshaler(fieldNode, fieldDst)
 			}
 		case typedOpIface:
@@ -739,6 +744,8 @@ func (cursor *decoderCursor) decodeCompiledArray(node *typedNode, dst unsafe.Poi
 				elementErr = cursor.decodeViaUnmarshaler(node.elem, element)
 			case typedUnmarshalerText:
 				elementErr = cursor.decodeViaTextUnmarshaler(node.elem, element)
+			case typedUnmarshalerSimd:
+				elementErr = cursor.decodeViaSimdHook(node.elem, element)
 			case typedIface:
 				elementErr = cursor.decodeCompiledIface(node.elem, element)
 			default:

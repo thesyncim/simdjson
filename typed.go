@@ -273,6 +273,10 @@ const (
 	typedMarshalerText
 	typedIface
 	typedTime
+	// The simdjson-native method hooks. A type carrying one of these decodes or
+	// encodes itself through the public Cursor/Appender surface; see typed_hook.go.
+	typedUnmarshalerSimd
+	typedMarshalerSimd
 )
 
 // typedOp selects a struct field's decode operation. Order is load-bearing:
@@ -329,6 +333,13 @@ type typedNode struct {
 	fieldTableMask   uint32
 	encFields        []typedEncField
 	encNameData      []byte
+	// decHookTab and encHookTab hold the *T -> hook-interface itabs captured at
+	// compile time (see captureHookTabs), so a hook dispatch is two word stores
+	// plus the call. They stay nil when the type carries no hook, or when the
+	// interface-layout self-test failed, in which case dispatch falls back to a
+	// safe reflect boxing. See typed_hook.go.
+	decHookTab unsafe.Pointer
+	encHookTab unsafe.Pointer
 	// encClose is what the pair encoder appends after the last member:
 	// a single brace normally, more when fused children close here too.
 	encClose []byte
@@ -842,7 +853,15 @@ func (c *typedCompiler) applyInterfaceKinds(node *typedNode, typ reflect.Type) b
 	}
 	pointerType := reflect.PointerTo(typ)
 	applied := false
-	if typ.Implements(jsonUnmarshalerReflectType) || pointerType.Implements(jsonUnmarshalerReflectType) {
+	if pointerType.Implements(unmarshalerSimdReflectType) {
+		// The simdjson-native hook wins over the standard interfaces: a type
+		// implements it precisely to skip their costs. Only the pointer form
+		// is honoured, since the body writes back through the receiver.
+		node.kind = typedUnmarshalerSimd
+		node.op = typedOpUnmarshaler
+		captureHookTabs(node, typ, true, false)
+		applied = true
+	} else if typ.Implements(jsonUnmarshalerReflectType) || pointerType.Implements(jsonUnmarshalerReflectType) {
 		node.kind = typedUnmarshalerJSON
 		node.op = typedOpUnmarshaler
 		applied = true
@@ -855,6 +874,21 @@ func (c *typedCompiler) applyInterfaceKinds(node *typedNode, typ reflect.Type) b
 		node.encKind = typedTime
 		node.encNonAddrKind = typedTime
 		node.encOp = typedOpMarshaler
+		return true
+	}
+	if pointerType.Implements(marshalerSimdReflectType) {
+		// The native append hook overrides the standard marshaler dispatch for
+		// addressable values. When the value type itself implements the hook
+		// (a value receiver), the non-addressable route can use it too; a
+		// pointer-receiver hook leaves the non-addressable route on its default
+		// encoding, matching encoding/json's condAddrEncoder. Returning here
+		// keeps the standard-marshaler block below from clobbering encKind.
+		node.encKind = typedMarshalerSimd
+		node.encOp = typedOpMarshaler
+		if typ.Implements(marshalerSimdReflectType) {
+			node.encNonAddrKind = typedMarshalerSimd
+		}
+		captureHookTabs(node, typ, false, true)
 		return true
 	}
 	if typ.Implements(jsonMarshalerReflectType) {

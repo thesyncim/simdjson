@@ -138,6 +138,16 @@ func (e *encodeState) encodeMarshaler(node *typedNode, src unsafe.Pointer) error
 	if node.encKind == typedTime {
 		return e.encodeTime(src)
 	}
+	if node.encKind == typedMarshalerSimd {
+		// A pointer-receiver hook cannot run on a non-addressable value; match
+		// encoding/json's condAddrEncoder and fall back to its default encoding
+		// (encNonAddrKind), which the compiler left as the structural kind
+		// unless the value type itself implements the hook.
+		if e.nonAddr && node.encNonAddrKind != typedMarshalerSimd {
+			return e.encodeKind(node, src, node.encNonAddrKind)
+		}
+		return e.encodeViaSimdHook(node, src)
+	}
 	return e.encodeMarshalerKind(node, src, node.encKind)
 }
 
@@ -286,7 +296,7 @@ func computeEncPtrMarshaler(node *typedNode, active map[*typedNode]bool) bool {
 
 	has := false
 	switch node.encKind {
-	case typedMarshalerJSON, typedMarshalerText:
+	case typedMarshalerJSON, typedMarshalerText, typedMarshalerSimd:
 		// encNonAddrKind holds the non-marshaler fallback only when the
 		// value type does not implement the interface itself.
 		has = node.encNonAddrKind != node.encKind
