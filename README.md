@@ -288,6 +288,38 @@ malformed `json.Number`) return an `EncodeError` with a typed path.
 </details>
 
 <details>
+<summary><b>Hand-written hooks for the last few percent</b></summary>
+
+The compiled decoder and encoder already outrun generated code and JIT
+libraries, but a hot type can shed the remaining per-field dispatch by
+implementing `UnmarshalSimdJSON(*Cursor) error` or `MarshalSimdJSON(Appender)
+Appender` — the simdjson-native counterparts of `json.Unmarshaler` and
+`json.Marshaler`. A `Cursor` exposes the same SIMD scalar kernels and object
+and array framing the decoder itself uses; an `Appender` is a by-value builder
+whose output buffer stays in registers. These read ~12–15% and write ~17–27%
+faster than the (already fastest-in-Go) compiled path, at zero allocation, and
+are entirely opt-in: a type without the methods is unaffected.
+
+```go
+func (e Event) MarshalSimdJSON(w simdjson.Appender) simdjson.Appender {
+	w = w.RawByte('{').Raw(`"id":`).Int(e.ID)
+	w = w.Raw(`,"name":`).String(e.Name)
+	return w.Raw(`,"active":`).Bool(e.Active).RawByte('}')
+}
+```
+
+Decode bodies read fields through the `Cursor` (`ObjectOpen`, `Field`/`NextField`,
+`Int64`/`String`/`Bool`/…, `Skip`); see the `Cursor` and `Appender` type
+documentation. A hook body must not retain the `Cursor` or `Appender` past the
+call, and an encode hook must emit valid compact JSON, since its bytes are
+spliced in without re-validation. Build with `-race` or the `simdjson_safehooks`
+tag during development: it runs each body against a heap-copied cursor and turns
+a retained handle into an immediate panic instead of latent corruption. Output
+and decoded values stay byte-identical to `encoding/json`.
+
+</details>
+
+<details>
 <summary><b>Capture unknown members with an <code>,inline</code> catch-all</b></summary>
 
 An opt-in extension routes object members that match no declared field into a
