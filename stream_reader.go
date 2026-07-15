@@ -348,6 +348,29 @@ func (r *Reader) Next() bool {
 		}
 	}
 
+	// Fast path: the value is usually already fully buffered, and one
+	// validation pass both checks it and locates its end. It counts only when
+	// something confirms the boundary — a byte after the value or the end of
+	// input — since a number or literal ending exactly at the buffer edge may
+	// continue in unread input. Anything unconfirmed or invalid falls through
+	// to the resumable framer below, which settles incomplete-versus-invalid
+	// exactly as before; the retried prefix is bounded by one buffer, so a
+	// value spanning refills still frames in linear time overall.
+	{
+		window := r.buf[:r.end]
+		base := unsafe.Pointer(unsafe.SliceData(window))
+		if end, ok := validValueFast(window, base, r.end, i, window[i], 0); ok && (end < r.end || r.eof) {
+			if r.maxValue > 0 && end-i > r.maxValue {
+				r.err = fmt.Errorf("simdjson: value at input offset %d exceeds the %d byte limit", r.consumed+int64(i), r.maxValue)
+				return false
+			}
+			r.valStart, r.valEnd = i, end
+			r.pos = end
+			r.hasValue = true
+			return true
+		}
+	}
+
 	// Locate the value's end by resumable framing, so a value spanning many
 	// refills is scanned once rather than re-scanned from the start each time.
 	// Once the value is fully buffered it is validated exactly once; validLen
