@@ -431,6 +431,28 @@ func TestProbeMarshalerInvalidUTF8CarveOut(t *testing.T) {
 	}
 }
 
+// TestProbeMarshalerLoneSurrogateRejected pins the deliberate encode/decode
+// symmetry documented in the README: a MarshalJSON or json.RawMessage emitting
+// a lone \uXXXX surrogate is rejected, because simdjson also rejects that byte
+// sequence on decode. stdlib passes it through (and substitutes U+FFFD when it
+// reads it back). Emitting it here would produce JSON simdjson cannot itself
+// consume, so rejection keeps the round trip consistent.
+func TestProbeMarshalerLoneSurrogateRejected(t *testing.T) {
+	type doc struct {
+		V probeRawOut `json:"v"`
+	}
+	for _, out := range []string{`"\ud83d"`, `"\udc00"`, `"a\ud800b"`} {
+		v := doc{V: probeRawOut{Out: out}}
+		if _, err := Marshal(&v); err == nil {
+			t.Errorf("Marshal accepted lone-surrogate marshaler output %q; expected rejection (encode/decode symmetry)", out)
+		}
+		// The same bytes must indeed be rejected on decode, proving symmetry.
+		if err := Unmarshal([]byte(out), new(string)); err == nil {
+			t.Errorf("decode of %q unexpectedly accepted; symmetry claim is wrong", out)
+		}
+	}
+}
+
 func TestProbeTextMarshalerInvalidUTF8(t *testing.T) {
 	type doc struct {
 		V probeTextOut `json:"v"`

@@ -452,7 +452,12 @@ positioned error. Depth is limited (default 10000, configurable through the
 `MaxDepth` options).
 
 **encoding/json parity.** Encoded output matches `encoding/json` byte for
-byte. Decoding follows stdlib semantics: struct tags, case-insensitive field
+byte, with one deliberate exception: a custom `json.Marshaler` or
+`json.RawMessage` whose bytes contain a lone `\uXXXX` surrogate or invalid
+UTF-8 is rejected rather than passed through. simdjson rejects those same
+bytes on decode, so accepting them here would emit JSON it could not read
+back; the strict-UTF-8 guarantee is symmetric across encode and decode.
+Decoding follows stdlib semantics: struct tags, case-insensitive field
 fallback (disable with `CaseSensitive`), merge-into-existing destinations
 (switch with `Replace`), `json.Unmarshaler`/`json.Marshaler`,
 `encoding.TextUnmarshaler`/`encoding.TextMarshaler`, and `time.Time`. Typed
