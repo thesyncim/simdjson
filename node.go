@@ -167,13 +167,49 @@ func (v Node) Get(key string) (Node, bool) {
 	return Node{src: v.src, entry: found}, true
 }
 
-// Pointer returns a JSON Pointer target relative to v.
+// Pointer returns a JSON Pointer target relative to v. It walks pointer tokens
+// in place, so a slash-free pointer resolves without allocating a compiled
+// token list, matching Value.Pointer.
 func (v Node) Pointer(pointer string) (Node, bool, error) {
-	compiled, err := CompilePointer(pointer)
-	if err != nil {
-		return Node{}, false, err
+	if pointer == "" {
+		return v, v.valid(), nil
 	}
-	return v.PointerCompiled(compiled)
+	if pointer[0] != '/' {
+		return Node{}, false, &PointerError{Pointer: pointer, Message: "pointer must be empty or start with slash"}
+	}
+	cur := v
+	for i := 1; i <= len(pointer); {
+		j := i
+		for j < len(pointer) && pointer[j] != '/' {
+			j++
+		}
+		token, err := unescapePointerToken(pointer[i:j])
+		if err != nil {
+			return Node{}, false, err
+		}
+		switch cur.Kind() {
+		case Object:
+			next, ok := cur.Get(token)
+			if !ok {
+				return Node{}, false, nil
+			}
+			cur = next
+		case Array:
+			index, ok, err := parsePointerIndex(token)
+			if err != nil || !ok {
+				return Node{}, ok, err
+			}
+			next, ok := cur.Index(index)
+			if !ok {
+				return Node{}, false, nil
+			}
+			cur = next
+		default:
+			return Node{}, false, nil
+		}
+		i = j + 1
+	}
+	return cur, cur.valid(), nil
 }
 
 // PointerCompiled resolves pointer from v without allocating.
