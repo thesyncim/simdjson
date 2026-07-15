@@ -178,49 +178,67 @@ func (c *compactParser) object(depth int) error {
 }
 
 func (c *compactParser) number() error {
-	start := c.i
-	v := validator{src: c.src, i: c.i, maxDepth: c.maxDepth}
-	if err := v.parseNumber(); err != nil {
-		return err
-	}
-	c.i = v.i
-	c.dst = append(c.dst, c.src[start:c.i]...)
-	return nil
+	var err error
+	c.dst, c.i, err = appendJSONNumberToken(c.dst, c.src, c.i, c.maxDepth)
+	return err
 }
 
 func (c *compactParser) string() error {
-	start := c.i
-	c.i++
+	var err error
+	c.dst, c.i, err = appendJSONStringToken(c.dst, c.src, c.i, c.maxDepth)
+	return err
+}
+
+// appendJSONNumberToken validates the number at src[i] and copies its exact
+// source bytes to dst, so no re-formatting alters the literal. It returns the
+// updated dst, the index just past the number, and any error. Shared by the
+// compact and indent transforms.
+func appendJSONNumberToken(dst, src []byte, i, maxDepth int) ([]byte, int, error) {
+	start := i
+	v := validator{src: src, i: i, maxDepth: maxDepth}
+	if err := v.parseNumber(); err != nil {
+		return dst, i, err
+	}
+	return append(dst, src[start:v.i]...), v.i, nil
+}
+
+// appendJSONStringToken validates the string at src[i] (src[i] must be '"') and
+// copies its exact source bytes to dst, preserving the original escape spelling
+// (\uXXXX, \/, surrogate pairs) rather than re-encoding a decoded value. It
+// enforces the same strict escape and UTF-8 rules as the parser. Shared by the
+// compact and indent transforms.
+func appendJSONStringToken(dst, src []byte, i, maxDepth int) ([]byte, int, error) {
+	start := i
+	i++
 	for {
-		j := scanStringSpecial(c.src, c.i)
-		if j >= len(c.src) {
-			return syntaxError(c.src, len(c.src), "unterminated string")
+		j := scanStringSpecial(src, i)
+		if j >= len(src) {
+			return dst, len(src), syntaxError(src, len(src), "unterminated string")
 		}
-		c.i = j
-		ch := c.src[c.i]
+		i = j
+		ch := src[i]
 		switch {
 		case ch == '"':
-			c.i++
-			c.dst = append(c.dst, c.src[start:c.i]...)
-			return nil
+			i++
+			return append(dst, src[start:i]...), i, nil
 		case ch == '\\':
-			c.i++
-			if c.i >= len(c.src) {
-				return syntaxError(c.src, c.i, "unterminated escape sequence")
+			i++
+			if i >= len(src) {
+				return dst, i, syntaxError(src, i, "unterminated escape sequence")
 			}
-			v := validator{src: c.src, i: c.i, maxDepth: c.maxDepth}
+			v := validator{src: src, i: i, maxDepth: maxDepth}
 			if err := v.validateEscape(); err != nil {
-				return err
+				return dst, i, err
 			}
-			c.i = v.i
+			i = v.i
 		case ch < 0x20:
-			return syntaxError(c.src, c.i, "unescaped control byte in string")
+			return dst, i, syntaxError(src, i, "unescaped control byte in string")
 		default:
-			next, bad := scanStringUnicodeRun(c.src, c.i)
+			next, bad := scanStringUnicodeRun(src, i)
 			if bad >= 0 {
-				return syntaxError(c.src, bad, "invalid UTF-8 in string")
+				return dst, bad, syntaxError(src, bad, "invalid UTF-8 in string")
 			}
-			c.i = next
+			i = next
 		}
 	}
 }

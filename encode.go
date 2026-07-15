@@ -55,13 +55,12 @@ func Indent(src []byte, prefix, indent string) ([]byte, error) {
 	return AppendIndent(nil, src, prefix, indent)
 }
 
-// AppendIndent parses src and appends pretty JSON using prefix and indent.
+// AppendIndent validates src and appends pretty JSON using prefix and indent.
+// Like json.Indent, string and number tokens are copied from src verbatim, so
+// escape spelling and number literals are preserved exactly; only structural
+// whitespace is inserted.
 func AppendIndent(dst, src []byte, prefix, indent string) ([]byte, error) {
-	v, err := ParseOptions(src, Options{ZeroCopy: true})
-	if err != nil {
-		return dst, err
-	}
-	return v.AppendIndent(dst, prefix, indent), nil
+	return appendIndentBytes(dst, src, prefix, indent, defaultMaxDepth)
 }
 
 // AppendIndent appends pretty JSON for v to dst.

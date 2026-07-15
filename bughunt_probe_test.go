@@ -874,6 +874,33 @@ func TestProbeIndentContract(t *testing.T) {
 	}
 }
 
+// TestProbeIndentPreservesEscapeSpelling pins Indent to json.Indent byte for
+// byte: like stdlib, it copies string and number tokens from the source
+// verbatim rather than re-encoding a decoded value, so \uXXXX, \/, and
+// surrogate-pair spellings survive. Inputs are pre-compacted so no surrounding
+// whitespace is involved.
+func TestProbeIndentPreservesEscapeSpelling(t *testing.T) {
+	for _, src := range []string{
+		`{"k":"A\/>"}`,
+		`["😀","plain"]`,
+		`{"num":1e10,"big":123456789012345678,"neg":-0.5}`,
+		`{"nested":{"a":"\t\n","b":[true,null,false]}}`,
+		`"  "`,
+	} {
+		got, err := Indent([]byte(src), "", "  ")
+		if err != nil {
+			t.Fatalf("Indent(%s): %v", src, err)
+		}
+		var want bytes.Buffer
+		if err := json.Indent(&want, []byte(src), "", "  "); err != nil {
+			t.Fatalf("json.Indent(%s): %v", src, err)
+		}
+		if string(got) != want.String() {
+			t.Errorf("Indent(%s) not byte-identical to json.Indent:\n simd=%q\n json=%q", src, got, want.String())
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Probe J: raw spans. Targets never include surrounding whitespace; root
 // scalars work; ScanRaw's documented stop-early behavior on trailing garbage.
