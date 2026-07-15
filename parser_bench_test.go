@@ -601,6 +601,71 @@ func BenchmarkIndexArrayFloat64Sum(b *testing.B) {
 	}
 }
 
+// sumNodeFull walks a pre-parsed tape summing every number through
+// Node.Float64, forcing the real-float scalar read path on every element.
+func sumNodeFull(n Node) float64 {
+	switch n.Kind() {
+	case Number:
+		f, _ := n.Float64()
+		return f
+	case Array:
+		iter, _ := n.ArrayIter()
+		var s float64
+		for {
+			el, ok := iter.Next()
+			if !ok {
+				break
+			}
+			s += sumNodeFull(el)
+		}
+		return s
+	case Object:
+		iter, _ := n.ObjectIter()
+		var s float64
+		for {
+			_, val, ok := iter.Next()
+			if !ok {
+				break
+			}
+			s += sumNodeFull(val)
+		}
+		return s
+	default:
+		return 0
+	}
+}
+
+// BenchmarkIndexFloatWalk reads every number of a real-float corpus through
+// Node.Float64 over a pre-parsed tape, isolating the lazy scalar read (Parse is
+// excluded). FloatArray is a flat mixed-magnitude array; CoordRings is the
+// nested GeoJSON coordinate shape. Both route through the fraction/exponent
+// kernel path this change added.
+func BenchmarkIndexFloatWalk(b *testing.B) {
+	for _, c := range []struct {
+		name string
+		data []byte
+	}{
+		{"FloatArray", floatArrayJSON(8192)},
+		{"CoordRings", coordRingsJSON(4096)},
+	} {
+		storage := make([]IndexEntry, len(c.data))
+		tape, err := BuildIndex(c.data, storage)
+		if err != nil {
+			b.Fatal(err)
+		}
+		root := tape.Root()
+		b.Run(c.name, func(b *testing.B) {
+			b.SetBytes(int64(len(c.data)))
+			b.ReportAllocs()
+			var s float64
+			for i := 0; i < b.N; i++ {
+				s += sumNodeFull(root)
+			}
+			indexBenchmarkSinkFloat64 = s
+		})
+	}
+}
+
 func BenchmarkParseOptionsZeroCopySmall(b *testing.B) {
 	src := smallJSON()
 	b.SetBytes(int64(len(src)))

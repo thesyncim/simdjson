@@ -87,10 +87,20 @@ func checkAllFloatPaths(t *testing.T, text string) {
 		}
 	}
 
-	// any / Value path.
+	// any / Value path (Value.Float64 routes through Node.Float64, the lazy
+	// kernel read).
 	if v, err := Parse([]byte(text)); err == nil && strconvOK {
 		if f, ok := v.Float64(); ok && math.Float64bits(f) != math.Float64bits(ref64) {
 			t.Fatalf("Value.Float64(%q) = %x (%v) want %x (%v)", text,
+				math.Float64bits(f), f, math.Float64bits(ref64), ref64)
+		}
+	}
+
+	// RawValue path: no tape flag, so it classifies inline before reusing the
+	// same kernel. Whole-document GetRaw yields the number slice.
+	if raw, ok, err := GetRaw([]byte(text), ""); err == nil && ok && strconvOK {
+		if f, fok := raw.Float64(); fok && math.Float64bits(f) != math.Float64bits(ref64) {
+			t.Fatalf("RawValue.Float64(%q) = %x (%v) want %x (%v)", text,
 				math.Float64bits(f), f, math.Float64bits(ref64), ref64)
 		}
 	}

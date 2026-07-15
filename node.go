@@ -132,9 +132,11 @@ func (v Node) Float64() (float64, bool) {
 			return f, true
 		}
 	}
-	s := ownedBytesString(tapeSourceBytes(v.src, e.start, e.end))
-	n, err := strconv.ParseFloat(s, 64)
-	return n, err == nil
+	// A real float — fraction, exponent, or an integer too wide for the fast
+	// path — rounds through the same kernels the streaming decoder uses,
+	// reaching strconv only for the spellings they defer on. ok is false only
+	// on an out-of-range magnitude, exactly as strconv.ParseFloat reports.
+	return tapeFloat64(unsafe.Pointer(v.src), int(e.start), int(e.end))
 }
 
 // StringBytes returns an unescaped string as a source alias. Escaped strings

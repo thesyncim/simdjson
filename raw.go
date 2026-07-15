@@ -2,6 +2,7 @@ package simdjson
 
 import (
 	"strconv"
+	"unsafe"
 )
 
 // RawValue is an exact JSON value slice aliasing the source passed to GetRaw.
@@ -88,22 +89,57 @@ func (r RawValue) NumberText() (string, bool) {
 
 // Int64 parses r as an int64 JSON number.
 func (r RawValue) Int64() (int64, bool) {
-	s, ok := r.NumberText()
-	if !ok {
+	if len(r.src) == 0 {
 		return 0, false
 	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	return n, err == nil
+	base := unsafe.Pointer(unsafe.SliceData(r.src))
+	// One pass validates the number and reports the same plain-integer
+	// classification the tape records: an optional minus and digits, no
+	// fraction or exponent. Anything else is not an int64 and rejects the way
+	// strconv.ParseInt does. A whole-slice match is the RawValue invariant that
+	// there is exactly one value with no trailing bytes.
+	end, integer, ok := scanNumberFastTagged(base, len(r.src), 0)
+	if !ok || end != len(r.src) || !integer {
+		return 0, false
+	}
+	i := 0
+	negative := fastByteAt(base, i) == '-'
+	if negative {
+		i++
+	}
+	// Twenty digits or more can exceed int64 without overflow analysis; hand
+	// those to strconv for the value verdict.
+	value, ok := parseTapeDigitsUint64(base, i, end)
+	if !ok {
+		n, err := strconv.ParseInt(ownedBytesString(r.src), 10, 64)
+		return n, err == nil
+	}
+	if negative {
+		if value > 1<<63 {
+			return 0, false
+		}
+		return -int64(value), true
+	}
+	if value > 1<<63-1 {
+		return 0, false
+	}
+	return int64(value), true
 }
 
 // Float64 parses r as a float64 JSON number.
 func (r RawValue) Float64() (float64, bool) {
-	s, ok := r.NumberText()
-	if !ok {
+	if len(r.src) == 0 {
 		return 0, false
 	}
-	n, err := strconv.ParseFloat(s, 64)
-	return n, err == nil
+	base := unsafe.Pointer(unsafe.SliceData(r.src))
+	// Validate that the slice is exactly one JSON number, then round through
+	// the same kernels Node.Float64 uses, reaching strconv only for the
+	// truncated or tie-ambiguous spellings they defer on.
+	end, _, ok := scanNumberFastTagged(base, len(r.src), 0)
+	if !ok || end != len(r.src) {
+		return 0, false
+	}
+	return tapeFloat64(base, 0, len(r.src))
 }
 
 // Text returns r as an unquoted JSON string. The boolean reports whether r
