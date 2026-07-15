@@ -2,7 +2,7 @@ package simdjson
 
 import (
 	"encoding/json"
-	"strconv"
+	"unsafe"
 )
 
 // Kind is the JSON type stored in a Value.
@@ -43,121 +43,177 @@ type Member struct {
 	Value Value
 }
 
-// Value is an immutable JSON AST node.
+// valueRoot owns the storage a Value tree reads from. Parse copies the source
+// (unless ZeroCopy) and the structural index into a root, and every Value
+// navigated from that document holds a pointer to it. The root therefore keeps
+// both the source bytes and the index alive for as long as any reachable Value
+// still refers to them, so a Value stays valid after the caller drops the
+// original src slice.
+type valueRoot struct {
+	src     []byte
+	entries []IndexEntry
+}
+
+// Value is an immutable handle into a parsed JSON document. Parse builds only
+// the structural index and reads each value straight from it as the caller
+// navigates, so a document read in part never pays to materialize the whole.
+//
+// A Value keeps its document alive through root: the lightweight node cursor
+// aliases the owned source and index, and root is what holds that storage
+// reachable. Navigation (Get, Index, Array, Object, Pointer) yields further
+// Values that share the same root without reparsing.
 type Value struct {
-	kind Kind
-	b    bool
-	s    string
-	n    string
-	a    []Value
-	o    []Member
+	node Node
+	root *valueRoot
+}
+
+// with rebinds a navigated node back into v's owning root so the result keeps
+// the document's storage alive.
+func (v Value) with(node Node) Value {
+	return Value{node: node, root: v.root}
 }
 
 // Kind returns the JSON kind of v.
 func (v Value) Kind() Kind {
-	return v.kind
+	return v.node.Kind()
 }
 
 // Bool returns v as a bool.
 func (v Value) Bool() (bool, bool) {
-	if v.kind != Bool {
-		return false, false
-	}
-	return v.b, true
+	return v.node.Bool()
 }
 
-// Text returns v as a string.
+// Text returns v as a decoded (unescaped) string. Escaped strings decode into
+// fresh storage; unescaped strings alias v's owned source.
 func (v Value) Text() (string, bool) {
-	if v.kind != String {
+	if v.node.Kind() != String {
 		return "", false
 	}
-	return v.s, true
+	if b, ok := v.node.StringBytes(); ok {
+		return ownedBytesString(b), true
+	}
+	out, _ := v.node.AppendString(nil)
+	return ownedBytesString(out), true
 }
 
 // NumberText returns the original JSON number spelling.
 func (v Value) NumberText() (string, bool) {
-	if v.kind != Number {
-		return "", false
-	}
-	return v.n, true
+	return v.node.NumberText()
 }
 
 // Float64 parses a number value as float64.
 func (v Value) Float64() (float64, bool) {
-	if v.kind != Number {
-		return 0, false
-	}
-	f, err := strconv.ParseFloat(v.n, 64)
-	return f, err == nil
+	return v.node.Float64()
 }
 
 // Int64 parses an integer number value as int64.
 func (v Value) Int64() (int64, bool) {
-	if v.kind != Number {
-		return 0, false
-	}
-	i, err := strconv.ParseInt(v.n, 10, 64)
-	return i, err == nil
+	return v.node.Int64()
 }
 
-// Array returns v as an array.
+// Array returns v as an array. The element Values are materialized on demand
+// and share v's root.
 func (v Value) Array() ([]Value, bool) {
-	if v.kind != Array {
+	iter, ok := v.node.ArrayIter()
+	if !ok {
 		return nil, false
 	}
-	return v.a, true
+	n, _ := v.node.ArrayLen()
+	out := make([]Value, 0, n)
+	for {
+		node, ok := iter.Next()
+		if !ok {
+			break
+		}
+		out = append(out, v.with(node))
+	}
+	return out, true
 }
 
-// Object returns v as ordered object members.
+// Object returns v as ordered object members. The member Values are
+// materialized on demand and share v's root.
 func (v Value) Object() ([]Member, bool) {
-	if v.kind != Object {
+	iter, ok := v.node.ObjectIter()
+	if !ok {
 		return nil, false
 	}
-	return v.o, true
+	n, _ := v.node.ObjectLen()
+	out := make([]Member, 0, n)
+	for {
+		key, val, ok := iter.Next()
+		if !ok {
+			break
+		}
+		out = append(out, Member{Key: nodeKeyString(key), Value: v.with(val)})
+	}
+	return out, true
 }
 
-// Get returns the last object member with key.
+// nodeKeyString decodes an object key node into a Go string, matching the
+// decoded (unescaped) form the eager tree used for keys.
+func nodeKeyString(key Node) string {
+	if b, ok := key.StringBytes(); ok {
+		return ownedBytesString(b)
+	}
+	out, _ := key.AppendString(nil)
+	return ownedBytesString(out)
+}
+
+// Get returns the last object member with key, matching encoding/json's
+// last-occurrence semantics for duplicate keys.
 func (v Value) Get(key string) (Value, bool) {
-	if v.kind != Object {
+	node, ok := v.node.Get(key)
+	if !ok {
 		return Value{}, false
 	}
-	for i := len(v.o) - 1; i >= 0; i-- {
-		if v.o[i].Key == key {
-			return v.o[i].Value, true
-		}
-	}
-	return Value{}, false
+	return v.with(node), true
 }
 
 // Index returns the ith array element.
 func (v Value) Index(i int) (Value, bool) {
-	if v.kind != Array || i < 0 || i >= len(v.a) {
+	node, ok := v.node.Index(i)
+	if !ok {
 		return Value{}, false
 	}
-	return v.a[i], true
+	return v.with(node), true
 }
 
 // Any converts v to standard Go JSON shapes. Numbers are json.Number.
 func (v Value) Any() any {
-	switch v.kind {
+	switch v.node.Kind() {
 	case Null:
 		return nil
 	case Bool:
-		return v.b
+		b, _ := v.node.Bool()
+		return b
 	case Number:
-		return json.Number(v.n)
+		s, _ := v.node.NumberText()
+		return json.Number(s)
 	case String:
-		return v.s
+		s, _ := v.Text()
+		return s
 	case Array:
-		out := make([]any, len(v.a))
-		for i := range v.a {
-			out[i] = v.a[i].Any()
+		n, _ := v.node.ArrayLen()
+		out := make([]any, 0, n)
+		iter, _ := v.node.ArrayIter()
+		for {
+			node, ok := iter.Next()
+			if !ok {
+				break
+			}
+			out = append(out, v.with(node).Any())
 		}
 		return out
 	case Object:
-		out := make(map[string]any, len(v.o))
-		for _, m := range v.o {
-			out[m.Key] = m.Value.Any()
+		n, _ := v.node.ObjectLen()
+		out := make(map[string]any, n)
+		iter, _ := v.node.ObjectIter()
+		for {
+			key, val, ok := iter.Next()
+			if !ok {
+				break
+			}
+			out[nodeKeyString(key)] = v.with(val).Any()
 		}
 		return out
 	default:
@@ -165,8 +221,20 @@ func (v Value) Any() any {
 	}
 }
 
+// Node returns the underlying lightweight cursor. The cursor is valid only
+// while v is reachable, so it must not outlive v.
+func (v Value) Node() Node { return v.node }
+
 // String returns compact JSON for v.
 func (v Value) String() string {
 	b, _ := v.MarshalJSON()
 	return string(b)
+}
+
+// newRootValue wraps owned source and index storage in a root and returns the
+// document's top-level Value.
+func newRootValue(src []byte, entries []IndexEntry) Value {
+	root := &valueRoot{src: src, entries: entries}
+	node := Node{src: unsafe.SliceData(src), entry: unsafe.SliceData(entries)}
+	return Value{node: node, root: root}
 }

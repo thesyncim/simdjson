@@ -101,75 +101,20 @@ func GetOptions(src []byte, pointer string, opts Options) (Value, bool, error) {
 
 // Pointer returns the RFC 6901 JSON Pointer target within v.
 func (v Value) Pointer(pointer string) (Value, bool, error) {
-	if pointer == "" {
-		return v, true, nil
+	node, ok, err := v.node.Pointer(pointer)
+	if err != nil || !ok {
+		return Value{}, ok, err
 	}
-	if pointer[0] != '/' {
-		return Value{}, false, &PointerError{Pointer: pointer, Message: "pointer must be empty or start with slash"}
-	}
-
-	cur := v
-	for i := 1; i <= len(pointer); {
-		j := i
-		for j < len(pointer) && pointer[j] != '/' {
-			j++
-		}
-		token, err := unescapePointerToken(pointer[i:j])
-		if err != nil {
-			return Value{}, false, err
-		}
-		switch cur.kind {
-		case Object:
-			next, ok := cur.Get(token)
-			if !ok {
-				return Value{}, false, nil
-			}
-			cur = next
-		case Array:
-			idx, ok, err := parsePointerIndex(token)
-			if err != nil || !ok {
-				return Value{}, ok, err
-			}
-			next, ok := cur.Index(idx)
-			if !ok {
-				return Value{}, false, nil
-			}
-			cur = next
-		default:
-			return Value{}, false, nil
-		}
-		i = j + 1
-	}
-	return cur, true, nil
+	return v.with(node), true, nil
 }
 
 // PointerCompiled returns the precompiled JSON Pointer target within v.
 func (v Value) PointerCompiled(pointer CompiledPointer) (Value, bool, error) {
-	cur := v
-	for i := range pointer.tokens {
-		token := pointer.tokens[i]
-		switch cur.kind {
-		case Object:
-			next, ok := cur.Get(token.text)
-			if !ok {
-				return Value{}, false, nil
-			}
-			cur = next
-		case Array:
-			idx, ok, err := token.arrayIndex()
-			if err != nil || !ok {
-				return Value{}, ok, err
-			}
-			next, ok := cur.Index(idx)
-			if !ok {
-				return Value{}, false, nil
-			}
-			cur = next
-		default:
-			return Value{}, false, nil
-		}
+	node, ok, err := v.node.PointerCompiled(pointer)
+	if err != nil || !ok {
+		return Value{}, ok, err
 	}
-	return cur, true, nil
+	return v.with(node), true, nil
 }
 
 // PointerError describes an invalid JSON Pointer expression.

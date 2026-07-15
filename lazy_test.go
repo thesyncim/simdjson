@@ -10,12 +10,15 @@ import (
 	"testing"
 )
 
-// lazyToAny walks a LazyValue into the same standard Go shapes that
-// Value.Any() and encoding/json produce, so the three can be compared directly.
-// Numbers become json.Number to preserve exact spelling.
-func lazyToAny(t *testing.T, v LazyValue) any {
+// valueToAny walks a Value through its node cursor into the same standard Go
+// shapes that Value.Any() and encoding/json produce, so the three can be
+// compared directly. Numbers become json.Number to preserve exact spelling.
+// Walking through the cursor (rather than calling Any directly) keeps the
+// differential proof independent of Any's own traversal.
+func valueToAny(t *testing.T, v Value) any {
 	t.Helper()
-	switch v.Kind() {
+	node := v.Node()
+	switch node.Kind() {
 	case Null:
 		return nil
 	case Bool:
@@ -37,23 +40,23 @@ func lazyToAny(t *testing.T, v LazyValue) any {
 		}
 		return s
 	case Array:
-		n, _ := v.ArrayLen()
+		n, _ := node.ArrayLen()
 		out := make([]any, 0, n)
-		iter, ok := v.ArrayIter()
+		iter, ok := node.ArrayIter()
 		if !ok {
 			t.Fatal("ArrayIter() failed on Array kind")
 		}
 		for {
-			node, ok := iter.Next()
+			el, ok := iter.Next()
 			if !ok {
 				break
 			}
-			out = append(out, lazyToAny(t, v.with(node)))
+			out = append(out, valueToAny(t, v.with(el)))
 		}
 		return out
 	case Object:
 		out := map[string]any{}
-		iter, ok := v.ObjectIter()
+		iter, ok := node.ObjectIter()
 		if !ok {
 			t.Fatal("ObjectIter() failed on Object kind")
 		}
@@ -70,11 +73,11 @@ func lazyToAny(t *testing.T, v LazyValue) any {
 				b, _ := key.AppendString(nil)
 				keyStr = string(b)
 			}
-			out[keyStr] = lazyToAny(t, v.with(val))
+			out[keyStr] = valueToAny(t, v.with(val))
 		}
 		return out
 	default:
-		t.Fatalf("unexpected kind %v", v.Kind())
+		t.Fatalf("unexpected kind %v", node.Kind())
 		return nil
 	}
 }
@@ -123,25 +126,21 @@ var lazyCorpus = func() map[string][]byte {
 	}
 }()
 
-// TestLazyMatchesEagerAndStdlib is the core differential proof: for every
-// corpus document, ParseLazy read fully must agree with Parse's eager tree and
+// TestLazyMatchesAnyAndStdlib is the core differential proof: for every corpus
+// document, a cursor walk of the parsed Value must agree with Value.Any() and
 // with encoding/json.
-func TestLazyMatchesEagerAndStdlib(t *testing.T) {
+func TestLazyMatchesAnyAndStdlib(t *testing.T) {
 	for name, src := range lazyCorpus {
 		t.Run(name, func(t *testing.T) {
-			lazy, err := ParseLazy(src)
-			if err != nil {
-				t.Fatalf("ParseLazy: %v", err)
-			}
-			eager, err := Parse(src)
+			v, err := Parse(src)
 			if err != nil {
 				t.Fatalf("Parse: %v", err)
 			}
 
-			lazyAny := normalizeNumbers(t, lazyToAny(t, lazy))
-			eagerAny := normalizeNumbers(t, eager.Any())
-			if !reflect.DeepEqual(lazyAny, eagerAny) {
-				t.Fatalf("lazy != eager\nlazy:  %#v\neager: %#v", lazyAny, eagerAny)
+			cursorAny := normalizeNumbers(t, valueToAny(t, v))
+			anyAny := normalizeNumbers(t, v.Any())
+			if !reflect.DeepEqual(cursorAny, anyAny) {
+				t.Fatalf("cursor != Any\ncursor: %#v\nany:    %#v", cursorAny, anyAny)
 			}
 
 			var stdAny any
@@ -151,80 +150,54 @@ func TestLazyMatchesEagerAndStdlib(t *testing.T) {
 				t.Fatalf("encoding/json: %v", err)
 			}
 			stdAny = normalizeNumbers(t, stdAny)
-			if !reflect.DeepEqual(lazyAny, stdAny) {
-				t.Fatalf("lazy != encoding/json\nlazy: %#v\nstd:  %#v", lazyAny, stdAny)
+			if !reflect.DeepEqual(cursorAny, stdAny) {
+				t.Fatalf("cursor != encoding/json\ncursor: %#v\nstd:    %#v", cursorAny, stdAny)
 			}
 		})
 	}
 }
 
-// TestLazyZeroCopyMatches confirms the zero-copy handle reads identically.
+// TestLazyZeroCopyMatches confirms the zero-copy Value reads identically to a
+// copied one.
 func TestLazyZeroCopyMatches(t *testing.T) {
 	for name, src := range lazyCorpus {
 		t.Run(name, func(t *testing.T) {
 			// zero-copy aliases src, so keep a private copy alive.
 			buf := append([]byte(nil), src...)
-			lazy, err := ParseLazyOptions(buf, Options{ZeroCopy: true})
+			zc, err := ParseOptions(buf, Options{ZeroCopy: true})
 			if err != nil {
-				t.Fatalf("ParseLazyOptions: %v", err)
+				t.Fatalf("ParseOptions(ZeroCopy): %v", err)
 			}
-			eager, err := Parse(src)
+			owned, err := Parse(src)
 			if err != nil {
 				t.Fatalf("Parse: %v", err)
 			}
 			if !reflect.DeepEqual(
-				normalizeNumbers(t, lazyToAny(t, lazy)),
-				normalizeNumbers(t, eager.Any()),
+				normalizeNumbers(t, valueToAny(t, zc)),
+				normalizeNumbers(t, owned.Any()),
 			) {
-				t.Fatalf("zero-copy lazy != eager for %s", name)
+				t.Fatalf("zero-copy != owned for %s", name)
 			}
 		})
 	}
 }
 
-// TestLazyValueBridge confirms LazyValue.Value() produces the same tree as the
-// eager Parse for a navigated subtree.
-func TestLazyValueBridge(t *testing.T) {
-	src := lazyCorpus["citm"]
-	lazy, err := ParseLazy(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sub, ok, err := lazy.Pointer("/events/3")
-	if err != nil || !ok {
-		t.Fatalf("pointer /events/3: %v %v", ok, err)
-	}
-	eager, err := Parse(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	eagerSub, ok, err := eager.Pointer("/events/3")
-	if err != nil || !ok {
-		t.Fatalf("eager pointer: %v %v", ok, err)
-	}
-	if !reflect.DeepEqual(
-		normalizeNumbers(t, sub.Value().Any()),
-		normalizeNumbers(t, eagerSub.Any()),
-	) {
-		t.Fatal("LazyValue.Value() subtree != eager subtree")
-	}
-}
-
-// TestLazyPartialGCSafe checks that a handle survives after src is dropped and a
-// GC is forced, proving the non-zero-copy handle is self-contained.
+// TestLazyPartialGCSafe checks that a Value survives after src is dropped and a
+// GC is forced, proving the default (non-zero-copy) Value is self-contained:
+// its root keeps a private copy of the source and the index alive.
 func TestLazyPartialGCSafe(t *testing.T) {
 	makeAndRead := func() (int64, bool) {
 		src := citmLikeJSON(64)
-		lazy, err := ParseLazy(src)
+		v, err := Parse(src)
 		if err != nil {
 			t.Fatal(err)
 		}
-		// src goes out of scope here; the handle must own its bytes.
-		v, ok, err := lazy.Pointer("/events/10/id")
+		// src goes out of scope here; the Value must own its bytes.
+		id, ok, err := v.Pointer("/events/10/id")
 		if err != nil || !ok {
 			return 0, false
 		}
-		return v.Int64()
+		return id.Int64()
 	}
 	id, ok := makeAndRead()
 	if !ok {
@@ -236,9 +209,96 @@ func TestLazyPartialGCSafe(t *testing.T) {
 	}
 }
 
-// TestLazyFloatExactness spot-checks that lazy Float64 matches strconv for a set
-// of adversarial spellings, since number parsing is the correctness-critical
-// path.
+// TestLazyDropSrcThenGC drops the original src slice explicitly, forces GC, and
+// re-reads a deep string, proving the Value's owned storage outlives src.
+func TestLazyDropSrcThenGC(t *testing.T) {
+	src := []byte(`{"a":{"b":[1,2,{"c":"keep-me"}]}}`)
+	v, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Scribble over and drop the caller's src to prove the Value does not read
+	// from it.
+	for i := range src {
+		src[i] = 0
+	}
+	src = nil
+	_ = src
+	runtime.GC()
+	runtime.GC()
+	got, ok, err := v.Pointer("/a/b/2/c")
+	if err != nil || !ok {
+		t.Fatalf("pointer: %v %v", ok, err)
+	}
+	text, ok := got.Text()
+	if !ok || text != "keep-me" {
+		t.Fatalf("after GC got %q ok=%v, want %q", text, ok, "keep-me")
+	}
+}
+
+// TestLazyMarshalNormalizesEscapes is the byte-exact differential for the
+// subtle trap: because Parse is lazy and reads strings straight from the
+// source, MarshalJSON must still DECODE and RE-ENCODE each string so that
+// non-canonical source escapes (e.g. "A", "\/") collapse to their
+// canonical spelling ("A", "/") exactly as encoding/json emits them. A raw
+// pass-through (Compact of the source range) would preserve the source escapes
+// and diverge, so this test compares Marshal(Parse(x)) byte-for-byte against
+// encoding/json's re-marshaled form.
+func TestLazyMarshalNormalizesEscapes(t *testing.T) {
+	cases := []string{
+		`"A"`,
+		`"ABC"`,
+		`"a\/b"`,
+		`"é raw and é escaped"`,
+		`"tab\tnew\nline"`,
+		`"𝄞"`,
+		`"\uFFFD escaped replacement"`,
+		`"ctl \u0000 and \u007f done"`,
+		// Arrays preserve element order in both producers, so their bytes
+		// are directly comparable; each element still exercises normalization.
+		`["A","\/","tab\ther",2,true,null]`,
+	}
+	for _, c := range cases {
+		src := []byte(c)
+
+		// encoding/json's canonical re-marshaling of the same value.
+		var v any
+		if err := json.Unmarshal(src, &v); err != nil {
+			t.Fatalf("stdlib rejected %s: %v", c, err)
+		}
+		want, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("stdlib re-marshal %s: %v", c, err)
+		}
+
+		parsed, err := Parse(src)
+		if err != nil {
+			t.Fatalf("Parse(%s): %v", c, err)
+		}
+		got, err := parsed.MarshalJSON()
+		if err != nil {
+			t.Fatalf("MarshalJSON(%s): %v", c, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("MarshalJSON(%s) = %s, want %s (escape normalization diverged)", c, got, want)
+		}
+
+		// AppendIndent's scalar leaves reuse AppendJSON, so its string spelling
+		// must match too. Indent stdlib to compare structural-only differences
+		// away by re-compacting.
+		gotIndent := parsed.AppendIndent(nil, "", "  ")
+		compacted, err := Compact(gotIndent)
+		if err != nil {
+			t.Fatalf("Compact(indent(%s)): %v", c, err)
+		}
+		if !bytes.Equal(compacted, want) {
+			t.Errorf("AppendIndent(%s) compacted = %s, want %s", c, compacted, want)
+		}
+	}
+}
+
+// TestLazyFloatExactness spot-checks that Float64 matches strconv for a set of
+// adversarial spellings, since number parsing is the correctness-critical path.
 func TestLazyFloatExactness(t *testing.T) {
 	cases := []string{
 		"0", "-0", "3.141592653589793", "1e308", "5e-324",
@@ -247,11 +307,11 @@ func TestLazyFloatExactness(t *testing.T) {
 	}
 	for _, c := range cases {
 		src := []byte("[" + c + "]")
-		lazy, err := ParseLazy(src)
+		v, err := Parse(src)
 		if err != nil {
 			t.Fatalf("%s: %v", c, err)
 		}
-		el, ok := lazy.Index(0)
+		el, ok := v.Index(0)
 		if !ok {
 			t.Fatalf("%s: index 0 missing", c)
 		}
@@ -266,13 +326,13 @@ func TestLazyFloatExactness(t *testing.T) {
 	}
 }
 
-// --- A/B throughput and allocation benchmarks (lazy vs eager Parse) ---
+// --- Parse throughput and allocation benchmarks ---
 //
-// Each corpus is measured under three access patterns, always A/B interleaved
-// so the ratio is trustworthy under load:
+// Each corpus is measured under two access patterns:
 //   Full    - traverse the whole document, forcing every scalar.
-//   Partial - read a handful of fields, the On-Demand sweet spot.
-//   ParseOnly - build the tree/index without reading any value.
+//   Partial - read a handful of fields, the on-demand sweet spot.
+// Parse-only throughput (build the index without reading any value) lives in
+// BenchmarkNumberCorpusParse.
 
 func lazyBenchCorpus() []struct {
 	name string
@@ -289,59 +349,34 @@ func lazyBenchCorpus() []struct {
 	}
 }
 
-// sumEagerFull walks the eager Value tree summing every number, forcing the
-// whole tree to be materialized and read.
-func sumEagerFull(v Value) float64 {
-	switch v.Kind() {
+// sumValueFull walks a Value through its cursor summing every number, forcing
+// the whole document to be read without materializing an eager tree.
+func sumValueFull(v Value) float64 {
+	node := v.Node()
+	switch node.Kind() {
 	case Number:
 		f, _ := v.Float64()
 		return f
 	case Array:
-		arr, _ := v.Array()
-		var s float64
-		for i := range arr {
-			s += sumEagerFull(arr[i])
-		}
-		return s
-	case Object:
-		obj, _ := v.Object()
-		var s float64
-		for i := range obj {
-			s += sumEagerFull(obj[i].Value)
-		}
-		return s
-	default:
-		return 0
-	}
-}
-
-// sumLazyFull walks a LazyValue summing every number without ever building a
-// Value tree.
-func sumLazyFull(v LazyValue) float64 {
-	switch v.Kind() {
-	case Number:
-		f, _ := v.Float64()
-		return f
-	case Array:
-		iter, _ := v.ArrayIter()
+		iter, _ := node.ArrayIter()
 		var s float64
 		for {
-			node, ok := iter.Next()
+			el, ok := iter.Next()
 			if !ok {
 				break
 			}
-			s += sumLazyFull(v.with(node))
+			s += sumValueFull(v.with(el))
 		}
 		return s
 	case Object:
-		iter, _ := v.ObjectIter()
+		iter, _ := node.ObjectIter()
 		var s float64
 		for {
 			_, val, ok := iter.Next()
 			if !ok {
 				break
 			}
-			s += sumLazyFull(v.with(val))
+			s += sumValueFull(v.with(val))
 		}
 		return s
 	default:
@@ -351,7 +386,7 @@ func sumLazyFull(v LazyValue) float64 {
 
 var lazyFloatSink float64
 
-func BenchmarkParseFullEager(b *testing.B) {
+func BenchmarkParseFull(b *testing.B) {
 	for _, c := range lazyBenchCorpus() {
 		b.Run(c.name, func(b *testing.B) {
 			b.SetBytes(int64(len(c.data)))
@@ -362,25 +397,7 @@ func BenchmarkParseFullEager(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				s += sumEagerFull(v)
-			}
-			lazyFloatSink = s
-		})
-	}
-}
-
-func BenchmarkParseFullLazy(b *testing.B) {
-	for _, c := range lazyBenchCorpus() {
-		b.Run(c.name, func(b *testing.B) {
-			b.SetBytes(int64(len(c.data)))
-			b.ReportAllocs()
-			var s float64
-			for range b.N {
-				v, err := ParseLazy(c.data)
-				if err != nil {
-					b.Fatal(err)
-				}
-				s += sumLazyFull(v)
+				s += sumValueFull(v)
 			}
 			lazyFloatSink = s
 		})
@@ -388,11 +405,10 @@ func BenchmarkParseFullLazy(b *testing.B) {
 }
 
 // Partial access: read four fields from the 3rd, 100th, and 900th events of
-// Citm; for the flat number arrays, read three individual elements. This is
-// where On-Demand should shine: the eager path pays to materialize the whole
-// document, the lazy path pays only the index build plus a few reads.
+// Citm; for the flat number array, read three individual elements. Parse only
+// builds the index, so the reads pay only for the values touched.
 
-func BenchmarkParsePartialEager(b *testing.B) {
+func BenchmarkParsePartial(b *testing.B) {
 	citm := citmLikeJSON(1024)
 	ints := intArrayJSON(8192)
 	b.Run("Citm", func(b *testing.B) {
@@ -442,93 +458,11 @@ func BenchmarkParsePartialEager(b *testing.B) {
 	})
 }
 
-func BenchmarkParsePartialLazy(b *testing.B) {
-	citm := citmLikeJSON(1024)
-	ints := intArrayJSON(8192)
-	b.Run("Citm", func(b *testing.B) {
-		b.SetBytes(int64(len(citm)))
-		b.ReportAllocs()
-		var s float64
-		for range b.N {
-			v, err := ParseLazy(citm)
-			if err != nil {
-				b.Fatal(err)
-			}
-			for _, idx := range []int{3, 100, 900} {
-				ev, ok, _ := v.Pointer("/events/" + itoa(idx))
-				if !ok {
-					b.Fatal("event missing")
-				}
-				id, _ := ev.Get("id")
-				price, _ := ev.Get("price")
-				name, _ := ev.Get("name")
-				fid, _ := id.Float64()
-				fpr, _ := price.Float64()
-				ntxt, _ := name.Text()
-				s += fid + fpr + float64(len(ntxt))
-			}
-		}
-		lazyFloatSink = s
-	})
-	b.Run("IntArray", func(b *testing.B) {
-		b.SetBytes(int64(len(ints)))
-		b.ReportAllocs()
-		var s float64
-		for range b.N {
-			v, err := ParseLazy(ints)
-			if err != nil {
-				b.Fatal(err)
-			}
-			for _, idx := range []int{7, 4000, 8000} {
-				el, ok := v.Index(idx)
-				if !ok {
-					b.Fatal("index missing")
-				}
-				f, _ := el.Float64()
-				s += f
-			}
-		}
-		lazyFloatSink = s
-	})
-}
-
-func BenchmarkParseOnlyEager(b *testing.B) {
-	for _, c := range lazyBenchCorpus() {
-		b.Run(c.name, func(b *testing.B) {
-			b.SetBytes(int64(len(c.data)))
-			b.ReportAllocs()
-			for range b.N {
-				v, err := Parse(c.data)
-				if err != nil {
-					b.Fatal(err)
-				}
-				benchmarkSink = v.Kind()
-			}
-		})
-	}
-}
-
-func BenchmarkParseOnlyLazy(b *testing.B) {
-	for _, c := range lazyBenchCorpus() {
-		b.Run(c.name, func(b *testing.B) {
-			b.SetBytes(int64(len(c.data)))
-			b.ReportAllocs()
-			for range b.N {
-				v, err := ParseLazy(c.data)
-				if err != nil {
-					b.Fatal(err)
-				}
-				benchmarkSink = v.Kind()
-			}
-		})
-	}
-}
-
 func itoa(i int) string { return strconv.Itoa(i) }
 
-// TestLazyPoolReuseIsolation hammers ParseLazy concurrently with distinct
-// documents to prove the pooled index storage is copied out per handle and no
-// two handles ever share a recycled buffer.
+// TestLazyPoolReuseIsolation hammers Parse concurrently with distinct documents
+// to prove the pooled index storage is copied out per Value and no two Values
+// ever share a recycled buffer.
 func TestLazyPoolReuseIsolation(t *testing.T) {
 	docs := [][]byte{
 		[]byte(`{"n":1}`),
@@ -543,14 +477,14 @@ func TestLazyPoolReuseIsolation(t *testing.T) {
 		go func(seed int) {
 			for iter := 0; iter < 2000; iter++ {
 				src := docs[(seed+iter)%len(docs)]
-				lazy, err := ParseLazy(src)
+				v, err := Parse(src)
 				if err != nil {
 					done <- err
 					return
 				}
 				want, _ := Parse(src)
 				if !reflect.DeepEqual(
-					normalizeNumbers(t, lazyToAny(t, lazy)),
+					normalizeNumbers(t, valueToAny(t, v)),
 					normalizeNumbers(t, want.Any()),
 				) {
 					done <- errMismatch
@@ -567,7 +501,7 @@ func TestLazyPoolReuseIsolation(t *testing.T) {
 	}
 }
 
-var errMismatch = &pointerErrorStub{"lazy handle content diverged under concurrent pool reuse"}
+var errMismatch = &pointerErrorStub{"parsed Value content diverged under concurrent pool reuse"}
 
 type pointerErrorStub struct{ msg string }
 

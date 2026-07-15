@@ -36,20 +36,34 @@ var parseTapePool = sync.Pool{
 	},
 }
 
-// ParseOptions parses src using opts. It builds the structural tape first,
-// so containers allocate exactly once from shared arenas sized by the tape.
+// ParseOptions parses src using opts and returns the document's root Value. It
+// builds only the structural index; each value is read from that index straight
+// off the source as the caller navigates, so a document read in part never pays
+// to materialize the whole. The returned Value owns its index and (unless
+// opts.ZeroCopy) a private copy of src, so it stays valid after the caller
+// drops src.
 func ParseOptions(src []byte, opts Options) (Value, error) {
 	maxDepth := opts.MaxDepth
 	if maxDepth <= 0 {
 		maxDepth = defaultMaxDepth
 	}
+
+	// The index needs one entry per structural token. Reuse a pooled estimate
+	// buffer for the common case; grow (and keep) a private buffer when the
+	// document is larger than the estimate.
 	pooled := parseTapePool.Get().(*[]IndexEntry)
 	storage := (*pooled)[:cap(*pooled)]
+
 	estimate := len(src)/8 + 8
 	var entries []IndexEntry
+	grown := false
 	for {
 		if cap(storage) < estimate {
-			storage = make([]IndexEntry, estimate)
+			// The builder writes entries into storage[:cap] from index 0, so only
+			// the capacity matters; allocate with zero length to skip zeroing the
+			// whole estimate, which the builder immediately overwrites.
+			storage = make([]IndexEntry, 0, estimate)
+			grown = true
 		}
 		index, err := BuildIndexOptions(src, storage[:cap(storage)], IndexOptions{MaxDepth: maxDepth})
 		if err == ErrIndexFull {
@@ -57,117 +71,43 @@ func ParseOptions(src []byte, opts Options) (Value, error) {
 			continue
 		}
 		if err != nil {
-			*pooled = storage[:0]
+			if !grown {
+				*pooled = storage[:0]
+			}
 			parseTapePool.Put(pooled)
 			return Value{}, err
 		}
 		entries = index.entries
 		break
 	}
-	defer func() {
-		*pooled = storage[:0]
-		parseTapePool.Put(pooled)
-	}()
+
 	if len(entries) == 0 {
+		if !grown {
+			*pooled = storage[:0]
+		}
+		parseTapePool.Put(pooled)
 		return Value{}, syntaxError(src, 0, "expected value")
 	}
-	builder := astBuilder{src: src, entries: entries, zeroCopy: opts.ZeroCopy}
-	values, members := 0, 0
-	for i := range entries {
-		if entries[i].flags&tapeFlagKey != 0 {
-			members++
-		} else {
-			values++
-		}
-	}
-	// Object member values live inside Member entries, so the value arena
-	// only holds array elements: every non-key entry except the root and
-	// the object member values (one per key).
-	if arrayValues := values - members - 1; arrayValues > 0 {
-		builder.valueArena = make([]Value, arrayValues)
-	}
-	if members > 0 {
-		builder.memberArena = make([]Member, members)
-	}
-	value, _ := builder.build(0)
-	return value, nil
-}
 
-// astBuilder turns a validated structural tape into the ordered Value tree.
-type astBuilder struct {
-	src         []byte
-	entries     []IndexEntry
-	valueArena  []Value
-	valuePos    int
-	memberArena []Member
-	memberPos   int
-	zeroCopy    bool
-	ownedSrc    []byte
-}
+	// The Value must own its index storage so it outlives this call. When the
+	// pooled buffer was large enough we copy the used entries out and return the
+	// buffer to the pool; a grown buffer is already private and belongs to the
+	// Value, so we trim it and do not recycle it.
+	var owned []IndexEntry
+	if grown {
+		owned = storage[:len(entries):len(entries)]
+	} else {
+		owned = make([]IndexEntry, len(entries))
+		copy(owned, entries)
+		*pooled = storage[:0]
+	}
+	parseTapePool.Put(pooled)
 
-func (b *astBuilder) build(idx int) (Value, int) {
-	entry := &b.entries[idx]
-	switch entry.kind {
-	case Object:
-		count := int(entry.count)
-		var members []Member
-		if count > 0 {
-			members = b.memberArena[b.memberPos : b.memberPos+count]
-			b.memberPos += count
-		}
-		i := idx + 1
-		for m := 0; m < count; m++ {
-			key := b.stringAt(&b.entries[i])
-			var value Value
-			value, i = b.build(i + 1)
-			members[m] = Member{Key: key, Value: value}
-		}
-		return Value{kind: Object, o: members}, i
-	case Array:
-		count := int(entry.count)
-		var values []Value
-		if count > 0 {
-			values = b.valueArena[b.valuePos : b.valuePos+count]
-			b.valuePos += count
-		}
-		i := idx + 1
-		for m := 0; m < count; m++ {
-			values[m], i = b.build(i)
-		}
-		return Value{kind: Array, a: values}, i
-	case String:
-		return Value{kind: String, s: b.stringAt(entry)}, idx + 1
-	case Number:
-		return Value{kind: Number, n: b.text(entry.start, entry.end)}, idx + 1
-	case Bool:
-		return Value{kind: Bool, b: b.src[entry.start] == 't'}, idx + 1
-	default:
-		return Value{kind: Null}, idx + 1
+	body := src
+	if !opts.ZeroCopy {
+		body = append([]byte(nil), src...)
 	}
-}
-
-// stringAt decodes a string entry: escaped strings decode into owned storage,
-// clean strings follow the parser's ownership rules.
-func (b *astBuilder) stringAt(entry *IndexEntry) string {
-	if entry.flags&tapeFlagEscaped != 0 {
-		return ownedBytesString(appendDecodedJSONString(nil, b.src[entry.start+1:entry.end-1]))
-	}
-	return b.text(entry.start+1, entry.end-1)
-}
-
-// text returns src[start:end] under the parser's ownership rules: zero copy
-// aliases src, owned mode aliases one lazily made private copy of the input.
-func (b *astBuilder) text(start, end uint32) string {
-	if start == end {
-		return ""
-	}
-	if b.zeroCopy {
-		return unsafe.String(unsafe.SliceData(b.src[start:end]), int(end-start))
-	}
-	if b.ownedSrc == nil {
-		b.ownedSrc = append([]byte(nil), b.src...)
-	}
-	return unsafe.String(&b.ownedSrc[start], int(end-start))
+	return newRootValue(body, owned), nil
 }
 
 // parser holds shared low-level scanning state for the dynamic decoding

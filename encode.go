@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // MarshalJSON implements json.Marshaler.
@@ -11,43 +12,68 @@ func (v Value) MarshalJSON() ([]byte, error) {
 	return v.AppendJSON(nil), nil
 }
 
-// AppendJSON appends compact JSON for v to dst.
+// AppendJSON appends compact JSON for v to dst. Strings are decoded and
+// re-encoded through appendJSONString, so non-canonical escapes in the source
+// are normalized exactly as encoding/json would emit them; number spellings are
+// preserved verbatim.
 func (v Value) AppendJSON(dst []byte) []byte {
-	switch v.kind {
+	switch v.node.Kind() {
 	case Null:
 		return append(dst, "null"...)
 	case Bool:
-		if v.b {
+		if b, _ := v.node.Bool(); b {
 			return append(dst, "true"...)
 		}
 		return append(dst, "false"...)
 	case Number:
-		return append(dst, v.n...)
+		s, _ := v.node.NumberBytes()
+		return append(dst, s...)
 	case String:
-		return appendJSONString(dst, v.s)
+		return appendJSONNodeString(dst, v.node)
 	case Array:
 		dst = append(dst, '[')
-		for i := range v.a {
+		iter, _ := v.node.ArrayIter()
+		for i := 0; ; i++ {
+			node, ok := iter.Next()
+			if !ok {
+				break
+			}
 			if i > 0 {
 				dst = append(dst, ',')
 			}
-			dst = v.a[i].AppendJSON(dst)
+			dst = v.with(node).AppendJSON(dst)
 		}
 		return append(dst, ']')
 	case Object:
 		dst = append(dst, '{')
-		for i, m := range v.o {
+		iter, _ := v.node.ObjectIter()
+		for i := 0; ; i++ {
+			key, val, ok := iter.Next()
+			if !ok {
+				break
+			}
 			if i > 0 {
 				dst = append(dst, ',')
 			}
-			dst = appendJSONString(dst, m.Key)
+			dst = appendJSONNodeString(dst, key)
 			dst = append(dst, ':')
-			dst = m.Value.AppendJSON(dst)
+			dst = v.with(val).AppendJSON(dst)
 		}
 		return append(dst, '}')
 	default:
 		return append(dst, "null"...)
 	}
+}
+
+// appendJSONNodeString decodes a string node and re-encodes it, normalizing
+// escape spelling the same way appendJSONString does for a Go string, but
+// without allocating for the common unescaped case.
+func appendJSONNodeString(dst []byte, node Node) []byte {
+	if b, ok := node.StringBytes(); ok {
+		return appendJSONStringBytes(dst, b)
+	}
+	decoded, _ := node.AppendString(nil)
+	return appendJSONStringBytes(dst, decoded)
 }
 
 // Indent parses src and returns pretty JSON using prefix and indent.
@@ -69,40 +95,50 @@ func (v Value) AppendIndent(dst []byte, prefix, indent string) []byte {
 }
 
 func appendIndentValue(dst []byte, v Value, prefix, indent string, depth int) []byte {
-	switch v.kind {
+	switch v.node.Kind() {
 	case Array:
-		if len(v.a) == 0 {
+		if n, _ := v.node.ArrayLen(); n == 0 {
 			return append(dst, "[]"...)
 		}
 		dst = append(dst, '[')
-		for i := range v.a {
+		iter, _ := v.node.ArrayIter()
+		for i := 0; ; i++ {
+			node, ok := iter.Next()
+			if !ok {
+				break
+			}
 			if i > 0 {
 				dst = append(dst, ',')
 			}
 			dst = append(dst, '\n')
 			dst = append(dst, prefix...)
 			dst = append(dst, strings.Repeat(indent, depth+1)...)
-			dst = appendIndentValue(dst, v.a[i], prefix, indent, depth+1)
+			dst = appendIndentValue(dst, v.with(node), prefix, indent, depth+1)
 		}
 		dst = append(dst, '\n')
 		dst = append(dst, prefix...)
 		dst = append(dst, strings.Repeat(indent, depth)...)
 		return append(dst, ']')
 	case Object:
-		if len(v.o) == 0 {
+		if n, _ := v.node.ObjectLen(); n == 0 {
 			return append(dst, "{}"...)
 		}
 		dst = append(dst, '{')
-		for i, m := range v.o {
+		iter, _ := v.node.ObjectIter()
+		for i := 0; ; i++ {
+			key, val, ok := iter.Next()
+			if !ok {
+				break
+			}
 			if i > 0 {
 				dst = append(dst, ',')
 			}
 			dst = append(dst, '\n')
 			dst = append(dst, prefix...)
 			dst = append(dst, strings.Repeat(indent, depth+1)...)
-			dst = appendJSONString(dst, m.Key)
+			dst = appendJSONNodeString(dst, key)
 			dst = append(dst, ": "...)
-			dst = appendIndentValue(dst, m.Value, prefix, indent, depth+1)
+			dst = appendIndentValue(dst, v.with(val), prefix, indent, depth+1)
 		}
 		dst = append(dst, '\n')
 		dst = append(dst, prefix...)
@@ -114,13 +150,21 @@ func appendIndentValue(dst []byte, v Value, prefix, indent string, depth int) []
 }
 
 func appendJSONString(dst []byte, text string) []byte {
+	return appendJSONStringBytes(dst, unsafe.Slice(unsafe.StringData(text), len(text)))
+}
+
+// appendJSONStringBytes appends text as a quoted, canonically escaped JSON
+// string. It is the shared core behind appendJSONString and the decoded-node
+// path, so a Value re-encodes strings identically whether the caller holds a
+// Go string or an already-decoded byte slice.
+func appendJSONStringBytes(dst, text []byte) []byte {
 	const hex = "0123456789abcdef"
 	dst = append(dst, '"')
 	start := 0
 	for i := 0; i < len(text); {
 		c := text[i]
 		if c >= utf8.RuneSelf {
-			_, size := utf8.DecodeRuneInString(text[i:])
+			_, size := utf8.DecodeRune(text[i:])
 			if size != 1 {
 				i += size
 				continue
@@ -171,26 +215,45 @@ func AppendCanonicalize(dst, src []byte) ([]byte, error) {
 	if err != nil {
 		return dst, err
 	}
-	return canonical(v).AppendJSON(dst), nil
+	return appendCanonical(dst, v), nil
 }
 
-func canonical(v Value) Value {
-	switch v.kind {
+// appendCanonical appends compact JSON for v with every object's members sorted
+// by decoded key. Arrays keep their order. Strings and numbers are normalized
+// exactly as AppendJSON does, so the canonical form is stable regardless of the
+// source's escape spelling or member order.
+func appendCanonical(dst []byte, v Value) []byte {
+	switch v.node.Kind() {
 	case Array:
-		a := make([]Value, len(v.a))
-		for i := range v.a {
-			a[i] = canonical(v.a[i])
+		dst = append(dst, '[')
+		iter, _ := v.node.ArrayIter()
+		for i := 0; ; i++ {
+			node, ok := iter.Next()
+			if !ok {
+				break
+			}
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = appendCanonical(dst, v.with(node))
 		}
-		v.a = a
+		return append(dst, ']')
 	case Object:
-		o := make([]Member, len(v.o))
-		for i := range v.o {
-			o[i] = Member{Key: v.o[i].Key, Value: canonical(v.o[i].Value)}
-		}
-		sort.SliceStable(o, func(i, j int) bool {
-			return o[i].Key < o[j].Key
+		members, _ := v.Object()
+		sort.SliceStable(members, func(i, j int) bool {
+			return members[i].Key < members[j].Key
 		})
-		v.o = o
+		dst = append(dst, '{')
+		for i := range members {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = appendJSONString(dst, members[i].Key)
+			dst = append(dst, ':')
+			dst = appendCanonical(dst, members[i].Value)
+		}
+		return append(dst, '}')
+	default:
+		return v.AppendJSON(dst)
 	}
-	return v
 }

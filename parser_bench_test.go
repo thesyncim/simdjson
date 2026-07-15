@@ -517,7 +517,7 @@ func BenchmarkPointer(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		v, ok, err := Get(src, "/items/2/message")
-		if err != nil || !ok || v.kind != String {
+		if err != nil || !ok || v.Kind() != String {
 			b.Fatal(v, ok, err)
 		}
 	}
@@ -529,7 +529,7 @@ func BenchmarkPointerZeroCopy(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		v, ok, err := GetOptions(src, "/items/2/message", Options{ZeroCopy: true})
-		if err != nil || !ok || v.kind != String {
+		if err != nil || !ok || v.Kind() != String {
 			b.Fatal(v, ok, err)
 		}
 	}
