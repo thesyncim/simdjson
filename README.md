@@ -140,7 +140,11 @@ for the dynamic APIs.
 <summary><b>Dynamic values: <code>any</code> trees and ordered trees</b></summary>
 
 `ParseAny` produces the standard Go JSON shapes without an intermediate tree;
-`Parse` produces an ordered AST of `Value` nodes when member order matters.
+`Parse` produces an ordered, on-demand `Value` when member order matters.
+Parsing builds only the structural index — scalars decode and containers
+materialize when they are actually read, so a document consumed in part never
+pays for the whole. A `Value` keeps its backing storage alive, so it stays
+usable after the source slice is gone.
 
 ```go
 value, err := simdjson.ParseAny(src)
@@ -156,7 +160,7 @@ if err != nil {
 	return err
 }
 
-// Ordered tree that preserves member order:
+// Ordered on-demand value that preserves member order:
 root, err := simdjson.Parse(src)
 if err != nil {
 	return err
@@ -217,7 +221,37 @@ w.EndObject()
 return w.Close()
 ```
 
-`Reader.Bytes` and zero-copy decodes of the current value alias the rolling
+For dynamic single-pass consumption, `Reader.Cursor` walks the current value
+forward without building any tree or index: scalars parse on demand through
+the same kernels the compiled decoder uses, `Skip` hops unwanted subtrees
+structurally, and a full stream costs two allocations total rather than
+allocations per value. The contract is forward-only and explicit —
+`BeginObject`/`NextField`, `BeginArray`/`NextElement`, `Skip`, `Finish`:
+
+```go
+r := simdjson.NewReader(in)
+for r.Next() {
+	c := r.Cursor()
+	if err := c.BeginObject(); err != nil {
+		return err
+	}
+	for {
+		key, ok, err := c.NextField()
+		if err != nil || !ok {
+			break
+		}
+		if key == "id" {
+			id, _ := c.Int64()
+			// use id
+		} else {
+			c.Skip()
+		}
+	}
+}
+return r.Err()
+```
+
+`Reader.Bytes`, zero-copy decodes, and cursor strings alias the rolling
 buffer and stay valid only until the next `Next`; `SetMaxValueBytes` bounds
 buffer growth on untrusted input.
 
@@ -435,6 +469,11 @@ The upcoming `encoding/json/v2` (`GOEXPERIMENT=jsonv2`) trails on the same
 corpus by 3.9x on typed decode, 2.5x on dynamic decode, and 3.3x on owned
 `Marshal` — see [the v2 table](benchmarks/README.md#encodingjsonv2).
 
+The table is the pinned 2026-07-14 snapshot; decode and validation have
+improved since (on-demand `Parse`, Eisel-Lemire floats, batched stage-1
+validation), so treat it as a conservative lower bound until the next
+regeneration.
+
 [Full per-corpus results, allocations, SIMD uplift, versions, and exact commands](benchmarks/README.md#published-corpus-snapshot).
 For context beyond Go — C++ simdjson and Rust serde_json/simd-json on the
 same corpus and machine — see the
@@ -465,7 +504,10 @@ and dynamic differential tests run against `encoding/json`.
 
 **Ownership.** Default decodes return owned results that are independent of
 the source. `ZeroCopy` decodes alias the source: keep it alive and unmodified
-while results are in use. `RawValue`, `Index`, and `Node` always alias the
+while results are in use. A `Value` from `Parse` owns a private copy of the
+source and its structural index (with `Options.ZeroCopy` it aliases the
+caller's bytes instead), and keeps both alive for as long as any `Value`
+derived from it is reachable. `RawValue`, `Index`, and `Node` always alias the
 source; `Index` and `Node` also alias the caller-provided `IndexEntry`
 workspace. `AppendJSON` requires destination storage disjoint from storage
 reachable through the source value; on error it returns the original

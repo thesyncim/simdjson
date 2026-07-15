@@ -45,6 +45,13 @@ These are medians of six 300 ms, single-CPU samples on an Apple M4 Max
 `03845e30f7b73d1703bd8c21017297f6eecb76d6`. Compilation happens before the
 timer. Every result is checked against `encoding/json` before measurement.
 
+> **Snapshot date: 2026-07-14.** The library has improved since — notably
+> Eisel-Lemire float parsing, fused scalar-slice decoding, batched stage-1
+> classification and per-run UTF-8 checking in `Valid`, and an on-demand
+> `Parse` — so the decode and validation rows below understate the current
+> build. The tables will be regenerated as one coherent run; treat these
+> numbers as conservative lower bounds until then.
+
 "Rival" is the fastest compatible same-toolchain result from go-json v0.10.6,
 Segment encoding v0.5.4, jsoniter v1.1.12, or fastjson v1.6.10. The headline
 speedups in the root README are geometric means over all seven payloads.
