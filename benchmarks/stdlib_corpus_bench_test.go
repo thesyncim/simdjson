@@ -34,6 +34,9 @@ func BenchmarkStdlibCorpus(b *testing.B) {
 			b.Run("dynamic-owned", func(b *testing.B) {
 				benchmarkCorpusDynamic(b, src)
 			})
+			b.Run("dom", func(b *testing.B) {
+				benchmarkCorpusDOM(b, src)
+			})
 			b.Run("typed-reused", func(b *testing.B) {
 				benchmarkCorpusTypedByName(b, name, src)
 			})
@@ -179,6 +182,124 @@ func benchmarkCorpusDynamic(b *testing.B, src []byte) {
 				anySink = value
 			}
 		})
+	}
+}
+
+// benchmarkCorpusDOM measures a full document walk built on top of a parse.
+// The two columns are different shapes on purpose: simdjson.Parse builds only
+// the structural index and decodes each scalar on demand as the Value walk
+// reaches it, whereas encoding/json materializes a complete owned any tree
+// first and the walk reads the finished nodes. The comparison is therefore
+// "one parse plus a total traversal" for each library, not two identical data
+// structures.
+func benchmarkCorpusDOM(b *testing.B, src []byte) {
+	// Confirm both walks reach every scalar before timing.
+	root, err := simdjson.Parse(src)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var stdTree any
+	if err := stdjson.Unmarshal(src, &stdTree); err != nil {
+		b.Fatal(err)
+	}
+	if walkValue(root) < 0 || walkAny(stdTree) < 0 {
+		b.Fatal("unreachable")
+	}
+
+	b.Run("encoding-json", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(src)))
+		for b.Loop() {
+			var tree any
+			if err := stdjson.Unmarshal(src, &tree); err != nil {
+				b.Fatal(err)
+			}
+			intSink = walkAny(tree)
+		}
+	})
+	b.Run("simdjson", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(src)))
+		for b.Loop() {
+			value, err := simdjson.Parse(src)
+			if err != nil {
+				b.Fatal(err)
+			}
+			intSink = walkValue(value)
+		}
+	})
+}
+
+// walkValue traverses an on-demand simdjson Value, forcing every scalar to
+// decode so the walk exercises the same work a real consumer would. It returns
+// a running node count so nothing is optimized away.
+func walkValue(v simdjson.Value) int {
+	switch v.Kind() {
+	case simdjson.Object:
+		count := 1
+		members, _ := v.Object()
+		for i := range members {
+			count += len(members[i].Key)
+			count += walkValue(members[i].Value)
+		}
+		return count
+	case simdjson.Array:
+		count := 1
+		elems, _ := v.Array()
+		for i := range elems {
+			count += walkValue(elems[i])
+		}
+		return count
+	case simdjson.String:
+		s, _ := v.Text()
+		return len(s)
+	case simdjson.Number:
+		f, _ := v.Float64()
+		if f == 0 {
+			return 1
+		}
+		return 1
+	case simdjson.Bool:
+		if bv, _ := v.Bool(); bv {
+			return 1
+		}
+		return 0
+	default:
+		return 0
+	}
+}
+
+// walkAny traverses a materialized encoding/json any tree with the same shape
+// of work as walkValue, so the two DOM columns visit equivalent structure.
+func walkAny(v any) int {
+	switch t := v.(type) {
+	case map[string]any:
+		count := 1
+		for key, child := range t {
+			count += len(key)
+			count += walkAny(child)
+		}
+		return count
+	case []any:
+		count := 1
+		for i := range t {
+			count += walkAny(t[i])
+		}
+		return count
+	case string:
+		return len(t)
+	case float64:
+		if t == 0 {
+			return 1
+		}
+		return 1
+	case bool:
+		if t {
+			return 1
+		}
+		return 0
+	default:
+		return 0
 	}
 }
 

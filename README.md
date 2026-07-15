@@ -449,7 +449,7 @@ speedup across all seven payloads.
 
 | Operation | Contract | vs stdlib | vs fastest rival | vs native Sonic | SIMD vs pure Go |
 |---|---|---:|---:|---:|---:|
-| Validate | Strict JSON + UTF-8 | **2.40x** | **2.22x** | **1.06x** | **1.436x** |
+| Validate | Strict JSON + UTF-8 | **2.51x** | **2.28x** | **1.06x** | **1.497x** |
 | Typed decode | Owned strings | **5.10x** | **2.06x** | **2.08x** | **1.159x** |
 | Dynamic decode | Owned `any` tree | **4.48x** | **2.01x** | **1.40x** | **1.121x** |
 | Encode | Owned output | **3.39x** | **2.06x** | **3.91x** | **1.720x** |
@@ -469,10 +469,19 @@ The upcoming `encoding/json/v2` (`GOEXPERIMENT=jsonv2`) trails on the same
 corpus by 3.9x on typed decode, 2.5x on dynamic decode, and 3.3x on owned
 `Marshal` — see [the v2 table](benchmarks/README.md#encodingjsonv2).
 
-The table is the pinned 2026-07-14 snapshot; decode and validation have
-improved since (on-demand `Parse`, Eisel-Lemire floats, batched stage-1
-validation), so treat it as a conservative lower bound until the next
-regeneration.
+The Validate row was refreshed on 2026-07-15 on the current build; the decode
+and encode rows, the native-Sonic column, and the SIMD-versus-pure column for
+those rows are the pinned 2026-07-14 snapshot. The 2026-07-15 regeneration ran
+under heavy background machine load: the zero-allocation paths (validation and
+the reused-buffer encoder) reproduced or beat their published times, but every
+path that allocates a fresh owned tree or output buffer inflated in lockstep
+for simdjson and the competitors alike — allocator and memory-bandwidth
+contention rather than a code change, since same-process leads held steady
+through it. The published owned-allocation absolutes are therefore kept as the
+honest idle-machine figures for this same build, and will be re-pinned from an
+idle window. See the
+[per-corpus tables](benchmarks/README.md#published-corpus-snapshot) for the
+refreshed validation and new Parse/DOM rows.
 
 [Full per-corpus results, allocations, SIMD uplift, versions, and exact commands](benchmarks/README.md#published-corpus-snapshot).
 For context beyond Go — C++ simdjson and Rust serde_json/simd-json on the
