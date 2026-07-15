@@ -38,6 +38,13 @@ type Reader struct {
 	eof      bool
 	hasValue bool
 	err      error
+
+	// pipe drives the optional pipelined mode (SetPipelined). When non-nil,
+	// Next pulls framed, validated values from a worker goroutine that reads
+	// one batch ahead, and buf/valStart/valEnd alias the current batch buffer
+	// so Bytes, Cursor, DecodeTo, and DecodeNext work unchanged. It is nil for
+	// the default single-goroutine Reader, which pays nothing for it.
+	pipe *pipeline
 }
 
 // valueFrame resumably locates the end of one JSON value across buffer refills.
@@ -213,6 +220,41 @@ func (r *Reader) SetMaxValueBytes(n int) {
 	r.maxValue = n
 }
 
+// SetPipelined enables (or, with false, disables before the first Next)
+// pipelined framing: a worker goroutine reads and validates the next batch of
+// values while the caller decodes the current one, overlapping read latency
+// and framing with the caller's decode work. Everything else is unchanged —
+// Next, Bytes, Cursor, InputOffset, Err, DecodeTo, and DecodeNext behave
+// identically and yield the same value sequence and errors — so pipelining is
+// a drop-in switch, not a new API.
+//
+// A pipelined Reader owns a goroutine and must be released with Close when
+// abandoned before the end of the stream; draining it to completion also
+// releases it. It pays off when the source has real read latency or the
+// per-value decode is substantial; on a zero-latency source feeding a trivial
+// decode it only adds handoff overhead, so leave it off there. Call it before
+// the first Next; a pipelined Reader is not safe for concurrent use.
+func (r *Reader) SetPipelined(on bool) {
+	if !on {
+		r.pipe = nil
+		return
+	}
+	if r.pipe == nil {
+		r.pipe = newPipeline(r.in, len(r.buf), r.maxValue)
+	}
+}
+
+// Close releases the worker goroutine of a pipelined Reader. It is safe to
+// call at any point, is idempotent, and is a no-op on a non-pipelined Reader.
+// After Close, Next returns false. Close does not report stream errors; use
+// Err for those.
+func (r *Reader) Close() error {
+	if r.pipe != nil {
+		r.pipe.close()
+	}
+	return nil
+}
+
 // Err returns the first error encountered, or nil after a clean end of
 // stream.
 func (r *Reader) Err() error {
@@ -254,6 +296,19 @@ func DecodeTo[T any](r *Reader, dec Decoder[T], dst *T) error {
 // error; Err distinguishes the two. After a true result, Bytes and InputOffset
 // describe the decoded value.
 func DecodeNext[T any](r *Reader, dec Decoder[T], dst *T) bool {
+	if r.pipe != nil {
+		// The worker already framed and validated the value, so this is a plain
+		// advance plus decode with no boundary scan on the caller's goroutine.
+		if !r.pipeNext() {
+			return false
+		}
+		if err := dec.Decode(r.buf[r.valStart:r.valEnd], dst); err != nil {
+			r.err = fmt.Errorf("simdjson: value at input offset %d: %w", r.consumed+int64(r.valStart), err)
+			r.hasValue = false
+			return false
+		}
+		return true
+	}
 	if r.err != nil {
 		return false
 	}
@@ -328,6 +383,9 @@ func DecodeNext[T any](r *Reader, dec Decoder[T], dst *T) bool {
 // Next advances to the next value in the stream. It returns false at the
 // end of the stream or on error; Err distinguishes the two.
 func (r *Reader) Next() bool {
+	if r.pipe != nil {
+		return r.pipeNext()
+	}
 	if r.err != nil {
 		return false
 	}
