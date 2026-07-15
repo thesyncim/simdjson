@@ -507,6 +507,11 @@ func (p *parser) parseAnyNumber(useNumber bool) (any, error) {
 	if n, exact := exactJSONFloat64(base, start, end); exact {
 		return p.boxAnyFloat64(n), nil
 	}
+	if _, number, ok := scanJSONNumber(base, end, start); ok && !number.truncated {
+		if n, ok := eiselLemire64(number.mantissa, number.exponent, number.negative); ok {
+			return p.boxAnyFloat64(n), nil
+		}
+	}
 	text := unsafe.String((*byte)(unsafe.Add(base, start)), end-start)
 	n, err := strconv.ParseFloat(text, 64)
 	if err != nil {

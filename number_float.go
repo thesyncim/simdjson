@@ -42,6 +42,11 @@ func ParseFloat64(src []byte) (float64, error) {
 	if value, exact := number.exactFloat64(); exact {
 		return value, nil
 	}
+	if !number.truncated {
+		if value, ok := eiselLemire64(number.mantissa, number.exponent, number.negative); ok {
+			return value, nil
+		}
+	}
 	text := unsafe.String((*byte)(unsafe.Add(base, start)), end-start)
 	value, err := strconv.ParseFloat(text, 64)
 	if err != nil {

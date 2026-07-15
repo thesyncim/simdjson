@@ -750,12 +750,26 @@ func (c *decoderCursor) floatSlow[T floatValue](dst *T) error {
 	base := unsafe.Pointer(unsafe.SliceData(c.src))
 	bits := int(unsafe.Sizeof(*dst)) * 8
 	if bits == 64 {
+		// scanTypedFloat64 validates the digits and fast-paths the values that
+		// convert with one exact multiply. Its end and ok drive validation and
+		// cursor advance exactly as before.
 		end, value, exact, ok := scanTypedFloat64(base, len(c.src), start)
 		if !ok {
 			_, message := scanNumber(c.src, start)
 			return c.err(start, message)
 		}
 		if !exact {
+			// Outside the exact-multiply envelope, round with Eisel-Lemire from
+			// the mantissa and exponent the SIMD scanner recovers, and reserve
+			// the scalar strconv path for the truncated or tie-ambiguous inputs
+			// it defers on.
+			if _, number, ok := scanJSONNumber(base, len(c.src), start); ok && !number.truncated {
+				if v, exactLemire := eiselLemire64(number.mantissa, number.exponent, number.negative); exactLemire {
+					*dst = T(v)
+					c.i = end
+					return nil
+				}
+			}
 			text := unsafe.String((*byte)(unsafe.Add(base, start)), end-start)
 			var err error
 			value, err = strconv.ParseFloat(text, 64)
