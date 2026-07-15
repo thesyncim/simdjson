@@ -1,6 +1,7 @@
 package simdjson
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -60,6 +61,70 @@ func checkAPIAgreement(t *testing.T, src []byte) {
 	var list []any
 	if err := Unmarshal(src, &list); !want && err == nil {
 		t.Fatalf("Unmarshal into slice accepted invalid input (length %d)", len(src))
+	}
+
+	// FieldCursor must resolve every key of every object in the document exactly
+	// like the independent first-forward-match reference, including nested,
+	// escaped, duplicate, and empty objects. Only reachable on acceptance.
+	if want {
+		if v, err := Parse(src); err == nil {
+			checkFieldCursorTree(t, v)
+		}
+	}
+}
+
+// checkFieldCursorTree walks every object and array in v and asserts the field
+// cursor agrees with the reference oracle on that object, then recurses. This
+// folds the cursor into the truncation, mutation, and fuzz sweeps so it is
+// checked against the whole adversarial corpus at every nesting level.
+func checkFieldCursorTree(t *testing.T, v Value) {
+	t.Helper()
+	switch v.Kind() {
+	case Object:
+		members, ok := v.Object()
+		if !ok {
+			t.Fatal("Object() failed on Object kind")
+		}
+		ref := make([]refMember, len(members))
+		var order []string
+		seen := map[string]bool{}
+		for i, m := range members {
+			ref[i] = refMember{key: m.Key, raw: append([]byte(nil), m.Value.Node().Raw().Bytes()...)}
+			if !seen[m.Key] {
+				seen[m.Key] = true
+				order = append(order, m.Key)
+			}
+		}
+		// Look up every distinct key twice (checking wrap-resume) plus one
+		// guaranteed-absent key, against the reference cursor.
+		lookups := make([]string, 0, len(order)*2+1)
+		for _, k := range order {
+			lookups = append(lookups, k, k)
+		}
+		lookups = append(lookups, "\x00__no_such_key__")
+		rc := &refCursor{members: ref}
+		fc := v.Fields()
+		for _, key := range lookups {
+			wantRaw, wantOK := rc.find(key)
+			got, gotOK := fc.Find(key)
+			if gotOK != wantOK {
+				t.Fatalf("FieldCursor key=%q ok=%v want %v", key, gotOK, wantOK)
+			}
+			if gotOK && !bytes.Equal(got.Node().Raw().Bytes(), wantRaw) {
+				t.Fatalf("FieldCursor key=%q raw=%q want %q", key, got.Node().Raw().Bytes(), wantRaw)
+			}
+		}
+		for _, m := range members {
+			checkFieldCursorTree(t, m.Value)
+		}
+	case Array:
+		els, ok := v.Array()
+		if !ok {
+			t.Fatal("Array() failed on Array kind")
+		}
+		for _, el := range els {
+			checkFieldCursorTree(t, el)
+		}
 	}
 }
 
