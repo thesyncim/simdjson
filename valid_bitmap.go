@@ -66,7 +66,9 @@ func validBitmap(src []byte) (valid, decided bool) {
 	state := vbValue
 	depth := 0
 	follows := uint64(0) // bit 0: last byte of the previous block was a scalar byte
-	anyNonASCII := false
+	// UTF-8 runs: [utf8RunStart, utf8RunEnd) brackets the current run of
+	// blocks holding non-ASCII bytes, validated per run below.
+	utf8RunStart, utf8RunEnd := -1, 0
 	wsSample, emitSample := 0, 0
 	skipEscape := -1 // low-surrogate escape already consumed by its high half
 
@@ -101,8 +103,23 @@ func validBitmap(src []byte) (valid, decided bool) {
 		if m.Control&outside&^m.Whitespace != 0 {
 			return false, true
 		}
+		// UTF-8 is checked per run of non-ASCII blocks while the bytes are
+		// still cache-warm, instead of a second full pass over the document.
+		// A multi-byte sequence cannot cross a pure-ASCII block (every lead
+		// and continuation byte has the high bit set), so a maximal run
+		// validates as an independent slice. Runs separated by at most eight
+		// ASCII blocks coalesce — ASCII is valid UTF-8, so validating the gap
+		// is harmless and caps per-run kernel setup on alternating layouts.
 		if m.NonASCII {
-			anyNonASCII = true
+			if utf8RunStart >= 0 && block-utf8RunEnd > 8 {
+				if !validUTF8Fast(src[utf8RunStart*64 : utf8RunEnd*64]) {
+					return false, true
+				}
+				utf8RunStart = block
+			} else if utf8RunStart < 0 {
+				utf8RunStart = block
+			}
+			utf8RunEnd = block + 1
 		}
 
 		// Escape targets inside strings must name a legal escape; \u needs
@@ -277,7 +294,7 @@ func validBitmap(src []byte) (valid, decided bool) {
 	if carry.InString != 0 || state != vbDone || depth != 0 {
 		return false, true
 	}
-	if anyNonASCII && !validUTF8Fast(src) {
+	if utf8RunStart >= 0 && !validUTF8Fast(src[utf8RunStart*64:min(utf8RunEnd*64, n)]) {
 		return false, true
 	}
 	return true, true
