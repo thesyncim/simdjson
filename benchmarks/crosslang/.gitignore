@@ -4,3 +4,4 @@ bench_simdjson
 corpus/
 rustbench/target/
 rustbench/Cargo.lock
+bench_stage1
