@@ -896,6 +896,10 @@ func consumerCheck(t *testing.T, src []byte, label string) {
 		if got, n := consumerPairEntriesAsm(src, emit, kinds, entries); got != want || n != npos {
 			t.Fatalf("%s: pair asm = %v (n=%d), oracle = %v (npos=%d)\n%.200q", label, got, n, want, npos, src)
 		}
+		clear(kinds)
+		if got, n := consumerPairEntriesAsmSuper(src, emit, kinds, entries); got != want || n != npos {
+			t.Fatalf("%s: pair asm super = %v (n=%d), oracle = %v (npos=%d)\n%.200q", label, got, n, want, npos, src)
+		}
 	}
 	clear(kinds)
 	if got, n := consumerDFAEntries(src, emit, kinds, entries); got != want || n != npos {
@@ -935,17 +939,25 @@ func TestConsumerCorpora(t *testing.T) {
 			}
 		}
 
-		// The hand-written machine must produce byte-identical entries.
+		// The hand-written machines must produce byte-identical entries.
 		if consumerAsmEnabled {
-			entries2 := make([]uint64, len(entries))
-			clear(kinds)
-			ok, n := consumerPairEntriesAsm(c.src, c.emit, kinds, entries2)
-			if !ok || n != len(c.positions) {
-				t.Fatalf("%s: asm ok=%v n=%d want %d", c.label, ok, n, len(c.positions))
-			}
-			for i := range 2 * n {
-				if entries2[i] != entries[i] {
-					t.Fatalf("%s: asm entry word %d = %#x, want %#x", c.label, i, entries2[i], entries[i])
+			for _, variant := range []struct {
+				name string
+				fn   func([]byte, []uint64, []byte, []uint64) (bool, int)
+			}{
+				{"asm", consumerPairEntriesAsm},
+				{"asm super", consumerPairEntriesAsmSuper},
+			} {
+				entries2 := make([]uint64, len(entries))
+				clear(kinds)
+				ok, n := variant.fn(c.src, c.emit, kinds, entries2)
+				if !ok || n != len(c.positions) {
+					t.Fatalf("%s: %s ok=%v n=%d want %d", c.label, variant.name, ok, n, len(c.positions))
+				}
+				for i := range 2 * n {
+					if entries2[i] != entries[i] {
+						t.Fatalf("%s: %s entry word %d = %#x, want %#x", c.label, variant.name, i, entries2[i], entries[i])
+					}
 				}
 			}
 		}
@@ -978,6 +990,40 @@ func TestConsumerGrammarCases(t *testing.T) {
 	}
 	for _, src := range cases {
 		consumerCheck(t, []byte(src), "case "+src[:min(len(src), 40)])
+	}
+}
+
+// TestConsumerSuperFusedEdges targets the supplied variant's new fused
+// paths: the pair-table-free ',' and '}' consumption after completed
+// object values (legality there rests on the entry guards, not the
+// table), close chains across nesting, depth-zero commas and closes,
+// and the fused scalar-value consumption with hostile followers. Every
+// case runs through consumerCheck, so the variant must match the oracle
+// and the original machine must match it entry for entry.
+func TestConsumerSuperFusedEdges(t *testing.T) {
+	if len(loadGapCorpora(t)) == 0 {
+		t.Skip("stage-1 kernel unavailable")
+	}
+	cases := []string{
+		// fused ',' / '}' after completed object values
+		`{"a":1,"b":2}`, `{"a":"x","b":"y"}`, `{"a":{"b":1},"c":2}`,
+		`{"a":{"b":{"c":{"d":1}}}}`, `{"a":{"b":1}}`, `{"a":[1,2],"b":{}}`,
+		`{"a":{},"b":{}}`, `{"a":{"b":[{"c":1}]}}`,
+		// rejections the guards must not blur
+		`{,}`, `{"a":1,}`, `{"a":1,,"b":2}`, `{"a":1}}`, `{"a":{"b":1}}}`,
+		`{"a":{"b":1}]`, `[{"a":1}}`, `[1}`, `{"a":1},`, `,{"a":1}`,
+		`{"a":1}{"b":2}`, `{"a":1} 5`, `{"a":}`, `{"a":,}`, `{"a"::1}`,
+		// fused scalar values and their followers
+		`{"a":5}`, `{"a":true,"b":null}`, `{"a":5,"b":"x"}`, `{"a":x}`,
+		`{"a":5[}`, `{"a":5:1}`, `{"a":5"b"}`, `{"a":[}`, `{"a":]}`,
+		`{"a":5,"b":[1,{"c":false}],"d":{}}`,
+		// deep chains ending at depth zero, then trailing garbage
+		strings.Repeat(`{"k":`, 40) + "1" + strings.Repeat("}", 40),
+		strings.Repeat(`{"k":`, 40) + "1" + strings.Repeat("}", 41),
+		strings.Repeat(`{"k":`, 40) + "1" + strings.Repeat("}", 39) + "]",
+	}
+	for _, src := range cases {
+		consumerCheck(t, []byte(src), "super edge "+src[:min(len(src), 48)])
 	}
 }
 
@@ -1192,6 +1238,26 @@ func BenchmarkConsumerPairEntriesAsm(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				ok, n := consumerPairEntriesAsm(c.src, c.emit, kinds, entries)
+				boolSink = ok
+				intSink = n
+			}
+			reportPerPosition(b, len(c.positions))
+		})
+	}
+}
+
+func BenchmarkConsumerPairEntriesAsmSuper(b *testing.B) {
+	if !consumerAsmEnabled {
+		b.Skip("arm64 only")
+	}
+	for _, c := range loadGapCorpora(b) {
+		b.Run(c.label, func(b *testing.B) {
+			kinds := make([]byte, consumerKindsLen)
+			entries := make([]uint64, 2*(len(c.positions)+flattenSlack))
+			b.SetBytes(int64(len(c.src)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				ok, n := consumerPairEntriesAsmSuper(c.src, c.emit, kinds, entries)
 				boolSink = ok
 				intSink = n
 			}

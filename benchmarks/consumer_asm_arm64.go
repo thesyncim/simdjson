@@ -49,6 +49,15 @@ var consumerClsOff = func() (t [512]uint64) {
 	return
 }()
 
+// consumerAsmLoopSuper is the externally supplied variant
+// (consumer_asm_super_arm64.s): fusedComma also consumes '}' inline so
+// nested object closes chain without generic dispatch, fusedValue
+// consumes scalar values after ':' reusing the loaded dispatch slot on
+// a miss, and fused-guard misses dispatch off the already-loaded byte.
+//
+//go:noescape
+func consumerAsmLoopSuper(base *byte, emit *uint64, nwords int64, clsOff *uint64, pt *uint8, kinds *byte, entries *uint64, out *consumerAsmOut)
+
 // consumerPairEntriesAsm wraps the register machine with the same
 // contract as consumerPairEntriesGolf: grammar verdict plus one 16-byte
 // entry per position.
@@ -58,6 +67,32 @@ func consumerPairEntriesAsm(src []byte, emit []uint64, kinds []byte, entries []u
 	}
 	var out consumerAsmOut
 	consumerAsmLoop(
+		unsafe.SliceData(src),
+		unsafe.SliceData(emit),
+		int64(len(emit)),
+		&consumerClsOff[0],
+		&consumerPairBad[0],
+		unsafe.SliceData(kinds),
+		unsafe.SliceData(entries),
+		&out,
+	)
+	bad := out.bad
+	bad |= uint64(consumerEOFBad[out.prevRowIO>>4&15])
+	if out.depth != 0 {
+		bad |= 1
+	}
+	n = int(out.ep-uint64(uintptr(unsafe.Pointer(unsafe.SliceData(entries))))) / 16
+	return bad == 0, n
+}
+
+// consumerPairEntriesAsmSuper is consumerPairEntriesAsm on the supplied
+// variant; the harness holds the two to identical verdicts and entries.
+func consumerPairEntriesAsmSuper(src []byte, emit []uint64, kinds []byte, entries []uint64) (ok bool, n int) {
+	if len(emit) == 0 {
+		return false, 0
+	}
+	var out consumerAsmOut
+	consumerAsmLoopSuper(
 		unsafe.SliceData(src),
 		unsafe.SliceData(emit),
 		int64(len(emit)),
