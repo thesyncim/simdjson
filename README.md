@@ -306,7 +306,7 @@ are entirely opt-in: a type without the methods is unaffected.
 
 ```go
 func (e Event) MarshalSimdJSON(w simdjson.Appender) simdjson.Appender {
-	w = w.RawByte('{').Raw(`"id":`).Int(e.ID)
+	w = w.RawByte('{').Raw(`"id":`).Int(int64(e.ID))
 	w = w.Raw(`,"name":`).String(e.Name)
 	return w.Raw(`,"active":`).Bool(e.Active).RawByte('}')
 }

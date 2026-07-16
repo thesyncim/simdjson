@@ -536,7 +536,7 @@ func TestUnmarshalAnyLargeDocumentKeepsValuesAlive(t *testing.T) {
 	}
 	src.WriteString(`]}`)
 
-	value, err := parseAnyZeroCopyForTest([]byte(src.String()))
+	value, err := decodeAnyZeroCopyForTest([]byte(src.String()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +562,7 @@ func TestUnmarshalAnyLargeDocumentKeepsValuesAlive(t *testing.T) {
 
 func detachedAnyValue() (any, error) {
 	src := []byte(`{"items":[{"name":"still alive","score":1234567890123456},{"name":"second","score":2.5}],"wide":{"a":1,"b":2,"c":3,"d":4,"e":5,"f":6,"g":7,"h":8},"padding":"plain ascii payload keeps this input on the arena path"}`)
-	return parseAnyZeroCopyForTest(src)
+	return decodeAnyZeroCopyForTest(src)
 }
 
 func TestIndexValueKeepsSourceAndEntriesAlive(t *testing.T) {
@@ -951,7 +951,7 @@ func FuzzUnmarshalAny(f *testing.F) {
 		}
 		var want any
 		wantErr := json.Unmarshal(src, &want)
-		for _, parse := range []func([]byte) (any, error){unmarshalAnyForTest, parseAnyZeroCopyForTest} {
+		for _, parse := range []func([]byte) (any, error){unmarshalAnyForTest, decodeAnyZeroCopyForTest} {
 			got, gotErr := parse(src)
 			if (gotErr == nil) != (wantErr == nil) {
 				t.Fatalf("parse error = %v, encoding/json error = %v", gotErr, wantErr)
@@ -1514,12 +1514,12 @@ func TestUnmarshalAnyDirect(t *testing.T) {
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("Unmarshal any(%s) = %#v, want %#v", src, got, want)
 		}
-		got, err = parseAnyZeroCopyForTest(src)
+		got, err = decodeAnyZeroCopyForTest(src)
 		if err != nil {
-			t.Fatalf("parseAnyZeroCopyForTest(%s): %v", src, err)
+			t.Fatalf("decodeAnyZeroCopyForTest(%s): %v", src, err)
 		}
 		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("parseAnyZeroCopyForTest(%s) = %#v, want %#v", src, got, want)
+			t.Fatalf("decodeAnyZeroCopyForTest(%s) = %#v, want %#v", src, got, want)
 		}
 	}
 }
@@ -1534,7 +1534,7 @@ func TestUnmarshalAnyLongNumberArrayFastPath(t *testing.T) {
 		if err := json.Unmarshal(src, &want); err != nil {
 			t.Fatal(err)
 		}
-		for _, parse := range []func([]byte) (any, error){unmarshalAnyForTest, parseAnyZeroCopyForTest} {
+		for _, parse := range []func([]byte) (any, error){unmarshalAnyForTest, decodeAnyZeroCopyForTest} {
 			got, err := parse(src)
 			if err != nil {
 				t.Fatalf("parse(%s): %v", src, err)
@@ -1567,7 +1567,7 @@ func TestUnmarshalAnyRepeatedObjectSchemas(t *testing.T) {
 	if err := json.Unmarshal(src, &want); err != nil {
 		t.Fatal(err)
 	}
-	for _, parse := range []func([]byte) (any, error){unmarshalAnyForTest, parseAnyZeroCopyForTest} {
+	for _, parse := range []func([]byte) (any, error){unmarshalAnyForTest, decodeAnyZeroCopyForTest} {
 		got, err := parse(src)
 		if err != nil {
 			t.Fatalf("parse: %v", err)
@@ -1585,7 +1585,7 @@ func TestUnmarshalAnyRepeatedObjectSchemas(t *testing.T) {
 }
 
 func TestUnmarshalAnyOptions(t *testing.T) {
-	v, err := parseAnyUseNumberForTest([]byte(`1e400`))
+	v, err := decodeAnyUseNumberForTest([]byte(`1e400`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1742,7 +1742,7 @@ func assertUnmarshalAnyFloatBits(t testing.TB, text string) {
 
 func TestUnmarshalAnyZeroCopyAliasesStrings(t *testing.T) {
 	src := []byte(`["abc"]`)
-	zeroCopy, err := parseAnyZeroCopyForTest(src)
+	zeroCopy, err := decodeAnyZeroCopyForTest(src)
 	if err != nil {
 		t.Fatal(err)
 	}

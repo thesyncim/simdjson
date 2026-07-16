@@ -31,11 +31,11 @@ func decodeAnyForTest(src []byte, opts DecoderOptions) (any, error) {
 	return v, err
 }
 
-func parseAnyZeroCopyForTest(src []byte) (any, error) {
+func decodeAnyZeroCopyForTest(src []byte) (any, error) {
 	return decodeAnyForTest(src, DecoderOptions{ZeroCopy: true})
 }
 
-func parseAnyUseNumberForTest(src []byte) (any, error) {
+func decodeAnyUseNumberForTest(src []byte) (any, error) {
 	return decodeAnyForTest(src, DecoderOptions{UseNumber: true})
 }
 
@@ -122,7 +122,7 @@ func TestUnmarshalAnyUseNumber(t *testing.T) {
 	if err := stdlib.Decode(&want); err != nil {
 		t.Fatal(err)
 	}
-	got, err := parseAnyUseNumberForTest(src)
+	got, err := decodeAnyUseNumberForTest(src)
 	if err != nil {
 		t.Fatal(err)
 	}

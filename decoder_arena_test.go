@@ -57,7 +57,7 @@ func TestArenaBlockSwitchRetention(t *testing.T) {
 		}
 	}
 
-	tree, err := parseAnyZeroCopyForTest(doc)
+	tree, err := decodeAnyZeroCopyForTest(doc)
 	if err != nil {
 		t.Fatal(err)
 	}

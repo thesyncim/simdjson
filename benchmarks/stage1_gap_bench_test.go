@@ -6,17 +6,23 @@ package benchmarks
 // precondition: can structural positions be materialized and consumed at
 // or below one nanosecond per position? Each benchmark isolates one leg:
 //
-//   GapValid            the shipping strict validator (simdjson.Valid)
-//   GapIndex            the shipping index build (simdjson.BuildIndex)
-//   GapStage1Kernel     batched mask production alone (Stage1BlocksGP)
-//   GapFlattenExtract   mask -> []uint32 positions (simdjson flatten_bits port)
-//   GapConsume          positions -> byte load + dispatch + checksum
-//   GapExtractConsume   flatten + consume from precomputed masks
-//   GapStage1Pipeline   kernel + flatten + consume end to end
+//   GapValid             the shipping strict validator (simdjson.Valid)
+//   GapIndex             the shipping index build (simdjson.BuildIndex)
+//   GapStage1Kernel      batched mask production alone (Stage1BlocksGP)
+//   GapFlattenExtract    mask -> []uint32 positions (simdjson flatten_bits port)
+//   GapConsume           positions -> byte load + dispatch + checksum
+//   GapMaskIterConsume   the in-place bitmap walk: dispatch straight off masks
+//   GapExtractConsume    flatten + consume from precomputed masks
+//   GapStage1Pipeline    kernel + flatten + consume end to end
 //
 // ns/pos is reported per benchmark; pos/byte per corpus makes the
 // corpus-level arithmetic explicit (walker ns/byte vs pipeline ns/byte =
 // kernel ns/byte + pos/byte x cursor ns/pos).
+//
+// Rerun from this directory:
+//
+//	GOEXPERIMENT=simd "$TIP_GO" test -run='^TestGap' -bench='^BenchmarkGap' \
+//	  -benchtime=300ms -count=6 -cpu=1 .
 
 import (
 	"math/bits"

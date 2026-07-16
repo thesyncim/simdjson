@@ -41,7 +41,9 @@
 // remain stack eligible. Pointer-receiver methods use a heap-backed shadow that
 // is copied back before return, so a retained receiver cannot become a stale
 // stack pointer. The shadow is a shallow Go copy and does not preserve receiver
-// pointer identity after the method returns.
+// pointer identity after the method returns. Hot types can instead implement
+// the simdjson-native [UnmarshalerSimd] and [MarshalerSimd] hooks, whose
+// [DecodeCursor] and [Appender] expose the kernels the compiled codecs use.
 //
 // # Validation and selection
 //

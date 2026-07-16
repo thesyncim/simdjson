@@ -17,6 +17,11 @@ package benchmarks
 //   ConsumerDFAEntries        classic DFA LUT (state = table[state|class])
 //   ConsumerSwitchEntries     production-shaped switch FSM plus entry writes
 //
+// Further pair-machine refinements — Reg (register bit-stack kinds),
+// Branchy (branched container block), Golf (Branchy minus codegen slop),
+// the hand-written arm64 Asm machine (consumer_asm_arm64.s) and its
+// Dense/Uniform mask-shape probes — are documented at their definitions.
+//
 // The pair machine is built around dependency-chain economics rather than
 // instruction minimality:
 //
@@ -42,6 +47,11 @@ package benchmarks
 // bar) on the full corpus, the JSONTestSuite documents plain and wrapped,
 // and 20k structured mutations; consumers must also accept everything
 // simdjson.Valid accepts.
+//
+// Rerun from this directory (the differential harness runs as the tests):
+//
+//	GOEXPERIMENT=simd "$TIP_GO" test -run='^TestConsumer' \
+//	  -bench='^BenchmarkConsumer' -benchtime=300ms -count=6 -cpu=1 .
 
 import (
 	"bytes"

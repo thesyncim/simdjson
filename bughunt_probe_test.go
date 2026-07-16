@@ -977,7 +977,7 @@ func TestProbeCrossAPIScalarAgreement(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		dynamic, err := parseAnyUseNumberForTest(src)
+		dynamic, err := decodeAnyUseNumberForTest(src)
 		if err != nil {
 			t.Fatal(err)
 		}

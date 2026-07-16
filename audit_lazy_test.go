@@ -102,7 +102,7 @@ func TestAuditLazyNavigateFuzz(t *testing.T) {
 		if got := canonicalMarshal(v.Any()); !bytes.Equal(got, m) {
 			t.Fatalf("Any divergence:\n got %s\nwant %s", got, m)
 		}
-		pa, err := parseAnyUseNumberForTest(m)
+		pa, err := decodeAnyUseNumberForTest(m)
 		if err != nil {
 			t.Fatalf("UseNumber dynamic decode rejected %q: %v", m, err)
 		}
