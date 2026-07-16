@@ -147,6 +147,67 @@ func BuildIndexOptions(src []byte, storage []IndexEntry, opts IndexOptions) (Ind
 	return Index{src: src, entries: b.entries}, nil
 }
 
+// IndexParser builds borrowed indexes while retaining entry storage between
+// calls. Its zero value is ready to use.
+//
+// Each returned Index and every Node derived from it alias src and the
+// parser's storage. They remain valid only until the next call to Parse,
+// ParseOptions, or Reset. An IndexParser belongs to one goroutine at a time.
+type IndexParser struct {
+	storage []IndexEntry
+}
+
+// Parse validates src and returns a borrowed structural index. After the
+// parser has grown enough for the document shape, repeated calls allocate
+// nothing.
+func (p *IndexParser) Parse(src []byte) (Index, error) {
+	return p.ParseOptions(src, IndexOptions{})
+}
+
+// ParseOptions is Parse with depth control.
+func (p *IndexParser) ParseOptions(src []byte, opts IndexOptions) (Index, error) {
+	if uint64(len(src)) > uint64(^uint32(0)) {
+		return Index{}, ErrIndexTooLarge
+	}
+	if cap(p.storage) == 0 {
+		estimate := len(src)/8 + 8
+		if estimate > len(src) {
+			estimate = len(src)
+		}
+		if estimate == 0 {
+			estimate = 1
+		}
+		p.storage = make([]IndexEntry, estimate)
+	}
+
+	for {
+		index, err := BuildIndexOptions(src, p.storage, opts)
+		if err != ErrIndexFull {
+			return index, err
+		}
+
+		oldCapacity := cap(p.storage)
+		maxCapacity := len(src)
+		if maxCapacity == 0 {
+			maxCapacity = 1
+		}
+		nextCapacity := oldCapacity * 2
+		if nextCapacity <= oldCapacity || nextCapacity > maxCapacity {
+			nextCapacity = maxCapacity
+		}
+		if nextCapacity <= oldCapacity {
+			return Index{}, ErrIndexTooLarge
+		}
+		p.storage = make([]IndexEntry, nextCapacity)
+	}
+}
+
+// Reset invalidates the current borrowed index and releases retained entry
+// storage. The parser can be used again immediately.
+func (p *IndexParser) Reset() {
+	p.storage = nil
+}
+
 // RequiredIndexEntries validates src and returns the exact storage length
 // BuildIndex needs. Ordinary documents are counted without heap allocation.
 func RequiredIndexEntries(src []byte) (int, error) {
