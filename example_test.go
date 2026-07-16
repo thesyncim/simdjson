@@ -1,6 +1,7 @@
 package simdjson_test
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"time"
@@ -178,4 +179,77 @@ func ExampleCompileEncoder() {
 
 	fmt.Println(string(out))
 	// Output: {"name":"launch","at":"2026-07-11T01:30:00Z"}
+}
+
+func ExampleCompileCodec() {
+	codec, err := simdjson.CompileCodec[exampleEvent](simdjson.CodecOptions{})
+	if err != nil {
+		panic(err)
+	}
+
+	var stream bytes.Buffer
+	w := simdjson.NewWriter(&stream)
+	for _, event := range []exampleEvent{{ID: 1, Name: "boot"}, {ID: 2, Name: "run"}} {
+		if err := codec.EncodeTo(w, &event); err != nil {
+			panic(err)
+		}
+		w.Newline()
+	}
+	if err := w.Close(); err != nil {
+		panic(err)
+	}
+
+	r := simdjson.NewReader(&stream)
+	var event exampleEvent
+	for simdjson.DecodeNext(r, codec.Decoder(), &event) {
+		fmt.Println(event.ID, event.Name)
+	}
+	if err := r.Err(); err != nil {
+		panic(err)
+	}
+	// Output:
+	// 1 boot
+	// 2 run
+}
+
+// examplePoint decodes itself through a DecodeCursor, reading the members it
+// models and skipping the rest.
+type examplePoint struct {
+	X, Y int64
+}
+
+func (p *examplePoint) UnmarshalSimdJSON(c *simdjson.DecodeCursor) error {
+	if err := c.BeginObject("examplePoint"); err != nil {
+		return err
+	}
+	for first := true; ; first = false {
+		key, ok, err := c.NextField(first)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		switch key {
+		case "x":
+			err = c.Int64(&p.X)
+		case "y":
+			err = c.Int64(&p.Y)
+		default:
+			err = c.Skip()
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func ExampleUnmarshalerSimd() {
+	var point examplePoint
+	if err := simdjson.Unmarshal([]byte(`{"x":3,"note":"ignored","y":4}`), &point); err != nil {
+		panic(err)
+	}
+
+	fmt.Println(point.X, point.Y)
+	// Output: 3 4
 }
