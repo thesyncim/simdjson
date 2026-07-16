@@ -88,7 +88,7 @@ func buildIndexBitmap(src []byte, storage []IndexEntry) (entries []IndexEntry, o
 	var slab [simdkernels.Stage2IndexSlabLen]uint64
 
 	utf8RunStart, utf8RunEnd := -1, 0
-	wsSample, emitSample := 0, 0
+	wsSample, emitSample, inStrSample, escSample := 0, 0, 0, 0
 	skipEscape := -1
 
 	fullBlocks := n / 64
@@ -156,8 +156,10 @@ func buildIndexBitmap(src []byte, storage []IndexEntry) (entries []IndexEntry, o
 			if block < validBitmapSampleBlocks {
 				wsSample += bits.OnesCount64(rec.WsOut)
 				emitSample += bits.OnesCount64(rec.Emit)
+				inStrSample += bits.OnesCount64(rec.InStr)
+				escSample += bits.OnesCount64(rec.EscInStr)
 				if block == validBitmapSampleBlocks-1 &&
-					(wsSample < validBitmapSampleMinWs || wsSample*2 < emitSample*7) {
+					!validBitmapSampleCommit(wsSample, emitSample, inStrSample, escSample) {
 					return nil, false
 				}
 			}
