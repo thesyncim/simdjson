@@ -175,16 +175,16 @@ func validBitmapPerBlock(src []byte) (valid, decided bool) {
 		starts := cand &^ (cand<<1 | follows)
 		follows = cand >> 63
 
-		emit := m.Structural&outside | openers | starts&outside
+		emit := [1]uint64{m.Structural&outside | openers | starts&outside}
 		if block < validBitmapSampleBlocks {
 			wsSample += bits.OnesCount64(m.Whitespace & outside)
-			emitSample += bits.OnesCount64(emit)
+			emitSample += bits.OnesCount64(emit[0])
 			if block == validBitmapSampleBlocks-1 &&
 				(wsSample < validBitmapSampleMinWs || wsSample*2 < emitSample*7) {
 				return false, false
 			}
 		}
-		if v, done := validBitmapWalk(src, base, n, pos, emit, &g); done {
+		if v, done := validBitmapWalk(src, base, n, pos, emit[:], &g); done {
 			return v, true
 		}
 	}
@@ -242,6 +242,12 @@ func validBitmapStreamed(src []byte) (valid, decided bool) {
 			recs[full] = tailRecs[0]
 		}
 
+		// Per-block checks run over the whole chunk first, then the grammar
+		// machine consumes the chunk's emit masks in one call. Validity is a
+		// conjunction of order-independent checks and the walk only ever
+		// concludes with a rejection, so regrouping cannot change the verdict;
+		// it amortizes the walk's call and state traffic over the chunk.
+		var emits [validBitmapStreamChunk]uint64
 		for i := 0; i < cnt; i++ {
 			block := chunk + i
 			pos := block * 64
@@ -269,18 +275,18 @@ func validBitmapStreamed(src []byte) (valid, decided bool) {
 				return false, true
 			}
 
-			emit := rec.Emit
+			emits[i] = rec.Emit
 			if block < validBitmapSampleBlocks {
 				wsSample += bits.OnesCount64(rec.WsOut)
-				emitSample += bits.OnesCount64(emit)
+				emitSample += bits.OnesCount64(rec.Emit)
 				if block == validBitmapSampleBlocks-1 &&
 					(wsSample < validBitmapSampleMinWs || wsSample*2 < emitSample*7) {
 					return false, false
 				}
 			}
-			if v, done := validBitmapWalk(src, base, n, pos, emit, &g); done {
-				return v, true
-			}
+		}
+		if v, done := validBitmapWalk(src, base, n, chunk*64, emits[:cnt], &g); done {
+			return v, true
 		}
 	}
 
@@ -335,127 +341,142 @@ func validBitmapEscapes(src []byte, n, pos int, escInStr uint64, skipEscape *int
 	return false
 }
 
-// validBitmapWalk feeds one block's emit mask to the grammar machine,
-// advancing g. done reports that validation has concluded (valid carries
-// the verdict); otherwise the caller proceeds to the next block. Both
-// engines share this walk so the grammar lives in exactly one place.
-func validBitmapWalk(src []byte, base unsafe.Pointer, n, pos int, emit uint64, g *vbState) (valid, done bool) {
-	for emit != 0 {
-		j := pos + bits.TrailingZeros64(emit)
-		emit &= emit - 1
-		if j >= n {
-			return false, true
-		}
-		switch fastByteAt(base, j) {
-		case '{':
-			if g.state != vbValue && g.state != vbValueOrEnd {
+// validBitmapWalk feeds a run of consecutive blocks' emit masks to the
+// grammar machine, advancing g. pos is the byte offset of the first mask;
+// each subsequent mask covers the next 64 bytes. done reports that
+// validation has concluded (valid carries the verdict, which is always a
+// rejection — a valid document is decided only after the last block);
+// otherwise the caller proceeds to the next run. Both engines share this
+// walk so the grammar lives in exactly one place; the streamed engine
+// hands it a whole chunk per call, amortizing the call and the machine's
+// state traffic over several blocks.
+func validBitmapWalk(src []byte, base unsafe.Pointer, n, pos int, emits []uint64, g *vbState) (valid, done bool) {
+	// state and depth live in locals across the whole run and are stored
+	// back only on the fall-through return; the early returns all report
+	// done, after which g is never read again.
+	state := g.state
+	depth := g.depth
+	for _, emit := range emits {
+		for emit != 0 {
+			j := pos + bits.TrailingZeros64(emit)
+			emit &= emit - 1
+			if j >= n {
 				return false, true
 			}
-			if g.depth >= defaultMaxDepth {
-				return false, true
-			}
-			g.depth++
-			g.containers[g.depth>>6] |= 1 << (g.depth & 63)
-			g.state = vbKeyOrEnd
-		case '[':
-			if g.state != vbValue && g.state != vbValueOrEnd {
-				return false, true
-			}
-			if g.depth >= defaultMaxDepth {
-				return false, true
-			}
-			g.depth++
-			g.containers[g.depth>>6] &^= 1 << (g.depth & 63)
-			g.state = vbValueOrEnd
-		case '}':
-			if g.depth == 0 || g.containers[g.depth>>6]&(1<<(g.depth&63)) == 0 ||
-				(g.state != vbKeyOrEnd && g.state != vbNext) {
-				return false, true
-			}
-			g.depth--
-			g.state = vbNext
-			if g.depth == 0 {
-				g.state = vbDone
-			}
-		case ']':
-			if g.depth == 0 || g.containers[g.depth>>6]&(1<<(g.depth&63)) != 0 ||
-				(g.state != vbValueOrEnd && g.state != vbNext) {
-				return false, true
-			}
-			g.depth--
-			g.state = vbNext
-			if g.depth == 0 {
-				g.state = vbDone
-			}
-		case ':':
-			if g.state != vbColon {
-				return false, true
-			}
-			g.state = vbValue
-		case ',':
-			if g.state != vbNext {
-				return false, true
-			}
-			if g.containers[g.depth>>6]&(1<<(g.depth&63)) != 0 {
-				g.state = vbKey
-			} else {
-				g.state = vbValue
-			}
-		case '"':
-			switch g.state {
-			case vbKeyOrEnd, vbKey:
-				g.state = vbColon
-			case vbValue, vbValueOrEnd:
-				g.state = vbNext
-				if g.depth == 0 {
-					g.state = vbDone
+			switch fastByteAt(base, j) {
+			case '{':
+				if state != vbValue && state != vbValueOrEnd {
+					return false, true
+				}
+				if depth >= defaultMaxDepth {
+					return false, true
+				}
+				depth++
+				g.containers[depth>>6] |= 1 << (depth & 63)
+				state = vbKeyOrEnd
+			case '[':
+				if state != vbValue && state != vbValueOrEnd {
+					return false, true
+				}
+				if depth >= defaultMaxDepth {
+					return false, true
+				}
+				depth++
+				g.containers[depth>>6] &^= 1 << (depth & 63)
+				state = vbValueOrEnd
+			case '}':
+				if depth == 0 || g.containers[depth>>6]&(1<<(depth&63)) == 0 ||
+					(state != vbKeyOrEnd && state != vbNext) {
+					return false, true
+				}
+				depth--
+				state = vbNext
+				if depth == 0 {
+					state = vbDone
+				}
+			case ']':
+				if depth == 0 || g.containers[depth>>6]&(1<<(depth&63)) != 0 ||
+					(state != vbValueOrEnd && state != vbNext) {
+					return false, true
+				}
+				depth--
+				state = vbNext
+				if depth == 0 {
+					state = vbDone
+				}
+			case ':':
+				if state != vbColon {
+					return false, true
+				}
+				state = vbValue
+			case ',':
+				if state != vbNext {
+					return false, true
+				}
+				if g.containers[depth>>6]&(1<<(depth&63)) != 0 {
+					state = vbKey
+				} else {
+					state = vbValue
+				}
+			case '"':
+				switch state {
+				case vbKeyOrEnd, vbKey:
+					state = vbColon
+				case vbValue, vbValueOrEnd:
+					state = vbNext
+					if depth == 0 {
+						state = vbDone
+					}
+				default:
+					return false, true
 				}
 			default:
-				return false, true
-			}
-		default:
-			// Scalar value: strict number or literal, which must end at
-			// whitespace, a structural byte, or the document's end.
-			if g.state != vbValue && g.state != vbValueOrEnd {
-				return false, true
-			}
-			var end int
-			switch c := fastByteAt(base, j); {
-			case c == '-' || '0' <= c && c <= '9':
-				var msg string
-				end, msg = scanNumber(src, j)
-				if msg != "" {
+				// Scalar value: strict number or literal, which must end at
+				// whitespace, a structural byte, or the document's end.
+				if state != vbValue && state != vbValueOrEnd {
 					return false, true
 				}
-			case c == 't':
-				if !literalTrueAt(src, j) {
+				var end int
+				switch c := fastByteAt(base, j); {
+				case c == '-' || '0' <= c && c <= '9':
+					var msg string
+					end, msg = scanNumber(src, j)
+					if msg != "" {
+						return false, true
+					}
+				case c == 't':
+					if !literalTrueAt(src, j) {
+						return false, true
+					}
+					end = j + 4
+				case c == 'f':
+					if !literalFalseAt(src, j) {
+						return false, true
+					}
+					end = j + 5
+				case c == 'n':
+					if !literalNullAt(src, j) {
+						return false, true
+					}
+					end = j + 4
+				default:
 					return false, true
 				}
-				end = j + 4
-			case c == 'f':
-				if !literalFalseAt(src, j) {
-					return false, true
+				if end < n {
+					if c := fastByteAt(base, end); !isJSONSpaceOrStructural(c) {
+						return false, true
+					}
 				}
-				end = j + 5
-			case c == 'n':
-				if !literalNullAt(src, j) {
-					return false, true
+				state = vbNext
+				if depth == 0 {
+					state = vbDone
 				}
-				end = j + 4
-			default:
-				return false, true
-			}
-			if end < n {
-				if c := fastByteAt(base, end); !isJSONSpaceOrStructural(c) {
-					return false, true
-				}
-			}
-			g.state = vbNext
-			if g.depth == 0 {
-				g.state = vbDone
 			}
 		}
+		pos += 64
 	}
+	g.state = state
+	g.depth = depth
 	return false, false
 }
 
