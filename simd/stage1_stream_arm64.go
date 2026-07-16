@@ -19,8 +19,12 @@ func Stage1StreamEnabled() bool { return true }
 // scalar code. This is the C++ simdjson pipeline shape (json_scanner ->
 // to_bitmask -> GP bit math), batched so vector constants load once per
 // chunk instead of once per block.
+//
+// nblocks must be in [1, Stage1ChunkBlocks]; slicing the output up front
+// hoists the nil and range checks so the loop body carries neither.
 func Stage1BlocksGP(p *byte, nblocks int, st *Stage1Stream, out *[Stage1ChunkBlocks]Stage1Rec) {
 	base := unsafe.Pointer(p)
+	recs := out[:nblocks]
 
 	zip := archsimd.LoadUint8x16Array(&stage1ZipIndex)
 	weights := archsimd.LoadUint8x16Array(&stage1Weights)
@@ -30,9 +34,12 @@ func Stage1BlocksGP(p *byte, nblocks int, st *Stage1Stream, out *[Stage1ChunkBlo
 	lowNibble := archsimd.BroadcastUint8x16(0x0f)
 	loTable := archsimd.LoadUint8x16Array(&stage1ClassLo)
 	hiTable := archsimd.LoadUint8x16Array(&stage1ClassHi)
-	wsBits := archsimd.BroadcastUint8x16(stage1WhitespaceBits)
-	structBits := archsimd.BroadcastUint8x16(stage1StructuralBits)
+	wsMax := archsimd.BroadcastUint8x16(stage1WhitespaceBits)
 	zero := archsimd.BroadcastUint8x16(0)
+	// Variable-shift USHL with a broadcast -4 keeps the high-nibble shift
+	// count in a register across the loop; the immediate-count form
+	// rematerializes its splat constant every block.
+	nibShift := archsimd.BroadcastInt8x16(-4)
 
 	carryEsc := st.Carry.Escaped
 	carryStr := st.Carry.InString
@@ -40,7 +47,7 @@ func Stage1BlocksGP(p *byte, nblocks int, st *Stage1Stream, out *[Stage1ChunkBlo
 
 	const evenBits = uint64(0x5555555555555555)
 
-	for i := 0; i < nblocks; i++ {
+	for i := range recs {
 		bp := unsafe.Add(base, i*64)
 		r0 := archsimd.LoadUint8x16Array((*[16]uint8)(bp))
 		r1 := archsimd.LoadUint8x16Array((*[16]uint8)(unsafe.Add(bp, 16)))
@@ -52,27 +59,34 @@ func Stage1BlocksGP(p *byte, nblocks int, st *Stage1Stream, out *[Stage1ChunkBlo
 		v2 := r2.LookupOrZero(zip)
 		v3 := r3.LookupOrZero(zip)
 
-		c0 := loTable.LookupOrZero(v0.And(lowNibble)).And(hiTable.LookupOrZero(v0.ShiftAllRight(4)))
-		c1 := loTable.LookupOrZero(v1.And(lowNibble)).And(hiTable.LookupOrZero(v1.ShiftAllRight(4)))
-		c2 := loTable.LookupOrZero(v2.And(lowNibble)).And(hiTable.LookupOrZero(v2.ShiftAllRight(4)))
-		c3 := loTable.LookupOrZero(v3.And(lowNibble)).And(hiTable.LookupOrZero(v3.ShiftAllRight(4)))
+		// The interleave permutes bytes, so the maximum over the zipped
+		// vectors equals the maximum over the raw block; taking it here
+		// lets the raw vectors die at the lookups above instead of
+		// staying live across all five reduction trees.
+		hi := v0.Or(v1).Or(v2).Or(v3)
 
-		ws := stage1Movemask64(
-			c0.And(wsBits).Greater(zero),
-			c1.And(wsBits).Greater(zero),
-			c2.And(wsBits).Greater(zero),
-			c3.And(wsBits).Greater(zero),
-			weights,
+		c0 := loTable.LookupOrZero(v0.And(lowNibble)).And(hiTable.LookupOrZero(v0.Shift(nibShift)))
+		c1 := loTable.LookupOrZero(v1.And(lowNibble)).And(hiTable.LookupOrZero(v1.Shift(nibShift)))
+		c2 := loTable.LookupOrZero(v2.And(lowNibble)).And(hiTable.LookupOrZero(v2.Shift(nibShift)))
+		c3 := loTable.LookupOrZero(v3.And(lowNibble)).And(hiTable.LookupOrZero(v3.Shift(nibShift)))
+
+		// Class values are one-hot: whitespace classes are 1 and 2,
+		// structural classes 4 through 32, everything else 0. One
+		// unsigned compare per vector therefore tests each group — "any
+		// class" is c > 0 and "structural" is c > stage1WhitespaceBits —
+		// and whitespace falls out of the two masks with one scalar op,
+		// saving a weighted AND per vector over testing the two bit
+		// groups separately. The paired reduction shares its final ADDP
+		// between the two masks.
+		sig, structural := stage1MovemaskPair(
+			stage1MovemaskSum(c0.Greater(zero), c1.Greater(zero), c2.Greater(zero), c3.Greater(zero), weights),
+			stage1MovemaskSum(c0.Greater(wsMax), c1.Greater(wsMax), c2.Greater(wsMax), c3.Greater(wsMax), weights),
 		)
-		structural := stage1Movemask64(
-			c0.And(structBits).Greater(zero),
-			c1.And(structBits).Greater(zero),
-			c2.And(structBits).Greater(zero),
-			c3.And(structBits).Greater(zero),
-			weights,
+		ws := sig &^ structural
+		quoteRaw, backslash := stage1MovemaskPair(
+			stage1MovemaskSum(v0.Equal(quoteB), v1.Equal(quoteB), v2.Equal(quoteB), v3.Equal(quoteB), weights),
+			stage1MovemaskSum(v0.Equal(slashB), v1.Equal(slashB), v2.Equal(slashB), v3.Equal(slashB), weights),
 		)
-		quoteRaw := stage1Movemask64(v0.Equal(quoteB), v1.Equal(quoteB), v2.Equal(quoteB), v3.Equal(quoteB), weights)
-		backslash := stage1Movemask64(v0.Equal(slashB), v1.Equal(slashB), v2.Equal(slashB), v3.Equal(slashB), weights)
 		control := stage1Movemask64(v0.Less(ctrlB), v1.Less(ctrlB), v2.Less(ctrlB), v3.Less(ctrlB), weights)
 
 		// Escape chain in GP (the production Stage1Escaped, inlined so the
@@ -102,20 +116,23 @@ func Stage1BlocksGP(p *byte, nblocks int, st *Stage1Stream, out *[Stage1ChunkBlo
 		inStr := m ^ carryStr
 		carryStr = uint64(int64(inStr) >> 63)
 
-		closers := quotes &^ inStr
+		// outside excludes interiors, opening quotes (inside inStr), and
+		// closing quotes: inStr | (quotes &^ inStr) == inStr | quotes.
+		outside := ^(inStr | quotes)
 		openers := quotes & inStr
-		outside := ^(inStr | closers)
-		cand := ^(ws | structural | quoteRaw | inStr)
+		cand := ^(sig | quoteRaw | inStr)
 		starts := cand &^ (cand<<1 | follows)
 		follows = cand >> 63
 
-		out[i].Emit = structural&outside | openers | starts&outside
-		out[i].EscInStr = escaped & inStr
-		out[i].Bad = control&inStr | control&outside&^ws
-		out[i].WsOut = ws & outside
-		// Per-block non-ASCII: the validator brackets UTF-8 runs by block, so
-		// each record carries its own flag rather than a document-wide OR.
-		out[i].NonASCII = r0.Or(r1).Or(r2).Or(r3).ReduceMax() >= 0x80
+		rec := &recs[i]
+		rec.Emit = (structural|starts)&outside | openers
+		rec.EscInStr = escaped & inStr
+		rec.Bad = control & (inStr | outside&^ws)
+		rec.WsOut = ws & outside
+		// Per-block non-ASCII: the validator brackets UTF-8 runs by block,
+		// so each record carries its own flag rather than a document-wide
+		// OR.
+		rec.NonASCII = hi.ReduceMax() >= 0x80
 	}
 
 	st.Carry.Escaped = carryEsc
