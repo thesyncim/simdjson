@@ -108,7 +108,7 @@ func (p *parser) parseAnyArray(depth int, useNumber bool) (any, error) {
 	p.skipSpace()
 	if p.i < len(p.src) && p.src[p.i] == ']' {
 		p.i++
-		return []any{}, nil
+		return boxedEmptyAnyValues, nil
 	}
 	if p.i < len(p.src) && (p.src[p.i] == '-' || isDigit(p.src[p.i])) {
 		digitStart := p.i
@@ -573,20 +573,40 @@ var anyPow10 = [...]float64{
 	1e21, 1e22,
 }
 
+// boxedEmptyAnyValues is the one boxed empty array every empty JSON array
+// decodes to. The sharing is unobservable: the slice has no elements to
+// mutate, an append copies out of the zero-capacity backing, and interface
+// comparison of slice values panics regardless of identity. It saves the
+// interface header allocation the conversion would otherwise pay per empty
+// array.
+var boxedEmptyAnyValues any = []any{}
+
 // anyValueArena uses ordinary Go backing arrays to amortize storage for small
-// nested arrays. It deliberately does not construct map or interface headers.
+// nested arrays, and carries the slab boxer that amortizes the interface
+// headers of the document's scalars (see any_box.go). Only array backing is
+// constructed here; interface construction stays in the boxer.
 type anyValueArena struct {
 	sourceSize int
 
 	arrays   [][4]any
 	arrayPos int
+
+	box anyBoxer
 }
 
 func boxedAnyBool(v bool) any {
 	return v
 }
 
+// The boxAny helpers funnel every scalar the one-pass parser produces, so the
+// arena's slab boxers plug in here. The tiny-input path (no arena) keeps
+// ordinary conversions: a document of a few values would pay more for a first
+// slab chunk than for the conversions it replaces.
+
 func (p *parser) boxAnyFloat64(v float64) any {
+	if a := p.anyArena; a != nil {
+		return a.box.float(v)
+	}
 	return v
 }
 
@@ -594,10 +614,16 @@ func (p *parser) boxAnyString(v string, number bool) any {
 	if number {
 		return json.Number(v)
 	}
+	if a := p.anyArena; a != nil {
+		return a.box.str(v)
+	}
 	return v
 }
 
 func (p *parser) boxAnySlice(v []any) any {
+	if a := p.anyArena; a != nil {
+		return a.box.slice(v)
+	}
 	return v
 }
 

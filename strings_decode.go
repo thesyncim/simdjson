@@ -1,6 +1,7 @@
 package simdjson
 
 import (
+	"bytes"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -8,11 +9,15 @@ import (
 func appendDecodedJSONString(dst, raw []byte) []byte {
 	for i := 0; i < len(raw); {
 		if raw[i] != '\\' {
-			start := i
-			for i < len(raw) && raw[i] != '\\' {
-				i++
+			// The next backslash bounds a clean run; IndexByte finds it a
+			// vector at a time. raw was validated, so nothing else needs
+			// inspection.
+			j := bytes.IndexByte(raw[i:], '\\')
+			if j < 0 {
+				return append(dst, raw[i:]...)
 			}
-			dst = append(dst, raw[start:i]...)
+			dst = append(dst, raw[i:i+j]...)
+			i += j
 			continue
 		}
 		i++
