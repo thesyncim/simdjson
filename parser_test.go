@@ -1082,9 +1082,13 @@ func TestAppendCompactAllocs(t *testing.T) {
 	}
 }
 
-func TestGetPointer(t *testing.T) {
+func TestValuePointer(t *testing.T) {
 	src := []byte(`{"a/b":{"~key":[10,20,30]},"dup":1,"dup":2}`)
-	v, ok, err := Get(src, "/a~1b/~0key/2")
+	root, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, ok, err := root.Pointer("/a~1b/~0key/2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1095,7 +1099,7 @@ func TestGetPointer(t *testing.T) {
 	if !ok || n != 30 {
 		t.Fatalf("number = %d, %v", n, ok)
 	}
-	dup, ok, err := Get(src, "/dup")
+	dup, ok, err := root.Pointer("/dup")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1661,12 +1665,12 @@ func TestScaledJSONFloat64MatchesStrconv(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, err := ParseFloat64([]byte(text))
+		got, err := parseFloat64([]byte(text))
 		if err != nil {
-			t.Fatalf("ParseFloat64(%q): %v", text, err)
+			t.Fatalf("parseFloat64(%q): %v", text, err)
 		}
 		if math.Float64bits(got) != math.Float64bits(want) {
-			t.Fatalf("ParseFloat64(%q) = %.17g (%#x), want %.17g (%#x)",
+			t.Fatalf("parseFloat64(%q) = %.17g (%#x), want %.17g (%#x)",
 				text, got, math.Float64bits(got), want, math.Float64bits(want))
 		}
 	}
@@ -1687,28 +1691,28 @@ func TestParseFloat64(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, err := ParseFloat64([]byte(text))
+		got, err := parseFloat64([]byte(text))
 		if err != nil {
-			t.Fatalf("ParseFloat64(%q): %v", text, err)
+			t.Fatalf("parseFloat64(%q): %v", text, err)
 		}
 		if math.Float64bits(got) != math.Float64bits(want) {
-			t.Fatalf("ParseFloat64(%q) = %.17g, want %.17g", text, got, want)
+			t.Fatalf("parseFloat64(%q) = %.17g, want %.17g", text, got, want)
 		}
 	}
 	for _, text := range []string{"", " ", "+1", "01", "1.", "1e", "NaN", "1 2", "1e400"} {
-		if _, err := ParseFloat64([]byte(text)); err == nil {
-			t.Fatalf("ParseFloat64(%q) succeeded", text)
+		if _, err := parseFloat64([]byte(text)); err == nil {
+			t.Fatalf("parseFloat64(%q) succeeded", text)
 		}
 	}
 	allocs := testing.AllocsPerRun(1000, func() {
-		value, err := ParseFloat64([]byte("1234567890123456"))
+		value, err := parseFloat64([]byte("1234567890123456"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		benchmarkFloatSink = value
 	})
 	if allocs != 0 {
-		t.Fatalf("ParseFloat64 allocs = %v, want 0", allocs)
+		t.Fatalf("parseFloat64 allocs = %v, want 0", allocs)
 	}
 }
 
@@ -1726,12 +1730,12 @@ func assertUnmarshalAnyFloatBits(t testing.TB, text string) {
 		t.Fatalf("Unmarshal any(%q) = %.17g (%#x), want %.17g (%#x)",
 			text, got, math.Float64bits(got.(float64)), want, math.Float64bits(want))
 	}
-	direct, err := ParseFloat64([]byte(text))
+	direct, err := parseFloat64([]byte(text))
 	if err != nil {
-		t.Fatalf("ParseFloat64(%q): %v", text, err)
+		t.Fatalf("parseFloat64(%q): %v", text, err)
 	}
 	if math.Float64bits(direct) != math.Float64bits(want) {
-		t.Fatalf("ParseFloat64(%q) = %.17g (%#x), want %.17g (%#x)",
+		t.Fatalf("parseFloat64(%q) = %.17g (%#x), want %.17g (%#x)",
 			text, direct, math.Float64bits(direct), want, math.Float64bits(want))
 	}
 }

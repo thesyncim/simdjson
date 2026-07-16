@@ -16,11 +16,11 @@ func diffFloat64(t *testing.T, s string) {
 		return
 	}
 
-	// 1. Public ParseFloat64.
-	if got, err := ParseFloat64([]byte(s)); err != nil {
-		t.Fatalf("ParseFloat64(%q) unexpected error: %v", s, err)
+	// 1. The number kernel entry point, parseFloat64.
+	if got, err := parseFloat64([]byte(s)); err != nil {
+		t.Fatalf("parseFloat64(%q) unexpected error: %v", s, err)
 	} else if got != want && !(math.IsNaN(got) && math.IsNaN(want)) {
-		t.Fatalf("ParseFloat64(%q) = %v (bits %#x), want %v (bits %#x)", s, got, math.Float64bits(got), want, math.Float64bits(want))
+		t.Fatalf("parseFloat64(%q) = %v (bits %#x), want %v (bits %#x)", s, got, math.Float64bits(got), want, math.Float64bits(want))
 	}
 
 	// 2. Typed scalar decode.

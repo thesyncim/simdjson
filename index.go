@@ -55,8 +55,8 @@ func (e *IndexEntry) Kind() Kind {
 	return Kind((e.info & infoKindMask) >> infoKindShift)
 }
 
-// Flags returns the entry's tape flags (escaped, key, integer).
-func (e *IndexEntry) Flags() uint8 {
+// flags returns the entry's tape flags (escaped, key, integer).
+func (e *IndexEntry) flags() uint8 {
 	return uint8(e.info >> infoFlagsShift)
 }
 

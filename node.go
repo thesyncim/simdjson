@@ -73,7 +73,7 @@ func (v Node) Int64() (int64, bool) {
 		return 0, false
 	}
 	e := v.entry
-	if e.Flags()&tapeFlagInt != 0 {
+	if e.flags()&tapeFlagInt != 0 {
 		return tapeInt64(v.src, e.start, e.end)
 	}
 	// Fractional and exponent spellings reject the same way ParseInt does.
@@ -114,7 +114,7 @@ func (v Node) Float64() (float64, bool) {
 		return 0, false
 	}
 	e := v.entry
-	if e.Flags()&tapeFlagInt != 0 {
+	if e.flags()&tapeFlagInt != 0 {
 		// A plain integer needs no fraction or exponent handling: parse the
 		// digits and let the conversion round once, exactly as ParseFloat
 		// rounds decimal input. Twenty digits or more fall through.
@@ -146,7 +146,7 @@ func (v Node) StringBytes() ([]byte, bool) {
 		return nil, false
 	}
 	e := v.entry
-	if e.Flags()&tapeFlagEscaped != 0 {
+	if e.flags()&tapeFlagEscaped != 0 {
 		return nil, false
 	}
 	return tapeSourceBytes(v.src, e.start+1, e.end-1), true
@@ -159,7 +159,7 @@ func (v Node) AppendString(dst []byte) ([]byte, bool) {
 	}
 	e := v.entry
 	raw := tapeSourceBytes(v.src, e.start+1, e.end-1)
-	if e.Flags()&tapeFlagEscaped == 0 {
+	if e.flags()&tapeFlagEscaped == 0 {
 		return append(dst, raw...), true
 	}
 	return appendDecodedJSONString(dst, raw), true
@@ -214,7 +214,7 @@ func (v Node) Get(key string) (Node, bool) {
 		var found *IndexEntry
 		for member := 0; member < count; member++ {
 			keyEntry := tapeEntryOffset(v.entry, uintptr(2*member)+1)
-			if tapeKeyEqual(tapeSourceBytes(v.src, keyEntry.start, keyEntry.end), keyEntry.Flags(), key) {
+			if tapeKeyEqual(tapeSourceBytes(v.src, keyEntry.start, keyEntry.end), keyEntry.flags(), key) {
 				found = tapeEntryOffset(keyEntry, 1)
 			}
 		}
@@ -227,7 +227,7 @@ func (v Node) Get(key string) (Node, bool) {
 	var found *IndexEntry
 	for member := 0; member < count; member++ {
 		valueEntry := tapeEntryOffset(keyEntry, 1)
-		if tapeKeyEqual(tapeSourceBytes(v.src, keyEntry.start, keyEntry.end), keyEntry.Flags(), key) {
+		if tapeKeyEqual(tapeSourceBytes(v.src, keyEntry.start, keyEntry.end), keyEntry.flags(), key) {
 			found = valueEntry
 		}
 		if member+1 < count {

@@ -84,21 +84,6 @@ func (p CompiledPointer) String() string {
 	return p.pointer
 }
 
-// Get parses src and returns the JSON Pointer target.
-func Get(src []byte, pointer string) (Value, bool, error) {
-	return GetOptions(src, pointer, Options{})
-}
-
-// GetOptions parses src using opts and returns the JSON Pointer target.
-func GetOptions(src []byte, pointer string, opts Options) (Value, bool, error) {
-	v, err := ParseOptions(src, opts)
-	if err != nil {
-		return Value{}, false, err
-	}
-	got, ok, err := v.Pointer(pointer)
-	return got, ok, err
-}
-
 // Pointer returns the RFC 6901 JSON Pointer target within v.
 func (v Value) Pointer(pointer string) (Value, bool, error) {
 	node, ok, err := v.node.Pointer(pointer)

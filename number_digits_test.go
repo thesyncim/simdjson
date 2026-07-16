@@ -306,7 +306,7 @@ func BenchmarkParseFloat64(b *testing.B) {
 		b.Run(text+"/SIMDJSON", func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				value, err := ParseFloat64(data)
+				value, err := parseFloat64(data)
 				if err != nil {
 					b.Fatal(err)
 				}

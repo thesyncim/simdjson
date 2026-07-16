@@ -51,7 +51,7 @@ func onlyDigits(s string, max int) string {
 }
 
 // checkAllFloatPaths compares every float decode entry point against strconv
-// for one JSON number text: ParseFloat64, typed float64 decode, the any/Value
+// for one JSON number text: parseFloat64, typed float64 decode, the any/Value
 // path, and float32. A parse error from our side is only a mismatch when
 // strconv also would have produced a finite value from the identical text.
 func checkAllFloatPaths(t *testing.T, text string) {
@@ -62,18 +62,18 @@ func checkAllFloatPaths(t *testing.T, text string) {
 	// parsers reject overflow, an intentional strictness, so skip those.
 	strconvOK := err64 == nil && !math.IsInf(ref64, 0)
 
-	got, err := ParseFloat64([]byte(text))
+	got, err := parseFloat64([]byte(text))
 	if err == nil {
 		if !strconvOK {
 			// We accepted something strconv rejected/overflowed: only flag if the
 			// text is genuinely a finite number strconv can read.
 			if r, e := strconv.ParseFloat(text, 64); e == nil && !math.IsInf(r, 0) {
 				if math.Float64bits(got) != math.Float64bits(r) {
-					t.Fatalf("ParseFloat64(%q)=%x want %x", text, math.Float64bits(got), math.Float64bits(r))
+					t.Fatalf("parseFloat64(%q)=%x want %x", text, math.Float64bits(got), math.Float64bits(r))
 				}
 			}
 		} else if math.Float64bits(got) != math.Float64bits(ref64) {
-			t.Fatalf("ParseFloat64(%q)=%x (%v) want %x (%v)", text,
+			t.Fatalf("parseFloat64(%q)=%x (%v) want %x (%v)", text,
 				math.Float64bits(got), got, math.Float64bits(ref64), ref64)
 		}
 	}
@@ -138,7 +138,7 @@ func mustCompileFloatDecoder[T float32 | float64]() Decoder[T] {
 }
 
 // FuzzFloatDecodeAllPaths composes JSON numbers from raw fuzzer material and
-// pins ParseFloat64, typed float64, typed float32, and the any/Value decode all
+// pins parseFloat64, typed float64, typed float32, and the any/Value decode all
 // to strconv. It deliberately reaches the extreme-exponent, long-mantissa,
 // subnormal, and truncated regimes that route around the exact-multiply fast
 // path and into Eisel-Lemire and the strconv fallback.
@@ -229,13 +229,13 @@ func FuzzFloatRoundTripMarshalDecode(f *testing.F) {
 		if math.Float64bits(back) != bits {
 			t.Fatalf("round trip via strconv lost bits: %x -> %q -> %x", bits, text, math.Float64bits(back))
 		}
-		// And our own ParseFloat64 must recover the same bits from that text.
-		mine, merr := ParseFloat64([]byte(text))
+		// And our own parseFloat64 must recover the same bits from that text.
+		mine, merr := parseFloat64([]byte(text))
 		if merr != nil {
-			t.Fatalf("ParseFloat64(%q) from Marshal error: %v", text, merr)
+			t.Fatalf("parseFloat64(%q) from Marshal error: %v", text, merr)
 		}
 		if math.Float64bits(mine) != bits {
-			t.Fatalf("ParseFloat64 round trip lost bits: %x -> %q -> %x", bits, text, math.Float64bits(mine))
+			t.Fatalf("parseFloat64 round trip lost bits: %x -> %q -> %x", bits, text, math.Float64bits(mine))
 		}
 	})
 }

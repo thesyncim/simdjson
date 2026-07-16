@@ -19,7 +19,7 @@ func floatDecodeOracle(t *testing.T, text string) (float64, bool) {
 }
 
 // checkFloatDecodePaths pins every float decode entry point — typed decode,
-// ParseFloat64, and the any/Value path — to strconv for one JSON number, so a
+// parseFloat64, and the any/Value path — to strconv for one JSON number, so a
 // wiring mistake in the Eisel-Lemire hand-off (sign, exponent, offset) cannot
 // slip through even though eiselLemire64 is proven in isolation.
 func checkFloatDecodePaths(t *testing.T, text string) {
@@ -30,10 +30,10 @@ func checkFloatDecodePaths(t *testing.T, text string) {
 	}
 	refBits := math.Float64bits(ref)
 
-	if got, err := ParseFloat64([]byte(text)); err != nil {
-		t.Fatalf("ParseFloat64(%q) error: %v", text, err)
+	if got, err := parseFloat64([]byte(text)); err != nil {
+		t.Fatalf("parseFloat64(%q) error: %v", text, err)
 	} else if math.Float64bits(got) != refBits {
-		t.Fatalf("ParseFloat64(%q) = %x want %x", text, math.Float64bits(got), refBits)
+		t.Fatalf("parseFloat64(%q) = %x want %x", text, math.Float64bits(got), refBits)
 	}
 
 	dec, err := CompileDecoder[float64](DecoderOptions{})
@@ -117,12 +117,12 @@ func FuzzFloatDecodeMatchesStrconv(f *testing.F) {
 		if err != nil || math.IsInf(ref, 0) {
 			t.Skip()
 		}
-		got, err := ParseFloat64([]byte(s))
+		got, err := parseFloat64([]byte(s))
 		if err != nil {
 			t.Skip() // our parser is stricter on some spellings; not a mismatch
 		}
 		if math.Float64bits(got) != math.Float64bits(ref) {
-			t.Fatalf("ParseFloat64(%q) = %x want %x", s, math.Float64bits(got), math.Float64bits(ref))
+			t.Fatalf("parseFloat64(%q) = %x want %x", s, math.Float64bits(got), math.Float64bits(ref))
 		}
 	})
 }

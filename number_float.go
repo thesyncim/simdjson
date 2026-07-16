@@ -23,9 +23,9 @@ type jsonNumber struct {
 	dp        int // decimal point position relative to the digits
 }
 
-// ParseFloat64 parses one strict JSON number with optional surrounding JSON
+// parseFloat64 parses one strict JSON number with optional surrounding JSON
 // whitespace. Successful calls do not allocate.
-func ParseFloat64(src []byte) (float64, error) {
+func parseFloat64(src []byte) (float64, error) {
 	start := skipSpace(src, 0)
 	if start == len(src) {
 		return 0, (&parser{src: src}).err(start, "expected number")

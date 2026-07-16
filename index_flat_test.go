@@ -279,7 +279,7 @@ func TestNodeIntegerReadEquivalence(t *testing.T) {
 		if node.Kind() != Number {
 			t.Fatalf("%q: kind = %v, want Number", s, node.Kind())
 		}
-		if got, want := node.entry.Flags()&tapeFlagInt != 0, integerSpelling(s); got != want {
+		if got, want := node.entry.flags()&tapeFlagInt != 0, integerSpelling(s); got != want {
 			t.Fatalf("%q: integer flag = %v, want %v", s, got, want)
 		}
 		wantInt, err := strconv.ParseInt(s, 10, 64)

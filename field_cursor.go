@@ -115,7 +115,7 @@ func (c *FieldCursor) findEntry(key string) *IndexEntry {
 	keyEntry := c.pos
 	index := c.index
 	for scanned := uint32(0); scanned < c.count; scanned++ {
-		if tapeKeyEqual(tapeSourceBytes(c.src, keyEntry.start, keyEntry.end), keyEntry.Flags(), key) {
+		if tapeKeyEqual(tapeSourceBytes(c.src, keyEntry.start, keyEntry.end), keyEntry.flags(), key) {
 			// Advance past the match so the next Find resumes here. A match on
 			// the object's last member leaves the cursor wrapped to the start.
 			valueEntry := tapeEntryOffset(keyEntry, 1)

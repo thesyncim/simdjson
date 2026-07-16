@@ -83,6 +83,17 @@ type pointerOutcome struct {
 	raw   string // canonical JSON of target when ok
 }
 
+// parseValuePointer resolves a pointer through the dynamic tree: Parse
+// followed by Value.Pointer. Parse errors surface through the error result so
+// the probes can compare outcomes across lookup paths.
+func parseValuePointer(src []byte, pointer string) (Value, bool, error) {
+	root, err := Parse(src)
+	if err != nil {
+		return Value{}, false, err
+	}
+	return root.Pointer(pointer)
+}
+
 // resolveAll runs one pointer through GetRaw, ScanRaw, compiled GetRaw,
 // Index.Pointer and Value.Pointer and asserts they agree; returns the outcome.
 func resolveAll(t *testing.T, src []byte, pointer string) pointerOutcome {
@@ -127,7 +138,7 @@ func resolveAll(t *testing.T, src []byte, pointer string) pointerOutcome {
 			pointer, node.Raw().Bytes(), nodeOK, nodeErr, getRaw.Bytes(), getOK, getErr)
 	}
 
-	value, valueOK, valueErr := Get(src, pointer)
+	value, valueOK, valueErr := parseValuePointer(src, pointer)
 	if valueOK != getOK || (valueErr != nil) != (getErr != nil) {
 		t.Errorf("pointer %q: Value.Pointer = (%v, %v), GetRaw = (%v, %v)", pointer, valueOK, valueErr, getOK, getErr)
 	} else if valueOK {
@@ -397,7 +408,7 @@ func TestProbeNumberAccessorConsistency(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatal(spelling, err)
 		}
-		val, ok, err := Get(src, "/0")
+		val, ok, err := parseValuePointer(src, "/0")
 		if err != nil || !ok {
 			t.Fatal(spelling, err)
 		}
@@ -490,7 +501,7 @@ func TestProbeStringDecodingVsStdlib(t *testing.T) {
 			t.Errorf("RawValue.Text(%s) = %q, %v, %v; want %q", q, got, ok, err, want)
 		}
 
-		val, ok, err := Get(src, "/0")
+		val, ok, err := parseValuePointer(src, "/0")
 		if err != nil || !ok {
 			t.Fatal(q, err)
 		}

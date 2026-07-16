@@ -189,21 +189,8 @@ func (w Appender) Float32(v float32) Appender {
 	return w
 }
 
-// Buffer exposes the bytes appended so far so a body can splice output from
-// another package kernel and hand the extended slice back through SetBuffer.
-// The returned slice aliases the encoder's buffer; treat it as append-only.
-func (w Appender) Buffer() []byte { return w.dst }
-
-// SetBuffer replaces the underlying buffer, for a body that appended through a
-// raw kernel on the slice from Buffer. Passing a slice not derived from Buffer
-// discards prior output.
-func (w Appender) SetBuffer(dst []byte) Appender {
-	w.dst = dst
-	return w
-}
-
 // EscapeHTML reports whether the encoder escapes HTML-sensitive bytes, so a
-// body appending strings through the raw kernels can match the option.
+// body that formats its own output through Raw can match the option.
 func (w Appender) EscapeHTML() bool { return w.escapeHTML }
 
 // --- Cursor: object framing ------------------------------------------------
@@ -342,11 +329,6 @@ func (c *Cursor) Float64(dst *float64) error { return c.d.Float(dst) }
 // mode an unescaped string aliases the source.
 func (c *Cursor) String(dst *string) error { return c.d.String(dst) }
 
-// Text decodes a JSON string into dst. It is an alias for String, named for the
-// generator convention of "text" members; both unescape as needed and, in
-// zero-copy mode, alias the source for an unescaped string.
-func (c *Cursor) Text(dst *string) error { return c.d.String(dst) }
-
 // Number decodes a JSON number as its literal text, for a json.Number-style
 // field that preserves the exact digits.
 func (c *Cursor) Number(dst *string) error { return c.d.Number(dst) }
@@ -484,30 +466,6 @@ func foldFieldKey(key string) string {
 		b[i] = c
 	}
 	return string(b)
-}
-
-// --- public append kernels for generated encode bodies ---------------------
-//
-// A generator can also emit against these free functions when it holds the
-// buffer directly (see Appender.Buffer / Appender.SetBuffer). They are the same
-// kernels the Appender methods call.
-
-// AppendInt appends v in base 10.
-func AppendInt(dst []byte, v int64) []byte { return appendCompactInt(dst, v) }
-
-// AppendUint appends v in base 10.
-func AppendUint(dst []byte, v uint64) []byte { return appendCompactUint(dst, v) }
-
-// AppendString appends s as a JSON string; escapeHTML matches
-// Appender.EscapeHTML.
-func AppendString(dst []byte, s string, escapeHTML bool) []byte {
-	return appendEncodedJSONString(dst, s, escapeHTML)
-}
-
-// AppendFloat appends v in encoding/json's shortest form. bits is 32 or 64. A
-// NaN or an infinity returns an error and leaves dst unchanged.
-func AppendFloat(dst []byte, v float64, bits int) ([]byte, error) {
-	return appendJSONFloat(dst, v, bits)
 }
 
 // --- plan dispatch ---------------------------------------------------------

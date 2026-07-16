@@ -695,7 +695,11 @@ func BenchmarkPointer(b *testing.B) {
 	b.SetBytes(int64(len(src)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		v, ok, err := Get(src, "/items/2/message")
+		root, err := Parse(src)
+		if err != nil {
+			b.Fatal(err)
+		}
+		v, ok, err := root.Pointer("/items/2/message")
 		if err != nil || !ok || v.Kind() != String {
 			b.Fatal(v, ok, err)
 		}
@@ -707,7 +711,11 @@ func BenchmarkPointerZeroCopy(b *testing.B) {
 	b.SetBytes(int64(len(src)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		v, ok, err := GetOptions(src, "/items/2/message", Options{ZeroCopy: true})
+		root, err := ParseOptions(src, Options{ZeroCopy: true})
+		if err != nil {
+			b.Fatal(err)
+		}
+		v, ok, err := root.Pointer("/items/2/message")
 		if err != nil || !ok || v.Kind() != String {
 			b.Fatal(v, ok, err)
 		}

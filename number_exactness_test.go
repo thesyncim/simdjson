@@ -47,12 +47,12 @@ func checkFloatExactness(t testing.TB, text string) {
 		t.Fatalf("%q: encoding/json accept = %v, strconv accept = %v", clip(text), stdErr == nil, ok64)
 	}
 
-	got, err := ParseFloat64(src)
+	got, err := parseFloat64(src)
 	if (err == nil) != ok64 {
-		t.Fatalf("%q: ParseFloat64 error = %v, strconv accept = %v", clip(text), err, ok64)
+		t.Fatalf("%q: parseFloat64 error = %v, strconv accept = %v", clip(text), err, ok64)
 	}
 	if ok64 && math.Float64bits(got) != want64 {
-		t.Fatalf("ParseFloat64(%q) = %.17g (%#x), want %.17g (%#x)",
+		t.Fatalf("parseFloat64(%q) = %.17g (%#x), want %.17g (%#x)",
 			clip(text), got, math.Float64bits(got), math.Float64frombits(want64), want64)
 	}
 
@@ -389,8 +389,8 @@ func FuzzFloatExactness(f *testing.F) {
 		src := []byte(text)
 		trimmed := bytes.TrimSpace(src)
 		if !ValidNumber(trimmed) {
-			if _, err := ParseFloat64(src); err == nil {
-				t.Fatalf("ParseFloat64 accepted %q, which is not a strict JSON number", clip(text))
+			if _, err := parseFloat64(src); err == nil {
+				t.Fatalf("parseFloat64 accepted %q, which is not a strict JSON number", clip(text))
 			}
 			var f64 float64
 			if err := Unmarshal(src, &f64); err == nil && !bytes.Equal(trimmed, []byte("null")) {
