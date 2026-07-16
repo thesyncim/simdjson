@@ -83,6 +83,7 @@ func buildIndexBitmap(src []byte, storage []IndexEntry) (entries []IndexEntry, o
 
 	var st simdkernels.Stage1Stream
 	var recs [simdkernels.Stage1ChunkBlocks]simdkernels.Stage1Rec
+	var scalars [simdkernels.Stage2IndexScalarSlots]uint32
 	var g simdkernels.Stage2IndexState
 	simdkernels.Stage2IndexReset(&g)
 	var slab [simdkernels.Stage2IndexSlabLen]uint64
@@ -184,14 +185,14 @@ func buildIndexBitmap(src []byte, storage []IndexEntry) (entries []IndexEntry, o
 		}
 
 		prevOff := g.EntryOff
-		simdkernels.Stage2IndexWalk((*byte)(base), chunk*64, emits[:cnt], &slab, entBase, cap(storage), &g)
+		nscalars := simdkernels.Stage2IndexWalk((*byte)(base), chunk*64, emits[:cnt], &slab, entBase, cap(storage), scalars[:], &g)
 		if g.Bad != 0 {
 			return nil, false
 		}
 		// Finish the chunk's new string and scalar entries while their
 		// bytes are cache-warm. Containers are patched by the machine when
 		// their closers arrive, possibly chunks later.
-		if !indexBitmapFinish(src, base, n, full, prevOff, g.EntryOff, &recs, chunk*64, cnt) {
+		if !indexBitmapFinish(src, base, n, full, prevOff, g.EntryOff, scalars[:nscalars], &recs, chunk*64, cnt) {
 			return nil, false
 		}
 	}
@@ -229,14 +230,16 @@ func buildIndexBitmap(src []byte, storage []IndexEntry) (entries []IndexEntry, o
 // trailing bytes merge into its token, so `1x` reaches the scanner
 // rather than the pair table) — and the escaped flags, driven by the
 // chunk's escape-target bits so chunks without escapes pay nothing.
-func indexBitmapFinish(src []byte, base unsafe.Pointer, n int, entries []IndexEntry, fromOff, toOff uint64,
+func indexBitmapFinish(src []byte, base unsafe.Pointer, n int, entries []IndexEntry, fromOff, toOff uint64, scalars []uint32,
 	recs *[simdkernels.Stage1ChunkBlocks]simdkernels.Stage1Rec, chunkPos, cnt int) bool {
-	for off := fromOff; off < toOff; off += 16 {
-		e := &entries[off>>4]
+	fromEntry, toEntry := uint32(fromOff>>4), uint32(toOff>>4)
+	for _, entryIndex := range scalars {
+		if entryIndex < fromEntry || entryIndex >= toEntry {
+			return false
+		}
+		e := &entries[entryIndex]
 		if e.info != 0 {
-			// Containers, and strings with their info word stamped by the
-			// machine; only scalar placeholders carry a zero kind.
-			continue
+			return false
 		}
 		s := int(e.start)
 		var end int

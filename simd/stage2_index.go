@@ -41,6 +41,11 @@ const Stage2IndexMaxDepth = 64
 // store-to-load forwarding chains in the token loop.
 const Stage2IndexSlabLen = 128
 
+// Stage2IndexScalarSlots is the scratch capacity required when the index
+// machine consumes a full stage-1 chunk. Scalar records are uint32 absolute
+// entry indexes; the emit-bit bound makes every assembly store unconditional.
+const Stage2IndexScalarSlots = Stage1ChunkBlocks * 64
+
 // Abort flags folded into Stage2IndexState.Bad alongside the grammar
 // bits: entry storage exhausted, and nesting past the machine's cap.
 const (

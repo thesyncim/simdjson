@@ -307,15 +307,16 @@ func TestIndexBitmapChunkResume(t *testing.T) {
 		simdkernels.Stage2IndexReset(&g)
 		var slab [simdkernels.Stage2IndexSlabLen]uint64
 		var recs [simdkernels.Stage1ChunkBlocks]simdkernels.Stage1Rec
+		var scalars [simdkernels.Stage2IndexScalarSlots]uint32
 		start := 0
 		for _, end := range splits {
 			prevOff := g.EntryOff
-			simdkernels.Stage2IndexWalk((*byte)(unsafe.Pointer(unsafe.SliceData(doc))), start*64, emit[start:end], &slab, entBase, cap(storage), &g)
+			nscalars := simdkernels.Stage2IndexWalk((*byte)(unsafe.Pointer(unsafe.SliceData(doc))), start*64, emit[start:end], &slab, entBase, cap(storage), scalars[:], &g)
 			if g.Bad != 0 {
 				return nil, false
 			}
 			copy(recs[:], allRecs[start:end])
-			if !indexBitmapFinish(doc, base, n, full, prevOff, g.EntryOff, &recs, start*64, end-start) {
+			if !indexBitmapFinish(doc, base, n, full, prevOff, g.EntryOff, scalars[:nscalars], &recs, start*64, end-start) {
 				return nil, false
 			}
 			start = end

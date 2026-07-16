@@ -13,7 +13,7 @@
 // Register map (live across the call):
 //   R0  src base (absolute)   R13 keyRow8 (1<<3 when key context follows)
 //   R1  emit cursor           R14 entry cursor (STP.P writes)
-//   R2  emit end              R15 dzMask8 (256 while depth==0, else 0)
+//   R2  emit end              R15 scalar-entry cursor (uint32 stores)
 //   R3  pos (absolute)        R19 scope slab base
 //   R4  m (mask word)         R20 hr = maxDepth+1-depth (0 => too deep)
 //   R5  j (position)          R21 handler slot base
@@ -53,7 +53,7 @@
 	ADD   R6, R21, R16         \
 	JMP   (R16)
 
-TEXT ·stage2IndexLoop(SB), NOSPLIT, $0-80
+TEXT ·stage2IndexLoop(SB), NOSPLIT, $0-96
 	B    imain
 
 	// ---- handler slots: symbol+256 + class*256 ----
@@ -79,7 +79,6 @@ TEXT ·stage2IndexLoop(SB), NOSPLIT, $0-80
 	MOVD  $8, R11              // inObj8
 	MOVD  $8, R12              // prevRowIO = rowO<<4 | inObj8
 	MOVD  $8, R13              // keyRow8: '{' opens a key context
-	MOVD  ZR, R15              // depth > 0
 	B     ifusedKey            // a key quote nearly always follows '{'
 
 	PCALIGN $256
@@ -103,7 +102,6 @@ TEXT ·stage2IndexLoop(SB), NOSPLIT, $0-80
 	MOVD  ZR, R11
 	MOVD  $16, R12             // rowA<<4
 	MOVD  ZR, R13
-	MOVD  ZR, R15
 	IDISPATCH
 
 	PCALIGN $256
@@ -153,9 +151,6 @@ cfxdone:
 	AND   $127, R10, R16
 	MOVD  (R19)(R16<<3), R17   // parent scope word
 	AND   $8, R17, R11         // enclosing kind
-	MOVD  $256, R16
-	CMP   $0, R10
-	CSEL  EQ, R16, ZR, R15
 	ORR   $32, R11, R12        // rowC<<4 | inObj8
 	MOVD  ZR, R13
 	TBNZ  $3, R11, ifusedComma // in an object: ',' or another '}' next
@@ -207,9 +202,6 @@ bfxdone:
 	AND   $127, R10, R16
 	MOVD  (R19)(R16<<3), R17
 	AND   $8, R17, R11
-	MOVD  $256, R16
-	CMP   $0, R10
-	CSEL  EQ, R16, ZR, R15
 	ORR   $48, R11, R12        // rowB<<4 | inObj8
 	MOVD  ZR, R13
 	TBNZ  $3, R11, ifusedComma // in an object: ',' or another '}' next
@@ -245,7 +237,8 @@ lfxdone:
 	ADD   $5, R12, R16
 	MOVBU (R8)(R16), R16
 	ORR   R16, R9, R9
-	ORR   R15, R9, R9          // comma at depth 0 (dzMask8 sentinel)
+	CMP   $0, R10
+	CSINC NE, R9, R9, R9       // comma at depth 0
 	// String-end fixup: when the previous token was a string, its close
 	// is the first non-whitespace byte behind this token (the grammar
 	// admits nothing else between them), and its entry is the last one
@@ -296,6 +289,9 @@ mfxdone:
 	ORR   R16, R9, R9
 	CMP   R24, R14
 	BHS   idxfull
+	SUB   R25, R14, R16
+	LSR   $4, R16, R16
+	MOVW.P R16, 4(R15)         // record the scalar entry index
 	MOVD  $1, R23              // word1: next 1, info 0 (placeholder kind)
 	STP.P (R5, R23), 16(R14)   // entry {start=j, end pending}
 	ORR   $112, R11, R12       // rowS<<4 | inObj8
@@ -374,9 +370,6 @@ ifusedClose:
 	AND   $127, R10, R16
 	MOVD  (R19)(R16<<3), R17   // parent scope word
 	AND   $8, R17, R11         // enclosing kind
-	MOVD  $256, R16
-	CMP   $0, R10
-	CSEL  EQ, R16, ZR, R15
 	ORR   $32, R11, R12        // rowC<<4 | inObj8
 	MOVD  ZR, R13
 	TBNZ  $3, R11, ifusedComma // nested closes chain until an array
@@ -385,7 +378,8 @@ ifusedClose:
 ifusedCommaHit:
 	SUB   $1, R4, R16
 	AND   R16, R4, R4
-	ORR   R15, R9, R9          // comma at depth 0
+	CMP   $0, R10
+	CSINC NE, R9, R9, R9       // comma at depth 0
 	ADD   $1, R26, R26
 	ADD   $80, R11, R12        // rowM<<4 | inObj8
 	MOVD  R11, R13
@@ -456,6 +450,9 @@ ifusedValue:
 	AND   R16, R4, R4
 	CMP   R24, R14
 	BHS   idxfull
+	SUB   R25, R14, R16
+	LSR   $4, R16, R16
+	MOVW.P R16, 4(R15)
 	MOVD  $1, R23              // word1: next 1, info 0 (placeholder kind)
 	STP.P (R5, R23), 16(R14)
 	ORR   $112, R11, R12       // rowS<<4 | inObj8
@@ -552,7 +549,8 @@ imain:
 	MOVD ent+56(FP), R25
 	MOVD entCap+64(FP), R24
 	ADD  R24<<4, R25, R24      // entry storage end
-	MOVD st+72(FP), R22
+	MOVD scalars+72(FP), R15
+	MOVD st+80(FP), R22
 	MOVD $·stage2IndexLoop(SB), R21
 	ADD  $256, R21             // handler slot base
 
@@ -566,9 +564,6 @@ imain:
 	MOVD 40(R22), R14
 	ADD  R25, R14, R14         // entry cursor = base + offset
 	AND  $8, R12, R11          // inObj8
-	MOVD $256, R16
-	CMP  $0, R10
-	CSEL EQ, R16, ZR, R15      // dzMask8
 	MOVD $65, R20              // Stage2IndexMaxDepth + 1
 	SUB  R10, R20, R20         // headroom
 
@@ -589,4 +584,8 @@ idone:
 	MOVD R26, 32(R22)          // member count
 	SUB  R25, R14, R16
 	MOVD R16, 40(R22)          // entry cursor offset
+	MOVD scalars+72(FP), R16
+	SUB  R16, R15, R16
+	LSR  $2, R16, R16
+	MOVD R16, nscalars+88(FP)
 	RET

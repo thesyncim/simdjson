@@ -15,6 +15,6 @@ func Stage2Walk(base *byte, emit []uint64, kinds *[Stage2KindsLen]byte, scalars 
 
 // Stage2IndexWalk is unreachable on builds without the machine; callers
 // must gate on Stage2Enabled.
-func Stage2IndexWalk(base *byte, pos int, emit []uint64, slab *[Stage2IndexSlabLen]uint64, ent *byte, entCap int, st *Stage2IndexState) {
+func Stage2IndexWalk(base *byte, pos int, emit []uint64, slab *[Stage2IndexSlabLen]uint64, ent *byte, entCap int, scalars []uint32, st *Stage2IndexState) int {
 	panic("simd: stage-2 index machine not available on this build")
 }

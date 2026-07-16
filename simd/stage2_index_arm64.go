@@ -11,7 +11,8 @@ import "unsafe"
 // pointer (exhaustion aborts before the store), scope words at
 // depth&(Stage2IndexSlabLen-1), patch stores at entry indexes the slab
 // received from this document's own opens (underflow aborts before a
-// patch can use a stale index), and the six state words.
+// patch can use a stale index), scalar indexes against a checked scratch
+// bound, and the six state words.
 
 // stage2IndexLoop runs the entry-writing machine over nwords emit masks
 // whose first mask covers the 64 source bytes at base+pos. Entries are
@@ -20,7 +21,7 @@ import "unsafe"
 // stored back at exit.
 //
 //go:noescape
-func stage2IndexLoop(base *byte, pos int64, emit *uint64, nwords int64, clsOff *uint64, pt *uint8, slab *uint64, ent *byte, entCap int64, st *Stage2IndexState)
+func stage2IndexLoop(base *byte, pos int64, emit *uint64, nwords int64, clsOff *uint64, pt *uint8, slab *uint64, ent *byte, entCap int64, scalars *uint32, st *Stage2IndexState) (nscalars int64)
 
 // Stage2IndexWalk resumes the index machine over a run of consecutive
 // blocks' emit masks. base is the document start; pos is the absolute
@@ -28,11 +29,15 @@ func stage2IndexLoop(base *byte, pos int64, emit *uint64, nwords int64, clsOff *
 // source byte. ent and entCap describe the caller's entry storage; the
 // machine appends at st.EntryOff and aborts with Stage2IndexFull rather
 // than write past entCap entries. slab persists across the document's
-// chunks and must start zeroed.
-func Stage2IndexWalk(base *byte, pos int, emit []uint64, slab *[Stage2IndexSlabLen]uint64, ent *byte, entCap int, st *Stage2IndexState) {
+// chunks and must start zeroed. scalars receives one absolute entry index per
+// scalar placeholder; its required capacity is the emit-bit upper bound.
+func Stage2IndexWalk(base *byte, pos int, emit []uint64, slab *[Stage2IndexSlabLen]uint64, ent *byte, entCap int, scalars []uint32, st *Stage2IndexState) int {
 	if len(emit) == 0 {
-		return
+		return 0
 	}
-	stage2IndexLoop(base, int64(pos), unsafe.SliceData(emit), int64(len(emit)),
-		&stage2IdxClsOff[0], &stage2PairBad[0], &slab[0], ent, int64(entCap), st)
+	if len(scalars) < 64*len(emit) {
+		panic("simd: Stage2IndexWalk scalars shorter than the emit-bit bound")
+	}
+	return int(stage2IndexLoop(base, int64(pos), unsafe.SliceData(emit), int64(len(emit)),
+		&stage2IdxClsOff[0], &stage2PairBad[0], &slab[0], ent, int64(entCap), unsafe.SliceData(scalars), st))
 }
