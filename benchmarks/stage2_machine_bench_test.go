@@ -52,6 +52,29 @@ func stage1CursorPositions(src []byte) ([]uint32, simdkernels.Stage1IndexStream)
 	return out[:written], st
 }
 
+func stage1ValidPositions(src []byte) ([]uint32, simdkernels.Stage1IndexStream) {
+	n := len(src)
+	base := unsafe.Pointer(unsafe.SliceData(src))
+	fullBlocks := n / 64
+	out := make([]uint32, n+128)
+	written := 0
+	var st simdkernels.Stage1IndexStream
+	var meta simdkernels.Stage1ValidMeta
+	for block := 0; block < fullBlocks; block += simdkernels.Stage1ChunkBlocks {
+		count := min(simdkernels.Stage1ChunkBlocks, fullBlocks-block)
+		written += simdkernels.Stage1ValidBlocks((*byte)(unsafe.Add(base, block*64)), count, uint32(block*64), &st, out[written:], &meta)
+	}
+	if fullBlocks*64 != n {
+		var tail [64]byte
+		for i := range tail {
+			tail[i] = ' '
+		}
+		copy(tail[:], src[fullBlocks*64:])
+		written += simdkernels.Stage1ValidBlocks(&tail[0], 1, uint32(fullBlocks*64), &st, out[written:], &meta)
+	}
+	return out[:written], st
+}
+
 // stage2RunChunked drives the machine over the corpus masks in runs of
 // chunkWords, collecting scalar positions, and returns the final verdict.
 func stage2RunChunked(src []byte, emit []uint64, chunkWords int, collect *[]uint32) bool {
@@ -101,6 +124,34 @@ func TestStage2MachineCorpora(t *testing.T) {
 	}
 	for _, c := range loadGapCorpora(t) {
 		wantScalars := stage2CorpusScalars(c)
+		validPositions, validStream := stage1ValidPositions(c.src)
+		if validStream.Bad || validStream.Carry.InString != 0 {
+			t.Fatalf("%s: validation producer rejected corpus", c.label)
+		}
+		if len(validPositions) != len(c.positions) {
+			t.Fatalf("%s: validation producer wrote %d positions, want %d", c.label, len(validPositions), len(c.positions))
+		}
+		for i := range c.positions {
+			if validPositions[i] != c.positions[i] {
+				t.Fatalf("%s: validation position %d = %d, want %d", c.label, i, validPositions[i], c.positions[i])
+			}
+		}
+		positionScalars := make([]uint32, len(validPositions))
+		positionKinds := new([simdkernels.Stage2KindsLen]byte)
+		var positionState simdkernels.Stage2State
+		simdkernels.Stage2Reset(&positionState)
+		npositionScalars := simdkernels.Stage2PositionsGo(unsafe.SliceData(c.src), validPositions, positionKinds, positionScalars, &positionState)
+		if !simdkernels.Stage2Finish(&positionState) {
+			t.Fatalf("%s: position machine rejected corpus", c.label)
+		}
+		if npositionScalars != len(wantScalars) {
+			t.Fatalf("%s position machine: %d scalar starts, want %d", c.label, npositionScalars, len(wantScalars))
+		}
+		for i := range wantScalars {
+			if positionScalars[i] != wantScalars[i] {
+				t.Fatalf("%s position machine: scalar %d = %d, want %d", c.label, i, positionScalars[i], wantScalars[i])
+			}
+		}
 		cursorPositions, cursorStream := stage1CursorPositions(c.src)
 		if cursorStream.Bad || cursorStream.Carry.InString != 0 {
 			t.Fatalf("%s: cursor producer rejected corpus", c.label)
@@ -257,6 +308,52 @@ func BenchmarkStage2CursorGo(b *testing.B) {
 				boolSink = simdkernels.Stage2Finish(&st)
 			}
 			reportPerPosition(b, len(c.positions))
+		})
+	}
+}
+
+func BenchmarkStage2PositionsGo(b *testing.B) {
+	for _, c := range loadGapCorpora(b) {
+		b.Run(c.label, func(b *testing.B) {
+			positions, stream := stage1ValidPositions(c.src)
+			if stream.Bad || stream.Carry.InString != 0 {
+				b.Fatal("validation producer rejected corpus")
+			}
+			base := unsafe.SliceData(c.src)
+			kinds := new([simdkernels.Stage2KindsLen]byte)
+			scalars := make([]uint32, len(positions))
+			var st simdkernels.Stage2State
+			b.SetBytes(int64(len(c.src)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				simdkernels.Stage2Reset(&st)
+				intSink = simdkernels.Stage2PositionsGo(base, positions, kinds, scalars, &st)
+				boolSink = simdkernels.Stage2Finish(&st)
+			}
+			reportPerPosition(b, len(c.positions))
+		})
+	}
+}
+
+func BenchmarkGapStage1ValidDirect(b *testing.B) {
+	for _, c := range loadGapCorpora(b) {
+		b.Run(c.label, func(b *testing.B) {
+			src := c.src
+			base := unsafe.Pointer(unsafe.SliceData(src))
+			fullBlocks := len(src) / 64
+			out := make([]uint32, len(src)+128)
+			b.SetBytes(int64(len(src)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var st simdkernels.Stage1IndexStream
+				var meta simdkernels.Stage1ValidMeta
+				written := 0
+				for block := 0; block < fullBlocks; block += simdkernels.Stage1ChunkBlocks {
+					count := min(simdkernels.Stage1ChunkBlocks, fullBlocks-block)
+					written += simdkernels.Stage1ValidBlocks((*byte)(unsafe.Add(base, block*64)), count, uint32(block*64), &st, out[written:], &meta)
+				}
+				intSink = written
+			}
 		})
 	}
 }

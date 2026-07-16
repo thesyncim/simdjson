@@ -20,6 +20,9 @@ import (
 // machine itself and the batched stage-1 kernel that feeds it.
 var stage2MachineEnabled = simdkernels.Stage2Enabled() && simdkernels.Stage1StreamEnabled()
 
+// stage2IndexPositionEnabled gates the Go-native forward index writer.
+var stage2IndexPositionEnabled = simdkernels.Stage1StreamEnabled()
+
 // The machine's depth limit must equal the walk's; both reject the open
 // that would exceed it.
 const _ = uint(simdkernels.Stage2MaxDepth-defaultMaxDepth) + uint(defaultMaxDepth-simdkernels.Stage2MaxDepth)

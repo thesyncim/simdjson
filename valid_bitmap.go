@@ -152,6 +152,9 @@ func validBitmapNumberMode(inStr int) uint8 {
 // instead; the result is then meaningless. On arm64 the batched kernel
 // classifies each chunk; elsewhere the per-block path runs directly.
 func validBitmap(src []byte) (valid, decided bool) {
+	if !stage2MachineEnabled && stage1StreamEnabled && len(src) >= validBitmapSampleBlocks*64 {
+		return validPositionsStreamed(src)
+	}
 	if stage2MachineEnabled {
 		// The grammar walk runs in the stage-2 register machine
 		// (valid_bitmap_stage2.go); the Go walk below stays the fallback

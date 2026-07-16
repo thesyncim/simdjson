@@ -117,9 +117,9 @@ func BuildIndexOptions(src []byte, storage []IndexEntry, opts IndexOptions) (Ind
 	// decline falls through to the portable builder below, which decides
 	// the exact error. The depth gate keeps callers' tighter limits with
 	// the builder that enforces them.
-	if stage2MachineEnabled && maxDepth >= fastWalkMaxDepth &&
+	if stage2IndexPositionEnabled && maxDepth >= fastWalkMaxDepth &&
 		len(src) >= validBitmapMinBytes && len(src) < indexBitmapMaxBytes {
-		if entries, ok := buildIndexBitmap(src, storage); ok {
+		if entries, ok := buildIndexPositions(src, storage); ok {
 			return Index{src: src, entries: entries}, nil
 		}
 	}

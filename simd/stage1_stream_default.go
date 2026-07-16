@@ -17,8 +17,20 @@ func Stage1IndexBlocks(p *byte, nblocks int, base uint32, st *Stage1IndexStream,
 	panic("simd: stage1 index kernel disabled")
 }
 
+// Stage1IndexBlocksMeta is unreachable on builds without the batched index
+// producer.
+func Stage1IndexBlocksMeta(p *byte, nblocks int, base uint32, st *Stage1IndexStream, out []uint32, meta *Stage1IndexMeta) int {
+	panic("simd: stage1 index kernel disabled")
+}
+
 // Stage1CursorBlocks is unreachable on builds without the compact batched
 // index producer.
 func Stage1CursorBlocks(p *byte, nblocks int, base uint32, st *Stage1IndexStream, out []uint32) int {
 	panic("simd: stage1 cursor kernel disabled")
+}
+
+// Stage1ValidBlocks is unreachable on builds without the batched validation
+// producer.
+func Stage1ValidBlocks(p *byte, nblocks int, base uint32, st *Stage1IndexStream, out []uint32, meta *Stage1ValidMeta) int {
+	panic("simd: stage1 validation kernel disabled")
 }

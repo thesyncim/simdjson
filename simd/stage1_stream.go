@@ -53,6 +53,28 @@ type Stage1IndexStream struct {
 	Escaped    bool
 }
 
+// Stage1ValidMeta carries the per-block checks that cannot be reduced to a
+// document-wide sticky bit. Stage1ValidBlocks overwrites entries for the
+// blocks in its current call.
+type Stage1ValidMeta struct {
+	EscInStr [Stage1ChunkBlocks]uint64
+	NonASCII uint32
+}
+
+// Stage1IndexMeta carries the per-block facts needed by a direct index
+// consumer. Counts cover the current call and let the first 2 KiB double as
+// the density sample instead of classifying it twice.
+type Stage1IndexMeta struct {
+	EscInStr   [Stage1ChunkBlocks]uint64
+	InStr      [Stage1ChunkBlocks]uint64
+	NonASCII   uint32
+	Sample     bool
+	WsCount    uint32
+	EmitCount  uint32
+	InStrCount uint32
+	EscCount   uint32
+}
+
 // Stage1RecFromMasks derives one record from a block's classification
 // masks using the portable carry kernels. It is the scalar reference
 // for the batched kernel and works on every build.

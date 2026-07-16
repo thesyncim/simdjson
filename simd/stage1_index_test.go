@@ -26,13 +26,13 @@ func TestStage1IndexBlocksMatchesRecordPipeline(t *testing.T) {
 			}
 		}
 
-		var direct Stage1IndexStream
+		var direct, directValid Stage1IndexStream
 		var records Stage1Stream
 		var previousIn uint64
 		var bad bool
 		var nonASCII bool
 		var hasEscapes bool
-		var got, want []uint32
+		var got, want, gotValid, wantValid []uint32
 		for block := 0; block < blocks; {
 			count := 1 + rng.Intn(Stage1ChunkBlocks)
 			if count > blocks-block {
@@ -41,6 +41,10 @@ func TestStage1IndexBlocksMatchesRecordPipeline(t *testing.T) {
 			out := make([]uint32, count*64+64)
 			written := Stage1IndexBlocks(&src[block*64], count, uint32(block*64), &direct, out)
 			got = append(got, out[:written]...)
+			validOut := make([]uint32, count*64+64)
+			var validMeta Stage1ValidMeta
+			validWritten := Stage1ValidBlocks(&src[block*64], count, uint32(block*64), &directValid, validOut, &validMeta)
+			gotValid = append(gotValid, validOut[:validWritten]...)
 
 			for recordBlock := 0; recordBlock < count; {
 				recordCount := count - recordBlock
@@ -59,6 +63,9 @@ func TestStage1IndexBlocksMatchesRecordPipeline(t *testing.T) {
 					}
 					mask := rec.Emit | closers
 					base := uint32((block + recordBlock + i) * 64)
+					for validMask := rec.Emit; validMask != 0; validMask &= validMask - 1 {
+						wantValid = append(wantValid, base+uint32(bits.TrailingZeros64(validMask)))
+					}
 					for mask != 0 {
 						position := bits.TrailingZeros64(mask)
 						entry := base + uint32(position)
@@ -74,10 +81,18 @@ func TestStage1IndexBlocksMatchesRecordPipeline(t *testing.T) {
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("trial %d index mismatch\ngot  %v\nwant %v", trial, got, want)
 		}
+		if !reflect.DeepEqual(gotValid, wantValid) {
+			t.Fatalf("trial %d validation stream mismatch\ngot  %v\nwant %v", trial, gotValid, wantValid)
+		}
 		if direct.Bad != bad || direct.Carry != records.Carry || direct.Follows != records.Follows ||
 			direct.PreviousIn != previousIn || direct.NonASCII != nonASCII || direct.Escaped != hasEscapes {
 			t.Fatalf("trial %d state mismatch: direct=%+v records=%+v previous=%x escaped=%v bad=%v",
 				trial, direct, records, previousIn, hasEscapes, bad)
+		}
+		if directValid.Bad != bad || directValid.Carry != records.Carry || directValid.Follows != records.Follows ||
+			directValid.PreviousIn != previousIn || directValid.NonASCII != nonASCII || directValid.Escaped != hasEscapes {
+			t.Fatalf("trial %d validation state mismatch: direct=%+v records=%+v previous=%x escaped=%v bad=%v",
+				trial, directValid, records, previousIn, hasEscapes, bad)
 		}
 	}
 }

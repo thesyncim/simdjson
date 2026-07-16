@@ -385,3 +385,194 @@ done:
 	st.KeyRow8 = key
 	return nscalars
 }
+
+// Stage2PositionsGo consumes the validation-only stream produced by
+// Stage1ValidBlocks. Positions name punctuation, opening quotes, and scalar
+// starts directly, so this machine has no bitmap-word traversal and no string
+// pairing or colon-gap recovery.
+func Stage2PositionsGo(base *byte, positions []uint32, kinds *[Stage2KindsLen]byte, scalars []uint32, st *Stage2State) int {
+	if len(scalars) < len(positions) {
+		panic("simd: Stage2PositionsGo scalars shorter than positions")
+	}
+	return Stage2PositionsTrusted(base, positions, kinds, scalars, st)
+}
+
+// Stage2PositionsTrusted is Stage2PositionsGo for callers that have already
+// proved len(scalars) >= len(positions). The trusted entry keeps the grammar
+// kernel free of panic edges and stack-frame spills.
+func Stage2PositionsTrusted(base *byte, positions []uint32, kinds *[Stage2KindsLen]byte, scalars []uint32, st *Stage2State) int {
+	basep := unsafe.Pointer(base)
+	posp := unsafe.Pointer(unsafe.SliceData(positions))
+	ptp := unsafe.Pointer(&stage2PairBad[0])
+	kindp := unsafe.Pointer(&kinds[0])
+	scalarp := unsafe.Pointer(unsafe.SliceData(scalars))
+
+	bad := st.Bad
+	depth := st.Depth
+	prev := st.PrevRowIO
+	key := st.KeyRow8
+	inObj := prev & 8
+	pi := 0
+	nscalars := 0
+	var j int
+	var cls uint64
+
+dispatch:
+	if pi == len(positions) {
+		goto done
+	}
+	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
+	pi++
+	cls = uint64(stage2Class[*(*byte)(unsafe.Add(basep, j))])
+
+handleKnown:
+	bad |= uint64(*(*byte)(unsafe.Add(ptp, prev|cls)))
+	switch cls {
+	case stage2ccO:
+		depth++
+		if depth > Stage2MaxDepth {
+			bad |= 1
+		}
+		*(*byte)(unsafe.Add(kindp, uintptr(uint64(depth)&(Stage2KindsLen-1)))) = 8
+		inObj = 8
+		prev = 8
+		key = 8
+		goto fusedKey
+	case stage2ccA:
+		depth++
+		if depth > Stage2MaxDepth {
+			bad |= 1
+		}
+		*(*byte)(unsafe.Add(kindp, uintptr(uint64(depth)&(Stage2KindsLen-1)))) = 0
+		inObj = 0
+		prev = 16
+		key = 0
+		goto dispatch
+	case stage2ccC:
+		bad |= (inObj ^ 8) >> 3
+		depth--
+		if depth < 0 {
+			bad |= 1
+		}
+		inObj = uint64(*(*byte)(unsafe.Add(kindp, uintptr(uint64(depth)&(Stage2KindsLen-1))))) & 8
+		prev = 32 | inObj
+		key = 0
+		if inObj != 0 {
+			goto fusedComma
+		}
+		goto dispatch
+	case stage2ccB:
+		bad |= inObj >> 3
+		depth--
+		if depth < 0 {
+			bad |= 1
+		}
+		inObj = uint64(*(*byte)(unsafe.Add(kindp, uintptr(uint64(depth)&(Stage2KindsLen-1))))) & 8
+		prev = 48 | inObj
+		key = 0
+		if inObj != 0 {
+			goto fusedComma
+		}
+		goto dispatch
+	case stage2ccL:
+		prev = 64 | inObj
+		key = 0
+		goto dispatch
+	case stage2ccM:
+		if depth == 0 {
+			bad |= 1
+		}
+		prev = 80 | inObj
+		key = inObj
+		if inObj != 0 {
+			goto fusedKey
+		}
+		goto dispatch
+	case stage2ccQ:
+		isKey := key
+		prev = 96 | key<<4 | inObj
+		key = 0
+		if isKey != 0 {
+			goto fusedColon
+		}
+		if inObj != 0 {
+			goto fusedComma
+		}
+		goto dispatch
+	default:
+		*(*uint32)(unsafe.Add(scalarp, uintptr(nscalars)*4)) = uint32(j)
+		nscalars++
+		prev = 112 | inObj
+		key = 0
+		if inObj != 0 {
+			goto fusedComma
+		}
+		goto dispatch
+	}
+
+fusedKey:
+	if pi == len(positions) {
+		goto done
+	}
+	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
+	if *(*byte)(unsafe.Add(basep, j)) != '"' {
+		pi++
+		cls = uint64(stage2Class[*(*byte)(unsafe.Add(basep, j))])
+		goto handleKnown
+	}
+	pi++
+	prev = 224 | inObj
+	goto fusedColon
+
+fusedColon:
+	if pi == len(positions) {
+		goto done
+	}
+	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
+	if *(*byte)(unsafe.Add(basep, j)) != ':' {
+		pi++
+		cls = uint64(stage2Class[*(*byte)(unsafe.Add(basep, j))])
+		goto handleKnown
+	}
+	pi++
+	prev = 64 | inObj
+	key = 0
+	goto dispatch
+
+fusedComma:
+	if pi == len(positions) {
+		goto done
+	}
+	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
+	switch *(*byte)(unsafe.Add(basep, j)) {
+	case ',':
+		pi++
+		prev = 80 | inObj
+		key = inObj
+		goto fusedKey
+	case '}':
+		pi++
+		depth--
+		if depth < 0 {
+			bad |= 1
+		}
+		inObj = uint64(*(*byte)(unsafe.Add(kindp, uintptr(uint64(depth)&(Stage2KindsLen-1))))) & 8
+		prev = 32 | inObj
+		key = 0
+		if inObj != 0 {
+			goto fusedComma
+		}
+		goto dispatch
+	default:
+		pi++
+		cls = uint64(stage2Class[*(*byte)(unsafe.Add(basep, j))])
+		goto handleKnown
+	}
+
+done:
+	st.Bad = bad
+	st.Depth = depth
+	st.PrevRowIO = prev
+	st.KeyRow8 = key
+	return nscalars
+}

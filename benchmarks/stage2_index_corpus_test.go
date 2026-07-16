@@ -15,7 +15,7 @@ import (
 // limit, so the cap changes routing and nothing else). Node-level
 // navigation over both indexes cross-checks the comparison itself.
 func TestStage2IndexCorpora(t *testing.T) {
-	if !simdkernels.Stage2Enabled() {
+	if !simdkernels.Stage1StreamEnabled() {
 		t.Skip("stage-2 machine not available on this build")
 	}
 	for _, c := range loadGapCorpora(t) {
@@ -36,6 +36,16 @@ func TestStage2IndexCorpora(t *testing.T) {
 			t.Fatalf("%s: machine tape %d entries, reference %d", c.label, machine.Len(), reference.Len())
 		}
 		if !reflect.DeepEqual(machine, reference) {
+			mv := reflect.ValueOf(machine).FieldByName("entries")
+			rv := reflect.ValueOf(reference).FieldByName("entries")
+			for i := 0; i < mv.Len(); i++ {
+				me, re := mv.Index(i), rv.Index(i)
+				for field := 0; field < me.NumField(); field++ {
+					if me.Field(field).Uint() != re.Field(field).Uint() {
+						t.Fatalf("%s: entry %d field %d = %#x, reference %#x", c.label, i, field, me.Field(field).Uint(), re.Field(field).Uint())
+					}
+				}
+			}
 			t.Fatalf("%s: tapes differ", c.label)
 		}
 		mr, rr := machine.Root(), reference.Root()
