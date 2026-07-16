@@ -302,7 +302,7 @@ const (
 	typedIface
 	typedTime
 	// The simdjson-native method hooks. A type carrying one of these decodes or
-	// encodes itself through the public Cursor/Appender surface; see typed_hook.go.
+	// encodes itself through the public DecodeCursor/Appender surface; see typed_hook.go.
 	typedUnmarshalerSimd
 	typedMarshalerSimd
 )

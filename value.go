@@ -92,7 +92,7 @@ func (v Value) Text() (string, bool) {
 	if b, ok := v.node.StringBytes(); ok {
 		return ownedBytesString(b), true
 	}
-	out, _ := v.node.AppendString(nil)
+	out, _ := v.node.AppendText(nil)
 	return ownedBytesString(out), true
 }
 
@@ -155,7 +155,7 @@ func nodeKeyString(key Node) string {
 	if b, ok := key.StringBytes(); ok {
 		return ownedBytesString(b)
 	}
-	out, _ := key.AppendString(nil)
+	out, _ := key.AppendText(nil)
 	return ownedBytesString(out)
 }
 

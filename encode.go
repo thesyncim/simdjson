@@ -72,7 +72,7 @@ func appendJSONNodeString(dst []byte, node Node) []byte {
 	if b, ok := node.StringBytes(); ok {
 		return appendJSONStringBytes(dst, b)
 	}
-	decoded, _ := node.AppendString(nil)
+	decoded, _ := node.AppendText(nil)
 	return appendJSONStringBytes(dst, decoded)
 }
 

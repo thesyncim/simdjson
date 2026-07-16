@@ -25,7 +25,7 @@ func TestCodecRoundTrip(t *testing.T) {
 	}
 
 	var back streamRecord
-	if err := codec.Decode(out, &back); err != nil || back != v {
+	if err := codec.Unmarshal(out, &back); err != nil || back != v {
 		t.Fatalf("Decode = %+v, %v", back, err)
 	}
 
@@ -35,9 +35,9 @@ func TestCodecRoundTrip(t *testing.T) {
 		t.Fatalf("Append = %s, %v", appended, err)
 	}
 
-	arr, err := codec.DecodeArray([]byte(`[`+string(want)+`,`+string(want)+`]`), nil)
+	arr, err := codec.UnmarshalArray([]byte(`[`+string(want)+`,`+string(want)+`]`), nil)
 	if err != nil || len(arr) != 2 || arr[1] != v {
-		t.Fatalf("DecodeArray = %+v, %v", arr, err)
+		t.Fatalf("UnmarshalArray = %+v, %v", arr, err)
 	}
 
 	// Streaming both ways through the codec.
@@ -97,7 +97,7 @@ func TestCodecMarshalHintAndConcurrency(t *testing.T) {
 					return
 				}
 				var back streamRecord
-				if err := codec.Decode(out, &back); err != nil || back != row {
+				if err := codec.Unmarshal(out, &back); err != nil || back != row {
 					t.Errorf("g=%d: %+v %v", g, back, err)
 					return
 				}
@@ -113,7 +113,7 @@ func TestCodecZeroValue(t *testing.T) {
 	if _, err := codec.Marshal(&v); err == nil {
 		t.Fatal("zero codec Marshal must error")
 	}
-	if err := codec.Decode([]byte(`{}`), &v); err == nil {
+	if err := codec.Unmarshal([]byte(`{}`), &v); err == nil {
 		t.Fatal("zero codec Decode must error")
 	}
 }

@@ -11,7 +11,7 @@ import (
 
 // This file is the corruption gate for the method-hook tier. The hook dispatch
 // uses two unsafe mechanisms — an itab rebind (two word stores that reconstruct
-// an interface) and a noescape-laundered Cursor/Appender — that fall squarely
+// an interface) and a noescape-laundered DecodeCursor/Appender — that fall squarely
 // in this package's known heap-corruption hazard class: a heap object holding a
 // pointer the GC cannot see, or a pointer into a goroutine stack that dangles
 // when the stack moves. -race MASKS this class (it changes scheduling and
@@ -37,13 +37,13 @@ type hookCorruptRecord struct {
 
 var hookCorruptFields = MakeFieldSet("id", "name", "addr", "kids", "score")
 
-func (r *hookCorruptRecord) UnmarshalSimdJSON(c *Cursor) error {
+func (r *hookCorruptRecord) UnmarshalSimdJSON(c *DecodeCursor) error {
 	if null, err := c.Null(); err != nil {
 		return err
 	} else if null {
 		return nil
 	}
-	if err := c.ObjectOpen("hookCorruptRecord"); err != nil {
+	if err := c.BeginObject("hookCorruptRecord"); err != nil {
 		return err
 	}
 	first := true
@@ -82,14 +82,14 @@ func (r *hookCorruptRecord) UnmarshalSimdJSON(c *Cursor) error {
 	}
 }
 
-func (r *hookCorruptRecord) decodeKids(c *Cursor) error {
+func (r *hookCorruptRecord) decodeKids(c *DecodeCursor) error {
 	if null, err := c.Null(); err != nil {
 		return err
 	} else if null {
 		r.Kids = nil
 		return nil
 	}
-	if err := c.ArrayOpen("[]hookAddress"); err != nil {
+	if err := c.BeginArray("[]hookAddress"); err != nil {
 		return err
 	}
 	if r.Kids == nil {
@@ -299,7 +299,7 @@ func newGCReceiverPayload() *gcReceiverPayload {
 	return p
 }
 
-func (p *gcReceiverProbe) UnmarshalSimdJSON(c *Cursor) error {
+func (p *gcReceiverProbe) UnmarshalSimdJSON(c *DecodeCursor) error {
 	if err := c.Skip(); err != nil {
 		return err
 	}

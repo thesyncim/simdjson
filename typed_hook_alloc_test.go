@@ -14,13 +14,13 @@ type hookAllocRecord struct {
 
 var hookAllocFields = MakeFieldSet("id", "active", "name", "score")
 
-func (r *hookAllocRecord) UnmarshalSimdJSON(c *Cursor) error {
+func (r *hookAllocRecord) UnmarshalSimdJSON(c *DecodeCursor) error {
 	if null, err := c.Null(); err != nil {
 		return err
 	} else if null {
 		return nil
 	}
-	if err := c.ObjectOpen("hookAllocRecord"); err != nil {
+	if err := c.BeginObject("hookAllocRecord"); err != nil {
 		return err
 	}
 	if c.Field(true, hookAllocFields.Field(0)) {
@@ -49,7 +49,7 @@ func (r *hookAllocRecord) UnmarshalSimdJSON(c *Cursor) error {
 	return r.unmarshalRest(c)
 }
 
-func (r *hookAllocRecord) unmarshalRest(c *Cursor) error {
+func (r *hookAllocRecord) unmarshalRest(c *DecodeCursor) error {
 	cs := c.CaseSensitive()
 	first := true
 	for {
@@ -94,11 +94,11 @@ func (r *hookAllocRecord) MarshalSimdJSON(w Appender) Appender {
 
 // TestHookDecodeZeroAllocDelta proves the hook decode dispatch adds no
 // allocation over the reflection path: the itab rebind and the noescape-
-// laundered Cursor keep the dispatch off the heap, so a hook-carrying type
+// laundered DecodeCursor keep the dispatch off the heap, so a hook-carrying type
 // allocates exactly what its plain twin does. It is the delta, not the absolute
 // count, that matters — the single unavoidable allocation is the shared decode-
 // entry cost, which both paths pay. Catching a nonzero delta is what would
-// surface the Cursor-escape regression the prototype hit (+292 allocs/op).
+// surface the DecodeCursor-escape regression the prototype hit (+292 allocs/op).
 // Under -race the safe dispatch boxes a reflect receiver, so the assertion is
 // scoped to the fast build.
 func TestHookDecodeZeroAllocDelta(t *testing.T) {
@@ -134,7 +134,7 @@ func TestHookDecodeZeroAllocDelta(t *testing.T) {
 		}
 	})
 	if hookAllocs != plainAllocs {
-		t.Fatalf("hook decode allocated %v/op vs reflection %v/op: the hook dispatch must add zero allocations (Cursor must not escape)", hookAllocs, plainAllocs)
+		t.Fatalf("hook decode allocated %v/op vs reflection %v/op: the hook dispatch must add zero allocations (DecodeCursor must not escape)", hookAllocs, plainAllocs)
 	}
 }
 

@@ -242,7 +242,7 @@ func TestGCCorruptionStreamGrowthUnderGC(t *testing.T) {
 			i := 0
 			for DecodeNext(r, dec, new(Doc)) {
 				var d Doc
-				if err := DecodeTo(r, dec, &d); err != nil {
+				if err := DecodeFrom(r, dec, &d); err != nil {
 					recordFail(&bad, &mu, &msg, fmt.Sprintf("g%d decodeTo %d: %v", g, i, err))
 					break
 				}

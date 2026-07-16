@@ -590,7 +590,7 @@ func TestCorruptionCodecRoundTrip(t *testing.T) {
 						continue
 					}
 					var dst CD
-					if err := codec.Decode(enc, &dst); err != nil {
+					if err := codec.Unmarshal(enc, &dst); err != nil {
 						if atomic.AddInt64(&bad, 1) == 1 {
 							mu.Lock()
 							msg = fmt.Sprintf("dec g%d i%d: %v enc=%s", g, it, err, enc)

@@ -222,8 +222,8 @@ func (w *Writer) Uint(v uint64) error {
 	return w.afterValue()
 }
 
-// Float writes a number value spelled exactly like Marshal.
-func (w *Writer) Float(v float64) error {
+// Float64 writes a number value spelled exactly like Marshal.
+func (w *Writer) Float64(v float64) error {
 	if !w.beforeValue() {
 		return w.err
 	}

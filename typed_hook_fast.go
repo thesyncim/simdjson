@@ -32,20 +32,21 @@ const hookLayoutForceUnsafe = true
 // cursor pointer handed to the body is laundered through noescape so this opaque
 // indirect call does not force every enclosing decoder cursor to the heap. That
 // is sound only under the no-retention contract: the body must not retain the
-// Cursor. A build that cannot vouch for a generated body should use -race or
-// the simdjson_safehooks tag, which routes through the reflect dispatch in
-// typed_hook_safe.go and turns a retention into a deterministic panic.
+// DecodeCursor. A build that cannot vouch for a generated body should use
+// -race or the simdjson_safehooks tag, which routes through the reflect
+// dispatch in typed_hook_safe.go and turns a retention into a deterministic
+// panic.
 func decodeViaSimdHookFast(cursor *decoderCursor, tab unsafe.Pointer, dst unsafe.Pointer) error {
 	var hook UnmarshalerSimd
 	h := (*hookIface)(unsafe.Pointer(&hook))
 	h.tab = tab
 	h.data = noescape(dst)
-	c := Cursor{d: (*decoderCursor)(noescape(unsafe.Pointer(cursor)))}
+	c := DecodeCursor{d: (*decoderCursor)(noescape(unsafe.Pointer(cursor)))}
 	// The opaque interface call would otherwise force &c to the heap. The
-	// no-retention contract forbids the body from keeping the *Cursor, so
-	// laundering its address keeps the whole dispatch allocation-free; the
+	// no-retention contract forbids the body from keeping the *DecodeCursor,
+	// so laundering its address keeps the whole dispatch allocation-free; the
 	// safe build (typed_hook_safe.go) does not launder and traps a retention.
-	return hook.UnmarshalSimdJSON((*Cursor)(noescape(unsafe.Pointer(&c))))
+	return hook.UnmarshalSimdJSON((*DecodeCursor)(noescape(unsafe.Pointer(&c))))
 }
 
 // encodeViaSimdHookFast rebuilds the *T -> MarshalerSimd interface from the
@@ -60,15 +61,16 @@ func encodeViaSimdHookFast(tab unsafe.Pointer, src unsafe.Pointer, w Appender) A
 }
 
 // dispatchDecodeHook calls a reflect-boxed decode hook (the itab-fallback path
-// on this fast build). Both the cursor pointer and the Cursor's address are
-// laundered through noescape: on the fast build the no-retention contract holds
-// package-wide, and leaving this branch un-laundered would statically force the
-// enclosing decode's cursor to the heap even for non-hook types whose plans
-// merely make this branch reachable. The safe build's copy (typed_hook_safe.go)
-// does not launder and traps a retained Cursor instead.
+// on this fast build). Both the cursor pointer and the DecodeCursor's address
+// are laundered through noescape: on the fast build the no-retention contract
+// holds package-wide, and leaving this branch un-laundered would statically
+// force the enclosing decode's cursor to the heap even for non-hook types
+// whose plans merely make this branch reachable. The safe build's copy
+// (typed_hook_safe.go) does not launder and traps a retained DecodeCursor
+// instead.
 func dispatchDecodeHook(hook UnmarshalerSimd, cursor *decoderCursor) error {
-	c := Cursor{d: (*decoderCursor)(noescape(unsafe.Pointer(cursor)))}
-	return hook.UnmarshalSimdJSON((*Cursor)(noescape(unsafe.Pointer(&c))))
+	c := DecodeCursor{d: (*decoderCursor)(noescape(unsafe.Pointer(cursor)))}
+	return hook.UnmarshalSimdJSON((*DecodeCursor)(noescape(unsafe.Pointer(&c))))
 }
 
 // dispatchEncodeHook calls a reflect-boxed encode hook (itab-fallback path).

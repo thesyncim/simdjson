@@ -328,8 +328,8 @@ func TestProbeAccessorWrongKinds(t *testing.T) {
 		if kind != String {
 			sb, ok := node.StringBytes()
 			check(field+" Node.StringBytes", ok, sb == nil)
-			dst, ok := node.AppendString([]byte("pre"))
-			check(field+" Node.AppendString", ok, string(dst) == "pre")
+			dst, ok := node.AppendText([]byte("pre"))
+			check(field+" Node.AppendText", ok, string(dst) == "pre")
 			text, ok, err := raw.Text()
 			if err != nil {
 				t.Fatal(err)
@@ -448,7 +448,7 @@ func TestProbeNumberAccessorConsistency(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // Probe E: string decoding must be byte-exact with encoding/json for every
-// escape form, on Node.AppendString, RawValue.Text, Value.Text, EachObject
+// escape form, on Node.AppendText, RawValue.Text, Value.Text, EachObject
 // keys, and Node.Get key matching.
 // ---------------------------------------------------------------------------
 
@@ -483,11 +483,11 @@ func TestProbeStringDecodingVsStdlib(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatal(q, err)
 		}
-		if got, ok := node.AppendString(nil); !ok || string(got) != want {
-			t.Errorf("Node.AppendString(%s) = %q, %v; want %q", q, got, ok, want)
+		if got, ok := node.AppendText(nil); !ok || string(got) != want {
+			t.Errorf("Node.AppendText(%s) = %q, %v; want %q", q, got, ok, want)
 		}
-		if got, ok := node.AppendString([]byte("prefix-")); !ok || string(got) != "prefix-"+want {
-			t.Errorf("Node.AppendString(%s) with prefix = %q, %v", q, got, ok)
+		if got, ok := node.AppendText([]byte("prefix-")); !ok || string(got) != "prefix-"+want {
+			t.Errorf("Node.AppendText(%s) with prefix = %q, %v", q, got, ok)
 		}
 		if sb, ok := node.StringBytes(); ok && string(sb) != want {
 			t.Errorf("Node.StringBytes(%s) = %q, want %q", q, sb, want)
@@ -600,7 +600,7 @@ func TestProbeIterationSemantics(t *testing.T) {
 		if !ok {
 			break
 		}
-		kb, _ := key.AppendString(nil)
+		kb, _ := key.AppendText(nil)
 		iterKeys = append(iterKeys, string(kb))
 		if val.Kind() == Invalid {
 			t.Error("iterator value invalid")
@@ -613,7 +613,7 @@ func TestProbeIterationSemantics(t *testing.T) {
 	var cursorKeys []string
 	for ; cursor.Valid(); cursor = cursor.Advance() {
 		key, _ := cursor.Current()
-		kb, _ := key.AppendString(nil)
+		kb, _ := key.AppendText(nil)
 		cursorKeys = append(cursorKeys, string(kb))
 	}
 	if !reflect.DeepEqual(cursorKeys, keys) {
@@ -1034,7 +1034,7 @@ func TestProbeCrossAPIScalarAgreement(t *testing.T) {
 					walk(pointer+"/"+strconv.Itoa(i), sub)
 				}
 			case string:
-				got, ok := node.AppendString(nil)
+				got, ok := node.AppendText(nil)
 				if !ok || string(got) != typed {
 					t.Errorf("pointer %q: node string %q, stdlib %q", pointer, got, typed)
 				}

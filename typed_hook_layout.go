@@ -23,8 +23,8 @@ type layoutProbe struct {
 
 // UnmarshalSimdJSON lets *layoutProbe satisfy UnmarshalerSimd for the self-test.
 // It records the receiver's tag through the cursor-free error channel: the test
-// passes a nil Cursor and never dereferences it, so this must not touch c.
-func (p *layoutProbe) UnmarshalSimdJSON(*Cursor) error {
+// passes a nil DecodeCursor and never dereferences it, so this must not touch c.
+func (p *layoutProbe) UnmarshalSimdJSON(*DecodeCursor) error {
 	if p.tag == layoutProbeTag {
 		return nil
 	}

@@ -42,7 +42,7 @@ type Reader struct {
 	// pipe drives the optional pipelined mode (SetPipelined). When non-nil,
 	// Next pulls framed, validated values from a worker goroutine that reads
 	// one batch ahead, and buf/valStart/valEnd alias the current batch buffer
-	// so Bytes, Cursor, DecodeTo, and DecodeNext work unchanged. It is nil for
+	// so Bytes, Cursor, DecodeFrom, and DecodeNext work unchanged. It is nil for
 	// the default single-goroutine Reader, which pays nothing for it.
 	pipe *pipeline
 }
@@ -224,7 +224,7 @@ func (r *Reader) SetMaxValueBytes(n int) {
 // pipelined framing: a worker goroutine reads and validates the next batch of
 // values while the caller decodes the current one, overlapping read latency
 // and framing with the caller's decode work. Everything else is unchanged —
-// Next, Bytes, Cursor, InputOffset, Err, DecodeTo, and DecodeNext behave
+// Next, Bytes, Cursor, InputOffset, Err, DecodeFrom, and DecodeNext behave
 // identically and yield the same value sequence and errors — so pipelining is
 // a drop-in switch, not a new API.
 //
@@ -276,21 +276,21 @@ func (r *Reader) Bytes() []byte {
 	return r.buf[r.valStart:r.valEnd]
 }
 
-// DecodeTo decodes the current value through a compiled decoder. Decoders
+// DecodeFrom decodes the current value through a compiled decoder. Decoders
 // compiled with ZeroCopy alias the reader's buffer and follow the Bytes
 // validity window; owned decoders copy and are safe to retain.
-func DecodeTo[T any](r *Reader, dec Decoder[T], dst *T) error {
+func DecodeFrom[T any](r *Reader, dec Decoder[T], dst *T) error {
 	if !r.hasValue {
 		if r.err != nil {
 			return r.err
 		}
-		return errors.New("simdjson: DecodeTo without a current value; call Next first")
+		return errors.New("simdjson: DecodeFrom without a current value; call Next first")
 	}
 	return dec.Decode(r.buf[r.valStart:r.valEnd], dst)
 }
 
 // DecodeNext advances to the next value and decodes it in one pass, combining
-// Next and DecodeTo. The value's extent is located by a resumable structural
+// Next and DecodeFrom. The value's extent is located by a resumable structural
 // frame, so a value split across reads is scanned once and decoded once, even
 // when it spans many refills. It returns false at the end of the stream or on
 // error; Err distinguishes the two. After a true result, Bytes and InputOffset

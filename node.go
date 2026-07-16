@@ -140,7 +140,7 @@ func (v Node) Float64() (float64, bool) {
 }
 
 // StringBytes returns an unescaped string as a source alias. Escaped strings
-// return false; use AppendString for those.
+// return false; use AppendText for those.
 func (v Node) StringBytes() ([]byte, bool) {
 	if v.Kind() != String {
 		return nil, false
@@ -152,8 +152,8 @@ func (v Node) StringBytes() ([]byte, bool) {
 	return tapeSourceBytes(v.src, e.start+1, e.end-1), true
 }
 
-// AppendString appends v's decoded string to dst.
-func (v Node) AppendString(dst []byte) ([]byte, bool) {
+// AppendText appends v's decoded string to dst.
+func (v Node) AppendText(dst []byte) ([]byte, bool) {
 	if v.Kind() != String {
 		return dst, false
 	}

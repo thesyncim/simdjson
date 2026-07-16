@@ -17,7 +17,7 @@ package simdjson
 // extents, and hands the batch off; a value straddling the batch boundary has
 // only its partial tail copied into the head of the next batch's buffer. Each
 // batch buffer stays alive for the whole batch, so the Reader can alias it into
-// buf/valStart/valEnd and every reader method (Bytes, Cursor, DecodeTo,
+// buf/valStart/valEnd and every reader method (Bytes, Cursor, DecodeFrom,
 // DecodeNext, InputOffset) works unchanged under the same "valid until the next
 // Next" contract. Buffers recycle through a two-slot free list once the caller
 // advances past them, so steady state allocates nothing.

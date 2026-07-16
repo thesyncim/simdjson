@@ -80,12 +80,12 @@ func TestWriterTokensMatchStdlib(t *testing.T) {
 	w.Key("name")
 	w.String("he said \"hi\" & <waved> ")
 	w.Key("score")
-	w.Float(12.5)
+	w.Float64(12.5)
 	w.Key("flags")
 	w.BeginArray()
 	w.Bool(true)
 	w.Null()
-	w.Float(1e30)
+	w.Float64(1e30)
 	w.EndArray()
 	w.Key("empty")
 	w.BeginObject()
@@ -258,7 +258,7 @@ func TestReaderNDJSONRoundTrip(t *testing.T) {
 			count := 0
 			for r.Next() {
 				var got streamRecord
-				if err := DecodeTo(r, dec, &got); err != nil {
+				if err := DecodeFrom(r, dec, &got); err != nil {
 					t.Fatalf("chunk=%d sep=%q row %d: %v", chunk, sep, count, err)
 				}
 				if got != streamRecordAt(count) {
@@ -288,13 +288,13 @@ func TestReaderValueLargerThanBuffer(t *testing.T) {
 	if !r.Next() {
 		t.Fatalf("first value: %v", r.Err())
 	}
-	if err := DecodeTo(r, dec, &got); err != nil || len(got.Name) != len(big) {
+	if err := DecodeFrom(r, dec, &got); err != nil || len(got.Name) != len(big) {
 		t.Fatalf("big value: %v len=%d", err, len(got.Name))
 	}
 	if !r.Next() {
 		t.Fatalf("second value: %v", r.Err())
 	}
-	if err := DecodeTo(r, dec, &got); err != nil || got.Name != "after" {
+	if err := DecodeFrom(r, dec, &got); err != nil || got.Name != "after" {
 		t.Fatalf("after value: %v %+v", err, got)
 	}
 	if r.Next() || r.Err() != nil {
@@ -428,7 +428,7 @@ func TestStreamWriterReaderPipe(t *testing.T) {
 	count := 0
 	for r.Next() {
 		var got streamRecord
-		if err := DecodeTo(r, dec, &got); err != nil {
+		if err := DecodeFrom(r, dec, &got); err != nil {
 			t.Fatal(err)
 		}
 		if got != streamRecordAt(count) {
@@ -468,7 +468,7 @@ func TestStreamSteadyStateAllocs(t *testing.T) {
 		r := NewReaderSize(bytes.NewReader(data), 64<<10)
 		var got streamRecord
 		for r.Next() {
-			if err := DecodeTo(r, dec, &got); err != nil {
+			if err := DecodeFrom(r, dec, &got); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -559,7 +559,7 @@ func BenchmarkStreamReadNDJSON(b *testing.B) {
 		r := NewReader(bytes.NewReader(data.Bytes()))
 		var got streamRecord
 		for r.Next() {
-			if err := DecodeTo(r, dec, &got); err != nil {
+			if err := DecodeFrom(r, dec, &got); err != nil {
 				b.Fatal(err)
 			}
 		}

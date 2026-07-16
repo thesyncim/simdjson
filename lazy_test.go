@@ -70,7 +70,7 @@ func valueToAny(t *testing.T, v Value) any {
 			if ks != nil {
 				keyStr = string(ks)
 			} else {
-				b, _ := key.AppendString(nil)
+				b, _ := key.AppendText(nil)
 				keyStr = string(b)
 			}
 			out[keyStr] = valueToAny(t, v.with(val))

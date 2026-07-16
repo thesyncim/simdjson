@@ -41,13 +41,13 @@ func (c Codec[T]) Encoder() Encoder[T] { return c.enc }
 // Decoder returns the underlying compiled decoder.
 func (c Codec[T]) Decoder() Decoder[T] { return c.dec }
 
-// Decode decodes one complete JSON value into dst.
-func (c Codec[T]) Decode(src []byte, dst *T) error {
+// Unmarshal decodes one complete JSON value into dst.
+func (c Codec[T]) Unmarshal(src []byte, dst *T) error {
 	return c.dec.Decode(src, dst)
 }
 
-// DecodeArray decodes a top-level array, reusing dst's capacity.
-func (c Codec[T]) DecodeArray(src []byte, dst []T) ([]T, error) {
+// UnmarshalArray decodes a top-level array, reusing dst's capacity.
+func (c Codec[T]) UnmarshalArray(src []byte, dst []T) ([]T, error) {
 	return c.dec.DecodeArray(src, dst)
 }
 
@@ -82,8 +82,8 @@ func (c Codec[T]) EncodeTo(w *Writer, src *T) error {
 	return EncodeTo(w, c.enc, src)
 }
 
-// DecodeFrom decodes the Reader's current value, under the same aliasing
-// window as DecodeTo.
+// DecodeFrom decodes the Reader's current value. Zero-copy decodes alias the
+// reader's buffer and follow the Bytes validity window.
 func (c Codec[T]) DecodeFrom(r *Reader, dst *T) error {
-	return DecodeTo(r, c.dec, dst)
+	return DecodeFrom(r, c.dec, dst)
 }

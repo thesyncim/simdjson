@@ -163,7 +163,7 @@ func TestBuildIndexAndTraverse(t *testing.T) {
 		t.Fatal("escaped key missing")
 	}
 	var decoded [32]byte
-	text, ok := escaped.AppendString(decoded[:0])
+	text, ok := escaped.AppendText(decoded[:0])
 	if !ok || string(text) != "line\n𝄞" {
 		t.Fatalf("decoded escaped string = %q, %v", text, ok)
 	}

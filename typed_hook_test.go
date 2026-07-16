@@ -10,7 +10,7 @@ import (
 
 // This file exercises the method-hook tier end to end. hookAddress and
 // hookPerson below implement UnmarshalerSimd/MarshalerSimd using only the
-// public Cursor/Appender/Field surface — the exact code a generator would emit,
+// public DecodeCursor/Appender/Field surface — the exact code a generator would emit,
 // including a full arbitrary-order fallback that handles reordered, missing,
 // extra, and duplicate members and honours DecoderOptions.CaseSensitive. Their
 // twins hookAddressPlain/hookPersonPlain carry the identical layout and json
@@ -33,14 +33,14 @@ type hookAddressPlain struct {
 
 var hookAddressFields = MakeFieldSet("street", "city", "zip")
 
-func (a *hookAddress) UnmarshalSimdJSON(c *Cursor) error {
+func (a *hookAddress) UnmarshalSimdJSON(c *DecodeCursor) error {
 	// A top-level null is a no-op on a struct, matching encoding/json.
 	if null, err := c.Null(); err != nil {
 		return err
 	} else if null {
 		return nil
 	}
-	if err := c.ObjectOpen("hookAddress"); err != nil {
+	if err := c.BeginObject("hookAddress"); err != nil {
 		return err
 	}
 	// Expected-order fast path: chain packed matches, drop to the general
@@ -72,7 +72,7 @@ func (a *hookAddress) UnmarshalSimdJSON(c *Cursor) error {
 // unmarshalRest is the arbitrary-order fallback: a NextField loop keyed by the
 // FieldSet, tolerant of reordered, missing, extra, and duplicate members and
 // case-insensitive per the decoder option. A real generator emits exactly this.
-func (a *hookAddress) unmarshalRest(c *Cursor, first bool) error {
+func (a *hookAddress) unmarshalRest(c *DecodeCursor, first bool) error {
 	cs := c.CaseSensitive()
 	for {
 		key, ok, err := c.NextField(first)
@@ -137,13 +137,13 @@ type hookPersonPlain struct {
 
 var hookPersonFields = MakeFieldSet("id", "name", "active", "score", "tags", "address", "aliases", "nickname")
 
-func (p *hookPerson) UnmarshalSimdJSON(c *Cursor) error {
+func (p *hookPerson) UnmarshalSimdJSON(c *DecodeCursor) error {
 	if null, err := c.Null(); err != nil {
 		return err
 	} else if null {
 		return nil
 	}
-	if err := c.ObjectOpen("hookPerson"); err != nil {
+	if err := c.BeginObject("hookPerson"); err != nil {
 		return err
 	}
 	// This body always takes the general loop, exercising the FieldSet lookup
@@ -151,7 +151,7 @@ func (p *hookPerson) UnmarshalSimdJSON(c *Cursor) error {
 	return p.unmarshalAll(c, true)
 }
 
-func (p *hookPerson) unmarshalAll(c *Cursor, first bool) error {
+func (p *hookPerson) unmarshalAll(c *DecodeCursor, first bool) error {
 	cs := c.CaseSensitive()
 	for {
 		key, ok, err := c.NextField(first)
@@ -193,14 +193,14 @@ func (p *hookPerson) unmarshalAll(c *Cursor, first bool) error {
 	}
 }
 
-func (p *hookPerson) decodeTags(c *Cursor) error {
+func (p *hookPerson) decodeTags(c *DecodeCursor) error {
 	if null, err := c.Null(); err != nil {
 		return err
 	} else if null {
 		p.Tags = nil
 		return nil
 	}
-	if err := c.ArrayOpen("[]string"); err != nil {
+	if err := c.BeginArray("[]string"); err != nil {
 		return err
 	}
 	// An empty array must decode to a non-nil empty slice, matching
@@ -228,14 +228,14 @@ func (p *hookPerson) decodeTags(c *Cursor) error {
 	}
 }
 
-func (p *hookPerson) decodeAliases(c *Cursor) error {
+func (p *hookPerson) decodeAliases(c *DecodeCursor) error {
 	if null, err := c.Null(); err != nil {
 		return err
 	} else if null {
 		p.Aliases = nil
 		return nil
 	}
-	if err := c.ArrayOpen("[]hookAddress"); err != nil {
+	if err := c.BeginArray("[]hookAddress"); err != nil {
 		return err
 	}
 	if p.Aliases == nil {

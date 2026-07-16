@@ -12,10 +12,10 @@ package simdjson
 //
 // # The no-retention contract
 //
-// The [Cursor] passed to UnmarshalSimdJSON and the [Appender] passed to
+// The [DecodeCursor] passed to UnmarshalSimdJSON and the [Appender] passed to
 // MarshalSimdJSON borrow state that lives on the enclosing decode or encode
 // call's stack. Neither may be retained past the method's return: do not store
-// the Cursor pointer or the Appender in a heap object, a goroutine, or a
+// the DecodeCursor pointer or the Appender in a heap object, a goroutine, or a
 // package variable, and do not capture either in a closure that outlives the
 // call. A hook that only reads scalars, iterates members and elements, and
 // returns (the shape a generator emits) satisfies this automatically. Building
@@ -48,10 +48,10 @@ import (
 // positioned immediately after it, exactly as the compiled decoder would.
 // Returning an error aborts the enclosing decode.
 //
-// The Cursor must not be retained past the call; see the no-retention contract
-// in this file's package comment.
+// The DecodeCursor must not be retained past the call; see the no-retention
+// contract in this file's package comment.
 type UnmarshalerSimd interface {
-	UnmarshalSimdJSON(c *Cursor) error
+	UnmarshalSimdJSON(c *DecodeCursor) error
 }
 
 // MarshalerSimd is the opt-in encode hook. A type implements it to append its
@@ -77,15 +77,16 @@ var (
 	marshalerSimdReflectType   = reflect.TypeFor[MarshalerSimd]()
 )
 
-// Cursor is the public face of the typed decoder inside an UnmarshalSimdJSON
-// body: a handle over the same interface-free parser the compiled interpreter
-// drives, exposing the scalar kernels, the packed-key field matcher, and the
-// array iterator. Generated code parses with exactly the machinery the
-// compiled path uses, so a hook pays no interpretation overhead.
+// DecodeCursor is the public face of the typed decoder inside an
+// UnmarshalSimdJSON body: a handle over the same interface-free parser the
+// compiled interpreter drives, exposing the scalar kernels, the packed-key
+// field matcher, and the array iterator. Generated code parses with exactly
+// the machinery the compiled path uses, so a hook pays no interpretation
+// overhead.
 //
-// A Cursor is only ever obtained as the argument to UnmarshalSimdJSON and must
-// not be retained past that call.
-type Cursor struct {
+// A DecodeCursor is only ever obtained as the argument to UnmarshalSimdJSON
+// and must not be retained past that call.
+type DecodeCursor struct {
 	d *decoderCursor
 }
 
@@ -193,23 +194,23 @@ func (w Appender) Float32(v float32) Appender {
 // body that formats its own output through Raw can match the option.
 func (w Appender) EscapeHTML() bool { return w.escapeHTML }
 
-// --- Cursor: object framing ------------------------------------------------
+// --- DecodeCursor: object framing ------------------------------------------
 
-// ObjectOpen consumes the opening brace of an object, applying the decoder's
+// BeginObject consumes the opening brace of an object, applying the decoder's
 // depth guard. typeName names the type in the error if the next value is not
 // an object.
-func (c *Cursor) ObjectOpen(typeName string) error { return c.d.BeginObject(typeName) }
+func (c *DecodeCursor) BeginObject(typeName string) error { return c.d.BeginObject(typeName) }
 
-// ArrayOpen consumes the opening bracket of an array, applying the depth guard.
-func (c *Cursor) ArrayOpen(typeName string) error { return c.d.BeginArray(typeName) }
+// BeginArray consumes the opening bracket of an array, applying the depth guard.
+func (c *DecodeCursor) BeginArray(typeName string) error { return c.d.BeginArray(typeName) }
 
 // NextField is the general object-member iterator. Pass first=true only for
-// the first call after ObjectOpen; it returns the next member's key and true,
+// the first call after BeginObject; it returns the next member's key and true,
 // or "" and false at the closing brace. The returned key aliases the source
 // (or the escaped-string arena) under the active decode mode and must not be
 // mutated. Use it for arbitrary member order, unknown members, and duplicates;
 // a straight-line body pairs it with a [FieldSet] for the packed-key match.
-func (c *Cursor) NextField(first bool) (key string, ok bool, err error) {
+func (c *DecodeCursor) NextField(first bool) (key string, ok bool, err error) {
 	return c.d.NextObjectField(first)
 }
 
@@ -219,28 +220,28 @@ func (c *Cursor) NextField(first bool) (key string, ok bool, err error) {
 // advancing when the next member is not name, so a body can fall back to
 // NextField. Expected-order bodies chain Field calls; the first miss should
 // drop to a NextField loop keyed by a [FieldSet].
-func (c *Cursor) Field(first bool, f *Field) bool {
+func (c *DecodeCursor) Field(first bool, f *Field) bool {
 	return c.d.matchObjectFieldExpected(first, &f.f)
 }
 
 // CaseSensitive reports whether the decoder was compiled with
 // DecoderOptions.CaseSensitive, so a NextField loop can fold key comparisons to
 // match the decoder's own field matching.
-func (c *Cursor) CaseSensitive() bool { return c.d.CaseSensitive() }
+func (c *DecodeCursor) CaseSensitive() bool { return c.d.CaseSensitive() }
 
-// --- Cursor: array framing -------------------------------------------------
+// --- DecodeCursor: array framing -------------------------------------------
 
 // NextElement reports whether another array element follows. Pass first=true
-// only for the first call after ArrayOpen. It consumes the comma between
+// only for the first call after BeginArray. It consumes the comma between
 // elements and the closing bracket at the end.
-func (c *Cursor) NextElement(first bool) (bool, error) { return c.d.NextArrayElement(first) }
+func (c *DecodeCursor) NextElement(first bool) (bool, error) { return c.d.NextArrayElement(first) }
 
-// --- Cursor: low-level positioning -----------------------------------------
+// --- DecodeCursor: low-level positioning -----------------------------------
 
 // Expect consumes ch when it is the next byte, without skipping whitespace, and
 // reports whether it did. It lets a body stay on the packed path for a compact
 // document and fall back explicitly when a delimiter is missing.
-func (c *Cursor) Expect(ch byte) bool {
+func (c *DecodeCursor) Expect(ch byte) bool {
 	d := c.d
 	if i := d.i; i < len(d.src) && d.src[i] == ch {
 		d.i = i + 1
@@ -251,8 +252,8 @@ func (c *Cursor) Expect(ch byte) bool {
 
 // ExpectObjectClose consumes a closing brace, updating the depth bookkeeping,
 // and reports whether it did. A body uses it to close an object opened with
-// ObjectOpen after matching every member in order.
-func (c *Cursor) ExpectObjectClose() bool {
+// BeginObject after matching every member in order.
+func (c *DecodeCursor) ExpectObjectClose() bool {
 	d := c.d
 	if i := d.i; i < len(d.src) && d.src[i] == '}' {
 		d.i = i + 1
@@ -264,18 +265,18 @@ func (c *Cursor) ExpectObjectClose() bool {
 
 // Skip validates and consumes exactly one JSON value without materializing it,
 // for a member or element a body does not model.
-func (c *Cursor) Skip() error { return c.d.Skip() }
+func (c *DecodeCursor) Skip() error { return c.d.Skip() }
 
 // Null consumes a null literal and reports true, or leaves a non-null value in
 // place and reports false. A body calls it before a scalar read to distinguish
 // an absent value.
-func (c *Cursor) Null() (bool, error) { return c.d.TryNull() }
+func (c *DecodeCursor) Null() (bool, error) { return c.d.TryNull() }
 
 // Raw captures the raw bytes of the next JSON value, validating and consuming
 // exactly one value. The returned RawValue aliases the source buffer, so it is
 // valid only under the input's lifetime and, in zero-copy mode, only while the
 // input is unmodified.
-func (c *Cursor) Raw() (RawValue, error) {
+func (c *DecodeCursor) Raw() (RawValue, error) {
 	d := c.d
 	start := d.i
 	if err := d.Skip(); err != nil {
@@ -284,54 +285,54 @@ func (c *Cursor) Raw() (RawValue, error) {
 	return RawValue{src: d.src[start:d.i]}, nil
 }
 
-// --- Cursor: scalar reads --------------------------------------------------
+// --- DecodeCursor: scalar reads --------------------------------------------
 
 // Bool decodes a JSON boolean into dst.
-func (c *Cursor) Bool(dst *bool) error { return c.d.Bool(dst) }
+func (c *DecodeCursor) Bool(dst *bool) error { return c.d.Bool(dst) }
 
 // Int decodes a JSON number into an int.
-func (c *Cursor) Int(dst *int) error { return c.d.Int(dst) }
+func (c *DecodeCursor) Int(dst *int) error { return c.d.Int(dst) }
 
 // Int8 decodes a JSON number into an int8.
-func (c *Cursor) Int8(dst *int8) error { return c.d.Int(dst) }
+func (c *DecodeCursor) Int8(dst *int8) error { return c.d.Int(dst) }
 
 // Int16 decodes a JSON number into an int16.
-func (c *Cursor) Int16(dst *int16) error { return c.d.Int(dst) }
+func (c *DecodeCursor) Int16(dst *int16) error { return c.d.Int(dst) }
 
 // Int32 decodes a JSON number into an int32.
-func (c *Cursor) Int32(dst *int32) error { return c.d.Int(dst) }
+func (c *DecodeCursor) Int32(dst *int32) error { return c.d.Int(dst) }
 
 // Int64 decodes a JSON number into an int64.
-func (c *Cursor) Int64(dst *int64) error { return c.d.Int(dst) }
+func (c *DecodeCursor) Int64(dst *int64) error { return c.d.Int(dst) }
 
 // Uint decodes a JSON number into a uint.
-func (c *Cursor) Uint(dst *uint) error { return c.d.Uint(dst) }
+func (c *DecodeCursor) Uint(dst *uint) error { return c.d.Uint(dst) }
 
 // Uint8 decodes a JSON number into a uint8.
-func (c *Cursor) Uint8(dst *uint8) error { return c.d.Uint(dst) }
+func (c *DecodeCursor) Uint8(dst *uint8) error { return c.d.Uint(dst) }
 
 // Uint16 decodes a JSON number into a uint16.
-func (c *Cursor) Uint16(dst *uint16) error { return c.d.Uint(dst) }
+func (c *DecodeCursor) Uint16(dst *uint16) error { return c.d.Uint(dst) }
 
 // Uint32 decodes a JSON number into a uint32.
-func (c *Cursor) Uint32(dst *uint32) error { return c.d.Uint(dst) }
+func (c *DecodeCursor) Uint32(dst *uint32) error { return c.d.Uint(dst) }
 
 // Uint64 decodes a JSON number into a uint64.
-func (c *Cursor) Uint64(dst *uint64) error { return c.d.Uint(dst) }
+func (c *DecodeCursor) Uint64(dst *uint64) error { return c.d.Uint(dst) }
 
 // Float32 decodes a JSON number into a float32.
-func (c *Cursor) Float32(dst *float32) error { return c.d.Float(dst) }
+func (c *DecodeCursor) Float32(dst *float32) error { return c.d.Float(dst) }
 
 // Float64 decodes a JSON number into a float64.
-func (c *Cursor) Float64(dst *float64) error { return c.d.Float(dst) }
+func (c *DecodeCursor) Float64(dst *float64) error { return c.d.Float(dst) }
 
 // String decodes a JSON string into dst, unescaping as needed. In zero-copy
 // mode an unescaped string aliases the source.
-func (c *Cursor) String(dst *string) error { return c.d.String(dst) }
+func (c *DecodeCursor) String(dst *string) error { return c.d.String(dst) }
 
-// Number decodes a JSON number as its literal text, for a json.Number-style
+// NumberText decodes a JSON number as its literal text, for a json.Number-style
 // field that preserves the exact digits.
-func (c *Cursor) Number(dst *string) error { return c.d.Number(dst) }
+func (c *DecodeCursor) NumberText(dst *string) error { return c.d.Number(dst) }
 
 // --- Field / FieldSet: packed-key matchers ---------------------------------
 
@@ -522,7 +523,8 @@ func (cursor *decoderCursor) decodeViaSimdHook(node *typedNode, dst unsafe.Point
 // decodeViaSimdHookReflect is the safe, reflect-based decode dispatch: the
 // itab-fallback path and the whole safe-hooks build route through it. It boxes
 // a genuine *T receiver, so the interface value and the pointer it carries are
-// ordinary heap-safe values and a retained Cursor cannot alias freed stack.
+// ordinary heap-safe values and a retained DecodeCursor cannot alias freed
+// stack.
 //
 // dst is the real decode destination — the caller's value, or a field within
 // it — alive for the whole call, so laundering it through noescape (the same

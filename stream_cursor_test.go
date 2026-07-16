@@ -489,7 +489,7 @@ func nodeWalkValue(n Node, s *walkSums) error {
 			if kb, ok := key.StringBytes(); ok {
 				s.strBytes += len(kb)
 			} else {
-				decoded, _ := key.AppendString(nil)
+				decoded, _ := key.AppendText(nil)
 				s.strBytes += len(decoded)
 			}
 			if err := nodeWalkValue(value, s); err != nil {
@@ -512,7 +512,7 @@ func nodeWalkValue(n Node, s *walkSums) error {
 		if b, ok := n.StringBytes(); ok {
 			s.strBytes += len(b)
 		} else {
-			decoded, _ := n.AppendString(nil)
+			decoded, _ := n.AppendText(nil)
 			s.strBytes += len(decoded)
 		}
 		return nil

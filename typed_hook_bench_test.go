@@ -36,13 +36,13 @@ type hkbHookRecord struct {
 
 var hkbHookFields = MakeFieldSet("id", "active", "name", "note", "score")
 
-func (r *hkbHookRecord) UnmarshalSimdJSON(c *Cursor) error {
+func (r *hkbHookRecord) UnmarshalSimdJSON(c *DecodeCursor) error {
 	if null, err := c.Null(); err != nil {
 		return err
 	} else if null {
 		return nil
 	}
-	if err := c.ObjectOpen("hkbHookRecord"); err != nil {
+	if err := c.BeginObject("hkbHookRecord"); err != nil {
 		return err
 	}
 	// Expected-order fast path with a general fallback.
@@ -77,7 +77,7 @@ func (r *hkbHookRecord) UnmarshalSimdJSON(c *Cursor) error {
 	return r.unmarshalRest(c)
 }
 
-func (r *hkbHookRecord) unmarshalRest(c *Cursor) error {
+func (r *hkbHookRecord) unmarshalRest(c *DecodeCursor) error {
 	cs := c.CaseSensitive()
 	first := true
 	for {

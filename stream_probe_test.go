@@ -291,7 +291,7 @@ func TestProbeReaderInputOffsetAfterCleanEnd(t *testing.T) {
 	}
 }
 
-// --- Attack surface 3: DecodeNext / DecodeTo ------------------------------
+// --- Attack surface 3: DecodeNext / DecodeFrom ------------------------------
 
 type streamProbeRec struct {
 	A int `json:"a"`
@@ -309,8 +309,8 @@ func TestProbeDecodeNextTypeMismatchMidStream(t *testing.T) {
 	r := NewReaderSize(strings.NewReader(data), 512)
 
 	var v streamProbeRec
-	if err := DecodeTo(r, dec, &v); err == nil {
-		t.Fatal("DecodeTo before Next must error")
+	if err := DecodeFrom(r, dec, &v); err == nil {
+		t.Fatal("DecodeFrom before Next must error")
 	}
 	if !DecodeNext(r, dec, &v) || v.A != 1 {
 		t.Fatalf("first value: %+v err=%v", v, r.Err())
@@ -384,7 +384,7 @@ func TestProbeAlternatingNextAndDecodeNext(t *testing.T) {
 				t.Fatalf("row %d: %v", i, r.Err())
 			}
 			var v streamProbeRec
-			if err := DecodeTo(r, dec, &v); err != nil || v.A != i {
+			if err := DecodeFrom(r, dec, &v); err != nil || v.A != i {
 				t.Fatalf("row %d: %+v err=%v", i, v, err)
 			}
 		}
@@ -468,7 +468,7 @@ func TestProbeWriterNonFiniteFloats(t *testing.T) {
 	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
 		var out bytes.Buffer
 		w := NewWriter(&out)
-		if err := w.Float(v); err == nil {
+		if err := w.Float64(v); err == nil {
 			t.Fatalf("Float(%v) must error like Marshal", v)
 		}
 		if w.Err() == nil {
@@ -558,7 +558,7 @@ func TestProbeWriterFloatParity(t *testing.T) {
 	for _, v := range values {
 		var out bytes.Buffer
 		w := NewWriter(&out)
-		if err := w.Float(v); err != nil {
+		if err := w.Float64(v); err != nil {
 			t.Fatal(err)
 		}
 		w.Flush()
