@@ -8,6 +8,15 @@ func Parse16Digits(digits *[16]byte) uint64 {
 	return parse16DigitsScalar(digits)
 }
 
+// Parse16DigitsChecked validates and reduces sixteen ASCII decimal digits in
+// one operation. It returns false and zero when any byte is not a digit.
+func Parse16DigitsChecked(digits *[16]byte) (uint64, bool) {
+	if !All16Digits(digits) {
+		return 0, false
+	}
+	return parse16DigitsScalar(digits), true
+}
+
 func store16Digits(dst *[16]byte, value uint64) {
 	store16DigitsScalar(dst, value)
 }

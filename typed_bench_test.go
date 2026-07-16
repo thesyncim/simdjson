@@ -33,6 +33,8 @@ type benchDocument struct {
 
 var benchSmallJSON = []byte(`{"id":1,"ok":true,"name":"sim"}`)
 
+var benchUint64SliceSink []uint64
+
 func benchRecordsJSON(count int) []byte {
 	var out strings.Builder
 	out.Grow(count * 128)
@@ -89,6 +91,41 @@ func BenchmarkDecodeMapReused(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func BenchmarkDecodeUint64Array16(b *testing.B) {
+	const count = 1024
+	var source strings.Builder
+	source.Grow(count*17 + 2)
+	source.WriteByte('[')
+	for i := range count {
+		if i != 0 {
+			source.WriteByte(',')
+		}
+		source.WriteString(strconv.FormatUint(1_000_000_000_000_000+uint64(i), 10))
+	}
+	source.WriteByte(']')
+	src := []byte(source.String())
+
+	decoder, err := CompileDecoder[uint64](DecoderOptions{Replace: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	dst := make([]uint64, 0, count)
+	dst, err = decoder.DecodeArray(src, dst)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		dst, err = decoder.DecodeArray(src, dst[:0])
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	benchUint64SliceSink = dst
 }
 
 func BenchmarkDecodeMedium(b *testing.B) {
