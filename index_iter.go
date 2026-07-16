@@ -1,6 +1,20 @@
 package simdjson
 
 // ArrayIter iterates array values without allocating.
+//
+// Two loop shapes are supported. The Next methods advance through a pointer
+// receiver and read naturally in a for loop. The Valid/Current/Advance
+// methods thread the iterator by value instead:
+//
+//	for ; it.Valid(); it = it.Advance() {
+//		use(it.Current())
+//	}
+//
+// The by-value shape keeps the iterator's state in registers, where the
+// pointer receiver pins it to the stack, and iterates measurably faster:
+// about 3.3x on a kind-only loop over an array of small objects
+// (BenchmarkIterShape). Prefer it on hot paths; the two shapes visit the
+// same elements.
 type ArrayIter struct {
 	src       *byte
 	entry     *IndexEntry
@@ -113,6 +127,11 @@ func (it *ArrayIter) NextRaw() (RawValue, bool) {
 
 // FlatArrayIter iterates an array whose direct elements each occupy one index
 // entry. Its fixed entry stride is faster than the general subtree cursor.
+//
+// It supports the same two loop shapes as [ArrayIter]; the by-value
+// Valid/Current/Advance form is about 6.4x faster than Next here
+// (BenchmarkIterShape), the fixed stride leaving nothing to hide the Next
+// family's per-element stack round trip behind.
 type FlatArrayIter struct {
 	src       *byte
 	entry     *IndexEntry
@@ -223,6 +242,10 @@ func (it *FlatArrayIter) NextRaw() (RawValue, bool) {
 }
 
 // ObjectIter iterates ordered object key/value pairs without allocating.
+//
+// It supports the same two loop shapes as [ArrayIter]; the by-value
+// Valid/Current/Advance form is about 1.3x faster than Next on a
+// record-shaped object (BenchmarkIterShape).
 type ObjectIter struct {
 	src       *byte
 	entry     *IndexEntry
@@ -323,6 +346,10 @@ func (it *ObjectIter) NextRaw() (key, value RawValue, ok bool) {
 
 // FlatObjectIter iterates an object whose direct values each occupy one index
 // entry.
+//
+// It supports the same two loop shapes as [ArrayIter]; the by-value
+// Valid/Current/Advance form is about 2.9x faster than Next on a flat
+// scalar object (BenchmarkIterShape).
 type FlatObjectIter struct {
 	src       *byte
 	entry     *IndexEntry
