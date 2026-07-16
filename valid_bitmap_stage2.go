@@ -57,7 +57,7 @@ func validBitmapStreamedAsm(src []byte) (valid, decided bool) {
 	var scalars [validBitmapStreamChunkAsm * 64]uint32
 
 	utf8RunStart, utf8RunEnd := -1, 0
-	wsSample, emitSample := 0, 0
+	wsSample, emitSample, inStrSample, escSample := 0, 0, 0, 0
 	skipEscape := -1
 
 	fullBlocks := n / 64
@@ -96,7 +96,7 @@ func validBitmapStreamedAsm(src []byte) (valid, decided bool) {
 			pos := block * 64
 			rec := &recs[i]
 
-			if rec.Bad != 0 {
+			if rec.Bad {
 				return false, true
 			}
 			// UTF-8 is checked per run of non-ASCII blocks while the bytes
@@ -122,8 +122,10 @@ func validBitmapStreamedAsm(src []byte) (valid, decided bool) {
 			if block < validBitmapSampleBlocks {
 				wsSample += bits.OnesCount64(rec.WsOut)
 				emitSample += bits.OnesCount64(rec.Emit)
+				inStrSample += bits.OnesCount64(rec.InStr)
+				escSample += bits.OnesCount64(rec.EscInStr)
 				if block == validBitmapSampleBlocks-1 &&
-					(wsSample < validBitmapSampleMinWs || wsSample*2 < emitSample*7) {
+					!validBitmapSampleCommit(wsSample, emitSample, inStrSample, escSample) {
 					return false, false
 				}
 			}

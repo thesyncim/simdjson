@@ -20,11 +20,20 @@ const Stage1ChunkBlocks = 32
 
 // Stage1Rec is the per-block output of the batched kernel. Bit i of each
 // mask describes byte i of the block.
+//
+// The record is deliberately 40 bytes. Growing it to 48 measured about one
+// percent slower end to end on emit-dense documents (the validator consumes
+// records from small stack arrays right after the kernel writes them), and
+// carrying the density signals as kernel-side popcounts instead measured
+// several percent worse (two popcounts per block dwarf the one store they
+// save). Bad therefore carries only the verdict — no consumer needs the
+// violation positions — which frees its mask slot for InStr.
 type Stage1Rec struct {
 	Emit     uint64 // structural bytes outside strings, opening quotes, scalar starts
 	EscInStr uint64 // escape-target bytes inside strings (byte after a backslash)
-	Bad      uint64 // control-byte violations (raw controls in strings, non-ws controls outside)
 	WsOut    uint64 // whitespace outside strings (density sampling)
+	InStr    uint64 // in-string bytes, opening quote included, closing quote excluded (density sampling)
+	Bad      bool   // any control-byte violation (raw control in a string, non-ws control outside)
 	NonASCII bool   // any byte at or above 0x80 in this block (drives per-run UTF-8 checking)
 }
 
@@ -50,7 +59,8 @@ func Stage1RecFromMasks(m *Stage1Masks, st *Stage1Stream, r *Stage1Rec) {
 	st.Follows = cand >> 63
 	r.Emit = m.Structural&outside | openers | starts&outside
 	r.EscInStr = escaped & inStr
-	r.Bad = m.Control&inStr | m.Control&outside&^m.Whitespace
+	r.Bad = m.Control&inStr|m.Control&outside&^m.Whitespace != 0
 	r.WsOut = m.Whitespace & outside
+	r.InStr = inStr
 	r.NonASCII = m.NonASCII
 }

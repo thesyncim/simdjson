@@ -15,9 +15,10 @@ import (
 // on indentation-heavy documents most bytes never reach the walk at all.
 //
 // Dense compact documents emit a position every few bytes, where the
-// recursive scanner is still faster, so a whitespace sample of the leading
-// blocks decides which engine runs. The engine only reports validity;
-// Validate re-runs the scalar validator for exact error offsets.
+// recursive scanner is still faster, so a density sample of the leading
+// blocks decides which engine runs (see validBitmapSampleCommit). The
+// engine only reports validity; Validate re-runs the scalar validator for
+// exact error offsets.
 //
 // On arm64 the classification runs through the batched stage-1 kernel
 // (simd.Stage1BlocksGP): a chunk of blocks is classified per call, so the
@@ -42,16 +43,22 @@ const (
 	// latency.
 	validBitmapMinBytes = 1 << 16
 
-	// The density dispatch samples the first 2 KiB. The engine only pays
-	// off when whitespace outside strings dominates AND grammar emits stay
-	// sparse: a skipped whitespace byte saves about a nanosecond while an
-	// emitted position costs several, so commitment requires at least 25%
-	// outside whitespace and a ws:emit ratio above 3.5 (2ws >= 7emits).
-	// The ratio was retuned from 4.5 after the ADDP mask kernels cut the
-	// per-block cost by about thirty percent; citm-shaped documents at a
-	// ratio near 3.8 now win with the engine.
+	// The density dispatch samples the first 2 KiB; the commit rule itself
+	// lives in validBitmapSampleCommit. The whitespace leg requires at
+	// least 25% outside whitespace and a ws:emit ratio above 3.5
+	// (2ws >= 7emits). The ratio was retuned from 4.5 after the ADDP mask
+	// kernels cut the per-block cost by about thirty percent; citm-shaped
+	// documents at a ratio near 3.8 now win with the engine.
 	validBitmapSampleBlocks = 32
 	validBitmapSampleMinWs  = 512
+
+	// validBitmapSampleMinInStr is the string leg's floor: 9/16 (56.25%)
+	// of the sampled bytes inside strings. Measured sample shares:
+	// twitter-shaped documents sit near 66% and win with the engine by
+	// about 10%, while compact source-code-in-strings documents sit near
+	// 50% and lose; the floor splits the two with better than 10% margin
+	// on each side.
+	validBitmapSampleMinInStr = validBitmapSampleBlocks * 64 * 9 / 16
 
 	// validBitmapStreamChunk is the number of blocks classified per batched
 	// kernel call. Smaller chunks interleave kernel and grammar work more
@@ -84,8 +91,44 @@ type vbState struct {
 	containers [defaultMaxDepth/64 + 1]uint64
 }
 
+// validBitmapSampleCommit decides engine commitment from the byte classes
+// of the 2 KiB sample: whitespace outside strings, grammar emits, in-string
+// bytes, and escape targets inside strings. Three signals separate the
+// document shapes:
+//
+//   - Spacey-structural (the whitespace leg): the engine wins when skipped
+//     whitespace pays for the mask trees and the grammar walk stays sparse.
+//     A skipped whitespace byte saves about a nanosecond while an emitted
+//     position costs several, hence the floor and the ws:emit ratio.
+//   - String-heavy (the in-string leg): string interiors die inside the
+//     masks, so the engine also wins when strings dominate even with
+//     little whitespace. But string bytes are worth far less than
+//     whitespace bytes: the recursive scanner skips string interiors with
+//     a vector scanner at tens of GB/s, while it walks whitespace nearly
+//     byte by byte. The engine's edge on string-heavy documents is
+//     therefore thin, and the grammar walk must stay very sparse: the
+//     bytes the engine skips wholesale (ws+inStr) must outnumber emitted
+//     positions six to one. Prose-payload documents sample near 10:1 and
+//     win by several percent; compact record shapes with short keys and
+//     values sample near 3:1 and lose double digits.
+//   - Escape-dense (the guard on the in-string leg): every escape target
+//     costs a per-bit scalar check in validBitmapEscapes, so documents
+//     whose strings are full of escapes lose despite their string share.
+//     Escape-dense corpora run near one escape per six string bytes; the
+//     1/16 ceiling refuses them while normal prose (one per hundred or
+//     less) commits with margin.
+//
+// Each threshold sits with better than 10% slack from the corpora it
+// separates, so small shifts in the signals do not flip the routing.
+func validBitmapSampleCommit(ws, emit, inStr, esc int) bool {
+	if ws >= validBitmapSampleMinWs && ws*2 >= emit*7 {
+		return true
+	}
+	return inStr >= validBitmapSampleMinInStr && esc*16 <= inStr && ws+inStr >= emit*6
+}
+
 // validBitmap reports strict validity of src via the stage-1 masks.
-// decided=false means the whitespace sample chose the recursive scanner
+// decided=false means the density sample chose the recursive scanner
 // instead; the result is then meaningless. On arm64 the batched kernel
 // classifies each chunk; elsewhere the per-block path runs directly.
 func validBitmap(src []byte) (valid, decided bool) {
@@ -117,7 +160,7 @@ func validBitmapPerBlock(src []byte) (valid, decided bool) {
 	// UTF-8 runs: [utf8RunStart, utf8RunEnd) brackets the current run of
 	// blocks holding non-ASCII bytes, validated per run below.
 	utf8RunStart, utf8RunEnd := -1, 0
-	wsSample, emitSample := 0, 0
+	wsSample, emitSample, inStrSample, escSample := 0, 0, 0, 0
 	skipEscape := -1 // low-surrogate escape already consumed by its high half
 
 	nBlocks := (n + 63) / 64
@@ -185,8 +228,10 @@ func validBitmapPerBlock(src []byte) (valid, decided bool) {
 		if block < validBitmapSampleBlocks {
 			wsSample += bits.OnesCount64(m.Whitespace & outside)
 			emitSample += bits.OnesCount64(emit[0])
+			inStrSample += bits.OnesCount64(inStr)
+			escSample += bits.OnesCount64(escaped & inStr)
 			if block == validBitmapSampleBlocks-1 &&
-				(wsSample < validBitmapSampleMinWs || wsSample*2 < emitSample*7) {
+				!validBitmapSampleCommit(wsSample, emitSample, inStrSample, escSample) {
 				return false, false
 			}
 		}
@@ -219,7 +264,7 @@ func validBitmapStreamed(src []byte) (valid, decided bool) {
 	g.state = vbValue
 
 	utf8RunStart, utf8RunEnd := -1, 0
-	wsSample, emitSample := 0, 0
+	wsSample, emitSample, inStrSample, escSample := 0, 0, 0, 0
 	skipEscape := -1
 
 	fullBlocks := n / 64
@@ -259,7 +304,7 @@ func validBitmapStreamed(src []byte) (valid, decided bool) {
 			pos := block * 64
 			rec := &recs[i]
 
-			if rec.Bad != 0 {
+			if rec.Bad {
 				return false, true
 			}
 			// UTF-8 is checked per run of non-ASCII blocks while the bytes
@@ -285,8 +330,10 @@ func validBitmapStreamed(src []byte) (valid, decided bool) {
 			if block < validBitmapSampleBlocks {
 				wsSample += bits.OnesCount64(rec.WsOut)
 				emitSample += bits.OnesCount64(rec.Emit)
+				inStrSample += bits.OnesCount64(rec.InStr)
+				escSample += bits.OnesCount64(rec.EscInStr)
 				if block == validBitmapSampleBlocks-1 &&
-					(wsSample < validBitmapSampleMinWs || wsSample*2 < emitSample*7) {
+					!validBitmapSampleCommit(wsSample, emitSample, inStrSample, escSample) {
 					return false, false
 				}
 			}

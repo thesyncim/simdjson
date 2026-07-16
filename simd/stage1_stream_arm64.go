@@ -127,8 +127,9 @@ func Stage1BlocksGP(p *byte, nblocks int, st *Stage1Stream, out *[Stage1ChunkBlo
 		rec := &recs[i]
 		rec.Emit = (structural|starts)&outside | openers
 		rec.EscInStr = escaped & inStr
-		rec.Bad = control & (inStr | outside&^ws)
+		rec.Bad = control&(inStr|outside&^ws) != 0
 		rec.WsOut = ws & outside
+		rec.InStr = inStr
 		// Per-block non-ASCII: the validator brackets UTF-8 runs by block,
 		// so each record carries its own flag rather than a document-wide
 		// OR.

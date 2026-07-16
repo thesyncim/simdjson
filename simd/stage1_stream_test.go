@@ -54,10 +54,13 @@ func (w *stage1RecWalker) block(b *[64]byte) Stage1Rec {
 			r.EscInStr |= bit
 		}
 		if isCtrl && in || isCtrl && outside && !isWs {
-			r.Bad |= bit
+			r.Bad = true
 		}
 		if isWs && outside {
 			r.WsOut |= bit
+		}
+		if in {
+			r.InStr |= bit
 		}
 	}
 	return r

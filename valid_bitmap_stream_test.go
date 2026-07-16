@@ -218,10 +218,95 @@ func buildNestedTwoSpaceDoc(tb testing.TB) []byte {
 	return doc
 }
 
+// buildProsePayloadDoc builds a compact string-heavy document: records of
+// long prose values behind short keys, no indentation. Roughly three
+// quarters of the sampled bytes are inside strings and emits stay sparse,
+// so the sampler's string leg commits it — the twitter_status shape.
+func buildProsePayloadDoc(tb testing.TB) []byte {
+	var out strings.Builder
+	out.WriteString(`[`)
+	for i := 0; out.Len() < validBitmapMinBytes+4096; i++ {
+		if i != 0 {
+			out.WriteByte(',')
+		}
+		out.WriteString(`{"text":"a status update written in plain prose, long enough that the payload dwarfs the punctuation around it","lang":"en","note":"more prose follows the first sentence and keeps the string share high"}`)
+	}
+	out.WriteString(`]`)
+	return []byte(out.String())
+}
+
+// buildEscapeDenseDoc builds a string-heavy document whose strings are
+// full of escapes — about one escape per six string bytes, the
+// string_escaped shape. The sampler's escape guard must refuse it.
+func buildEscapeDenseDoc(tb testing.TB) []byte {
+	var out strings.Builder
+	out.WriteString(`[`)
+	for i := 0; out.Len() < validBitmapMinBytes+4096; i++ {
+		if i != 0 {
+			out.WriteByte(',')
+		}
+		out.WriteString(`{"text":"line\none\ttab\"quote\\slash\nline\ntwo\ttab\"q\\s\nmore\nrows\there"}`)
+	}
+	out.WriteString(`]`)
+	return []byte(out.String())
+}
+
+// TestValidBitmapRouting pins the sampler's routing decision per document
+// shape, for every engine: the three samplers are separate code (Go
+// per-block, Go streamed, machine-backed streamed) applying one rule
+// (validBitmapSampleCommit), so identical routing is a contract, not a
+// coincidence. The expectations encode the rule's intent: whitespace-heavy
+// and prose-heavy shapes commit, compact records, escape-dense strings,
+// and number-dense shapes refuse.
+func TestValidBitmapRouting(t *testing.T) {
+	if !simdkernels.Stage1StreamEnabled() {
+		t.Skip("stage-1 stream kernel not built")
+	}
+	cases := []struct {
+		label       string
+		src         []byte
+		wantDecided bool
+	}{
+		{"indent4", buildWhitespaceHeavyDoc(t, "    "), true},
+		{"nested2", buildNestedTwoSpaceDoc(t), true},
+		{"prose payload", buildProsePayloadDoc(t), true},
+		{"escape dense", buildEscapeDenseDoc(t), false},
+		{"compact records", benchRecordsJSON(1024), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			refOK, refDecided := validBitmapPerBlock(tc.src)
+			gpOK, gpDecided := validBitmapStreamed(tc.src)
+			if refDecided != tc.wantDecided || gpDecided != tc.wantDecided {
+				t.Fatalf("decided: perBlock=%v streamed=%v, want %v (len %d)",
+					refDecided, gpDecided, tc.wantDecided, len(tc.src))
+			}
+			if stage2MachineEnabled {
+				asmOK, asmDecided := validBitmapStreamedAsm(tc.src)
+				if asmDecided != tc.wantDecided {
+					t.Fatalf("decided: machine=%v, want %v (len %d)", asmDecided, tc.wantDecided, len(tc.src))
+				}
+				if tc.wantDecided && !asmOK {
+					t.Fatal("machine engine rejected a valid document")
+				}
+			}
+			if tc.wantDecided && (!refOK || !gpOK) {
+				t.Fatal("engine rejected a valid document")
+			}
+		})
+	}
+}
+
 // BenchmarkValidBitmapIndent4: deep 4-space indentation, the engine's
 // home turf (whitespace dominates, sparse emits).
 func BenchmarkValidBitmapIndent4(b *testing.B) {
 	benchmarkBitmapEngines(b, buildWhitespaceHeavyDoc(b, "    "))
+}
+
+// BenchmarkValidBitmapProse: compact string-heavy prose records, the
+// string leg's home turf (string interiors dominate, sparse emits).
+func BenchmarkValidBitmapProse(b *testing.B) {
+	benchmarkBitmapEngines(b, buildProsePayloadDoc(b))
 }
 
 // BenchmarkValidBitmapNested2: 2-space indent, nested containers,

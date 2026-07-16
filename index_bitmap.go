@@ -125,7 +125,7 @@ func buildIndexBitmap(src []byte, storage []IndexEntry) (entries []IndexEntry, o
 
 			// Raw control bytes always reject: with string interiors never
 			// rescanned, this is the check that keeps them out of strings.
-			if rec.Bad != 0 {
+			if rec.Bad {
 				return nil, false
 			}
 			// UTF-8 runs bracket exactly as in the validator; the portable
