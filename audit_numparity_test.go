@@ -8,7 +8,8 @@ import (
 )
 
 // TestAuditNumberRejectionParity generates number-ish strings (many malformed)
-// and checks that the typed float64/int64/uint64 decoders and ParseAny agree
+// and checks that the typed float64/int64/uint64 decoders and dynamic any
+// decoding agree
 // with encoding/json on both acceptance AND the decoded value.
 func TestAuditNumberRejectionParity(t *testing.T) {
 	r := rand.New(rand.NewSource(0xBADF00D))
@@ -56,13 +57,13 @@ func TestAuditNumberRejectionParity(t *testing.T) {
 			t.Fatalf("uint64 value %q: stdlib=%v ours=%v", s, wu, gu)
 		}
 
-		// ParseAny float64 branch (skip UseNumber; compare acceptance only for
+		// Dynamic float64 branch (skip UseNumber; compare acceptance only for
 		// the number shape by wrapping so a bare token is unambiguous).
 		var wa any
 		waErr := json.Unmarshal(b, &wa)
-		_, gaErr := ParseAny(b)
+		_, gaErr := unmarshalAnyForTest(b)
 		if (waErr == nil) != (gaErr == nil) {
-			t.Fatalf("ParseAny accept parity %q: stdlib err=%v ours err=%v", s, waErr, gaErr)
+			t.Fatalf("Unmarshal any accept parity %q: stdlib err=%v ours err=%v", s, waErr, gaErr)
 		}
 	}
 }

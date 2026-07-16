@@ -20,16 +20,16 @@ func checkAPIAgreement(t *testing.T, src []byte) {
 	want := strictJSONValid(src)
 	checkValidationConsistency(t, src, want)
 
-	_, anyErr := ParseAny(src)
+	_, anyErr := unmarshalAnyForTest(src)
 	if !want {
 		if anyErr == nil {
-			t.Fatalf("ParseAny accepted invalid input (length %d)", len(src))
+			t.Fatalf("Unmarshal any accepted invalid input (length %d)", len(src))
 		}
 	} else {
 		var std any
 		stdErr := json.Unmarshal(src, &std)
 		if (anyErr == nil) != (stdErr == nil) {
-			t.Fatalf("ParseAny error = %v, encoding/json error = %v (length %d)", anyErr, stdErr, len(src))
+			t.Fatalf("Unmarshal any error = %v, encoding/json error = %v (length %d)", anyErr, stdErr, len(src))
 		}
 	}
 

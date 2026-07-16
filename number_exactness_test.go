@@ -58,17 +58,17 @@ func checkFloatExactness(t testing.TB, text string) {
 
 	checkFloatDecode(t, text, src, want64, ok64, want32, ok32)
 
-	tree, anyErr := ParseAny(src)
+	tree, anyErr := unmarshalAnyForTest(src)
 	if (anyErr == nil) != ok64 {
-		t.Fatalf("%q: ParseAny error = %v, strconv accept = %v", clip(text), anyErr, ok64)
+		t.Fatalf("%q: Unmarshal any error = %v, strconv accept = %v", clip(text), anyErr, ok64)
 	}
 	if ok64 {
 		value, isFloat := tree.(float64)
 		if !isFloat {
-			t.Fatalf("ParseAny(%q) = %T, want float64", clip(text), tree)
+			t.Fatalf("Unmarshal any(%q) = %T, want float64", clip(text), tree)
 		}
 		if math.Float64bits(value) != want64 {
-			t.Fatalf("ParseAny(%q) = %.17g (%#x), want %#x", clip(text), value, math.Float64bits(value), want64)
+			t.Fatalf("Unmarshal any(%q) = %.17g (%#x), want %#x", clip(text), value, math.Float64bits(value), want64)
 		}
 	}
 }

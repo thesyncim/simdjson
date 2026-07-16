@@ -324,7 +324,8 @@ another pinned environment.
   compiled zero-copy, compiled owned, and competitor modes.
 - `BenchmarkParseTypedJSONV2`: direct `encoding/json/v2` typed decoding.
 - `Valid`: strict JSON syntax and UTF-8 validation.
-- `ParseAny`: full conventional `any` materialization.
+- `ParseAny`: full conventional `any` materialization (simdjson rows spell it
+  `Unmarshal` into `*any`).
 - `ParseAnyNumbers16`: materialization of 1,024 exact 16-digit integers.
 - `ParseNative`: each library's native structural representation.
 - `Index`: simdjson validation plus caller-owned structural index construction.

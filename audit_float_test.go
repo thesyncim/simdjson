@@ -42,13 +42,13 @@ func diffFloat64(t *testing.T, s string) {
 		t.Fatalf("Unmarshal []float64 %q = %v, want [%v %v]", arr, slice, want, want)
 	}
 
-	// 4. ParseAny (float64 branch).
-	if v, err := ParseAny([]byte(s)); err != nil {
-		t.Fatalf("ParseAny %q unexpected error: %v", s, err)
+	// 4. Dynamic decode (float64 branch).
+	if v, err := unmarshalAnyForTest([]byte(s)); err != nil {
+		t.Fatalf("Unmarshal any %q unexpected error: %v", s, err)
 	} else if f, ok := v.(float64); !ok {
-		t.Fatalf("ParseAny %q returned %T, want float64", s, v)
+		t.Fatalf("Unmarshal any %q returned %T, want float64", s, v)
 	} else if f != want {
-		t.Fatalf("ParseAny %q = %v (bits %#x), want %v (bits %#x)", s, f, math.Float64bits(f), want, math.Float64bits(want))
+		t.Fatalf("Unmarshal any %q = %v (bits %#x), want %v (bits %#x)", s, f, math.Float64bits(f), want, math.Float64bits(want))
 	}
 }
 

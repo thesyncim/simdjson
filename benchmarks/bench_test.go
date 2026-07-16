@@ -268,23 +268,27 @@ func benchmarkParseAny(b *testing.B, src []byte) {
 			anySink = value.Any()
 		}
 	})
-	b.Run("simdjson-ParseAny", func(b *testing.B) {
+	b.Run("simdjson-Unmarshal-any", func(b *testing.B) {
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			value, err := simdjson.ParseAny(src)
-			if err != nil {
+			var value any
+			if err := simdjson.Unmarshal(src, &value); err != nil {
 				b.Fatal(err)
 			}
 			anySink = value
 		}
 	})
-	b.Run("simdjson-ParseAny-options-zero-copy", func(b *testing.B) {
+	zeroCopyDecoder, err := simdjson.CompileDecoder[any](simdjson.DecoderOptions{ZeroCopy: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Run("simdjson-Unmarshal-any-zero-copy", func(b *testing.B) {
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			value, err := simdjson.ParseAnyOptions(src, simdjson.AnyOptions{ZeroCopy: true})
-			if err != nil {
+			var value any
+			if err := zeroCopyDecoder.Decode(src, &value); err != nil {
 				b.Fatal(err)
 			}
 			anySink = value

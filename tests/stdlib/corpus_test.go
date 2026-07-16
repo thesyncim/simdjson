@@ -114,19 +114,23 @@ func checkDynamicDecode(t *testing.T, src []byte) {
 	if err := json.Unmarshal(src, &want); err != nil {
 		t.Fatalf("encoding/json.Unmarshal: %v", err)
 	}
-	got, err := simdjson.ParseAny(src)
-	if err != nil {
-		t.Fatalf("simdjson.ParseAny: %v", err)
+	var got any
+	if err := simdjson.Unmarshal(src, &got); err != nil {
+		t.Fatalf("simdjson.Unmarshal into any: %v", err)
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatal("simdjson.ParseAny result differs from encoding/json")
+		t.Fatal("simdjson dynamic result differs from encoding/json")
 	}
-	zeroCopy, err := simdjson.ParseAnyOptions(src, simdjson.AnyOptions{ZeroCopy: true})
+	zeroCopyDecoder, err := simdjson.CompileDecoder[any](simdjson.DecoderOptions{ZeroCopy: true})
 	if err != nil {
-		t.Fatalf("simdjson.ParseAnyOptions zero copy: %v", err)
+		t.Fatal(err)
+	}
+	var zeroCopy any
+	if err := zeroCopyDecoder.Decode(src, &zeroCopy); err != nil {
+		t.Fatalf("simdjson zero-copy dynamic decode: %v", err)
 	}
 	if !reflect.DeepEqual(zeroCopy, want) {
-		t.Fatal("simdjson ParseAny zero-copy result differs from encoding/json")
+		t.Fatal("simdjson zero-copy dynamic result differs from encoding/json")
 	}
 
 	wantJSON, err := json.Marshal(want)
@@ -154,9 +158,13 @@ func checkNumberDecode(t *testing.T, src []byte) {
 		t.Fatalf("encoding/json.Decoder trailing input: %v", err)
 	}
 
-	got, err := simdjson.ParseAnyOptions(src, simdjson.AnyOptions{UseNumber: true})
+	useNumberDecoder, err := simdjson.CompileDecoder[any](simdjson.DecoderOptions{UseNumber: true})
 	if err != nil {
-		t.Fatalf("simdjson.ParseAnyOptions with UseNumber: %v", err)
+		t.Fatal(err)
+	}
+	var got any
+	if err := useNumberDecoder.Decode(src, &got); err != nil {
+		t.Fatalf("simdjson dynamic decode with UseNumber: %v", err)
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatal("simdjson UseNumber result differs from encoding/json")

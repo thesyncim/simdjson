@@ -22,7 +22,7 @@ var validParitySeeds = []string{
 }
 
 // TestAuditValidateParity mutates valid JSON by byte flips, insertions, and
-// deletions, then checks Parse, ParseAny, and Validate all agree with json.Valid
+// deletions, then checks Parse, dynamic Unmarshal, and Validate all agree with json.Valid
 // on acceptance. A structural parser bug that accepts invalid input (or rejects
 // valid input) shows up as a mismatch here.
 func TestAuditValidateParity(t *testing.T) {
@@ -55,14 +55,14 @@ func TestAuditValidateParity(t *testing.T) {
 		if (verr == nil) != want {
 			t.Fatalf("Validate/%v disagree on %.80q: Validate=%v json.Valid=%v", want, b, verr, want)
 		}
-		// ParseAny DECODES numbers into float64, so it range-checks like
+		// Dynamic decode DECODES numbers into float64, so it range-checks like
 		// json.Unmarshal into any (not the purely structural json.Valid). Compare
 		// against that oracle instead.
 		var stdAny any
 		stdErr := json.Unmarshal(b, &stdAny)
-		_, aerr := ParseAny(b)
+		_, aerr := unmarshalAnyForTest(b)
 		if (aerr == nil) != (stdErr == nil) {
-			t.Fatalf("ParseAny disagree with Unmarshal-into-any on %.80q: ParseAny=%v stdlib=%v", b, aerr, stdErr)
+			t.Fatalf("dynamic decode disagrees with Unmarshal-into-any on %.80q: ours=%v stdlib=%v", b, aerr, stdErr)
 		}
 	}
 	for _, seed := range validParitySeeds {

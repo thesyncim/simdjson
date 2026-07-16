@@ -32,6 +32,14 @@ type DecoderOptions struct {
 	// fallback used after exact field-name matching.
 	CaseSensitive bool
 
+	// UseNumber decodes JSON numbers bound for dynamic destinations as
+	// json.Number instead of float64, like encoding/json's Decoder.UseNumber.
+	// It applies wherever a value's shape is chosen at decode time — a
+	// top-level *any as well as any-typed fields nested in structs, maps, and
+	// slices. Fields with a declared Go type are unaffected: their type
+	// already decides the representation.
+	UseNumber bool
+
 	// Replace decodes as if into a fresh zero destination, so a reused
 	// destination yields the same result as a new one: state the document
 	// does not mention is reset to its zero value. Absent struct fields become
@@ -104,6 +112,21 @@ func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 	if dst == nil {
 		return fmt.Errorf("simdjson: typed Decode destination is nil")
 	}
+	if plan.root.kind == typedAny {
+		// A top-level empty interface is a whole-document dynamic decode, so
+		// it takes the dedicated one-pass builder — unless the value already
+		// held requires encoding/json's decode-into-pointer merge, which only
+		// the cursor path implements. Every empty interface shares the eface
+		// layout, so the store through *any is exact for defined types too.
+		if out := (*any)(unsafe.Pointer(dst)); !anyDecodeMerges(*out) {
+			value, err := unmarshalAny(src, plan.options)
+			if err != nil {
+				return err
+			}
+			*out = value
+			return nil
+		}
+	}
 	cursor := newDecoderCursor(src, plan.options)
 	cursor.skipSpace()
 	var err error
@@ -131,7 +154,9 @@ func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 // returns the number of bytes consumed, leaving any following data
 // unexamined. It is the building block for reading concatenated values;
 // the streaming Reader uses it to decode without a separate boundary scan.
-// Decoding semantics match Decode.
+// Decoding semantics match Decode. Every destination decodes mid-stream
+// here, including a top-level *any: the whole-document builder Decode uses
+// assumes the value spans all of src, which a prefix cannot.
 func (plan Decoder[T]) DecodePrefix(src []byte, dst *T) (int, error) {
 	if plan.root == nil {
 		return 0, fmt.Errorf("simdjson: zero Decoder")

@@ -176,12 +176,31 @@ func BenchmarkDecodeLargeOwned(b *testing.B) {
 	}
 }
 
-func BenchmarkParseAnyLarge(b *testing.B) {
+func BenchmarkUnmarshalAnyLarge(b *testing.B) {
 	src := benchRecordsJSON(1024)
 	b.SetBytes(int64(len(src)))
 	b.ReportAllocs()
 	for range b.N {
-		if _, err := ParseAny(src); err != nil {
+		var v any
+		if err := Unmarshal(src, &v); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkDecodeAnyLarge measures the dynamic engine through a compiled
+// Decoder[any], without Unmarshal's per-call plan-cache lookup.
+func BenchmarkDecodeAnyLarge(b *testing.B) {
+	decoder, err := CompileDecoder[any](DecoderOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	src := benchRecordsJSON(1024)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	for range b.N {
+		var v any
+		if err := decoder.Decode(src, &v); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -380,22 +399,60 @@ func BenchmarkValidMedium(b *testing.B) {
 	}
 }
 
-func BenchmarkParseAnyMedium(b *testing.B) {
+func BenchmarkUnmarshalAnyMedium(b *testing.B) {
 	src := benchRecordsJSON(32)
 	b.SetBytes(int64(len(src)))
 	b.ReportAllocs()
 	for range b.N {
-		if _, err := ParseAny(src); err != nil {
+		var v any
+		if err := Unmarshal(src, &v); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkParseAnySmall(b *testing.B) {
+// BenchmarkDecodeAnyMedium is the compiled-decoder counterpart of
+// BenchmarkUnmarshalAnyMedium (see BenchmarkDecodeAnyLarge).
+func BenchmarkDecodeAnyMedium(b *testing.B) {
+	decoder, err := CompileDecoder[any](DecoderOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	src := benchRecordsJSON(32)
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	for range b.N {
+		var v any
+		if err := decoder.Decode(src, &v); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkUnmarshalAnySmall(b *testing.B) {
 	b.SetBytes(int64(len(benchSmallJSON)))
 	b.ReportAllocs()
 	for range b.N {
-		if _, err := ParseAny(benchSmallJSON); err != nil {
+		var v any
+		if err := Unmarshal(benchSmallJSON, &v); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkDecodeAnySmall is the compiled-decoder counterpart of
+// BenchmarkUnmarshalAnySmall; on a document this small the plan-cache lookup
+// is a visible fraction, so the pair separates engine from entry point.
+func BenchmarkDecodeAnySmall(b *testing.B) {
+	decoder, err := CompileDecoder[any](DecoderOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(benchSmallJSON)))
+	b.ReportAllocs()
+	for range b.N {
+		var v any
+		if err := decoder.Decode(benchSmallJSON, &v); err != nil {
 			b.Fatal(err)
 		}
 	}

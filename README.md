@@ -131,32 +131,36 @@ if err := decoder.Decode(src, &event); err != nil {
 
 Without `ZeroCopy`, results are independent of `src`: decoded strings alias at
 most one private copy of the input, so retaining any decoded string retains
-that copy. `Options.ZeroCopy` and `AnyOptions.ZeroCopy` offer the same choice
-for the dynamic APIs.
+that copy. `Options.ZeroCopy` offers the same choice for the ordered `Parse`
+tree.
 
 </details>
 
 <details>
 <summary><b>Dynamic values: <code>any</code> trees and ordered trees</b></summary>
 
-`ParseAny` produces the standard Go JSON shapes without an intermediate tree;
-`Parse` produces an ordered, on-demand `Value` when member order matters.
+`Unmarshal` into a `*any` produces the standard Go JSON shapes through a
+dedicated one-pass builder, with no intermediate tree; `Parse` produces an
+ordered, on-demand `Value` when member order matters.
 Parsing builds only the structural index — scalars decode and containers
 materialize when they are actually read, so a document consumed in part never
 pays for the whole. A `Value` keeps its backing storage alive, so it stays
 usable after the source slice is gone.
 
 ```go
-value, err := simdjson.ParseAny(src)
-if err != nil {
+var value any
+if err := simdjson.Unmarshal(src, &value); err != nil {
 	return err
 }
 object := value.(map[string]any)
 fmt.Println(object["scores"].([]any)[1]) // 2.5
 
 // json.Number instead of float64:
-value, err = simdjson.ParseAnyOptions(src, simdjson.AnyOptions{UseNumber: true})
+decoder, err := simdjson.CompileDecoder[any](simdjson.DecoderOptions{UseNumber: true})
 if err != nil {
+	return err
+}
+if err := decoder.Decode(src, &value); err != nil {
 	return err
 }
 

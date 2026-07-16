@@ -80,7 +80,7 @@ func TestAuditLazyEmptyContainers(t *testing.T) {
 
 // TestAuditLazyNavigateFuzz builds canonical documents (unique keys, canonical
 // numbers/strings, no HTML escapes), so the library's spelling-preserving
-// AppendJSON must reproduce the input byte for byte, and Any/ParseAny must
+// AppendJSON must reproduce the input byte for byte, and the dynamic trees must
 // round-trip through the same canonical serializer.
 func TestAuditLazyNavigateFuzz(t *testing.T) {
 	r := rand.New(rand.NewSource(0x1A2F))
@@ -96,18 +96,18 @@ func TestAuditLazyNavigateFuzz(t *testing.T) {
 			t.Fatalf("AppendJSON divergence:\n got %s\nwant %s", got, m)
 		}
 
-		// Any() and ParseAny(UseNumber) must round-trip to the same canonical
+		// Any() and the UseNumber dynamic decode must round-trip to the same canonical
 		// bytes. Any() yields json.Number for numbers, so compare via a
 		// UseNumber re-decode of the source to keep numeric spelling.
 		if got := canonicalMarshal(v.Any()); !bytes.Equal(got, m) {
 			t.Fatalf("Any divergence:\n got %s\nwant %s", got, m)
 		}
-		pa, err := ParseAnyOptions(m, AnyOptions{UseNumber: true})
+		pa, err := parseAnyUseNumberForTest(m)
 		if err != nil {
-			t.Fatalf("ParseAny rejected %q: %v", m, err)
+			t.Fatalf("UseNumber dynamic decode rejected %q: %v", m, err)
 		}
 		if got := canonicalMarshal(pa); !bytes.Equal(got, m) {
-			t.Fatalf("ParseAny divergence:\n got %s\nwant %s", got, m)
+			t.Fatalf("dynamic decode divergence:\n got %s\nwant %s", got, m)
 		}
 	}
 }

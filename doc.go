@@ -54,9 +54,11 @@
 //
 // # Dynamic values and transforms
 //
-// [Parse] produces an ordered syntax tree of [Value] nodes. [ParseAny]
-// produces ordinary maps, slices, strings, float64 values, booleans, and
-// nil. [AppendCompact], [AppendIndent], and [AppendCanonicalize] rewrite
+// [Parse] produces an ordered syntax tree of [Value] nodes. [Unmarshal]
+// into a *any produces ordinary maps, slices, strings, float64 values,
+// booleans, and nil through a dedicated one-pass builder;
+// [DecoderOptions].UseNumber selects json.Number for dynamic numbers.
+// [AppendCompact], [AppendIndent], and [AppendCanonicalize] rewrite
 // documents into caller-owned buffers.
 //
 // # Streaming

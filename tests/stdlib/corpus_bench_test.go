@@ -44,16 +44,22 @@ func BenchmarkHighLevelCorpus(b *testing.B) {
 				b.ReportAllocs()
 				b.SetBytes(int64(len(src)))
 				for b.Loop() {
-					if _, err := simdjson.ParseAny(src); err != nil {
+					var dst any
+					if err := simdjson.Unmarshal(src, &dst); err != nil {
 						b.Fatal(err)
 					}
 				}
 			})
+			zeroCopyAnyDecoder, err := simdjson.CompileDecoder[any](simdjson.DecoderOptions{ZeroCopy: true})
+			if err != nil {
+				b.Fatal(err)
+			}
 			b.Run("decode-any/simdjson-zero-copy", func(b *testing.B) {
 				b.ReportAllocs()
 				b.SetBytes(int64(len(src)))
 				for b.Loop() {
-					if _, err := simdjson.ParseAnyOptions(src, simdjson.AnyOptions{ZeroCopy: true}); err != nil {
+					var dst any
+					if err := zeroCopyAnyDecoder.Decode(src, &dst); err != nil {
 						b.Fatal(err)
 					}
 				}

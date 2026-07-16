@@ -486,7 +486,7 @@ func TestIndexStorageIsCompact(t *testing.T) {
 	}
 }
 
-func TestParseAnyArenaKeepsValuesAlive(t *testing.T) {
+func TestUnmarshalAnyArenaKeepsValuesAlive(t *testing.T) {
 	value, err := detachedAnyValue()
 	if err != nil {
 		t.Fatal(err)
@@ -521,7 +521,7 @@ func TestParseAnyArenaKeepsValuesAlive(t *testing.T) {
 	}
 }
 
-func TestParseAnyLargeDocumentKeepsValuesAlive(t *testing.T) {
+func TestUnmarshalAnyLargeDocumentKeepsValuesAlive(t *testing.T) {
 	var src strings.Builder
 	src.WriteString(`{"items":[`)
 	for i := range 192 {
@@ -934,7 +934,7 @@ func FuzzValidateConsistency(f *testing.F) {
 	})
 }
 
-func FuzzParseAny(f *testing.F) {
+func FuzzUnmarshalAny(f *testing.F) {
 	for _, seed := range [][]byte{
 		[]byte(`null`),
 		[]byte(`-0`),
@@ -951,7 +951,7 @@ func FuzzParseAny(f *testing.F) {
 		}
 		var want any
 		wantErr := json.Unmarshal(src, &want)
-		for _, parse := range []func([]byte) (any, error){ParseAny, parseAnyZeroCopyForTest} {
+		for _, parse := range []func([]byte) (any, error){unmarshalAnyForTest, parseAnyZeroCopyForTest} {
 			got, gotErr := parse(src)
 			if (gotErr == nil) != (wantErr == nil) {
 				t.Fatalf("parse error = %v, encoding/json error = %v", gotErr, wantErr)
@@ -1488,7 +1488,7 @@ func TestAnyRoundTrip(t *testing.T) {
 	}
 }
 
-func TestParseAnyDirect(t *testing.T) {
+func TestUnmarshalAnyDirect(t *testing.T) {
 	for _, src := range [][]byte{
 		[]byte(`null`),
 		[]byte(`true`),
@@ -1503,12 +1503,12 @@ func TestParseAnyDirect(t *testing.T) {
 		if err := json.Unmarshal(src, &want); err != nil {
 			t.Fatal(err)
 		}
-		got, err := ParseAny(src)
+		got, err := unmarshalAnyForTest(src)
 		if err != nil {
-			t.Fatalf("ParseAny(%s): %v", src, err)
+			t.Fatalf("Unmarshal any(%s): %v", src, err)
 		}
 		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("ParseAny(%s) = %#v, want %#v", src, got, want)
+			t.Fatalf("Unmarshal any(%s) = %#v, want %#v", src, got, want)
 		}
 		got, err = parseAnyZeroCopyForTest(src)
 		if err != nil {
@@ -1520,7 +1520,7 @@ func TestParseAnyDirect(t *testing.T) {
 	}
 }
 
-func TestParseAnyLongNumberArrayFastPath(t *testing.T) {
+func TestUnmarshalAnyLongNumberArrayFastPath(t *testing.T) {
 	for _, src := range [][]byte{
 		[]byte(`[1234567890123456,1000000000000001,-1000000000000002]`),
 		[]byte(`[ 1234567890123456 , 9007199254740993, 2.5, true, {"x":1} ]`),
@@ -1530,7 +1530,7 @@ func TestParseAnyLongNumberArrayFastPath(t *testing.T) {
 		if err := json.Unmarshal(src, &want); err != nil {
 			t.Fatal(err)
 		}
-		for _, parse := range []func([]byte) (any, error){ParseAny, parseAnyZeroCopyForTest} {
+		for _, parse := range []func([]byte) (any, error){unmarshalAnyForTest, parseAnyZeroCopyForTest} {
 			got, err := parse(src)
 			if err != nil {
 				t.Fatalf("parse(%s): %v", src, err)
@@ -1545,14 +1545,14 @@ func TestParseAnyLongNumberArrayFastPath(t *testing.T) {
 		[]byte(`[1234567890123456 true]`),
 		[]byte(`[12345678901234567]`),
 	} {
-		_, err := ParseAny(src)
+		_, err := unmarshalAnyForTest(src)
 		if (err == nil) != json.Valid(src) {
-			t.Fatalf("ParseAny(%s) error = %v, json.Valid = %v", src, err, json.Valid(src))
+			t.Fatalf("Unmarshal any(%s) error = %v, json.Valid = %v", src, err, json.Valid(src))
 		}
 	}
 }
 
-func TestParseAnyRepeatedObjectSchemas(t *testing.T) {
+func TestUnmarshalAnyRepeatedObjectSchemas(t *testing.T) {
 	src := []byte(`[
 		{"id":1,"active":true,"name":"first","message":"m","scores":[1,2,3]},
 		{"id":2,"active":false,"name":"second","message":"n","scores":[4,5,6]},
@@ -1563,7 +1563,7 @@ func TestParseAnyRepeatedObjectSchemas(t *testing.T) {
 	if err := json.Unmarshal(src, &want); err != nil {
 		t.Fatal(err)
 	}
-	for _, parse := range []func([]byte) (any, error){ParseAny, parseAnyZeroCopyForTest} {
+	for _, parse := range []func([]byte) (any, error){unmarshalAnyForTest, parseAnyZeroCopyForTest} {
 		got, err := parse(src)
 		if err != nil {
 			t.Fatalf("parse: %v", err)
@@ -1580,19 +1580,19 @@ func TestParseAnyRepeatedObjectSchemas(t *testing.T) {
 	}
 }
 
-func TestParseAnyOptions(t *testing.T) {
-	v, err := ParseAnyOptions([]byte(`1e400`), AnyOptions{UseNumber: true})
+func TestUnmarshalAnyOptions(t *testing.T) {
+	v, err := parseAnyUseNumberForTest([]byte(`1e400`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if number, ok := v.(json.Number); !ok || number != "1e400" {
 		t.Fatalf("UseNumber result = %#v", v)
 	}
-	if _, err := ParseAny([]byte(`1e400`)); err == nil {
-		t.Fatal("ParseAny accepted a float64 overflow")
+	if _, err := unmarshalAnyForTest([]byte(`1e400`)); err == nil {
+		t.Fatal("Unmarshal any accepted a float64 overflow")
 	}
-	if _, err := ParseAnyOptions([]byte(`[[0]]`), AnyOptions{MaxDepth: 1}); err == nil {
-		t.Fatal("ParseAnyOptions accepted depth 2 with MaxDepth 1")
+	if _, err := decodeAnyForTest([]byte(`[[0]]`), DecoderOptions{MaxDepth: 1}); err == nil {
+		t.Fatal("Decoder[any] accepted depth 2 with MaxDepth 1")
 	}
 }
 
@@ -1610,17 +1610,17 @@ func TestExactJSONFloat64(t *testing.T) {
 		if ok && math.Float64bits(got) != math.Float64bits(want) {
 			t.Fatalf("exactJSONFloat64(%q) = %v, want %v", text, got, want)
 		}
-		decoded, err := ParseAny(src)
+		decoded, err := unmarshalAnyForTest(src)
 		if err != nil {
-			t.Fatalf("ParseAny(%q): %v", text, err)
+			t.Fatalf("Unmarshal any(%q): %v", text, err)
 		}
 		if math.Float64bits(decoded.(float64)) != math.Float64bits(want) {
-			t.Fatalf("ParseAny(%q) = %v, want %v", text, decoded, want)
+			t.Fatalf("Unmarshal any(%q) = %v, want %v", text, decoded, want)
 		}
 	}
 }
 
-func TestParseAnyFloat64MatchesStrconv(t *testing.T) {
+func TestUnmarshalAnyFloat64MatchesStrconv(t *testing.T) {
 	for _, text := range []string{
 		"0.000000000000000000000000000000001",
 		"1234567890123456",
@@ -1632,7 +1632,7 @@ func TestParseAnyFloat64MatchesStrconv(t *testing.T) {
 		"4.9406564584124654e-324",
 		"1.7976931348623157e308",
 	} {
-		assertParseAnyFloatBits(t, text)
+		assertUnmarshalAnyFloatBits(t, text)
 	}
 
 	state := uint64(0x243f6a8885a308d3)
@@ -1644,7 +1644,7 @@ func TestParseAnyFloat64MatchesStrconv(t *testing.T) {
 		if math.IsNaN(value) || math.IsInf(value, 0) {
 			continue
 		}
-		assertParseAnyFloatBits(t, strconv.FormatFloat(value, 'g', -1, 64))
+		assertUnmarshalAnyFloatBits(t, strconv.FormatFloat(value, 'g', -1, 64))
 	}
 }
 
@@ -1712,18 +1712,18 @@ func TestParseFloat64(t *testing.T) {
 	}
 }
 
-func assertParseAnyFloatBits(t testing.TB, text string) {
+func assertUnmarshalAnyFloatBits(t testing.TB, text string) {
 	t.Helper()
 	want, err := strconv.ParseFloat(text, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := ParseAny([]byte(text))
+	got, err := unmarshalAnyForTest([]byte(text))
 	if err != nil {
-		t.Fatalf("ParseAny(%q): %v", text, err)
+		t.Fatalf("Unmarshal any(%q): %v", text, err)
 	}
 	if math.Float64bits(got.(float64)) != math.Float64bits(want) {
-		t.Fatalf("ParseAny(%q) = %.17g (%#x), want %.17g (%#x)",
+		t.Fatalf("Unmarshal any(%q) = %.17g (%#x), want %.17g (%#x)",
 			text, got, math.Float64bits(got.(float64)), want, math.Float64bits(want))
 	}
 	direct, err := ParseFloat64([]byte(text))
@@ -1736,13 +1736,13 @@ func assertParseAnyFloatBits(t testing.TB, text string) {
 	}
 }
 
-func TestParseAnyOptionsZeroCopyAliasesStrings(t *testing.T) {
+func TestUnmarshalAnyZeroCopyAliasesStrings(t *testing.T) {
 	src := []byte(`["abc"]`)
 	zeroCopy, err := parseAnyZeroCopyForTest(src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	owned, err := ParseAny(src)
+	owned, err := unmarshalAnyForTest(src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1853,10 +1853,6 @@ func parseOptionsZeroCopyForTest(src []byte) (Value, error) {
 	return ParseOptions(src, Options{ZeroCopy: true})
 }
 
-func parseAnyZeroCopyForTest(src []byte) (any, error) {
-	return ParseAnyOptions(src, AnyOptions{ZeroCopy: true})
-}
-
 func TestOwnedResultsSurviveSourceMutation(t *testing.T) {
 	src := []byte(`{"name":"keepsake","n":12345,"nested":["alpha","beta"]}`)
 
@@ -1865,7 +1861,7 @@ func TestOwnedResultsSurviveSourceMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	parsed := bytes.Clone(src)
-	dynamic, err := ParseAny(parsed)
+	dynamic, err := unmarshalAnyForTest(parsed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1879,9 +1875,9 @@ func TestOwnedResultsSurviveSourceMutation(t *testing.T) {
 	}
 	object := dynamic.(map[string]any)
 	if got := object["name"]; got != "keepsake" {
-		t.Fatalf("ParseAny string = %v, want keepsake", got)
+		t.Fatalf("Unmarshal any string = %v, want keepsake", got)
 	}
 	if got := object["nested"].([]any)[1]; got != "beta" {
-		t.Fatalf("ParseAny nested string = %v, want beta", got)
+		t.Fatalf("Unmarshal any nested string = %v, want beta", got)
 	}
 }

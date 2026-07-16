@@ -734,8 +734,8 @@ func TestProbeDepthLimitAgreement(t *testing.T) {
 		if _, err := AppendCompact(nil, src); (err == nil) != want {
 			t.Errorf("depth %d: AppendCompact err = %v, Valid = %v", depth, err, want)
 		}
-		if _, err := ParseAny(src); (err == nil) != want {
-			t.Errorf("depth %d: ParseAny err = %v, Valid = %v", depth, err, want)
+		if _, err := unmarshalAnyForTest(src); (err == nil) != want {
+			t.Errorf("depth %d: Unmarshal any err = %v, Valid = %v", depth, err, want)
 		}
 		if _, err := Indent(src, "", " "); (err == nil) != want {
 			t.Errorf("depth %d: Indent err = %v, Valid = %v", depth, err, want)
@@ -948,7 +948,7 @@ func TestProbeRawSpans(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Probe K: cross-API semantic agreement on a set of adversarial documents:
 // every scalar reachable by pointer must decode identically through raw,
-// index, AST, and ParseAny+manual-walk paths.
+// index, AST, and dynamic Unmarshal+manual-walk paths.
 // ---------------------------------------------------------------------------
 
 func TestProbeCrossAPIScalarAgreement(t *testing.T) {
@@ -966,7 +966,7 @@ func TestProbeCrossAPIScalarAgreement(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		dynamic, err := ParseAnyOptions(src, AnyOptions{UseNumber: true})
+		dynamic, err := parseAnyUseNumberForTest(src)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1049,7 +1049,7 @@ func TestProbeCrossAPIScalarAgreement(t *testing.T) {
 		}
 		walk("", std)
 
-		// ParseAny(UseNumber) must round-trip to the stdlib value semantically.
+		// The UseNumber dynamic tree must round-trip to the stdlib value semantically.
 		encoded, err := json.Marshal(dynamic)
 		if err != nil {
 			t.Fatal(err)
@@ -1059,7 +1059,7 @@ func TestProbeCrossAPIScalarAgreement(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !reflect.DeepEqual(back, std) {
-			t.Errorf("ParseAny tree %v != stdlib tree %v", back, std)
+			t.Errorf("dynamic tree %v != stdlib tree %v", back, std)
 		}
 	}
 }

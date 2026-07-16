@@ -104,9 +104,9 @@ func checkAllFloatPaths(t *testing.T, text string) {
 				math.Float64bits(f), f, math.Float64bits(ref64), ref64)
 		}
 	}
-	if a, err := ParseAny([]byte(text)); err == nil && strconvOK {
+	if a, err := unmarshalAnyForTest([]byte(text)); err == nil && strconvOK {
 		if f, ok := a.(float64); ok && math.Float64bits(f) != math.Float64bits(ref64) {
-			t.Fatalf("ParseAny(%q) = %x (%v) want %x (%v)", text,
+			t.Fatalf("Unmarshal any(%q) = %x (%v) want %x (%v)", text,
 				math.Float64bits(f), f, math.Float64bits(ref64), ref64)
 		}
 	}

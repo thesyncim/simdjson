@@ -57,14 +57,14 @@ func TestArenaBlockSwitchRetention(t *testing.T) {
 		}
 	}
 
-	tree, err := ParseAnyOptions(doc, AnyOptions{ZeroCopy: true})
+	tree, err := parseAnyZeroCopyForTest(doc)
 	if err != nil {
 		t.Fatal(err)
 	}
 	values := tree.([]any)
 	for i := range want {
 		if values[i] != any(want[i]) {
-			t.Fatalf("ParseAny string %d = %.40q, want %.40q", i, values[i], want[i])
+			t.Fatalf("dynamic string %d = %.40q, want %.40q", i, values[i], want[i])
 		}
 	}
 }

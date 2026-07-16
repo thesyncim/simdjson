@@ -1074,11 +1074,24 @@ func setMapKeyValue(keyValue reflect.Value, unmarshaler encoding.TextUnmarshaler
 	}
 }
 
+// anyDecodeMerges reports whether decoding into an empty interface that
+// already holds existing must merge rather than replace: like encoding/json,
+// only a held non-nil pointer is decoded into. Everything else — nil, maps,
+// slices, scalars, nil pointers — is replaced wholesale (and null clears),
+// so those destinations are free to take the whole-document builder.
+func anyDecodeMerges(existing any) bool {
+	if existing == nil {
+		return false
+	}
+	value := reflect.ValueOf(existing)
+	return value.Kind() == reflect.Pointer && !value.IsNil()
+}
+
 // decodeCompiledAny decodes one JSON value into an empty interface using the
-// standard dynamic shapes: map[string]any, []any, string, float64, bool, and
-// nil. Like encoding/json, an interface already holding a non-nil pointer is
-// decoded into rather than replaced; anything else is replaced, and null
-// clears the interface.
+// standard dynamic shapes: map[string]any, []any, string, float64 (or
+// json.Number under UseNumber), bool, and nil. Like encoding/json, an
+// interface already holding a non-nil pointer is decoded into rather than
+// replaced; anything else is replaced, and null clears the interface.
 func (cursor *decoderCursor) decodeCompiledAny(dst unsafe.Pointer) error {
 	if existing := *(*any)(dst); existing != nil {
 		null := false
@@ -1107,7 +1120,7 @@ func (cursor *decoderCursor) decodeCompiledAny(dst unsafe.Pointer) error {
 	cursor.ownSource()
 	p := cursor.slowParser()
 	p.skipSpace()
-	value, err := p.parseAnyValue(cursor.depth, false)
+	value, err := p.parseAnyValue(cursor.depth, cursor.flags&decoderUseNumber != 0)
 	cursor.i = p.i
 	// The dynamic tree retains any escaped strings it materialized in the
 	// arena; advancing the arena keeps later escaped strings from

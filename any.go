@@ -1,5 +1,9 @@
 package simdjson
 
+// The one-pass builder behind dynamic decoding: Unmarshal into a *any and
+// Decoder[any].Decode land in unmarshalAny, which turns a whole document
+// into the standard Go JSON shapes without an intermediate tree.
+
 import (
 	"bytes"
 	"encoding/binary"
@@ -9,38 +13,25 @@ import (
 	"unsafe"
 )
 
-// AnyOptions controls direct decoding into standard Go JSON shapes.
-type AnyOptions struct {
-	// MaxDepth has the same meaning as Options.MaxDepth.
-	MaxDepth int
-
-	// ZeroCopy aliases unescaped strings and, when UseNumber is enabled,
-	// json.Number text into src. Callers must not mutate src while the decoded
-	// value is in use. When false, results are independent of src: decoded
-	// strings alias at most one private copy of the input, so retaining any
-	// decoded string retains that copy.
-	ZeroCopy bool
-
-	// UseNumber decodes numbers as json.Number instead of float64.
-	UseNumber bool
-}
-
-// ParseAny decodes src directly into maps, slices, strings, float64 values,
-// booleans, and nil without building an intermediate Value tree.
-func ParseAny(src []byte) (any, error) {
-	return ParseAnyOptions(src, AnyOptions{})
-}
-
-// ParseAnyOptions decodes src directly according to opts.
-func ParseAnyOptions(src []byte, opts AnyOptions) (any, error) {
-	if len(src) <= 64 {
-		return parseAnyOptions(src, opts, nil)
+// unmarshalAny is the whole-document engine behind dynamic decoding: one
+// pass over src builds the standard Go JSON shapes — map[string]any, []any,
+// string, float64 (json.Number under opts.UseNumber), bool, and nil — with
+// no intermediate tree. [Unmarshal] and [Decoder.Decode] route top-level
+// empty-interface destinations here whenever the existing value does not
+// require encoding/json's decode-into-pointer merge; nested any fields
+// decode mid-stream through decodeCompiledAny instead.
+//
+// The whole-document contract is what pays: because the value must span all
+// of src, the parser can size the [4]any array arena from the source length
+// and switch on the slab boxers (any_box.go) for large documents. Only
+// MaxDepth, ZeroCopy, and UseNumber apply from opts; the remaining
+// DecoderOptions concern typed destinations and have nothing to act on in
+// the dynamic shapes.
+func unmarshalAny(src []byte, opts DecoderOptions) (any, error) {
+	var arena *anyValueArena
+	if len(src) > 64 {
+		arena = &anyValueArena{sourceSize: len(src), boxScalars: len(src) >= anyBoxMinSource}
 	}
-	arena := &anyValueArena{sourceSize: len(src), boxScalars: len(src) >= anyBoxMinSource}
-	return parseAnyOptions(src, opts, arena)
-}
-
-func parseAnyOptions(src []byte, opts AnyOptions, arena *anyValueArena) (any, error) {
 	p := parser{src: src, maxDepth: opts.MaxDepth, zeroCopy: opts.ZeroCopy, anyArena: arena}
 	if p.maxDepth <= 0 {
 		p.maxDepth = defaultMaxDepth

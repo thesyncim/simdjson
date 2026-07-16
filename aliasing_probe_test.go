@@ -490,11 +490,12 @@ func TestProbeReaderBytesGrowAndCompact(t *testing.T) {
 	}
 }
 
-// TestProbeParseAnySlabIsolation exercises the ParseAny slab arena. Arrays
+// TestProbeUnmarshalAnySlabIsolation exercises the dynamic decoder's slab
+// arena. Arrays
 // with 1..10 elements drive slab slot handoff, append growth past the
 // 4-element slot capacity, and slab replacement; the whole tree is compared
 // against encoding/json.
-func TestProbeParseAnySlabIsolation(t *testing.T) {
+func TestProbeUnmarshalAnySlabIsolation(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 	var build func(depth int) string
 	build = func(depth int) string {
@@ -526,12 +527,12 @@ func TestProbeParseAnySlabIsolation(t *testing.T) {
 		if err := json.Unmarshal(src, &want); err != nil {
 			t.Fatal(err)
 		}
-		got, err := ParseAny(src)
+		got, err := unmarshalAnyForTest(src)
 		if err != nil {
 			t.Fatalf("round %d: %v", round, err)
 		}
-		// ParseAny boxes numbers as float64, exactly like encoding/json, so the
-		// trees compare directly.
+		// Dynamic decoding boxes numbers as float64, exactly like encoding/json,
+		// so the trees compare directly.
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("round %d mismatch:\nsrc  %s\ngot  %#v\nwant %#v", round, src, got, want)
 		}

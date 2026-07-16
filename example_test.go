@@ -90,9 +90,9 @@ func ExampleGetRaw() {
 	// Output: ops
 }
 
-func ExampleParseAny() {
-	value, err := simdjson.ParseAny([]byte(`{"name":"ada","scores":[1,2.5]}`))
-	if err != nil {
+func ExampleUnmarshal_dynamic() {
+	var value any
+	if err := simdjson.Unmarshal([]byte(`{"name":"ada","scores":[1,2.5]}`), &value); err != nil {
 		panic(err)
 	}
 

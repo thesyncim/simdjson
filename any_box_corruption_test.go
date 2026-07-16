@@ -2,7 +2,7 @@ package simdjson
 
 // Slab-boxer corruption pass.
 //
-// ParseAny builds interface values whose data words are interior pointers
+// Dynamic decoding builds interface values whose data words are interior pointers
 // into shared heap slabs (any_box.go). The invariants that keep that safe —
 // slabs are heap-resident, slots are written once before handout, chunks are
 // never recycled — would, if violated, corrupt trees only when the collector
@@ -12,7 +12,7 @@ package simdjson
 // retained tree at the end. A violation surfaces as a fatal "found bad
 // pointer in Go heap", or as a tree that no longer DeepEquals the
 // encoding/json ground truth (the safe build's boxers are ordinary
-// conversions, and the differential suites prove ParseAny matches
+// conversions, and the differential suites prove dynamic decoding matches
 // encoding/json, so ground truth and safe path agree).
 //
 // As with the sibling corruption files, -race MASKS this class by perturbing
@@ -70,6 +70,14 @@ func TestGCCorruptionAnyBoxSlabs(t *testing.T) {
 	if len(anyBoxCorpusDoc(0)) < anyBoxMinSource {
 		t.Fatalf("corpus document is smaller than anyBoxMinSource; the slab boxers are not exercised")
 	}
+	ownedDecoder, err := CompileDecoder[any](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroCopyDecoder, err := CompileDecoder[any](DecoderOptions{ZeroCopy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	const goroutines = 12
 	iters := 24
 	if testing.Short() {
@@ -94,13 +102,17 @@ func TestGCCorruptionAnyBoxSlabs(t *testing.T) {
 					atomic.AddInt64(&bad, 1)
 					continue
 				}
-				opts := AnyOptions{ZeroCopy: it%2 == 1}
-				got, err := ParseAnyOptions(src, opts)
-				if err != nil {
+				zeroCopy := it%2 == 1
+				decoder := ownedDecoder
+				if zeroCopy {
+					decoder = zeroCopyDecoder
+				}
+				var got any
+				if err := decoder.Decode(src, &got); err != nil {
 					atomic.AddInt64(&bad, 1)
 					continue
 				}
-				if !opts.ZeroCopy {
+				if !zeroCopy {
 					// Owned results must not alias src in any way.
 					for i := range src {
 						src[i] = 'X'
@@ -113,7 +125,7 @@ func TestGCCorruptionAnyBoxSlabs(t *testing.T) {
 					atomic.AddInt64(&bad, 1)
 					continue
 				}
-				if opts.ZeroCopy {
+				if zeroCopy {
 					// Zero-copy trees alias src, which this loop rewrites next
 					// iteration by building a fresh one; retain only owned trees.
 					continue

@@ -1,6 +1,6 @@
 package simdjson
 
-// Slab boxing for ParseAny's scalars.
+// Slab boxing for the dynamic decoder's scalars (unmarshalAny in any.go).
 //
 // Converting a scalar to any normally heap-allocates a private copy of its
 // value — eight bytes per float64, a two-word header per string, a

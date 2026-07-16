@@ -128,9 +128,9 @@ func checkValidationConsistency(t *testing.T, src []byte, want bool) {
 	if (zeroCopyErr == nil) != want {
 		t.Fatalf("ParseOptions(ZeroCopy) error = %v, want valid %v", zeroCopyErr, want)
 	}
-	_, anyErr := ParseAnyOptions(src, AnyOptions{ZeroCopy: true, UseNumber: true})
+	_, anyErr := decodeAnyForTest(src, DecoderOptions{ZeroCopy: true, UseNumber: true})
 	if (anyErr == nil) != want {
-		t.Fatalf("ParseAnyOptions error = %v, want valid %v", anyErr, want)
+		t.Fatalf("Decoder[any] error = %v, want valid %v", anyErr, want)
 	}
 
 	raw, rawOK, rawErr := GetRaw(src, "")

@@ -159,13 +159,17 @@ func benchmarkCorpusDynamic(b *testing.B, src []byte) {
 	}
 	for _, tc := range []struct {
 		name string
-		opts simdjson.AnyOptions
+		opts simdjson.DecoderOptions
 	}{
-		{"simdjson-owned", simdjson.AnyOptions{}},
-		{"simdjson-zero-copy", simdjson.AnyOptions{ZeroCopy: true}},
+		{"simdjson-owned", simdjson.DecoderOptions{}},
+		{"simdjson-zero-copy", simdjson.DecoderOptions{ZeroCopy: true}},
 	} {
-		got, err := simdjson.ParseAnyOptions(src, tc.opts)
+		decoder, err := simdjson.CompileDecoder[any](tc.opts)
 		if err != nil {
+			b.Fatal(err)
+		}
+		var got any
+		if err := decoder.Decode(src, &got); err != nil {
 			b.Fatal(err)
 		}
 		if !reflect.DeepEqual(got, want) {
@@ -175,8 +179,8 @@ func benchmarkCorpusDynamic(b *testing.B, src []byte) {
 			b.ReportAllocs()
 			b.SetBytes(int64(len(src)))
 			for b.Loop() {
-				value, err := simdjson.ParseAnyOptions(src, tc.opts)
-				if err != nil {
+				var value any
+				if err := decoder.Decode(src, &value); err != nil {
 					b.Fatal(err)
 				}
 				anySink = value

@@ -34,7 +34,7 @@ type boolValue interface {
 	~bool
 }
 
-// decoderFlags carries the per-decode switches. The first five mirror
+// decoderFlags carries the per-decode switches. All but two mirror
 // DecoderOptions; decoderSourceOwned records that ownSource already copied
 // the input, and decoderExpectedSlow latches after the first miss of the
 // packed-key fast match, routing the rest of the decode through the fused
@@ -49,6 +49,7 @@ const (
 	decoderSourceOwned
 	decoderReplace
 	decoderExpectedSlow
+	decoderUseNumber
 )
 
 // decoderCursor is the concrete, interface-free parser used by compiled typed
@@ -95,6 +96,9 @@ func newDecoderCursor(src []byte, opts DecoderOptions) decoderCursor {
 	}
 	if opts.Replace {
 		flags |= decoderReplace
+	}
+	if opts.UseNumber {
+		flags |= decoderUseNumber
 	}
 	return decoderCursor{
 		src:      src,
