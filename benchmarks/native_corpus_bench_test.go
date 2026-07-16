@@ -46,22 +46,6 @@ func benchmarkNativeParse(b *testing.B, src []byte) {
 		}
 	})
 
-	var parser simdjson.IndexParser
-	if _, err := parser.Parse(src); err != nil {
-		b.Fatal(err)
-	}
-	b.Run("simdjson-index-parser-reused", func(b *testing.B) {
-		b.SetBytes(int64(len(src)))
-		b.ReportAllocs()
-		for b.Loop() {
-			index, err := parser.Parse(src)
-			if err != nil {
-				b.Fatal(err)
-			}
-			intSink = index.Len()
-		}
-	})
-
 	if !simdjsongo.SupportedCPU() {
 		b.Run("minio-simdjson-go-reused-zero-copy", func(b *testing.B) {
 			b.Skip("minio/simdjson-go requires amd64 AVX2 and CLMUL")
