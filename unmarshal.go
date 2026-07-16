@@ -14,6 +14,9 @@ type cachedDecoder[T any] struct {
 	err     error
 }
 
+// anyReflectType keys the *any special case in Unmarshal.
+var anyReflectType = reflect.TypeFor[any]()
+
 // Unmarshal decodes src into dst like encoding/json.Unmarshal: decoded strings
 // own their storage and field names match case-insensitively after an exact
 // match. The decoder for each destination type is compiled once and cached for
@@ -23,7 +26,24 @@ type cachedDecoder[T any] struct {
 // and reuse the returned Decoder; that also unlocks ZeroCopy and the other
 // DecoderOptions.
 func Unmarshal[T any](src []byte, dst *T) error {
-	entry, ok := unmarshalDecoders.Load(reflect.TypeFor[T]())
+	typ := reflect.TypeFor[T]()
+	if typ == anyReflectType && dst != nil {
+		// A *any destination needs no compiled plan, so it skips the decoder
+		// cache: the lookup is a visible fraction of decoding a small
+		// document. The dynamic builder applies unless the destination holds
+		// a non-nil pointer, which takes encoding/json's decode-into-pointer
+		// merge through the compiled cursor path below.
+		out := any(dst).(*any)
+		if existing := *out; existing == nil || !anyDecodeMerges(existing) {
+			value, err := unmarshalAny(src, DecoderOptions{})
+			if err != nil {
+				return err
+			}
+			*out = value
+			return nil
+		}
+	}
+	entry, ok := unmarshalDecoders.Load(typ)
 	if !ok {
 		entry = newCachedDecoder[T]()
 	}

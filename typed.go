@@ -118,7 +118,10 @@ func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 		// held requires encoding/json's decode-into-pointer merge, which only
 		// the cursor path implements. Every empty interface shares the eface
 		// layout, so the store through *any is exact for defined types too.
-		if out := (*any)(unsafe.Pointer(dst)); !anyDecodeMerges(*out) {
+		// The nil test stays at the call site: anyDecodeMerges is beyond the
+		// inlining budget, and a fresh destination should not pay a call.
+		out := (*any)(unsafe.Pointer(dst))
+		if existing := *out; existing == nil || !anyDecodeMerges(existing) {
 			value, err := unmarshalAny(src, plan.options)
 			if err != nil {
 				return err
