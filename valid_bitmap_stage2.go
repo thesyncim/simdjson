@@ -1,6 +1,7 @@
 package simdjson
 
 import (
+	"math/bits"
 	"unsafe"
 
 	simdkernels "github.com/thesyncim/simdjson/simd"
@@ -22,6 +23,125 @@ var stage2MachineEnabled = simdkernels.Stage2Enabled() && simdkernels.Stage1Stre
 // The machine's depth limit must equal the walk's; both reject the open
 // that would exceed it.
 const _ = uint(simdkernels.Stage2MaxDepth-defaultMaxDepth) + uint(defaultMaxDepth-simdkernels.Stage2MaxDepth)
+
+// validBitmapStreamChunkAsm is the number of blocks per batched kernel
+// call once the whitespace sample has committed and the stage-2 machine
+// is consuming the masks. The machine reloads and stores its state words
+// per call, so unlike the Go walk it wants wide runs: at 4 blocks the
+// call and state traffic cost about a third of a nanosecond per position
+// on FHIR-shaped documents (1.35 vs 1.07 ns/pos at 16 blocks), while 16
+// blocks holds every gate corpus at or under 1.1. Inside the sampling
+// window the engine keeps validBitmapStreamChunk's 4-block cadence so
+// the bailout decision — and therefore the decided verdict — is
+// bit-identical to the Go engines'. Must be a multiple of
+// validBitmapStreamChunk, divide validBitmapSampleBlocks' window
+// alignment, and not exceed simdkernels.Stage1ChunkBlocks.
+const validBitmapStreamChunkAsm = 16
+
+// validBitmapStreamedAsm is validBitmapStreamed with the grammar walk on
+// the stage-2 machine. The per-block checks — control bytes, UTF-8 run
+// bracketing, escape targets, the whitespace sample — are shared logic
+// and run identically; only the walk differs, and the Phase-A harness
+// pins the walk pair to identical verdicts at identical chunk
+// boundaries. The Go engine remains the fallback on builds without the
+// machine and the reference in the differential tests.
+func validBitmapStreamedAsm(src []byte) (valid, decided bool) {
+	n := len(src)
+	base := unsafe.Pointer(unsafe.SliceData(src))
+
+	var st simdkernels.Stage1Stream
+	var recs [simdkernels.Stage1ChunkBlocks]simdkernels.Stage1Rec
+	var g simdkernels.Stage2State
+	simdkernels.Stage2Reset(&g)
+	var kinds [simdkernels.Stage2KindsLen]byte
+	var scalars [validBitmapStreamChunkAsm * 64]uint32
+
+	utf8RunStart, utf8RunEnd := -1, 0
+	wsSample, emitSample := 0, 0
+	skipEscape := -1
+
+	fullBlocks := n / 64
+	nBlocks := (n + 63) / 64
+	for chunk := 0; chunk < nBlocks; {
+		step := validBitmapStreamChunkAsm
+		if chunk < validBitmapSampleBlocks {
+			step = validBitmapStreamChunk
+		}
+		cnt := nBlocks - chunk
+		if cnt > step {
+			cnt = step
+		}
+		if chunk+cnt <= fullBlocks {
+			simdkernels.Stage1BlocksGP((*byte)(unsafe.Add(base, chunk*64)), cnt, &st, &recs)
+		} else {
+			// The chunk contains the padded tail block. Space padding is
+			// whitespace: it emits nothing and cannot invalidate the block.
+			full := fullBlocks - chunk
+			if full > 0 {
+				simdkernels.Stage1BlocksGP((*byte)(unsafe.Add(base, chunk*64)), full, &st, &recs)
+			}
+			var tail [64]byte
+			for i := range tail {
+				tail[i] = ' '
+			}
+			copy(tail[:], src[fullBlocks*64:])
+			var tailRecs [simdkernels.Stage1ChunkBlocks]simdkernels.Stage1Rec
+			simdkernels.Stage1BlocksGP(&tail[0], 1, &st, &tailRecs)
+			recs[full] = tailRecs[0]
+		}
+
+		var emits [validBitmapStreamChunkAsm]uint64
+		for i := 0; i < cnt; i++ {
+			block := chunk + i
+			pos := block * 64
+			rec := &recs[i]
+
+			if rec.Bad != 0 {
+				return false, true
+			}
+			// UTF-8 is checked per run of non-ASCII blocks while the bytes
+			// are still cache-warm; see validBitmapPerBlock for the
+			// coalescing rationale.
+			if rec.NonASCII {
+				if utf8RunStart >= 0 && block-utf8RunEnd > 8 {
+					if !validUTF8Fast(src[utf8RunStart*64 : utf8RunEnd*64]) {
+						return false, true
+					}
+					utf8RunStart = block
+				} else if utf8RunStart < 0 {
+					utf8RunStart = block
+				}
+				utf8RunEnd = block + 1
+			}
+
+			if bad := validBitmapEscapes(src, n, pos, rec.EscInStr, &skipEscape); bad {
+				return false, true
+			}
+
+			emits[i] = rec.Emit
+			if block < validBitmapSampleBlocks {
+				wsSample += bits.OnesCount64(rec.WsOut)
+				emitSample += bits.OnesCount64(rec.Emit)
+				if block == validBitmapSampleBlocks-1 &&
+					(wsSample < validBitmapSampleMinWs || wsSample*2 < emitSample*7) {
+					return false, false
+				}
+			}
+		}
+		if v, done := validBitmapWalkAsm(src, base, n, chunk*64, emits[:cnt], &g, &kinds, scalars[:]); done {
+			return v, true
+		}
+		chunk += cnt
+	}
+
+	if st.Carry.InString != 0 || !simdkernels.Stage2Finish(&g) {
+		return false, true
+	}
+	if utf8RunStart >= 0 && !validUTF8Fast(src[utf8RunStart*64:min(utf8RunEnd*64, n)]) {
+		return false, true
+	}
+	return true, true
+}
 
 // validBitmapWalkAsm is validBitmapWalk over the stage-2 machine: it
 // feeds a run of consecutive blocks' emit masks to the machine, then

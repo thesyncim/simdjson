@@ -13,10 +13,12 @@ import (
 )
 
 // streamedOracle compares the batched engine against the per-block engine
-// and the scalar Validate on one input. Both engines must agree on decided
-// and, when decided, on the verdict. On arm64 validBitmap dispatches to the
-// batched engine, so this is the consumer-level differential that guards the
-// two classification paths against divergence.
+// and the scalar Validate on one input. All engines must agree on decided
+// and, when decided, on the verdict. On builds with the stage-2 machine
+// validBitmap dispatches to the machine-backed engine, which keeps the Go
+// engine's exact sampling cadence, so decided is compared strictly there
+// too — this is the consumer-level differential that guards the
+// classification paths and the two grammar walks against divergence.
 func streamedOracle(t *testing.T, src []byte, label string) {
 	t.Helper()
 	refOK, refDecided := validBitmapPerBlock(src)
@@ -25,13 +27,21 @@ func streamedOracle(t *testing.T, src []byte, label string) {
 		t.Fatalf("%s: decided mismatch: perBlock=%v streamed=%v (len %d)\n%.200q",
 			label, refDecided, gpDecided, len(src), src)
 	}
+	asmOK, asmDecided := gpOK, gpDecided
+	if stage2MachineEnabled {
+		asmOK, asmDecided = validBitmapStreamedAsm(src)
+		if asmDecided != refDecided {
+			t.Fatalf("%s: decided mismatch: perBlock=%v machine=%v (len %d)\n%.200q",
+				label, refDecided, asmDecided, len(src), src)
+		}
+	}
 	if !refDecided {
 		return
 	}
 	want := Validate(src) == nil
-	if refOK != want || gpOK != want {
-		t.Fatalf("%s: verdict mismatch: perBlock=%v streamed=%v, Validate=%v (len %d)\n%.200q",
-			label, refOK, gpOK, want, len(src), src)
+	if refOK != want || gpOK != want || asmOK != want {
+		t.Fatalf("%s: verdict mismatch: perBlock=%v streamed=%v machine=%v, Validate=%v (len %d)\n%.200q",
+			label, refOK, gpOK, asmOK, want, len(src), src)
 	}
 }
 
@@ -168,6 +178,16 @@ func benchmarkBitmapEngines(b *testing.B, doc []byte) {
 			}
 		}
 	})
+	if stage2MachineEnabled {
+		b.Run("machine", func(b *testing.B) {
+			b.SetBytes(int64(len(doc)))
+			for i := 0; i < b.N; i++ {
+				if ok, _ := validBitmapStreamedAsm(doc); !ok {
+					b.Fatal("invalid")
+				}
+			}
+		})
+	}
 }
 
 // buildNestedTwoSpaceDoc builds the borderline document: 2-space indent
