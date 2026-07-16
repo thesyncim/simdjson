@@ -37,12 +37,17 @@ import (
 // anyBoxCorpusDoc builds a document that hits every slab kind: float64s in
 // and out of the plain-integer fast path, strings clean and escaped, nested
 // non-empty arrays, empty arrays, and objects, salted so goroutines cannot
-// share results by accident.
+// share results by accident. The row count keeps the document above
+// anyBoxMinSource — smaller documents box scalars with ordinary conversions
+// and would not exercise the slabs at all; the test fails loudly if the two
+// ever drift apart.
+const anyBoxCorpusRows = 4300
+
 func anyBoxCorpusDoc(salt int) []byte {
 	var b strings.Builder
-	b.Grow(4096)
+	b.Grow(640 << 10)
 	fmt.Fprintf(&b, `{"salt":%d,"empty":[],"rows":[`, salt)
-	for i := 0; i < 24; i++ {
+	for i := 0; i < anyBoxCorpusRows; i++ {
 		if i != 0 {
 			b.WriteByte(',')
 		}
@@ -62,10 +67,13 @@ func anyBoxCorpusDoc(salt int) []byte {
 // re-verified after the churn, catching a chunk that was recycled or moved
 // out from under its boxed values.
 func TestGCCorruptionAnyBoxSlabs(t *testing.T) {
+	if len(anyBoxCorpusDoc(0)) < anyBoxMinSource {
+		t.Fatalf("corpus document is smaller than anyBoxMinSource; the slab boxers are not exercised")
+	}
 	const goroutines = 12
-	iters := 400
+	iters := 24
 	if testing.Short() {
-		iters = 60
+		iters = 6
 	}
 	var wg sync.WaitGroup
 	var bad int64
@@ -78,7 +86,7 @@ func TestGCCorruptionAnyBoxSlabs(t *testing.T) {
 				got  any
 				want any
 			}
-			keep := make([]kept, 0, 64)
+			keep := make([]kept, 0, 6)
 			for it := 0; it < iters; it++ {
 				src := anyBoxCorpusDoc(g*1_000_000 + it)
 				var want any
@@ -111,7 +119,7 @@ func TestGCCorruptionAnyBoxSlabs(t *testing.T) {
 					continue
 				}
 				keep = append(keep, kept{got: got, want: want})
-				if len(keep) >= 64 {
+				if len(keep) >= 6 {
 					runtime.GC()
 					for i := range keep {
 						if !reflect.DeepEqual(keep[i].got, keep[i].want) {

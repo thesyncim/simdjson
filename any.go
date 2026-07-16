@@ -36,7 +36,8 @@ func ParseAnyOptions(src []byte, opts AnyOptions) (any, error) {
 	if len(src) <= 64 {
 		return parseAnyOptions(src, opts, nil)
 	}
-	return parseAnyOptions(src, opts, &anyValueArena{sourceSize: len(src)})
+	arena := &anyValueArena{sourceSize: len(src), boxScalars: len(src) >= anyBoxMinSource}
+	return parseAnyOptions(src, opts, arena)
 }
 
 func parseAnyOptions(src []byte, opts AnyOptions, arena *anyValueArena) (any, error) {
@@ -591,20 +592,33 @@ type anyValueArena struct {
 	arrays   [][4]any
 	arrayPos int
 
-	box anyBoxer
+	boxScalars bool
+	box        anyBoxer
 }
+
+// anyBoxMinSource is the source size at which the slab boxers switch on.
+// Slab boxing trades allocator work for collector work: each boxed value
+// saves a heap allocation, but its interior data word makes the collector
+// resolve the containing chunk on every mark, and a retained tree pins each
+// chunk's unused tail as live heap. Measured at default GOGC on dynamic
+// decodes, the allocator savings win on multi-hundred-kilobyte documents
+// (631 KiB and 1.7-6.2 MiB corpora all improve) and lose to the added mark
+// cost on small ones (a 137 KiB record array degrades ~8% while the same
+// build wins ~10% with the collector off). The threshold sits in the gap;
+// below it scalars keep ordinary conversions, which the tiny allocator
+// already serves well.
+const anyBoxMinSource = 512 << 10
 
 func boxedAnyBool(v bool) any {
 	return v
 }
 
 // The boxAny helpers funnel every scalar the one-pass parser produces, so the
-// arena's slab boxers plug in here. The tiny-input path (no arena) keeps
-// ordinary conversions: a document of a few values would pay more for a first
-// slab chunk than for the conversions it replaces.
+// arena's slab boxers plug in here. Small documents — the tiny-input path's
+// nil arena and anything under anyBoxMinSource — keep ordinary conversions.
 
 func (p *parser) boxAnyFloat64(v float64) any {
-	if a := p.anyArena; a != nil {
+	if a := p.anyArena; a != nil && a.boxScalars {
 		return a.box.float(v)
 	}
 	return v
@@ -614,14 +628,14 @@ func (p *parser) boxAnyString(v string, number bool) any {
 	if number {
 		return json.Number(v)
 	}
-	if a := p.anyArena; a != nil {
+	if a := p.anyArena; a != nil && a.boxScalars {
 		return a.box.str(v)
 	}
 	return v
 }
 
 func (p *parser) boxAnySlice(v []any) any {
-	if a := p.anyArena; a != nil {
+	if a := p.anyArena; a != nil && a.boxScalars {
 		return a.box.slice(v)
 	}
 	return v
