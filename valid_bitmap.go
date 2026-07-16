@@ -405,132 +405,292 @@ func validBitmapEscapes(src []byte, n, pos int, escInStr uint64, skipEscape *int
 // state traffic over several blocks.
 func validBitmapWalk(src []byte, base unsafe.Pointer, n, pos int, emits []uint64, g *vbState) (valid, done bool) {
 	// state and depth live in locals across the whole run and are stored
-	// back only on the fall-through return; the early returns all report
+	// back only on the suspension return; the early returns all report
 	// done, after which g is never read again.
+	//
+	// The labeled blocks below are the superinstruction policy from the
+	// stage-2 consumer study, expressed portably: after '{' or ',' inside
+	// an object only a key quote can follow; after a key only ':'; after
+	// ':' a string or scalar value dominates; and after a completed object
+	// value the follower set is exactly ',' or '}'. Each block peeks the
+	// next emit bit under an exact-byte guard, consumes it inline on a
+	// hit, and bails to the generic switch on any miss without consuming,
+	// so fusion can never change a verdict — it only skips the dispatch
+	// and state checks the guards make redundant. Fusions stay gated to
+	// object context: the study's array-specific variant regressed the
+	// object and FHIR shapes and is fenced off.
 	state := g.state
 	depth := g.depth
-	for _, emit := range emits {
-		for emit != 0 {
-			j := pos + bits.TrailingZeros64(emit)
-			emit &= emit - 1
-			if j >= n {
+	wi := 0
+	wordBase := 0
+	var emit uint64
+	var j int
+
+next:
+	for emit == 0 {
+		if wi == len(emits) {
+			g.state = state
+			g.depth = depth
+			return false, false
+		}
+		wordBase = pos + wi*64
+		emit = emits[wi]
+		wi++
+	}
+	j = wordBase + bits.TrailingZeros64(emit)
+	emit &= emit - 1
+	if j >= n {
+		return false, true
+	}
+	switch fastByteAt(base, j) {
+	case '{':
+		if state != vbValue && state != vbValueOrEnd {
+			return false, true
+		}
+		if depth >= defaultMaxDepth {
+			return false, true
+		}
+		depth++
+		g.containers[depth>>6] |= 1 << (depth & 63)
+		state = vbKeyOrEnd
+		goto fusedKey
+	case '[':
+		if state != vbValue && state != vbValueOrEnd {
+			return false, true
+		}
+		if depth >= defaultMaxDepth {
+			return false, true
+		}
+		depth++
+		g.containers[depth>>6] &^= 1 << (depth & 63)
+		state = vbValueOrEnd
+		goto next
+	case '}':
+		if depth == 0 || g.containers[depth>>6]&(1<<(depth&63)) == 0 ||
+			(state != vbKeyOrEnd && state != vbNext) {
+			return false, true
+		}
+		depth--
+		state = vbNext
+		if depth == 0 {
+			state = vbDone
+			goto next
+		}
+		if g.containers[depth>>6]&(1<<(depth&63)) != 0 {
+			goto fusedComma
+		}
+		goto next
+	case ']':
+		if depth == 0 || g.containers[depth>>6]&(1<<(depth&63)) != 0 ||
+			(state != vbValueOrEnd && state != vbNext) {
+			return false, true
+		}
+		depth--
+		state = vbNext
+		if depth == 0 {
+			state = vbDone
+			goto next
+		}
+		if g.containers[depth>>6]&(1<<(depth&63)) != 0 {
+			goto fusedComma
+		}
+		goto next
+	case ':':
+		if state != vbColon {
+			return false, true
+		}
+		state = vbValue
+		goto fusedValue
+	case ',':
+		if state != vbNext {
+			return false, true
+		}
+		if g.containers[depth>>6]&(1<<(depth&63)) != 0 {
+			state = vbKey
+			goto fusedKey
+		}
+		state = vbValue
+		goto next
+	case '"':
+		switch state {
+		case vbKeyOrEnd, vbKey:
+			state = vbColon
+			goto fusedColon
+		case vbValue, vbValueOrEnd:
+			state = vbNext
+			if depth == 0 {
+				state = vbDone
+				goto next
+			}
+			if g.containers[depth>>6]&(1<<(depth&63)) != 0 {
+				goto fusedComma
+			}
+			goto next
+		default:
+			return false, true
+		}
+	default:
+		// Scalar value: strict number or literal, which must end at
+		// whitespace, a structural byte, or the document's end.
+		if state != vbValue && state != vbValueOrEnd {
+			return false, true
+		}
+		goto scalarValue
+	}
+
+scalarValue:
+	{
+		var end int
+		switch c := fastByteAt(base, j); {
+		case c == '-' || '0' <= c && c <= '9':
+			var msg string
+			end, msg = scanNumber(src, j)
+			if msg != "" {
 				return false, true
 			}
-			switch fastByteAt(base, j) {
-			case '{':
-				if state != vbValue && state != vbValueOrEnd {
-					return false, true
-				}
-				if depth >= defaultMaxDepth {
-					return false, true
-				}
-				depth++
-				g.containers[depth>>6] |= 1 << (depth & 63)
-				state = vbKeyOrEnd
-			case '[':
-				if state != vbValue && state != vbValueOrEnd {
-					return false, true
-				}
-				if depth >= defaultMaxDepth {
-					return false, true
-				}
-				depth++
-				g.containers[depth>>6] &^= 1 << (depth & 63)
-				state = vbValueOrEnd
-			case '}':
-				if depth == 0 || g.containers[depth>>6]&(1<<(depth&63)) == 0 ||
-					(state != vbKeyOrEnd && state != vbNext) {
-					return false, true
-				}
-				depth--
-				state = vbNext
-				if depth == 0 {
-					state = vbDone
-				}
-			case ']':
-				if depth == 0 || g.containers[depth>>6]&(1<<(depth&63)) != 0 ||
-					(state != vbValueOrEnd && state != vbNext) {
-					return false, true
-				}
-				depth--
-				state = vbNext
-				if depth == 0 {
-					state = vbDone
-				}
-			case ':':
-				if state != vbColon {
-					return false, true
-				}
-				state = vbValue
-			case ',':
-				if state != vbNext {
-					return false, true
-				}
-				if g.containers[depth>>6]&(1<<(depth&63)) != 0 {
-					state = vbKey
-				} else {
-					state = vbValue
-				}
-			case '"':
-				switch state {
-				case vbKeyOrEnd, vbKey:
-					state = vbColon
-				case vbValue, vbValueOrEnd:
-					state = vbNext
-					if depth == 0 {
-						state = vbDone
-					}
-				default:
-					return false, true
-				}
-			default:
-				// Scalar value: strict number or literal, which must end at
-				// whitespace, a structural byte, or the document's end.
-				if state != vbValue && state != vbValueOrEnd {
-					return false, true
-				}
-				var end int
-				switch c := fastByteAt(base, j); {
-				case c == '-' || '0' <= c && c <= '9':
-					var msg string
-					end, msg = scanNumber(src, j)
-					if msg != "" {
-						return false, true
-					}
-				case c == 't':
-					if !literalTrueAt(src, j) {
-						return false, true
-					}
-					end = j + 4
-				case c == 'f':
-					if !literalFalseAt(src, j) {
-						return false, true
-					}
-					end = j + 5
-				case c == 'n':
-					if !literalNullAt(src, j) {
-						return false, true
-					}
-					end = j + 4
-				default:
-					return false, true
-				}
-				if end < n {
-					if c := fastByteAt(base, end); !isJSONSpaceOrStructural(c) {
-						return false, true
-					}
-				}
-				state = vbNext
-				if depth == 0 {
-					state = vbDone
-				}
+		case c == 't':
+			if !literalTrueAt(src, j) {
+				return false, true
+			}
+			end = j + 4
+		case c == 'f':
+			if !literalFalseAt(src, j) {
+				return false, true
+			}
+			end = j + 5
+		case c == 'n':
+			if !literalNullAt(src, j) {
+				return false, true
+			}
+			end = j + 4
+		default:
+			return false, true
+		}
+		if end < n {
+			if c := fastByteAt(base, end); !isJSONSpaceOrStructural(c) {
+				return false, true
 			}
 		}
-		pos += 64
+		state = vbNext
+		if depth == 0 {
+			state = vbDone
+			goto next
+		}
+		if g.containers[depth>>6]&(1<<(depth&63)) != 0 {
+			goto fusedComma
+		}
+		goto next
 	}
-	g.state = state
-	g.depth = depth
-	return false, false
+
+	// fusedKey: after '{' or ',' in an object, only a key quote is legal.
+fusedKey:
+	for emit == 0 {
+		if wi == len(emits) {
+			g.state = state
+			g.depth = depth
+			return false, false
+		}
+		wordBase = pos + wi*64
+		emit = emits[wi]
+		wi++
+	}
+	j = wordBase + bits.TrailingZeros64(emit)
+	if j >= n {
+		return false, true
+	}
+	if fastByteAt(base, j) != '"' {
+		goto next
+	}
+	emit &= emit - 1
+	state = vbColon
+
+	// fusedColon: after a key quote, only ':' is legal.
+fusedColon:
+	for emit == 0 {
+		if wi == len(emits) {
+			g.state = state
+			g.depth = depth
+			return false, false
+		}
+		wordBase = pos + wi*64
+		emit = emits[wi]
+		wi++
+	}
+	j = wordBase + bits.TrailingZeros64(emit)
+	if j >= n {
+		return false, true
+	}
+	if fastByteAt(base, j) != ':' {
+		goto next
+	}
+	emit &= emit - 1
+	state = vbValue
+
+	// fusedValue: after the fused ':', a string or scalar value is the
+	// dominant case; containers bail to their own cases.
+fusedValue:
+	for emit == 0 {
+		if wi == len(emits) {
+			g.state = state
+			g.depth = depth
+			return false, false
+		}
+		wordBase = pos + wi*64
+		emit = emits[wi]
+		wi++
+	}
+	j = wordBase + bits.TrailingZeros64(emit)
+	if j >= n {
+		return false, true
+	}
+	switch fastByteAt(base, j) {
+	case '"':
+		emit &= emit - 1
+		state = vbNext
+		goto fusedComma
+	case '{', '[', '}', ']', ':', ',':
+		goto next
+	}
+	emit &= emit - 1
+	goto scalarValue
+
+	// fusedComma: after a completed value inside an object, the follower
+	// set is exactly ',' or '}'; nested closes chain until an array or
+	// the document's root.
+fusedComma:
+	for emit == 0 {
+		if wi == len(emits) {
+			g.state = state
+			g.depth = depth
+			return false, false
+		}
+		wordBase = pos + wi*64
+		emit = emits[wi]
+		wi++
+	}
+	j = wordBase + bits.TrailingZeros64(emit)
+	if j >= n {
+		return false, true
+	}
+	switch fastByteAt(base, j) {
+	case ',':
+		emit &= emit - 1
+		state = vbKey
+		goto fusedKey
+	case '}':
+		emit &= emit - 1
+		depth--
+		state = vbNext
+		if depth == 0 {
+			state = vbDone
+			goto next
+		}
+		if g.containers[depth>>6]&(1<<(depth&63)) != 0 {
+			goto fusedComma
+		}
+		goto next
+	}
+	goto next
 }
 
 func isJSONSpaceOrStructural(c byte) bool {
