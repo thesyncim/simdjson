@@ -12,7 +12,7 @@ import (
 // allocates nothing once the buffer has grown to its working size.
 //
 // Two levels are available and may be mixed between top-level values.
-// Encode appends one complete value through a compiled [Encoder]. The token
+// EncodeTo appends one complete value through a compiled [Encoder]. The token
 // methods (BeginObject, Key, Int, ...) build a value by hand with the same
 // byte output as Marshal; the writer tracks container state, inserts commas,
 // and turns any call that would produce malformed JSON into an error instead
@@ -92,7 +92,7 @@ func EncodeTo[T any](w *Writer, enc Encoder[T], src *T) error {
 		return w.err
 	}
 	if len(w.stack) != 0 {
-		return w.fail(errors.New("simdjson: Encode inside an unfinished token value"))
+		return w.fail(errors.New("simdjson: EncodeTo inside an unfinished token value"))
 	}
 	if w.started {
 		return w.fail(errors.New("simdjson: second top-level value without Newline"))
