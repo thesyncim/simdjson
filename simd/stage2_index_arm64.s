@@ -158,6 +158,7 @@ cfxdone:
 	CSEL  EQ, R16, ZR, R15
 	ORR   $32, R11, R12        // rowC<<4 | inObj8
 	MOVD  ZR, R13
+	TBNZ  $3, R11, ifusedComma // in an object: ',' or another '}' next
 	IDISPATCH
 
 	PCALIGN $256
@@ -211,6 +212,7 @@ bfxdone:
 	CSEL  EQ, R16, ZR, R15
 	ORR   $48, R11, R12        // rowB<<4 | inObj8
 	MOVD  ZR, R13
+	TBNZ  $3, R11, ifusedComma // in an object: ',' or another '}' next
 	IDISPATCH
 
 	PCALIGN $256
@@ -325,8 +327,10 @@ fcqhit:
 fcqdone:
 	MOVBU (R0)(R5), R6
 	CMP   $44, R6              // ','
-	BNE   idispatchKnown
-	B     ifusedCommaHit
+	BEQ   ifusedCommaHit
+	CMP   $125, R6             // '}'
+	BEQ   ifusedClose
+	B     idispatchKnown
 
 ifusedComma:
 	CBZ   R4, ifusedCommaNext
@@ -335,7 +339,49 @@ ifusedComma:
 	ADD   R16, R3, R5
 	MOVBU (R0)(R5), R6
 	CMP   $44, R6              // ','
+	BEQ   ifusedCommaHit
+	CMP   $125, R6             // '}': close inline and chain upward
 	BNE   idispatchKnown
+
+	// ifusedClose: the '}' following a completed object value. Legality
+	// and the kind match are guaranteed by the entry guards (a completed
+	// value inside an object), the preceding string's end was fixed at
+	// the peek that got us here, and a value just completed, so the
+	// member count is count+1 unconditionally — the empty-object case
+	// can only reach the generic C handler.
+ifusedClose:
+	SUB   $1, R4, R16
+	AND   R16, R4, R4
+	SUB   $1, R10, R10
+	TBNZ  $63, R10, idxunder   // underflow aborts before any patch
+	ADD   $1, R20, R20
+	ADD   $1, R10, R16
+	AND   $127, R16, R16
+	MOVD  (R19)(R16<<3), R17   // this container's scope word
+	ADD   $1, R26, R6          // members = count + 1
+	UBFX  $4, R17, $26, R26    // parent count, saved here at the open
+	LSR   $32, R17, R16        // entry index
+	ADD   R16<<4, R25, R23     // entry address
+	ADD   $1, R5, R12          // end = j+1
+	MOVW  R12, 4(R23)          // entry.end
+	SUB   R25, R14, R12
+	LSR   $4, R12, R12
+	SUB   R16, R12, R12        // next = current index - entry index
+	MOVD  $(6<<26), R16
+	ADD   R16, R6, R6          // info = members | Object<<26
+	ORR   R6<<32, R12, R12
+	MOVD  R12, 8(R23)          // entry.{next,info}
+	AND   $127, R10, R16
+	MOVD  (R19)(R16<<3), R17   // parent scope word
+	AND   $8, R17, R11         // enclosing kind
+	MOVD  $256, R16
+	CMP   $0, R10
+	CSEL  EQ, R16, ZR, R15
+	ORR   $32, R11, R12        // rowC<<4 | inObj8
+	MOVD  ZR, R13
+	TBNZ  $3, R11, ifusedComma // nested closes chain until an array
+	IDISPATCH
+
 ifusedCommaHit:
 	SUB   $1, R4, R16
 	AND   R16, R4, R4
@@ -388,15 +434,35 @@ flxdone:
 	ORR   $64, R11, R12        // rowL<<4 | inObj8
 	MOVD  ZR, R13
 
-	// ifusedValQ: after the fused ':', guess a string value.
-ifusedValQ:
-	CBZ   R4, ifusedValQNext
+	// ifusedValue: after the fused ':', consume a string or scalar value —
+	// together the dominant object-value classes. The scalar leg writes
+	// its placeholder entry exactly as the S handler would and rejoins the
+	// fixup-free comma peek; the string leg rejoins the fixing one. Any
+	// other class bails on the dispatch slot already loaded for the test.
+	// (A wider array-specific fusion was tried in the consumer study and
+	// rejected: code growth regressed the object and FHIR shapes.)
+ifusedValue:
+	CBZ   R4, ifusedValueNext
 	RBIT  R4, R16
 	CLZ   R16, R16
 	ADD   R16, R3, R5
 	MOVBU (R0)(R5), R6
 	CMP   $34, R6              // '"'
-	BNE   idispatchKnown
+	BEQ   ifusedValueQ
+	MOVD  (R7)(R6<<3), R17
+	CMP   $(7*256), R17        // scalar-start class slot
+	BNE   idispatchOffsetKnown
+	SUB   $1, R4, R16
+	AND   R16, R4, R4
+	CMP   R24, R14
+	BHS   idxfull
+	MOVD  $1, R23              // word1: next 1, info 0 (placeholder kind)
+	STP.P (R5, R23), 16(R14)
+	ORR   $112, R11, R12       // rowS<<4 | inObj8
+	MOVD  ZR, R13
+	B     ifusedComma
+
+ifusedValueQ:
 	SUB   $1, R4, R16
 	AND   R16, R4, R4
 	CMP   R24, R14
@@ -404,7 +470,15 @@ ifusedValQ:
 	MOVD  $(4<<58 + 1), R23
 	STP.P (R5, R23), 16(R14)
 	ADD   $96, R11, R12        // rowQv<<4 | inObj8
+	MOVD  ZR, R13
 	B     ifusedCommaQ
+
+	// idispatchOffsetKnown: bail with the dispatch slot already in hand.
+idispatchOffsetKnown:
+	SUB   $1, R4, R16
+	AND   R16, R4, R4
+	ADD   R17, R21, R16
+	JMP   (R16)
 
 	// idispatchKnown: shared bail target for failed peeks; the byte is
 	// already loaded, so consume the bit and dispatch off it.
@@ -444,12 +518,12 @@ ifusedLNext:
 	MOVD.P 8(R1), R4
 	B    ifusedL
 
-ifusedValQNext:
+ifusedValueNext:
 	ADD  $64, R3, R3
 	CMP  R1, R2
 	BEQ  idone
 	MOVD.P 8(R1), R4
-	B    ifusedValQ
+	B    ifusedValue
 
 	// Aborts: flag the state and suspend; the caller falls back to the
 	// portable builder, so nothing after the flag matters.

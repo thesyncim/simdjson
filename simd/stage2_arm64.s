@@ -115,6 +115,7 @@ TEXT ·stage2Loop(SB), NOSPLIT, $0-72
 	CSEL  EQ, R16, ZR, R15
 	ORR   $32, R11, R12        // rowC<<4 | inObj8
 	MOVD  ZR, R13
+	TBNZ  $3, R11, fusedComma  // in an object: ',' or another '}' next
 	DISPATCH
 
 	PCALIGN $128
@@ -134,6 +135,7 @@ TEXT ·stage2Loop(SB), NOSPLIT, $0-72
 	CSEL  EQ, R16, ZR, R15
 	ORR   $48, R11, R12        // rowB<<4 | inObj8
 	MOVD  ZR, R13
+	TBNZ  $3, R11, fusedComma  // in an object: ',' or another '}' next
 	DISPATCH
 
 	PCALIGN $128
@@ -200,7 +202,29 @@ fusedComma:
 	ADD   R16, R3, R5
 	MOVBU (R0)(R5), R6
 	CMP   $44, R6              // ','
+	BEQ   fusedCommaHit
+	CMP   $125, R6             // '}': close inline and chain upward
 	BNE   dispatchKnown
+	// Every path into fusedComma carries a completed value inside an
+	// object, so this '}' is unconditionally legal and its kind cannot
+	// mismatch; the pair table would contribute nothing.
+	SUB   $1, R4, R16
+	AND   R16, R4, R4
+	SUB   $1, R10, R10
+	ORR   R10>>63, R9, R9      // underflow
+	ADD   $1, R20, R20
+	AND   $16383, R10, R16
+	MOVBU (R19)(R16), R11      // enclosing kind
+	AND   $8, R11, R11
+	MOVD  $256, R16
+	CMP   $0, R10
+	CSEL  EQ, R16, ZR, R15
+	ORR   $32, R11, R12        // rowC<<4 | inObj8
+	MOVD  ZR, R13
+	TBNZ  $3, R11, fusedComma  // nested closes chain until an array
+	DISPATCH
+
+fusedCommaHit:
 	SUB   $1, R4, R16
 	AND   R16, R4, R4
 	ORR   R15, R9, R9          // comma at depth 0
@@ -233,21 +257,46 @@ fusedL:
 	ORR   $64, R11, R12        // rowL<<4 | inObj8
 	MOVD  ZR, R13
 
-	// fusedValQ: after the fused ':', guess a string value — the common
-	// case in string-heavy documents — and chain back into fusedComma to
-	// consume whole `"key":"value",` members per dispatch.
-fusedValQ:
-	CBZ   R4, fusedValQNext
+	// fusedValue: after the fused ':', consume a string or scalar value —
+	// together the dominant object-value classes — and chain back into
+	// fusedComma to consume whole members per dispatch. The scalar leg
+	// records the start exactly as the S handler would; any other class
+	// bails on the dispatch slot already loaded for the test. (A wider
+	// array-specific fusion was tried in the consumer study and rejected:
+	// the code growth regressed the object and FHIR shapes. These fusions
+	// stay gated to object context.)
+fusedValue:
+	CBZ   R4, fusedValueNext
 	RBIT  R4, R16
 	CLZ   R16, R16
 	ADD   R16, R3, R5
 	MOVBU (R0)(R5), R6
 	CMP   $34, R6              // '"'
-	BNE   dispatchKnown
+	BEQ   fusedValueQ
+	MOVD  (R7)(R6<<3), R17
+	CMP   $(7*128), R17        // scalar-start class slot
+	BNE   dispatchOffsetKnown
+	SUB   $1, R4, R16
+	AND   R16, R4, R4
+	MOVW.P R5, 4(R14)          // scalars append (position relative to base)
+	ORR   $112, R11, R12       // rowS<<4 | inObj8
+	MOVD  ZR, R13
+	B     fusedComma
+
+fusedValueQ:
 	SUB   $1, R4, R16
 	AND   R16, R4, R4
 	ADD   $96, R11, R12        // rowQv<<4 | inObj8
+	MOVD  ZR, R13
 	B     fusedComma
+
+	// dispatchOffsetKnown: the bail target when the dispatch slot is
+	// already in hand; skip the table reload dispatchKnown would do.
+dispatchOffsetKnown:
+	SUB   $1, R4, R16
+	AND   R16, R4, R4
+	ADD   R17, R21, R16
+	JMP   (R16)
 
 	// dispatchKnown: the shared bail target for failed peeks. The peek
 	// already computed j (R5) and loaded the byte (R6), so bail consumes
@@ -287,12 +336,12 @@ fusedLNext:
 	MOVD.P 8(R1), R4
 	B    fusedL
 
-fusedValQNext:
+fusedValueNext:
 	ADD  $64, R3, R3
 	CMP  R1, R2
 	BEQ  done
 	MOVD.P 8(R1), R4
-	B    fusedValQ
+	B    fusedValue
 
 	// ---- main ----
 main:
