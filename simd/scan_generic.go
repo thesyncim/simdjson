@@ -1,9 +1,15 @@
 package simd
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math/bits"
 	"unicode/utf8"
+)
+
+const (
+	htmlQuoteAmpFold     = 0x0404040404040404
+	htmlAngleBracketFold = 0x0202020202020202
 )
 
 func scanStringSpecialScalar(src []byte, i int) int {
@@ -70,9 +76,13 @@ func scanStringSyntaxScalar(src []byte, i int) int {
 }
 
 func scanEncodedHTMLSyntaxScalar(src []byte, i int) int {
+	const highBits = 0x8080808080808080
 	for i+8 <= len(src) {
 		x := binary.LittleEndian.Uint64(src[i:])
-		m := stringSyntaxMask(x) | byteEqMask(x, '<') | byteEqMask(x, '>') | byteEqMask(x, '&')
+		m := byteEqMask(x|htmlQuoteAmpFold, '&') |
+			byteEqMask(x, '\\') |
+			((x - 0x2020202020202020) & ^x & highBits) |
+			byteEqMask(x|htmlAngleBracketFold, '>')
 		if m != 0 {
 			return i + bits.TrailingZeros64(m)/8
 		}
@@ -89,9 +99,14 @@ func scanEncodedHTMLSyntaxScalar(src []byte, i int) int {
 }
 
 func scanEncodedHTMLSpecialScalar(src []byte, i int) int {
+	const highBits = 0x8080808080808080
 	for i+8 <= len(src) {
 		x := binary.LittleEndian.Uint64(src[i:])
-		m := stringSpecialMask(x) | byteEqMask(x, '<') | byteEqMask(x, '>') | byteEqMask(x, '&')
+		m := byteEqMask(x|htmlQuoteAmpFold, '&') |
+			byteEqMask(x, '\\') |
+			((x - 0x2020202020202020) & ^x & highBits) |
+			(x & highBits) |
+			byteEqMask(x|htmlAngleBracketFold, '>')
 		if m != 0 {
 			return i + bits.TrailingZeros64(m)/8
 		}
@@ -108,10 +123,37 @@ func scanEncodedHTMLSpecialScalar(src []byte, i int) int {
 }
 
 func hasJSONLineSeparatorScalar(src []byte, start int) bool {
-	for i := start; i+2 < len(src); i++ {
+	src = src[start:]
+	offset := bytes.IndexByte(src, 0xe2)
+	if offset < 0 {
+		return false
+	}
+	i := offset
+	if i+2 < len(src) && src[i+1] == 0x80 && (src[i+2] == 0xa8 || src[i+2] == 0xa9) {
+		return true
+	}
+	i++
+
+	for i+10 <= len(src) {
+		window := src[i : i+10]
+		candidates := byteEqMask(binary.LittleEndian.Uint64(window), 0xe2)
+		for candidates != 0 {
+			offset := bits.TrailingZeros64(candidates) / 8
+			if offset >= 8 {
+				break
+			}
+			if window[offset+1] == 0x80 && (window[offset+2] == 0xa8 || window[offset+2] == 0xa9) {
+				return true
+			}
+			candidates &= candidates - 1
+		}
+		i += 8
+	}
+	for i+2 < len(src) {
 		if src[i] == 0xe2 && src[i+1] == 0x80 && (src[i+2] == 0xa8 || src[i+2] == 0xa9) {
 			return true
 		}
+		i++
 	}
 	return false
 }
@@ -158,11 +200,12 @@ func stringSyntaxMask(x uint64) uint64 {
 }
 
 func htmlStringSpecialMask(x uint64) uint64 {
-	// Setting bit 1 folds '<' (0x3C) onto '>' (0x3E), so one equality probe
-	// covers both angle brackets; no other byte maps onto 0x3E that way.
-	return stringSpecialMask(x) |
-		byteEqMask(x, '&') |
-		byteEqMask(x|0x0202020202020202, '>')
+	const highBits = 0x8080808080808080
+	return byteEqMask(x|htmlQuoteAmpFold, '&') |
+		byteEqMask(x, '\\') |
+		((x - 0x2020202020202020) & ^x & highBits) |
+		(x & highBits) |
+		byteEqMask(x|htmlAngleBracketFold, '>')
 }
 
 func byteEqMask(x uint64, b byte) uint64 {

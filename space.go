@@ -2,6 +2,10 @@ package simdjson
 
 import "encoding/binary"
 
+func isJSONWhitespace(c byte) bool {
+	return c == ' ' || c == '\n' || c == '\r' || c == '\t'
+}
+
 // skipSpace returns the index of the first significant byte at or after i,
 // consuming runs of eight spaces word-at-a-time so indented documents skip
 // quickly. It must stay inlineable into every parser loop: the inlining

@@ -121,6 +121,16 @@ var stage2ClsOff = func() (t [256]uint64) {
 	return
 }()
 
+// stage2Class is the compact Go-machine companion to stage2ClsOff. The
+// assembly needs byte offsets into its handler grid; Go's dense switch wants
+// the class itself. Keeping both tables avoids a shift in the token loop.
+var stage2Class = func() (t [256]uint8) {
+	for i := range t {
+		t[i] = uint8(stage2ClsOff[i] >> 7)
+	}
+	return
+}()
+
 // stage2PairBad is the pair-legality table: 1 marks an illegal (previous
 // refined class, inObj, current raw class) triple. Index is
 // prevRow<<4 | inObj<<3 | cls. Rows not constructible by the machine stay

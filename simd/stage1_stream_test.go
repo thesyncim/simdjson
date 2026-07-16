@@ -50,6 +50,9 @@ func (w *stage1RecWalker) block(b *[64]byte) Stage1Rec {
 		if isStruct && outside || quote && in || start && outside {
 			r.Emit |= bit
 		}
+		if cand && outside {
+			r.Scalar |= bit
+		}
 		if esc && in {
 			r.EscInStr |= bit
 		}

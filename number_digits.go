@@ -9,13 +9,20 @@ import (
 )
 
 const (
-	digitLower = uint64(0x3030303030303030)
-	digitUpper = uint64(0x4646464646464646)
-	digitHigh  = uint64(0x8080808080808080)
+	digitLower  = uint64(0x3030303030303030)
+	digitUpper  = uint64(0x4646464646464646)
+	digitHigh   = uint64(0x8080808080808080)
+	digitLower4 = uint32(0x30303030)
+	digitUpper4 = uint32(0x46464646)
+	digitHigh4  = uint32(0x80808080)
 )
 
 func nonDigitMask8(x uint64) uint64 {
 	return ((x + digitUpper) | (x - digitLower)) & digitHigh
+}
+
+func nonDigitMask4(x uint32) uint32 {
+	return ((x + digitUpper4) | (x - digitLower4)) & digitHigh4
 }
 
 // scanDigitsFast advances over a decimal digit run. Short runs stay scalar;
@@ -92,8 +99,11 @@ func literalTrueAt(src []byte, i int) bool {
 		loadUint32LE(unsafe.Add(unsafe.Pointer(unsafe.SliceData(src)), i)) == wordTrueLE
 }
 
-func literalFalseAt(src []byte, i int) bool {
-	return i+5 <= len(src) && src[i] == 'f' &&
+// literalFalseTailAt validates the bytes after a leading 'f' already observed
+// by the caller. Keeping that precondition in the name prevents a redundant
+// indexed load and bounds check in every scalar and boolean dispatch path.
+func literalFalseTailAt(src []byte, i int) bool {
+	return i+5 <= len(src) &&
 		loadUint32LE(unsafe.Add(unsafe.Pointer(unsafe.SliceData(src)), i+1)) == wordAlseLE
 }
 

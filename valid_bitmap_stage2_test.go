@@ -66,7 +66,7 @@ func stage2RefRun(src []byte, emit []uint64, chunkWords int) (valid bool, doneCh
 	g.state = vbValue
 	for w, ci := 0, 0; w < len(emit); w, ci = w+chunkWords, ci+1 {
 		end := min(w+chunkWords, len(emit))
-		if v, done := validBitmapWalk(src, base, n, w*64, emit[w:end], &g); done {
+		if v, done := validBitmapWalk(src, base, n, w*64, emit[w:end], nil, &g); done {
 			return v, ci
 		}
 	}
@@ -347,7 +347,7 @@ func TestStage2WalkChunkResume(t *testing.T) {
 			refValid, refDone := false, -1
 			start := 0
 			for ci, end := range splits {
-				if v, done := validBitmapWalk(src, base, n, start*64, emit[start:end], &g); done {
+				if v, done := validBitmapWalk(src, base, n, start*64, emit[start:end], nil, &g); done {
 					refValid, refDone = v, ci
 					break
 				}

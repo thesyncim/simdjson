@@ -23,19 +23,40 @@ func Stage1Enabled() bool { return true }
 // contains only the intended characters.
 //
 // bit 0: space (0x20)      bit 1: tab, LF, CR
-// bit 2: comma             bit 3: colon
-// bit 4: [ and {           bit 5: ] and }
+// bit 2: unused            bit 3: colon
+// bit 4: comma             bit 5: [ and {
+// bit 6: ] and }
 var stage1ClassLo = [16]uint8{
 	1 << 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 1 << 1, 1<<1 | 1<<3, 1 << 4, 1 << 2, 1<<1 | 1<<5, 0, 0,
+	0, 1 << 1, 1<<1 | 1<<3, 1 << 5, 1 << 4, 1<<1 | 1<<6, 0, 0,
 }
 
 var stage1ClassHi = [16]uint8{
-	1 << 1, 0, 1<<0 | 1<<2, 1 << 3, 0, 1<<4 | 1<<5, 0, 1<<4 | 1<<5,
+	1 << 1, 0, 1<<0 | 1<<4, 1 << 3, 0, 1<<5 | 1<<6, 0, 1<<5 | 1<<6,
+	0, 0, 0, 0, 0, 0, 0, 0,
+}
+
+// The forward decoder does not need colon positions: its packed key match
+// validates the common case directly, and the generic cursor validates the
+// raw bytes between the closing quote and value. Swapping comma and colon's
+// class ranks makes colon a non-emitted separator without another SIMD
+// compare or movemask. It still participates in sig, so it cannot become a
+// scalar start. Treating it like whitespace in ws is harmless because ws is
+// only intersected with the control-byte mask.
+var stage1CursorClassLo = [16]uint8{
+	1 << 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 1 << 1, 1<<1 | 1<<2, 1 << 5, 1 << 4, 1<<1 | 1<<6, 0, 0,
+}
+
+var stage1CursorClassHi = [16]uint8{
+	1 << 1, 0, 1<<0 | 1<<4, 1 << 2, 0, 1<<5 | 1<<6, 0, 1<<5 | 1<<6,
 	0, 0, 0, 0, 0, 0, 0, 0,
 }
 
 const (
-	stage1WhitespaceBits = 1<<0 | 1<<1
-	stage1StructuralBits = 1<<2 | 1<<3 | 1<<4 | 1<<5
+	// Bit 2 is deliberately unused in the full table. Including it in the
+	// whitespace mask makes the same value the unsigned-comparison floor used
+	// by both full and colon-eliding classifiers.
+	stage1WhitespaceBits = 1<<0 | 1<<1 | 1<<2
+	stage1StructuralBits = 1<<3 | 1<<4 | 1<<5 | 1<<6
 )

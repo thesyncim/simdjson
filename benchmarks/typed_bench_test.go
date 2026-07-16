@@ -1,6 +1,7 @@
 package benchmarks
 
 import (
+	"bytes"
 	stdjson "encoding/json"
 	"testing"
 
@@ -45,6 +46,103 @@ func BenchmarkParseTyped(b *testing.B) {
 			benchmarkTypedDocument(b, fixture.data)
 		})
 	}
+}
+
+// BenchmarkParseTypedLargeIndentedReused isolates the workload that can
+// amortize a structural index: a large pretty-printed document decoded into
+// a reusable destination. Source-backed and owned simdjson rows stay separate
+// because string lifetime is part of the benchmark contract.
+func BenchmarkParseTypedLargeIndentedReused(b *testing.B) {
+	var formatted bytes.Buffer
+	if err := stdjson.Indent(&formatted, recordsJSON(1024), "", "  "); err != nil {
+		b.Fatal(err)
+	}
+	src := formatted.Bytes()
+
+	b.Run("stdlib-owned", func(b *testing.B) {
+		dst := TypedDocument{Items: make([]TypedRecord, 0, 1024)}
+		b.SetBytes(int64(len(src)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if err := stdjson.Unmarshal(src, &dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+		typedDocumentSink = dst
+	})
+	b.Run("go-json-owned", func(b *testing.B) {
+		dst := TypedDocument{Items: make([]TypedRecord, 0, 1024)}
+		b.SetBytes(int64(len(src)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if err := goccyjson.Unmarshal(src, &dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+		typedDocumentSink = dst
+	})
+	b.Run("Segment-owned", func(b *testing.B) {
+		dst := TypedDocument{Items: make([]TypedRecord, 0, 1024)}
+		b.SetBytes(int64(len(src)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if err := segmentjson.Unmarshal(src, &dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+		typedDocumentSink = dst
+	})
+	b.Run("jsoniter-owned", func(b *testing.B) {
+		dst := TypedDocument{Items: make([]TypedRecord, 0, 1024)}
+		b.SetBytes(int64(len(src)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if err := jsoniter.Unmarshal(src, &dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+		typedDocumentSink = dst
+	})
+	b.Run("easyjson-generated-owned", func(b *testing.B) {
+		dst := easyjsonmodel.TypedDocument{Items: make([]easyjsonmodel.TypedRecord, 0, 1024)}
+		b.SetBytes(int64(len(src)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if err := dst.UnmarshalJSON(src); err != nil {
+				b.Fatal(err)
+			}
+		}
+		easyDocumentSink = dst
+	})
+	b.Run("simdjson-compiled-source-backed", func(b *testing.B) {
+		dst := TypedDocument{Items: make([]TypedRecord, 0, 1024)}
+		b.SetBytes(int64(len(src)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if err := typedDocDecoder.Decode(src, &dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+		typedDocumentSink = dst
+	})
+	b.Run("simdjson-compiled-owned", func(b *testing.B) {
+		dst := TypedDocument{Items: make([]TypedRecord, 0, 1024)}
+		b.SetBytes(int64(len(src)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			if err := typedDocOwned.Decode(src, &dst); err != nil {
+				b.Fatal(err)
+			}
+		}
+		typedDocumentSink = dst
+	})
 }
 
 func benchmarkTypedSmall(b *testing.B, src []byte) {

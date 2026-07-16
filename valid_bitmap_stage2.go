@@ -113,9 +113,10 @@ func validBitmapStreamedAsm(src []byte) (valid, decided bool) {
 				}
 				utf8RunEnd = block + 1
 			}
-
-			if bad := validBitmapEscapes(src, n, pos, rec.EscInStr, &skipEscape); bad {
-				return false, true
+			if esc := rec.EscInStr; esc != 0 {
+				if validBitmapEscapes(src, n, pos, esc, &skipEscape) {
+					return false, true
+				}
 			}
 
 			emits[i] = rec.Emit
@@ -159,20 +160,8 @@ func validBitmapWalkAsm(src []byte, base unsafe.Pointer, n, pos int, emits []uin
 	// guard. They cannot arise from the space-padded tail block, so the
 	// scan only ever runs on the document's final chunk and fails closed
 	// on masks that violate the framing contract.
-	if pos+len(emits)*64 > n {
-		for i := len(emits) - 1; i >= 0; i-- {
-			wordBase := pos + i*64
-			if wordBase >= n {
-				if emits[i] != 0 {
-					return false, true
-				}
-				continue
-			}
-			if rel := uint(n - wordBase); rel < 64 && emits[i]>>rel != 0 {
-				return false, true
-			}
-			break
-		}
+	if !validBitmapEmitsInBounds(n, pos, emits) {
+		return false, true
 	}
 
 	ns := simdkernels.Stage2Walk((*byte)(unsafe.Add(base, pos)), emits, kinds, scalars, st)
@@ -209,7 +198,7 @@ func validScalarTokenAt(src []byte, base unsafe.Pointer, n, j int) bool {
 		}
 		end = j + 4
 	case c == 'f':
-		if !literalFalseAt(src, j) {
+		if !literalFalseTailAt(src, j) {
 			return false
 		}
 		end = j + 5

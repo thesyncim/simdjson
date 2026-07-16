@@ -211,6 +211,37 @@ func TestTypedDecoderSliceGrowthAndNamedPointer(t *testing.T) {
 	}
 }
 
+func TestTypedDecoderEmptySliceSentinelIsNonNilAndIsolated(t *testing.T) {
+	type document struct {
+		Values []int `json:"values"`
+	}
+	decoder, err := CompileDecoder[document](DecoderOptions{Replace: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var first, second document
+	for name, dst := range map[string]*document{"first": &first, "second": &second} {
+		if err := decoder.Decode([]byte(`{"values":[]}`), dst); err != nil {
+			t.Fatalf("%s decode: %v", name, err)
+		}
+		if dst.Values == nil || len(dst.Values) != 0 || cap(dst.Values) != 0 {
+			t.Fatalf("%s empty slice = %#v (len=%d cap=%d), want non-nil len=cap=0", name, dst.Values, len(dst.Values), cap(dst.Values))
+		}
+	}
+
+	first.Values = append(first.Values, 1)
+	if len(second.Values) != 0 || cap(second.Values) != 0 {
+		t.Fatalf("append to first contaminated second: %#v", second.Values)
+	}
+	if err := decoder.Decode([]byte(`{"values":[]}`), &first); err != nil {
+		t.Fatal(err)
+	}
+	if first.Values == nil || len(first.Values) != 0 || cap(first.Values) != 0 {
+		t.Fatalf("reused empty slice = %#v (len=%d cap=%d), want non-nil len=cap=0", first.Values, len(first.Values), cap(first.Values))
+	}
+}
+
 func TestTypedDecoderDecodeArray(t *testing.T) {
 	decoder, err := CompileDecoder[typedEdgeValue](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
 	if err != nil {

@@ -69,7 +69,7 @@ func (p *parser) parseAnyValue(depth int, useNumber bool) (any, error) {
 		p.i += 4
 		return boxedAnyBool(true), nil
 	case 'f':
-		if !literalFalseAt(p.src, p.i) {
+		if !literalFalseTailAt(p.src, p.i) {
 			return nil, p.err(p.i, "invalid literal")
 		}
 		p.i += 5
@@ -136,7 +136,7 @@ func (p *parser) parseAnyArrayValues(values []any, depth int, useNumber bool) (a
 			p.i += 4
 			v = boxedAnyBool(true)
 		case 'f':
-			if !literalFalseAt(p.src, p.i) {
+			if !literalFalseTailAt(p.src, p.i) {
 				return nil, p.err(p.i, "invalid literal")
 			}
 			p.i += 5
@@ -395,7 +395,7 @@ func (p *parser) parseAnyObject(depth int, useNumber bool) (any, error) {
 			p.i += 4
 			value = boxedAnyBool(true)
 		case 'f':
-			if !literalFalseAt(p.src, p.i) {
+			if !literalFalseTailAt(p.src, p.i) {
 				return nil, p.err(p.i, "invalid literal")
 			}
 			p.i += 5

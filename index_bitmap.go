@@ -91,6 +91,7 @@ func buildIndexBitmap(src []byte, storage []IndexEntry) (entries []IndexEntry, o
 	utf8RunStart, utf8RunEnd := -1, 0
 	wsSample, emitSample, inStrSample, escSample := 0, 0, 0, 0
 	skipEscape := -1
+	escapeState := indexBitmapEscapeState{entry: -1}
 
 	fullBlocks := n / 64
 	nBlocks := (n + 63) / 64
@@ -119,6 +120,7 @@ func buildIndexBitmap(src []byte, storage []IndexEntry) (entries []IndexEntry, o
 		}
 
 		var emits [indexBitmapChunkBlocks]uint64
+		var escapeBlocks uint32
 		for i := 0; i < cnt; i++ {
 			block := chunk + i
 			pos := block * 64
@@ -142,11 +144,13 @@ func buildIndexBitmap(src []byte, storage []IndexEntry) (entries []IndexEntry, o
 				}
 				utf8RunEnd = block + 1
 			}
-
 			// Escape targets inside strings must name a legal escape;
 			// string interiors are otherwise never rescanned.
-			if bad := validBitmapEscapes(src, n, pos, rec.EscInStr, &skipEscape); bad {
-				return nil, false
+			if esc := rec.EscInStr; esc != 0 {
+				escapeBlocks |= uint32(1) << uint(i)
+				if validBitmapEscapes(src, n, pos, esc, &skipEscape) {
+					return nil, false
+				}
 			}
 
 			emits[i] = rec.Emit
@@ -192,7 +196,7 @@ func buildIndexBitmap(src []byte, storage []IndexEntry) (entries []IndexEntry, o
 		// Finish the chunk's new string and scalar entries while their
 		// bytes are cache-warm. Containers are patched by the machine when
 		// their closers arrive, possibly chunks later.
-		if !indexBitmapFinish(src, base, n, full, prevOff, g.EntryOff, scalars[:nscalars], &recs, chunk*64, cnt) {
+		if !indexBitmapFinish(src, base, n, full, prevOff, g.EntryOff, scalars[:nscalars], &recs, chunk*64, cnt, escapeBlocks, &escapeState) {
 			return nil, false
 		}
 	}
@@ -230,8 +234,13 @@ func buildIndexBitmap(src []byte, storage []IndexEntry) (entries []IndexEntry, o
 // trailing bytes merge into its token, so `1x` reaches the scanner
 // rather than the pair table) — and the escaped flags, driven by the
 // chunk's escape-target bits so chunks without escapes pay nothing.
+type indexBitmapEscapeState struct {
+	entry int
+	seen  bool
+}
+
 func indexBitmapFinish(src []byte, base unsafe.Pointer, n int, entries []IndexEntry, fromOff, toOff uint64, scalars []uint32,
-	recs *[simdkernels.Stage1ChunkBlocks]simdkernels.Stage1Rec, chunkPos, cnt int) bool {
+	recs *[simdkernels.Stage1ChunkBlocks]simdkernels.Stage1Rec, chunkPos, cnt int, escapeBlocks uint32, escapeState *indexBitmapEscapeState) bool {
 	fromEntry, toEntry := uint32(fromOff>>4), uint32(toOff>>4)
 	for _, entryIndex := range scalars {
 		if entryIndex < fromEntry || entryIndex >= toEntry {
@@ -276,20 +285,39 @@ func indexBitmapFinish(src []byte, base unsafe.Pointer, n int, entries []IndexEn
 		e.end = uint32(end)
 		e.info = packInfo(0, kind, flags)
 	}
-
-	// Escaped flags: every escape target sits inside some string, and that
-	// string's entry is the last one whose start precedes the target. The
-	// search runs over all entries so far, so strings spanning chunk
-	// boundaries need no carried state.
-	total := int(toOff >> 4)
-	for i := 0; i < cnt; i++ {
-		esc := recs[i].EscInStr
-		if esc == 0 {
-			continue
+	// Escaped flags: InStr partitions escape targets into string runs. Only
+	// the first target in each run needs an entry lookup; the flag is already
+	// set for every later escape in that string. The carried state also spans
+	// chunks, while the previous escaped entry narrows each binary search.
+	total, blockCursor := int(toOff>>4), 0
+	for escapeBlocks != 0 {
+		i := bits.TrailingZeros32(escapeBlocks)
+		escapeBlocks &= escapeBlocks - 1
+		if escapeState.seen {
+			for ; blockCursor < i; blockCursor++ {
+				if recs[blockCursor].InStr != ^uint64(0) {
+					escapeState.seen = false
+					break
+				}
+			}
 		}
+		esc := recs[i].EscInStr
+		inStr := recs[i].InStr
+		bitCursor := 0
 		for ; esc != 0; esc &= esc - 1 {
-			p := uint32(chunkPos + i*64 + bits.TrailingZeros64(esc))
-			lo, hi := 0, total
+			bit := bits.TrailingZeros64(esc)
+			throughTarget := ^uint64(0) >> uint(63-bit)
+			fromCursor := ^uint64(0) << uint(bitCursor)
+			if (^inStr)&throughTarget&fromCursor != 0 {
+				escapeState.seen = false
+			}
+			if escapeState.seen {
+				bitCursor = bit + 1
+				continue
+			}
+
+			p := uint32(chunkPos + i*64 + bit)
+			lo, hi := escapeState.entry+1, total
 			for lo < hi {
 				mid := int(uint(lo+hi) >> 1)
 				if entries[mid].start < p {
@@ -298,14 +326,30 @@ func indexBitmapFinish(src []byte, base unsafe.Pointer, n int, entries []IndexEn
 					hi = mid
 				}
 			}
-			if lo == 0 {
+			entryIndex := lo - 1
+			if entryIndex < 0 {
 				return false
 			}
-			e := &entries[lo-1]
+			e := &entries[entryIndex]
 			if e.Kind() != String {
 				return false
 			}
 			e.info |= uint32(tapeFlagEscaped) << infoFlagsShift
+			escapeState.entry = entryIndex
+			escapeState.seen = true
+			bitCursor = bit + 1
+		}
+		if (^inStr)&(^uint64(0)<<uint(bitCursor)) != 0 {
+			escapeState.seen = false
+		}
+		blockCursor = i + 1
+	}
+	if escapeState.seen {
+		for ; blockCursor < cnt; blockCursor++ {
+			if recs[blockCursor].InStr != ^uint64(0) {
+				escapeState.seen = false
+				break
+			}
 		}
 	}
 	return true

@@ -426,6 +426,49 @@ func BenchmarkGapStage1Pipeline(b *testing.B) {
 	}
 }
 
+func benchmarkGapStage1Direct(b *testing.B, compact bool) {
+	for _, c := range loadGapCorpora(b) {
+		b.Run(c.label, func(b *testing.B) {
+			n := len(c.src)
+			base := unsafe.Pointer(unsafe.SliceData(c.src))
+			fullBlocks := n / 64
+			out := make([]uint32, n+128)
+			var tail [64]byte
+			for i := range tail {
+				tail[i] = ' '
+			}
+			copy(tail[:], c.src[fullBlocks*64:])
+
+			b.SetBytes(int64(n))
+			b.ResetTimer()
+			for iter := 0; iter < b.N; iter++ {
+				var st simdkernels.Stage1IndexStream
+				written := 0
+				for block := 0; block < fullBlocks; block += simdkernels.Stage1ChunkBlocks {
+					count := min(simdkernels.Stage1ChunkBlocks, fullBlocks-block)
+					if compact {
+						written += simdkernels.Stage1CursorBlocks((*byte)(unsafe.Add(base, block*64)), count, uint32(block*64), &st, out[written:])
+					} else {
+						written += simdkernels.Stage1IndexBlocks((*byte)(unsafe.Add(base, block*64)), count, uint32(block*64), &st, out[written:])
+					}
+				}
+				if fullBlocks*64 != n {
+					if compact {
+						written += simdkernels.Stage1CursorBlocks(&tail[0], 1, uint32(fullBlocks*64), &st, out[written:])
+					} else {
+						written += simdkernels.Stage1IndexBlocks(&tail[0], 1, uint32(fullBlocks*64), &st, out[written:])
+					}
+				}
+				intSink = written
+				boolSink = st.Bad
+			}
+		})
+	}
+}
+
+func BenchmarkGapStage1IndexDirect(b *testing.B)  { benchmarkGapStage1Direct(b, false) }
+func BenchmarkGapStage1CursorDirect(b *testing.B) { benchmarkGapStage1Direct(b, true) }
+
 // TestGapFlattenWrite pins the flatten port against a per-bit reference.
 func TestGapFlattenWrite(t *testing.T) {
 	ref := func(dst []uint32, tail int, idx uint32, mask uint64) int {

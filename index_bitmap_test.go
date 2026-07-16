@@ -308,6 +308,7 @@ func TestIndexBitmapChunkResume(t *testing.T) {
 		var slab [simdkernels.Stage2IndexSlabLen]uint64
 		var recs [simdkernels.Stage1ChunkBlocks]simdkernels.Stage1Rec
 		var scalars [simdkernels.Stage2IndexScalarSlots]uint32
+		escapeState := indexBitmapEscapeState{entry: -1}
 		start := 0
 		for _, end := range splits {
 			prevOff := g.EntryOff
@@ -316,7 +317,13 @@ func TestIndexBitmapChunkResume(t *testing.T) {
 				return nil, false
 			}
 			copy(recs[:], allRecs[start:end])
-			if !indexBitmapFinish(doc, base, n, full, prevOff, g.EntryOff, scalars[:nscalars], &recs, start*64, end-start) {
+			var escapeBlocks uint32
+			for i := range end - start {
+				if recs[i].EscInStr != 0 {
+					escapeBlocks |= uint32(1) << uint(i)
+				}
+			}
+			if !indexBitmapFinish(doc, base, n, full, prevOff, g.EntryOff, scalars[:nscalars], &recs, start*64, end-start, escapeBlocks, &escapeState) {
 				return nil, false
 			}
 			start = end
