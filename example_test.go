@@ -144,24 +144,6 @@ func ExampleBuildIndex() {
 	// Output: 7
 }
 
-func ExampleIndexParser() {
-	src := []byte(`{"items":[{"id":7}]}`)
-	var parser simdjson.IndexParser
-
-	index, err := parser.Parse(src)
-	if err != nil {
-		panic(err)
-	}
-	id, ok, err := index.PointerCompiled(simdjson.MustCompilePointer("/items/0/id"))
-	if err != nil || !ok {
-		panic("missing item id")
-	}
-	n, _ := id.Int64()
-
-	fmt.Println(n)
-	// Output: 7
-}
-
 func ExampleDecoderOptions() {
 	decoder, err := simdjson.CompileDecoder[exampleEvent](simdjson.DecoderOptions{Replace: true})
 	if err != nil {

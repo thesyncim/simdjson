@@ -52,8 +52,7 @@
 // raw source slices; [CompilePointer] avoids reparsing the pointer on hot
 // paths. [BuildIndex] validates the input once and lays out a navigable
 // structural index in caller-provided storage, which [Node] and the
-// iterators traverse without allocating. [IndexParser] owns and reuses that
-// storage when a borrowed, single-owner parser is more convenient.
+// iterators traverse without allocating.
 //
 // # Dynamic values and transforms
 //
