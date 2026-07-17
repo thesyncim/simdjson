@@ -310,15 +310,15 @@ malformed `json.Number`) return an `EncodeError` with a typed path.
 
 A type can decode from the package cursor or append through the package writer
 by implementing `UnmarshalSimdJSON(*DecodeCursor) error` or
-`MarshalSimdJSON(Appender) Appender`. The hooks avoid reparsing raw custom
-marshaler output and are useful for generated or carefully hand-written hot
-types.
+`MarshalSimdJSON(TrustedAppender) TrustedAppender`. The hooks avoid reparsing
+raw custom marshaler output and are useful for generated or carefully
+hand-written hot types.
 
 ```go
-func (e Event) MarshalSimdJSON(w simdjson.Appender) simdjson.Appender {
-	w = w.RawByte('{').Raw(`"id":`).Int(int64(e.ID))
-	w = w.Raw(`,"name":`).String(e.Name)
-	return w.Raw(`,"active":`).Bool(e.Active).RawByte('}')
+func (e Event) MarshalSimdJSON(w simdjson.TrustedAppender) simdjson.TrustedAppender {
+	w = w.RawByteUnchecked('{').RawUnchecked(`"id":`).Int(int64(e.ID))
+	w = w.RawUnchecked(`,"name":`).String(e.Name)
+	return w.RawUnchecked(`,"active":`).Bool(e.Active).RawByteUnchecked('}')
 }
 ```
 
@@ -333,9 +333,14 @@ pointer identity and retention safety without a per-hook receiver allocation.
 If an addressable source was otherwise stack-local, allowing a hook to retain
 one of its receivers may make that source escape once for the whole operation;
 an array does not allocate once per element.
-There is no itab rebinding, layout probe, unsafe fast mode, or safety build tag.
+There is no itab rebinding, layout probe, unsafe fast mode, or alternate
+dispatch build.
 Hooks must still consume or emit exactly one valid JSON value, and callers must
-not retain an `Appender` across reuse of its caller-owned output buffer.
+not retain a `TrustedAppender` across reuse of its caller-owned output buffer.
+Raw fragments use deliberately explicit `RawUnchecked`, `RawBytesUnchecked`,
+and `RawByteUnchecked` names. Tests and debug builds can use the
+`simdjson_validate_hooks` build tag to validate exactly the span emitted by
+each encode hook; production builds compile that validation away.
 
 </details>
 
@@ -390,8 +395,11 @@ number and string literals.
 <summary><b>Extract one value with a JSON Pointer</b></summary>
 
 `GetRaw` resolves an RFC 6901 pointer to a raw source slice while validating
-the whole document. `ScanRaw` validates only up to and including the target
+the whole document. `ScanFirstRaw` validates only up to and including the target
 and stops — the fast choice for plucking one field from a large document.
+The names also encode duplicate-key policy: `GetRaw` returns the last matching
+member like `encoding/json`, while `ScanFirstRaw` returns the first match it can
+stop on.
 
 ```go
 price, ok, err := simdjson.GetRaw(src, "/items/0/price")
@@ -401,10 +409,10 @@ if err != nil || !ok {
 v, _ := price.Float64()
 fmt.Println(v) // 9.99
 
-// ScanRaw stops as soon as the target has been validated; compile
+// ScanFirstRaw stops as soon as the target has been validated; compile
 // the pointer once on hot paths.
 pointer := simdjson.MustCompilePointer("/items/0/sku")
-sku, ok, err := pointer.ScanRaw(src)
+sku, ok, err := pointer.ScanFirstRaw(src)
 if err != nil || !ok {
 	return err
 }
@@ -533,7 +541,7 @@ the enforced parse-plus-semantic-digest contract as a direct comparison.
 **Strictness.** Parsing, decoding, validation, and transforms enforce RFC
 8259 syntax, full UTF-8 validity, and correct `\uXXXX` escapes including
 surrogate pairing, and reject trailing data after the top-level value
-(`ScanRaw` deliberately stops validating once its target is found; `Reader`
+(`ScanFirstRaw` deliberately stops validating once its target is found; `Reader`
 frames multiple top-level values by design). Where `encoding/json` silently
 replaces invalid UTF-8 during decode, simdjson rejects the document with a
 positioned error. Depth is limited (default 10000, configurable through the

@@ -734,12 +734,12 @@ func BenchmarkGetRaw(b *testing.B) {
 	}
 }
 
-func BenchmarkScanRaw(b *testing.B) {
+func BenchmarkScanFirstRaw(b *testing.B) {
 	src := benchmarkJSON()
 	b.SetBytes(int64(len(src)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		raw, ok, err := ScanRaw(src, "/items/2/message")
+		raw, ok, err := ScanFirstRaw(src, "/items/2/message")
 		if err != nil || !ok || raw.Kind() != String {
 			b.Fatal(raw, ok, err)
 		}
@@ -759,13 +759,13 @@ func BenchmarkGetRawCompiled(b *testing.B) {
 	}
 }
 
-func BenchmarkScanRawCompiled(b *testing.B) {
+func BenchmarkScanFirstRawCompiled(b *testing.B) {
 	src := benchmarkJSON()
 	ptr := MustCompilePointer("/items/2/message")
 	b.SetBytes(int64(len(src)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		raw, ok, err := ptr.ScanRaw(src)
+		raw, ok, err := ptr.ScanFirstRaw(src)
 		if err != nil || !ok || raw.Kind() != String {
 			b.Fatal(raw, ok, err)
 		}
@@ -784,25 +784,25 @@ func BenchmarkGetRawEarly(b *testing.B) {
 	}
 }
 
-func BenchmarkScanRawEarly(b *testing.B) {
+func BenchmarkScanFirstRawEarly(b *testing.B) {
 	src := benchmarkJSON()
 	b.SetBytes(int64(len(src)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		raw, ok, err := ScanRaw(src, "/items/0/id")
+		raw, ok, err := ScanFirstRaw(src, "/items/0/id")
 		if err != nil || !ok || raw.Kind() != Number {
 			b.Fatal(raw, ok, err)
 		}
 	}
 }
 
-func BenchmarkScanRawEarlyCompiled(b *testing.B) {
+func BenchmarkScanFirstRawEarlyCompiled(b *testing.B) {
 	src := benchmarkJSON()
 	ptr := MustCompilePointer("/items/0/id")
 	b.SetBytes(int64(len(src)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		raw, ok, err := ptr.ScanRaw(src)
+		raw, ok, err := ptr.ScanFirstRaw(src)
 		if err != nil || !ok || raw.Kind() != Number {
 			b.Fatal(raw, ok, err)
 		}
@@ -821,25 +821,25 @@ func BenchmarkGetRawLongString(b *testing.B) {
 	}
 }
 
-func BenchmarkScanRawLongString(b *testing.B) {
+func BenchmarkScanFirstRawLongString(b *testing.B) {
 	src := longStringJSON()
 	b.SetBytes(int64(len(src)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		raw, ok, err := ScanRaw(src, "/s")
+		raw, ok, err := ScanFirstRaw(src, "/s")
 		if err != nil || !ok || raw.Kind() != String {
 			b.Fatal(raw, ok, err)
 		}
 	}
 }
 
-func BenchmarkScanRawLongStringCompiled(b *testing.B) {
+func BenchmarkScanFirstRawLongStringCompiled(b *testing.B) {
 	src := longStringJSON()
 	ptr := MustCompilePointer("/s")
 	b.SetBytes(int64(len(src)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		raw, ok, err := ptr.ScanRaw(src)
+		raw, ok, err := ptr.ScanFirstRaw(src)
 		if err != nil || !ok || raw.Kind() != String {
 			b.Fatal(raw, ok, err)
 		}

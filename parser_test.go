@@ -873,8 +873,8 @@ func assertDepthAccepted(t *testing.T, src []byte, opts Options) {
 	if _, _, err := GetRawOptions(src, "", opts); err != nil {
 		t.Fatalf("GetRawOptions(%q) = %v", src, err)
 	}
-	if _, _, err := ScanRawOptions(src, "", opts); err != nil {
-		t.Fatalf("ScanRawOptions(%q) = %v", src, err)
+	if _, _, err := ScanFirstRawOptions(src, "", opts); err != nil {
+		t.Fatalf("ScanFirstRawOptions(%q) = %v", src, err)
 	}
 	if _, err := appendCompact(nil, src, opts.MaxDepth); err != nil {
 		t.Fatalf("appendCompact(%q) = %v", src, err)
@@ -895,8 +895,8 @@ func assertDepthRejected(t *testing.T, src []byte, opts Options) {
 	if _, _, err := GetRawOptions(src, "", opts); err == nil {
 		t.Fatalf("GetRawOptions(%q) succeeded, want depth error", src)
 	}
-	if _, _, err := ScanRawOptions(src, "", opts); err == nil {
-		t.Fatalf("ScanRawOptions(%q) succeeded, want depth error", src)
+	if _, _, err := ScanFirstRawOptions(src, "", opts); err == nil {
+		t.Fatalf("ScanFirstRawOptions(%q) succeeded, want depth error", src)
 	}
 	if _, err := appendCompact(nil, src, opts.MaxDepth); err == nil {
 		t.Fatalf("appendCompact(%q) succeeded, want depth error", src)
@@ -1152,17 +1152,17 @@ func TestGetRawPointer(t *testing.T) {
 	}
 }
 
-func TestScanRawPointer(t *testing.T) {
+func TestScanFirstRawPointer(t *testing.T) {
 	src := []byte(`{"items":[{"message":"first"},{"message":"second"}],"tail":`)
-	raw, ok, err := ScanRaw(src, "/items/1/message")
+	raw, ok, err := ScanFirstRaw(src, "/items/1/message")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ok || string(raw.Bytes()) != `"second"` {
 		t.Fatalf("raw = %q, %v", raw.Bytes(), ok)
 	}
-	if _, _, err = ScanRaw(src, "/tail"); err == nil {
-		t.Fatal("ScanRaw did not validate target value")
+	if _, _, err = ScanFirstRaw(src, "/tail"); err == nil {
+		t.Fatal("ScanFirstRaw did not validate target value")
 	}
 }
 
@@ -1199,7 +1199,7 @@ func TestCompiledPointer(t *testing.T) {
 	}
 
 	early := MustCompilePointer("/items/1/message")
-	raw, ok, err = early.ScanRaw(src)
+	raw, ok, err = early.ScanFirstRaw(src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1275,7 +1275,7 @@ func TestRawValueAccessors(t *testing.T) {
 	}
 
 	ptr := MustCompilePointer("/nested/x")
-	raw, ok, err = root.ScanPointerCompiled(ptr)
+	raw, ok, err = root.ScanFirstPointerCompiled(ptr)
 	if err != nil || !ok {
 		t.Fatalf("compiled nested = %v, %v", ok, err)
 	}
@@ -1359,30 +1359,30 @@ func TestGetRawAllocs(t *testing.T) {
 	}
 }
 
-func TestScanRawAllocs(t *testing.T) {
+func TestScanFirstRawAllocs(t *testing.T) {
 	src := benchmarkJSON()
 	allocs := testing.AllocsPerRun(1000, func() {
-		raw, ok, err := ScanRaw(src, "/items/2/message")
+		raw, ok, err := ScanFirstRaw(src, "/items/2/message")
 		if err != nil || !ok || raw.Kind() != String {
 			t.Fatalf("raw = %q, %v, %v", raw.Bytes(), ok, err)
 		}
 	})
 	if allocs != 0 {
-		t.Fatalf("ScanRaw allocs = %v, want 0", allocs)
+		t.Fatalf("ScanFirstRaw allocs = %v, want 0", allocs)
 	}
 }
 
-func TestCompiledScanRawAllocs(t *testing.T) {
+func TestCompiledScanFirstRawAllocs(t *testing.T) {
 	src := benchmarkJSON()
 	ptr := MustCompilePointer("/items/2/message")
 	allocs := testing.AllocsPerRun(1000, func() {
-		raw, ok, err := ptr.ScanRaw(src)
+		raw, ok, err := ptr.ScanFirstRaw(src)
 		if err != nil || !ok || raw.Kind() != String {
 			t.Fatalf("raw = %q, %v, %v", raw.Bytes(), ok, err)
 		}
 	})
 	if allocs != 0 {
-		t.Fatalf("compiled ScanRaw allocs = %v, want 0", allocs)
+		t.Fatalf("compiled ScanFirstRaw allocs = %v, want 0", allocs)
 	}
 }
 

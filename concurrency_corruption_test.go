@@ -706,7 +706,7 @@ func TestCorruptionStreaming(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared-source readers: Parse/Get, GetRaw, ScanRaw on one read-only buffer.
+// Shared-source readers: Parse/Get, GetRaw, ScanFirstRaw on one read-only buffer.
 // ---------------------------------------------------------------------------
 
 func TestCorruptionSharedSourceReaders(t *testing.T) {
@@ -743,9 +743,9 @@ func TestCorruptionSharedSourceReaders(t *testing.T) {
 					if e1 != nil || !ok1 || string(r1.Bytes()) != `"bob"` {
 						fail("g%d i%d GetRaw users/1/name = %q ok=%v err=%v", g, it, string(r1.Bytes()), ok1, e1)
 					}
-					r2, ok2, e2 := ScanRaw(src, "/deep/a/b/c")
+					r2, ok2, e2 := ScanFirstRaw(src, "/deep/a/b/c")
 					if e2 != nil || !ok2 || string(r2.Bytes()) != `"found"` {
-						fail("g%d i%d ScanRaw deep = %q", g, it, string(r2.Bytes()))
+						fail("g%d i%d ScanFirstRaw deep = %q", g, it, string(r2.Bytes()))
 					}
 					r3, ok3, e3 := GetRaw(src, "/meta")
 					if e3 != nil || !ok3 || string(r3.Bytes()) != `{"count":2,"tag":"x"}` {

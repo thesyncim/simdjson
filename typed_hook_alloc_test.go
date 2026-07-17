@@ -84,12 +84,12 @@ func (r *hookAllocRecord) unmarshalRest(c *DecodeCursor) error {
 	}
 }
 
-func (r *hookAllocRecord) MarshalSimdJSON(w Appender) Appender {
-	w = w.Raw(`{"id":`).Int(r.ID)
-	w = w.Raw(`,"active":`).Bool(r.Active)
-	w = w.Raw(`,"name":`).String(r.Name)
-	w = w.Raw(`,"score":`).Float64(r.Score)
-	return w.RawByte('}')
+func (r *hookAllocRecord) MarshalSimdJSON(w TrustedAppender) TrustedAppender {
+	w = w.RawUnchecked(`{"id":`).Int(r.ID)
+	w = w.RawUnchecked(`,"active":`).Bool(r.Active)
+	w = w.RawUnchecked(`,"name":`).String(r.Name)
+	w = w.RawUnchecked(`,"score":`).Float64(r.Score)
+	return w.RawByteUnchecked('}')
 }
 
 // TestHookDecodeAllocationBound guards the always-safe hook dispatch against
@@ -132,7 +132,7 @@ func TestHookDecodeAllocationBound(t *testing.T) {
 
 // TestHookEncodeAllocationBound proves that an addressable encode receiver is
 // exposed through an ordinary GC-visible interface without a detached shadow
-// or allocation while the Appender reuses caller-owned output storage.
+// or allocation while the TrustedAppender reuses caller-owned output storage.
 func TestHookEncodeAllocationBound(t *testing.T) {
 	enc, err := CompileEncoder[hookAllocRecord](EncoderOptions{})
 	if err != nil {

@@ -41,6 +41,6 @@ func dispatchDecodeHook(hook UnmarshalerSimd, cursor *decoderCursor) error {
 // dispatchEncodeHook calls the encode hook with an ordinary value. Retaining
 // that value cannot create a dangling stack pointer, but it still violates the
 // buffer-ownership contract if the caller later reuses the output storage.
-func dispatchEncodeHook(hook MarshalerSimd, w Appender) Appender {
+func dispatchEncodeHook(hook MarshalerSimd, w TrustedAppender) TrustedAppender {
 	return hook.MarshalSimdJSON(w)
 }

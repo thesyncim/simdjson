@@ -10,12 +10,12 @@ package simdjson
 //
 // # Lifetime contract
 //
-// The [DecodeCursor] passed to UnmarshalSimdJSON and the [Appender] passed to
+// The [DecodeCursor] passed to UnmarshalSimdJSON and the [TrustedAppender] passed to
 // MarshalSimdJSON borrow state that lives on the enclosing decode or encode
 // call. Neither should be retained past the method's return. Decode hooks
 // always receive a heap-backed cursor copy that is invalidated on return, so a
 // retained DecodeCursor deterministically panics instead of aliasing a reused
-// frame. Encode hooks receive an ordinary Appender value; retaining it keeps a
+// frame. Encode hooks receive an ordinary TrustedAppender value; retaining it keeps a
 // caller-owned buffer alive and can race with later buffer reuse, so it remains
 // a usage error rather than an unsafe runtime-layout contract.
 //
@@ -55,21 +55,24 @@ type UnmarshalerSimd interface {
 }
 
 // MarshalerSimd is the opt-in encode hook. A type implements it to append its
-// own compact JSON through the Appender's zero-cost helpers and return the
-// advanced Appender. It is the simdjson-native counterpart of json.Marshaler.
+// own compact JSON through the TrustedAppender's zero-cost helpers and return the
+// advanced TrustedAppender. It is the simdjson-native counterpart of json.Marshaler.
 //
 // The by-value builder shape keeps the output buffer in registers across the
 // whole body, which is measurably faster than a pointer-held writer. Bodies
-// thread the Appender through and return it (w = w.Int(...), or chained). The
+// thread the TrustedAppender through and return it (w = w.Int(...), or chained). The
 // output is trusted to be valid compact JSON for the value and is spliced into
 // the surrounding document verbatim: there is no re-validation, compaction, or
 // escape pass, which is the whole point of the hook. Emitting malformed JSON
 // corrupts the surrounding document, so a generator must emit correct syntax.
+// Tests and debug builds can enable the simdjson_validate_hooks build tag to
+// validate exactly the span emitted by every invocation; normal builds compile
+// that validation away.
 //
-// The Appender must not be retained past the call; see the lifetime
+// The TrustedAppender must not be retained past the call; see the lifetime
 // contract in this file's package comment.
 type MarshalerSimd interface {
-	MarshalSimdJSON(w Appender) Appender
+	MarshalSimdJSON(w TrustedAppender) TrustedAppender
 }
 
 var (
@@ -91,7 +94,7 @@ type DecodeCursor struct {
 	state decoderCursor
 }
 
-// Appender is the public face of the encoder inside a MarshalSimdJSON body: a
+// TrustedAppender is the public face of the encoder inside a MarshalSimdJSON body: a
 // by-value builder over the output buffer whose helpers are thin, inlinable
 // wrappers over the package's append kernels. Bodies thread it through and
 // return it, which keeps the buffer in registers for the whole method.
@@ -102,41 +105,42 @@ type DecodeCursor struct {
 // body stays straight-line with no per-helper error check. The poison is a
 // plain bool rather than an error field so the builder stays register-sized —
 // the shape the prototype's register-allocation study settled on.
-type Appender struct {
+type TrustedAppender struct {
 	dst        []byte
 	escapeHTML bool
 	bad        bool
 }
 
-// --- Appender: encode helpers ----------------------------------------------
+// --- TrustedAppender: encode helpers ---------------------------------------
 
-// Raw appends lit verbatim. The caller vouches that lit is valid JSON for the
-// position; it is spliced in with no validation or escaping.
-func (w Appender) Raw(lit string) Appender {
+// RawUnchecked appends lit verbatim. The caller vouches that lit is valid JSON
+// for the position; it is spliced in with no validation or escaping.
+func (w TrustedAppender) RawUnchecked(lit string) TrustedAppender {
 	w.dst = append(w.dst, lit...)
 	return w
 }
 
-// RawBytes appends lit verbatim, the []byte form of Raw.
-func (w Appender) RawBytes(lit []byte) Appender {
+// RawBytesUnchecked appends lit verbatim, the []byte form of RawUnchecked.
+func (w TrustedAppender) RawBytesUnchecked(lit []byte) TrustedAppender {
 	w.dst = append(w.dst, lit...)
 	return w
 }
 
-// RawByte appends one byte verbatim, typically a structural delimiter.
-func (w Appender) RawByte(b byte) Appender {
+// RawByteUnchecked appends one byte verbatim, typically a structural
+// delimiter. The caller is responsible for its position and validity.
+func (w TrustedAppender) RawByteUnchecked(b byte) TrustedAppender {
 	w.dst = append(w.dst, b)
 	return w
 }
 
 // Null appends the JSON null literal.
-func (w Appender) Null() Appender {
+func (w TrustedAppender) Null() TrustedAppender {
 	w.dst = append(w.dst, "null"...)
 	return w
 }
 
 // Bool appends true or false.
-func (w Appender) Bool(v bool) Appender {
+func (w TrustedAppender) Bool(v bool) TrustedAppender {
 	if v {
 		w.dst = append(w.dst, "true"...)
 	} else {
@@ -146,13 +150,13 @@ func (w Appender) Bool(v bool) Appender {
 }
 
 // Int appends v in base 10.
-func (w Appender) Int(v int64) Appender {
+func (w TrustedAppender) Int(v int64) TrustedAppender {
 	w.dst = appendCompactInt(w.dst, v)
 	return w
 }
 
 // Uint appends v in base 10.
-func (w Appender) Uint(v uint64) Appender {
+func (w TrustedAppender) Uint(v uint64) TrustedAppender {
 	w.dst = appendCompactUint(w.dst, v)
 	return w
 }
@@ -161,15 +165,15 @@ func (w Appender) Uint(v uint64) Appender {
 // matching encoding/json: control characters, quotes, and backslashes are
 // escaped, invalid UTF-8 becomes the replacement character, and HTML-sensitive
 // bytes are escaped unless the encoder disabled HTML escaping.
-func (w Appender) String(s string) Appender {
+func (w TrustedAppender) String(s string) TrustedAppender {
 	w.dst = appendEncodedJSONString(w.dst, s, w.escapeHTML)
 	return w
 }
 
 // Float64 appends v in encoding/json's shortest round-trippable form. A NaN or
-// an infinity has no JSON form and poisons the Appender; the enclosing encode
+// an infinity has no JSON form and poisons the TrustedAppender; the enclosing encode
 // then reports the value as unsupported.
-func (w Appender) Float64(v float64) Appender {
+func (w TrustedAppender) Float64(v float64) TrustedAppender {
 	dst, err := appendJSONFloat(w.dst, v, 64)
 	if err != nil {
 		w.bad = true
@@ -180,8 +184,8 @@ func (w Appender) Float64(v float64) Appender {
 }
 
 // Float32 appends v in encoding/json's shortest round-trippable form for a
-// 32-bit float. A NaN or an infinity poisons the Appender.
-func (w Appender) Float32(v float32) Appender {
+// 32-bit float. A NaN or an infinity poisons the TrustedAppender.
+func (w TrustedAppender) Float32(v float32) TrustedAppender {
 	dst, err := appendJSONFloat(w.dst, float64(v), 32)
 	if err != nil {
 		w.bad = true
@@ -193,7 +197,7 @@ func (w Appender) Float32(v float32) Appender {
 
 // EscapeHTML reports whether the encoder escapes HTML-sensitive bytes, so a
 // body that formats its own output through Raw can match the option.
-func (w Appender) EscapeHTML() bool { return w.escapeHTML }
+func (w TrustedAppender) EscapeHTML() bool { return w.escapeHTML }
 
 // --- DecodeCursor: object framing ------------------------------------------
 
@@ -621,10 +625,14 @@ func (e *encodeState) encodeViaSimdHook(node *typedNode, src unsafe.Pointer) err
 	if !ok {
 		return &EncodeError{Reason: "invalid compiled operation"}
 	}
-	w := dispatchEncodeHook(hook, Appender{dst: e.dst, escapeHTML: e.escapeHTML})
+	start := len(e.dst)
+	w := dispatchEncodeHook(hook, TrustedAppender{dst: e.dst, escapeHTML: e.escapeHTML})
 	e.dst = w.dst
 	if w.bad {
 		return &EncodeError{Reason: "MarshalSimdJSON: unsupported value"}
+	}
+	if validateSimdHookOutput && !Valid(e.dst[start:]) {
+		return &EncodeError{Reason: "MarshalSimdJSON produced invalid JSON"}
 	}
 	return nil
 }

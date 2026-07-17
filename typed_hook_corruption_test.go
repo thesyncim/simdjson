@@ -24,7 +24,7 @@ import (
 // hookCorruptRecord carries scalars, a string that outlives the frame, a nested
 // hooked struct, and a slice of nested hooks, so decode exercises every hook
 // dispatch site (scalar, nested struct, array element) and encode exercises the
-// by-value Appender through all of them.
+// by-value TrustedAppender through all of them.
 type hookCorruptRecord struct {
 	ID    int64         `json:"id"`
 	Name  string        `json:"name"`
@@ -113,26 +113,26 @@ func (r *hookCorruptRecord) decodeKids(c *DecodeCursor) error {
 	}
 }
 
-func (r *hookCorruptRecord) MarshalSimdJSON(w Appender) Appender {
-	w = w.Raw(`{"id":`).Int(r.ID)
-	w = w.Raw(`,"name":`).String(r.Name)
-	w = w.Raw(`,"addr":`)
+func (r *hookCorruptRecord) MarshalSimdJSON(w TrustedAppender) TrustedAppender {
+	w = w.RawUnchecked(`{"id":`).Int(r.ID)
+	w = w.RawUnchecked(`,"name":`).String(r.Name)
+	w = w.RawUnchecked(`,"addr":`)
 	w = r.Addr.MarshalSimdJSON(w)
-	w = w.Raw(`,"kids":`)
+	w = w.RawUnchecked(`,"kids":`)
 	if r.Kids == nil {
 		w = w.Null()
 	} else {
-		w = w.RawByte('[')
+		w = w.RawByteUnchecked('[')
 		for i := range r.Kids {
 			if i > 0 {
-				w = w.RawByte(',')
+				w = w.RawByteUnchecked(',')
 			}
 			w = r.Kids[i].MarshalSimdJSON(w)
 		}
-		w = w.RawByte(']')
+		w = w.RawByteUnchecked(']')
 	}
-	w = w.Raw(`,"score":`).Float64(r.Score)
-	return w.RawByte('}')
+	w = w.RawUnchecked(`,"score":`).Float64(r.Score)
+	return w.RawByteUnchecked('}')
 }
 
 // hookCorruptRecordPlain is the reflection-path twin used as the oracle.
@@ -215,7 +215,7 @@ func TestHookCorruptionConcurrentDecodeEncode(t *testing.T) {
 				}
 
 				// Encode through the hook path, then force a stack relocation
-				// while the (returned) Appender's laundered buffer pointer and
+				// while the (returned) TrustedAppender's laundered buffer pointer and
 				// the pooled decoder state are still around.
 				out, err := hookEnc.AppendJSON(nil, &viaHook)
 				if err != nil {

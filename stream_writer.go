@@ -119,9 +119,9 @@ func (w *Writer) Newline() error {
 	return w.maybeFlush()
 }
 
-// Raw appends an already encoded JSON value verbatim, like json.RawMessage.
-// The caller is responsible for its validity.
-func (w *Writer) Raw(value []byte) error {
+// RawUnchecked appends an already encoded JSON value verbatim, like
+// json.RawMessage. The caller is responsible for its validity.
+func (w *Writer) RawUnchecked(value []byte) error {
 	if !w.beforeValue() {
 		return w.err
 	}

@@ -114,17 +114,17 @@ func (r *hkbHookRecord) unmarshalRest(c *DecodeCursor) error {
 	}
 }
 
-func (r *hkbHookRecord) MarshalSimdJSON(w Appender) Appender {
-	w = w.Raw(`{"id":`).Int(r.ID)
+func (r *hkbHookRecord) MarshalSimdJSON(w TrustedAppender) TrustedAppender {
+	w = w.RawUnchecked(`{"id":`).Int(r.ID)
 	if r.Active {
-		w = w.Raw(`,"active":true`)
+		w = w.RawUnchecked(`,"active":true`)
 	} else {
-		w = w.Raw(`,"active":false`)
+		w = w.RawUnchecked(`,"active":false`)
 	}
-	w = w.Raw(`,"name":`).String(r.Name)
-	w = w.Raw(`,"note":`).String(r.Note)
-	w = w.Raw(`,"score":`).Float64(r.Score)
-	return w.RawByte('}')
+	w = w.RawUnchecked(`,"name":`).String(r.Name)
+	w = w.RawUnchecked(`,"note":`).String(r.Note)
+	w = w.RawUnchecked(`,"score":`).Float64(r.Score)
+	return w.RawByteUnchecked('}')
 }
 
 type hkbDoc struct {

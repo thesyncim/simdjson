@@ -748,7 +748,7 @@ func TestProbeWriterReaderRoundTripMixed(t *testing.T) {
 			want = append(want, fmt.Sprintf(`{"a":%d}`, i))
 		default:
 			raw := fmt.Sprintf(`{"a":%d}`, i)
-			if err := w.Raw([]byte(raw)); err != nil {
+			if err := w.RawUnchecked([]byte(raw)); err != nil {
 				t.Fatal(err)
 			}
 			want = append(want, raw)

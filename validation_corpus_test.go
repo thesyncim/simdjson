@@ -137,12 +137,12 @@ func checkValidationConsistency(t *testing.T, src []byte, want bool) {
 	if (rawErr == nil && rawOK) != want {
 		t.Fatalf("GetRaw = ok:%v err:%v, want valid %v", rawOK, rawErr, want)
 	}
-	found, foundOK, findErr := ScanRaw(src, "")
+	found, foundOK, findErr := ScanFirstRaw(src, "")
 	if want && (findErr != nil || !foundOK) {
-		t.Fatalf("ScanRaw = ok:%v err:%v, want target", foundOK, findErr)
+		t.Fatalf("ScanFirstRaw = ok:%v err:%v, want target", foundOK, findErr)
 	}
 	if findErr == nil && foundOK && !strictJSONValid(found.Bytes()) {
-		t.Fatal("ScanRaw returned a target that is not strict JSON")
+		t.Fatal("ScanFirstRaw returned a target that is not strict JSON")
 	}
 
 	compact, compactErr := AppendCompact(nil, src)
@@ -433,9 +433,9 @@ func FuzzPointerConsistency(f *testing.F) {
 		compiledRaw, compiledOK, compiledErr := compiled.GetRaw(src)
 		assertRawLookupEqual(t, "GetRaw", dynamicRaw, dynamicOK, dynamicErr, compiledRaw, compiledOK, compiledErr)
 
-		dynamicFound, dynamicFoundOK, dynamicFindErr := ScanRaw(src, pointer)
-		compiledFound, compiledFoundOK, compiledFindErr := compiled.ScanRaw(src)
-		assertRawLookupEqual(t, "ScanRaw", dynamicFound, dynamicFoundOK, dynamicFindErr, compiledFound, compiledFoundOK, compiledFindErr)
+		dynamicFound, dynamicFoundOK, dynamicFindErr := ScanFirstRaw(src, pointer)
+		compiledFound, compiledFoundOK, compiledFindErr := compiled.ScanFirstRaw(src)
+		assertRawLookupEqual(t, "ScanFirstRaw", dynamicFound, dynamicFoundOK, dynamicFindErr, compiledFound, compiledFoundOK, compiledFindErr)
 
 		count, err := RequiredIndexEntries(src)
 		if err != nil {

@@ -93,7 +93,7 @@ func TestWriterTokensMatchStdlib(t *testing.T) {
 	w.Key("when")
 	w.Time(when)
 	w.Key("raw")
-	w.Raw([]byte(`{"pre":"encoded"}`))
+	w.RawUnchecked([]byte(`{"pre":"encoded"}`))
 	if err := w.EndObject(); err != nil {
 		t.Fatal(err)
 	}

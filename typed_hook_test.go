@@ -10,7 +10,7 @@ import (
 
 // This file exercises the method-hook tier end to end. hookAddress and
 // hookPerson below implement UnmarshalerSimd/MarshalerSimd using only the
-// public DecodeCursor/Appender/Field surface — the exact code a generator would emit,
+// public DecodeCursor/TrustedAppender/Field surface — the exact code a generator would emit,
 // including a full arbitrary-order fallback that handles reordered, missing,
 // extra, and duplicate members and honours DecoderOptions.CaseSensitive. Their
 // twins hookAddressPlain/hookPersonPlain carry the identical layout and json
@@ -104,11 +104,11 @@ func (a *hookAddress) unmarshalRest(c *DecodeCursor, first bool) error {
 	}
 }
 
-func (a *hookAddress) MarshalSimdJSON(w Appender) Appender {
-	w = w.Raw(`{"street":`).String(a.Street)
-	w = w.Raw(`,"city":`).String(a.City)
-	w = w.Raw(`,"zip":`).Int(int64(a.Zip))
-	return w.RawByte('}')
+func (a *hookAddress) MarshalSimdJSON(w TrustedAppender) TrustedAppender {
+	w = w.RawUnchecked(`{"street":`).String(a.Street)
+	w = w.RawUnchecked(`,"city":`).String(a.City)
+	w = w.RawUnchecked(`,"zip":`).Int(int64(a.Zip))
+	return w.RawByteUnchecked('}')
 }
 
 // --- hookPerson: the outer type, nesting a hooked struct and a slice --------
@@ -261,43 +261,43 @@ func (p *hookPerson) decodeAliases(c *DecodeCursor) error {
 	}
 }
 
-func (p *hookPerson) MarshalSimdJSON(w Appender) Appender {
-	w = w.Raw(`{"id":`).Int(p.ID)
-	w = w.Raw(`,"name":`).String(p.Name)
-	w = w.Raw(`,"active":`).Bool(p.Active)
-	w = w.Raw(`,"score":`).Float64(p.Score)
-	w = w.Raw(`,"tags":`)
+func (p *hookPerson) MarshalSimdJSON(w TrustedAppender) TrustedAppender {
+	w = w.RawUnchecked(`{"id":`).Int(p.ID)
+	w = w.RawUnchecked(`,"name":`).String(p.Name)
+	w = w.RawUnchecked(`,"active":`).Bool(p.Active)
+	w = w.RawUnchecked(`,"score":`).Float64(p.Score)
+	w = w.RawUnchecked(`,"tags":`)
 	if p.Tags == nil {
 		w = w.Null()
 	} else {
-		w = w.RawByte('[')
+		w = w.RawByteUnchecked('[')
 		for i, t := range p.Tags {
 			if i > 0 {
-				w = w.RawByte(',')
+				w = w.RawByteUnchecked(',')
 			}
 			w = w.String(t)
 		}
-		w = w.RawByte(']')
+		w = w.RawByteUnchecked(']')
 	}
-	w = w.Raw(`,"address":`)
+	w = w.RawUnchecked(`,"address":`)
 	w = p.Address.MarshalSimdJSON(w)
-	w = w.Raw(`,"aliases":`)
+	w = w.RawUnchecked(`,"aliases":`)
 	if p.Aliases == nil {
 		w = w.Null()
 	} else {
-		w = w.RawByte('[')
+		w = w.RawByteUnchecked('[')
 		for i := range p.Aliases {
 			if i > 0 {
-				w = w.RawByte(',')
+				w = w.RawByteUnchecked(',')
 			}
 			w = p.Aliases[i].MarshalSimdJSON(w)
 		}
-		w = w.RawByte(']')
+		w = w.RawByteUnchecked(']')
 	}
 	if p.Nickname != "" {
-		w = w.Raw(`,"nickname":`).String(p.Nickname)
+		w = w.RawUnchecked(`,"nickname":`).String(p.Nickname)
 	}
-	return w.RawByte('}')
+	return w.RawByteUnchecked('}')
 }
 
 // sampleHookPersonJSON returns a canonical, in-order document.
@@ -514,7 +514,7 @@ func TestHookRoundTrip(t *testing.T) {
 	}
 }
 
-// TestHookEncodeFloatEdges checks that a NaN/Inf poisons the Appender and the
+// TestHookEncodeFloatEdges checks that a NaN/Inf poisons the TrustedAppender and the
 // enclosing encode reports the value as unsupported, matching encoding/json's
 // rejection.
 func TestHookEncodeFloatEdges(t *testing.T) {

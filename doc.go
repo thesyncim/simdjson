@@ -49,11 +49,12 @@
 // # Validation and selection
 //
 // [Valid] and [Validate] check strict JSON syntax without building any
-// representation. [GetRaw] and [ScanRaw] resolve RFC 6901 JSON Pointers to
-// raw source slices; [CompilePointer] avoids reparsing the pointer on hot
-// paths. [BuildIndex] validates the input once and lays out a navigable
-// structural index in caller-provided storage, which [Node] and the
-// iterators traverse without allocating.
+// representation. [GetRaw] resolves RFC 6901 JSON Pointers with last-duplicate
+// semantics after validating the document; [ScanFirstRaw] names its
+// early-exit, first-duplicate contract explicitly. [CompilePointer] avoids
+// reparsing the pointer on hot paths. [BuildIndex] validates the input once and
+// lays out a navigable structural index in caller-provided storage, which
+// [Node] and the iterators traverse without allocating.
 //
 // # Dynamic values and transforms
 //

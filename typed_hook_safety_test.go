@@ -17,7 +17,7 @@ var (
 
 type safeArrayHook int
 
-func (receiver *safeArrayHook) MarshalSimdJSON(appender Appender) Appender {
+func (receiver *safeArrayHook) MarshalSimdJSON(appender TrustedAppender) TrustedAppender {
 	index := int(*receiver)
 	if 0 <= index && index < len(retainedArrayReceivers) {
 		retainedArrayReceivers[index] = receiver
@@ -68,7 +68,7 @@ func TestEncodeHookArrayUsesStableSourcePointers(t *testing.T) {
 	}
 }
 
-func (receiver *safeHookReceiver) MarshalSimdJSON(appender Appender) Appender {
+func (receiver *safeHookReceiver) MarshalSimdJSON(appender TrustedAppender) TrustedAppender {
 	retainedEncodeReceiver = receiver
 	receiver.Value++
 	return appender.Int(int64(receiver.Value))

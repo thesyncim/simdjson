@@ -11,9 +11,8 @@ import (
 
 // ---------------------------------------------------------------------------
 // Probe A: duplicate-key semantics must agree across every pointer lookup path.
-// Node.Get and Value.Get document last-wins; GetRaw is tested for last-wins in
-// TestGetRawPointer. ScanRaw stops early, so its duplicate behavior is the open
-// question.
+// Node.Get, Value.Get, and GetRaw use last-wins. ScanFirstRaw names and tests
+// its first-wins early-exit contract explicitly.
 // ---------------------------------------------------------------------------
 
 func probeIndex(t *testing.T, src []byte) Index {
@@ -56,17 +55,17 @@ func TestProbeDuplicateKeyContracts(t *testing.T) {
 		if nodeErr != nil || nodeOK != tc.getOK || string(node.Raw().Bytes()) != tc.getRaw {
 			t.Errorf("Index.Pointer(%q) = %q, %v, %v; want %q, %v", tc.pointer, node.Raw().Bytes(), nodeOK, nodeErr, tc.getRaw, tc.getOK)
 		}
-		scanRaw, scanOK, scanErr := ScanRaw(src, tc.pointer)
+		scanRaw, scanOK, scanErr := ScanFirstRaw(src, tc.pointer)
 		if scanErr != nil || scanOK != tc.scanOK || string(scanRaw.Bytes()) != tc.scanRaw {
-			t.Errorf("ScanRaw(%q) = %q, %v, %v; want %q, %v", tc.pointer, scanRaw.Bytes(), scanOK, scanErr, tc.scanRaw, tc.scanOK)
+			t.Errorf("ScanFirstRaw(%q) = %q, %v, %v; want %q, %v", tc.pointer, scanRaw.Bytes(), scanOK, scanErr, tc.scanRaw, tc.scanOK)
 		}
 		compiled, err := CompilePointer(tc.pointer)
 		if err != nil {
 			t.Fatal(err)
 		}
-		compiledRaw, compiledOK, compiledErr := compiled.ScanRaw(src)
+		compiledRaw, compiledOK, compiledErr := compiled.ScanFirstRaw(src)
 		if compiledErr != nil || compiledOK != tc.scanOK || string(compiledRaw.Bytes()) != tc.scanRaw {
-			t.Errorf("CompiledPointer.ScanRaw(%q) = %q, %v, %v; want %q, %v", tc.pointer, compiledRaw.Bytes(), compiledOK, compiledErr, tc.scanRaw, tc.scanOK)
+			t.Errorf("CompiledPointer.ScanFirstRaw(%q) = %q, %v, %v; want %q, %v", tc.pointer, compiledRaw.Bytes(), compiledOK, compiledErr, tc.scanRaw, tc.scanOK)
 		}
 	}
 }
@@ -94,7 +93,7 @@ func parseValuePointer(src []byte, pointer string) (Value, bool, error) {
 	return root.Pointer(pointer)
 }
 
-// resolveAll runs one pointer through GetRaw, ScanRaw, compiled GetRaw,
+// resolveAll runs one pointer through GetRaw, ScanFirstRaw, compiled GetRaw,
 // Index.Pointer and Value.Pointer and asserts they agree; returns the outcome.
 func resolveAll(t *testing.T, src []byte, pointer string) pointerOutcome {
 	t.Helper()
@@ -113,9 +112,9 @@ func resolveAll(t *testing.T, src []byte, pointer string) pointerOutcome {
 		out.raw = canonical(getRaw.Bytes())
 	}
 
-	scanRaw, scanOK, scanErr := ScanRaw(src, pointer)
+	scanRaw, scanOK, scanErr := ScanFirstRaw(src, pointer)
 	if scanOK != getOK || (scanErr != nil) != (getErr != nil) || (scanOK && canonical(scanRaw.Bytes()) != out.raw) {
-		t.Errorf("pointer %q: ScanRaw = (%q, %v, %v), GetRaw = (%q, %v, %v)",
+		t.Errorf("pointer %q: ScanFirstRaw = (%q, %v, %v), GetRaw = (%q, %v, %v)",
 			pointer, scanRaw.Bytes(), scanOK, scanErr, getRaw.Bytes(), getOK, getErr)
 	}
 
@@ -739,8 +738,8 @@ func TestProbeDepthLimitAgreement(t *testing.T) {
 		if _, _, err := GetRaw(src, "/0"); (err == nil) != want {
 			t.Errorf("depth %d: GetRaw err = %v, Valid = %v", depth, err, want)
 		}
-		if _, _, err := ScanRaw(src, "/0"); (err == nil) != want {
-			t.Errorf("depth %d: ScanRaw err = %v, Valid = %v", depth, err, want)
+		if _, _, err := ScanFirstRaw(src, "/0"); (err == nil) != want {
+			t.Errorf("depth %d: ScanFirstRaw err = %v, Valid = %v", depth, err, want)
 		}
 		if _, err := AppendCompact(nil, src); (err == nil) != want {
 			t.Errorf("depth %d: AppendCompact err = %v, Valid = %v", depth, err, want)
@@ -914,7 +913,7 @@ func TestProbeIndentPreservesEscapeSpelling(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // Probe J: raw spans. Targets never include surrounding whitespace; root
-// scalars work; ScanRaw's documented stop-early behavior on trailing garbage.
+// scalars work; ScanFirstRaw's documented stop-early behavior on trailing garbage.
 // ---------------------------------------------------------------------------
 
 func TestProbeRawSpans(t *testing.T) {
@@ -940,13 +939,13 @@ func TestProbeRawSpans(t *testing.T) {
 		t.Errorf("root scalar kind = %v", rootRaw.Kind())
 	}
 
-	// GetRaw validates the tail; ScanRaw documents that it does not.
+	// GetRaw validates the tail; ScanFirstRaw documents that it does not.
 	garbage := []byte(`{"a":1} trailing`)
 	if _, _, err := GetRaw(garbage, "/a"); err == nil {
 		t.Error("GetRaw did not validate trailing garbage")
 	}
-	if raw, ok, err := ScanRaw(garbage, "/a"); err != nil || !ok || string(raw.Bytes()) != "1" {
-		t.Errorf("ScanRaw stop-early = %q, %v, %v", raw.Bytes(), ok, err)
+	if raw, ok, err := ScanFirstRaw(garbage, "/a"); err != nil || !ok || string(raw.Bytes()) != "1" {
+		t.Errorf("ScanFirstRaw stop-early = %q, %v, %v", raw.Bytes(), ok, err)
 	}
 
 	// Nested Get on a RawValue re-anchors pointers relative to the target.

@@ -179,10 +179,11 @@ func (r RawValue) Pointer(pointer string) (RawValue, bool, error) {
 	return GetRaw(r.src, pointer)
 }
 
-// ScanPointer returns a raw JSON Pointer target within r and stops after
-// validating the target. It does not validate bytes after the match.
-func (r RawValue) ScanPointer(pointer string) (RawValue, bool, error) {
-	return ScanRaw(r.src, pointer)
+// ScanFirstPointer returns a raw JSON Pointer target within r and stops after
+// validating the target. It does not validate bytes after the match, and each
+// pointer token resolves to the first matching object member.
+func (r RawValue) ScanFirstPointer(pointer string) (RawValue, bool, error) {
+	return ScanFirstRaw(r.src, pointer)
 }
 
 // PointerCompiled returns a strict precompiled JSON Pointer target within r.
@@ -190,9 +191,9 @@ func (r RawValue) PointerCompiled(pointer CompiledPointer) (RawValue, bool, erro
 	return pointer.GetRaw(r.src)
 }
 
-// ScanPointerCompiled is ScanPointer with a precompiled pointer.
-func (r RawValue) ScanPointerCompiled(pointer CompiledPointer) (RawValue, bool, error) {
-	return pointer.ScanRaw(r.src)
+// ScanFirstPointerCompiled is ScanFirstPointer with a precompiled pointer.
+func (r RawValue) ScanFirstPointerCompiled(pointer CompiledPointer) (RawValue, bool, error) {
+	return pointer.ScanFirstRaw(r.src)
 }
 
 // GetRaw validates src and returns the JSON Pointer target as a raw source
@@ -202,18 +203,18 @@ func GetRaw(src []byte, pointer string) (RawValue, bool, error) {
 	return GetRawOptions(src, pointer, Options{})
 }
 
-// ScanRaw returns the JSON Pointer target as a raw source slice and stops as
+// ScanFirstRaw returns the JSON Pointer target as a raw source slice and stops as
 // soon as that target has been validated. It validates the traversed path and
 // skipped siblings before the target, but unlike GetRaw it does not validate
 // the remainder of the document after a match, and each pointer token
 // resolves to the first matching member — an early-exit scanner never sees a
 // later duplicate. Use GetRaw for encoding/json's last-occurrence semantics.
-func ScanRaw(src []byte, pointer string) (RawValue, bool, error) {
-	return ScanRawOptions(src, pointer, Options{})
+func ScanFirstRaw(src []byte, pointer string) (RawValue, bool, error) {
+	return ScanFirstRawOptions(src, pointer, Options{})
 }
 
-// ScanRawOptions is ScanRaw with parser options.
-func ScanRawOptions(src []byte, pointer string, opts Options) (RawValue, bool, error) {
+// ScanFirstRawOptions is ScanFirstRaw with parser options.
+func ScanFirstRawOptions(src []byte, pointer string, opts Options) (RawValue, bool, error) {
 	if err := validatePointerSyntax(pointer); err != nil {
 		return RawValue{}, false, err
 	}
@@ -251,15 +252,15 @@ func (p CompiledPointer) GetRawOptions(src []byte, opts Options) (RawValue, bool
 	return raw, ok, nil
 }
 
-// ScanRaw returns p's target as a raw source slice and stops as soon as
-// that target has been validated. Like the package-level ScanRaw, each
+// ScanFirstRaw returns p's target as a raw source slice and stops as soon as
+// that target has been validated. Like the package-level ScanFirstRaw, each
 // pointer token resolves to the first matching member.
-func (p CompiledPointer) ScanRaw(src []byte) (RawValue, bool, error) {
-	return p.ScanRawOptions(src, Options{})
+func (p CompiledPointer) ScanFirstRaw(src []byte) (RawValue, bool, error) {
+	return p.ScanFirstRawOptions(src, Options{})
 }
 
-// ScanRawOptions is ScanRaw with parser options.
-func (p CompiledPointer) ScanRawOptions(src []byte, opts Options) (RawValue, bool, error) {
+// ScanFirstRawOptions is ScanFirstRaw with parser options.
+func (p CompiledPointer) ScanFirstRawOptions(src []byte, opts Options) (RawValue, bool, error) {
 	s := rawSeeker{src: src, maxDepth: opts.MaxDepth, stopAfterFound: true}
 	if s.maxDepth <= 0 {
 		s.maxDepth = defaultMaxDepth
