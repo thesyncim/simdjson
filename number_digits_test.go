@@ -12,6 +12,59 @@ import (
 var parsedDigitsSink uint64
 var benchmarkFloatSink float64
 
+func TestScanNumberFastTaggedSWARMatchesScalar(t *testing.T) {
+	cases := []string{
+		"0", "-0", "1", "10", "12345678", "123456789", "1234567890",
+		"-12345678901234567890", "1.0", "-12.345678901234", "123456789.25",
+		"1e2", "1E-20", "123456789e+100", "01", "00", "-", "1.", "1e", "1e+", ".1", "true",
+	}
+	check := func(data []byte) {
+		t.Helper()
+		base := unsafe.Pointer(unsafe.SliceData(data))
+		wantEnd, wantInt, wantOK := scanNumberFastTagged(base, len(data), 0)
+		gotEnd, gotInt, gotOK := scanNumberFastTaggedSWAR(base, len(data), 0)
+		if gotEnd != wantEnd || gotInt != wantInt || gotOK != wantOK {
+			t.Fatalf("scanNumberFastTaggedSWAR(%q) = (%d,%v,%v), scalar (%d,%v,%v)",
+				data, gotEnd, gotInt, gotOK, wantEnd, wantInt, wantOK)
+		}
+	}
+	for _, text := range cases {
+		check([]byte(text))
+	}
+
+	const alphabet = "0123456789+-.eE,xtruefalsn"
+	x := uint64(0x9e3779b97f4a7c15)
+	var random [64]byte
+	for round := 0; round < 1_000_000; round++ {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		n := 1 + int(x&63)
+		data := random[:n]
+		for i := range data {
+			x = x*6364136223846793005 + 1442695040888963407
+			data[i] = alphabet[x%uint64(len(alphabet))]
+		}
+		check(data)
+	}
+}
+
+func TestScanDigitsLongMatchesGeneralScanner(t *testing.T) {
+	for digits := 8; digits <= 96; digits++ {
+		for _, suffix := range []byte{',', '.', 'e', 'x'} {
+			data := make([]byte, digits+1)
+			for i := 0; i < digits; i++ {
+				data[i] = byte('0' + i%10)
+			}
+			data[digits] = suffix
+			base := unsafe.Pointer(unsafe.SliceData(data))
+			if got, want := scanDigitsLong(base, len(data), 0), scanDigitsFast(base, len(data), 0); got != want {
+				t.Fatalf("%d digits + %q: long scanner %d, general %d", digits, suffix, got, want)
+			}
+		}
+	}
+}
+
 func TestScanTypedFloat64LeadingZerosMatchesStrconv(t *testing.T) {
 	for _, text := range []string{
 		"0.0006988752666567719",

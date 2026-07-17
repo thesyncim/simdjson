@@ -110,3 +110,47 @@ func buildIndexPositions(src []byte, storage []IndexEntry) (entries []IndexEntry
 	}
 	return full[:grammar.EntryOff/16], true
 }
+
+func indexFallbackNumberMode(src []byte) uint8 {
+	if len(src) < validBitmapSampleBlocks*64 {
+		return tapeNumberScalar
+	}
+	var stream simdkernels.Stage1IndexStream
+	var meta simdkernels.Stage1IndexMeta
+	meta.Sample = true
+	var positions [simdkernels.Stage1ChunkBlocks*64 + 64]uint32
+	written := simdkernels.Stage1IndexBlocksMeta(
+		unsafe.SliceData(src), validBitmapSampleBlocks, 0, &stream, positions[:], &meta,
+	)
+	if stream.Bad {
+		return tapeNumberScalar
+	}
+	return indexPositionsFallbackNumberMode(src, positions[:written], &meta)
+}
+
+func indexPositionsFallbackNumberMode(src []byte, positions []uint32, meta *simdkernels.Stage1IndexMeta) uint8 {
+	// Only inspect candidate starts when the sample is both dense and string
+	// rich. This excludes short-decimal numeric arrays before the probe loop.
+	if meta.EmitCount < 512 || meta.InStrCount < 512 {
+		return tapeNumberScalar
+	}
+	base := unsafe.Pointer(unsafe.SliceData(src))
+	numbers, long := 0, 0
+	for _, pos := range positions {
+		i := int(pos)
+		c := fastByteAt(base, i)
+		if c == '-' {
+			i++
+		} else if !isDigit(c) {
+			continue
+		}
+		numbers++
+		if i+8 <= len(src) && nonDigitMask8(loadUint64LE(unsafe.Add(base, i))) == 0 {
+			long++
+		}
+	}
+	if long >= 8 && long*2 >= numbers {
+		return tapeNumberSWAR
+	}
+	return tapeNumberScalar
+}

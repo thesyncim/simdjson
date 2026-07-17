@@ -117,11 +117,13 @@ func BuildIndexOptions(src []byte, storage []IndexEntry, opts IndexOptions) (Ind
 	// decline falls through to the portable builder below, which decides
 	// the exact error. The depth gate keeps callers' tighter limits with
 	// the builder that enforces them.
+	fallbackNumberMode := uint8(tapeNumberScalar)
 	if stage2IndexPositionEnabled && maxDepth >= fastWalkMaxDepth &&
 		len(src) >= validBitmapMinBytes && len(src) < indexBitmapMaxBytes {
 		if entries, ok := buildIndexPositions(src, storage); ok {
 			return Index{src: src, entries: entries}, nil
 		}
+		fallbackNumberMode = indexFallbackNumberMode(src)
 	}
 	b := tapeBuilder{
 		src:      src,
@@ -130,7 +132,12 @@ func BuildIndexOptions(src []byte, storage []IndexEntry, opts IndexOptions) (Ind
 		parent:   noTapeParent,
 		maxDepth: maxDepth,
 	}
-	status := b.parseFast()
+	var status tapeParseStatus
+	if fallbackNumberMode == tapeNumberSWAR {
+		status = b.parseFastSWAR()
+	} else {
+		status = b.parseFast()
+	}
 	switch status {
 	case tapeParseOK:
 	case tapeParseFull:
@@ -192,6 +199,11 @@ type tapeBuilder struct {
 }
 
 const noTapeParent uint32 = ^uint32(0)
+
+const (
+	tapeNumberScalar uint8 = iota
+	tapeNumberSWAR
+)
 
 type tapeParseStatus uint8
 

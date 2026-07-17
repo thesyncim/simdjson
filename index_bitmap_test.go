@@ -51,6 +51,38 @@ func buildIndexReference(src []byte, storage []IndexEntry) (Index, error) {
 	return Index{src: src, entries: b.entries}, nil
 }
 
+func TestIndexPositionsFallbackNumberMode(t *testing.T) {
+	sample := func(long int) ([]byte, []uint32) {
+		var src []byte
+		var positions []uint32
+		for i := 0; i < 16; i++ {
+			positions = append(positions, uint32(len(src)))
+			if i < long {
+				src = append(src, "12345678"...)
+			} else {
+				src = append(src, '1')
+			}
+			src = append(src, ',')
+		}
+		return src, positions
+	}
+	src, positions := sample(8)
+	meta := simdkernels.Stage1IndexMeta{EmitCount: 512, InStrCount: 512}
+	if got := indexPositionsFallbackNumberMode(src, positions, &meta); got != tapeNumberSWAR {
+		t.Fatalf("half long heads selected mode %d", got)
+	}
+
+	short, shortPositions := sample(0)
+	if got := indexPositionsFallbackNumberMode(short, shortPositions, &meta); got != tapeNumberScalar {
+		t.Fatalf("short heads selected mode %d", got)
+	}
+
+	meta.EmitCount = 511
+	if got := indexPositionsFallbackNumberMode(src, positions, &meta); got != tapeNumberScalar {
+		t.Fatalf("sparse sample selected mode %d", got)
+	}
+}
+
 // indexOracleBufs hold reusable generous storage so the mutation battery
 // does not allocate per mutant. Generous capacity matters: an engine
 // starved of storage aborts Full, which would mask a wrong-accept.

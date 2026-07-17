@@ -44,6 +44,23 @@ func scanDigitsFast(base unsafe.Pointer, n, i int) int {
 	return i
 }
 
+// scanDigitsLong is scanDigitsFast after the caller has proved that lanes 0
+// through 7 are digits. It avoids repeating the short-run gate on fraction
+// paths that already loaded lane 7.
+func scanDigitsLong(base unsafe.Pointer, n, i int) int {
+	for i+8 <= n {
+		invalid := nonDigitMask8(loadUint64LE(unsafe.Add(base, i)))
+		if invalid != 0 {
+			return i + bits.TrailingZeros64(invalid)/8
+		}
+		i += 8
+	}
+	for i < n && isDigit(fastByteAt(base, i)) {
+		i++
+	}
+	return i
+}
+
 func all16Digits(base unsafe.Pointer) bool {
 	return simdkernels.All16Digits((*[16]byte)(base))
 }
