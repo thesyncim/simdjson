@@ -8,10 +8,11 @@ import (
 	"unsafe"
 )
 
-// stage1IndexBlocksMeta is the production full-index specialization. Keeping
-// metadata mandatory removes generic mode branches and dead document-wide
-// vector state from every 64-byte block.
-func stage1IndexBlocksMeta(p *byte, nblocks int, base uint32, st *Stage1IndexStream, out []uint32, indexMeta *Stage1IndexMeta) int {
+// stage1IndexBlocksMetaNoSample is the production steady-state full-index
+// specialization. Keeping metadata mandatory and density sampling disabled
+// removes generic mode branches, four popcounts, and dead document-wide vector
+// state from every 64-byte block after the first chunk.
+func stage1IndexBlocksMetaNoSample(p *byte, nblocks int, base uint32, st *Stage1IndexStream, out []uint32, indexMeta *Stage1IndexMeta) int {
 	if nblocks <= 0 {
 		return 0
 	}
@@ -21,13 +22,12 @@ func stage1IndexBlocksMeta(p *byte, nblocks int, base uint32, st *Stage1IndexStr
 	if len(out) < nblocks*64+64 {
 		panic("simd: Stage1IndexBlocks output lacks overwrite slack")
 	}
-	sample := indexMeta.Sample
 	indexMeta.NonASCII = 0
 	indexMeta.WsCount = 0
 	indexMeta.EmitCount = 0
 	indexMeta.InStrCount = 0
 	indexMeta.EscCount = 0
-	indexMeta.Sample = sample
+	indexMeta.Sample = false
 	src := unsafe.Pointer(p)
 	dst := unsafe.Pointer(unsafe.SliceData(out))
 
@@ -138,12 +138,6 @@ func stage1IndexBlocksMeta(p *byte, nblocks int, base uint32, st *Stage1IndexStr
 		escapeBits |= escInStr
 		indexMeta.EscInStr[block] = escInStr
 		indexMeta.InStr[block] = inStr
-		if indexMeta.Sample {
-			indexMeta.WsCount += uint32(bits.OnesCount64(ws))
-			indexMeta.EmitCount += uint32(bits.OnesCount64(emit))
-			indexMeta.InStrCount += uint32(bits.OnesCount64(inStr))
-			indexMeta.EscCount += uint32(bits.OnesCount64(escInStr))
-		}
 		if hi.ReduceMax() >= 0x80 {
 			indexMeta.NonASCII |= 1 << block
 		}

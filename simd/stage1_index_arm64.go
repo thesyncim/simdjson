@@ -21,7 +21,10 @@ func Stage1IndexBlocks(p *byte, nblocks int, base uint32, st *Stage1IndexStream,
 // Stage1IndexBlocksMeta is Stage1IndexBlocks with the per-block validity facts
 // and density totals needed by a forward index consumer.
 func Stage1IndexBlocksMeta(p *byte, nblocks int, base uint32, st *Stage1IndexStream, out []uint32, meta *Stage1IndexMeta) int {
-	return stage1IndexBlocksMeta(p, nblocks, base, st, out, meta)
+	if meta.Sample {
+		return stage1IndexBlocks(p, nblocks, base, st, out, stage1IndexFull, nil, meta)
+	}
+	return stage1IndexBlocksMetaNoSample(p, nblocks, base, st, out, meta)
 }
 
 // Stage1CursorBlocks emits the compact forward-decoder stream. It has the

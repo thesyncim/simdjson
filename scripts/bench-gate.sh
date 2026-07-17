@@ -30,13 +30,15 @@ shift $((OPTIND - 1))
 [ $# -ge 1 ] && pattern=$1
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-work=${TMPDIR:-/tmp}/simdjson-bench-gate
+repo_id=$(printf '%s' "$root" | cksum | cut -d ' ' -f 1)
+work=${TMPDIR:-/tmp}/simdjson-bench-gate-$repo_id
 mkdir -p "$work"
+baseline_commit=$(git -C "$root" rev-parse "$baseline^{commit}")
 
-echo "baseline: $(git -C "$root" rev-parse --short "$baseline")  rounds: $rounds  benchtime: $benchtime" >&2
+echo "baseline: $(git -C "$root" rev-parse --short "$baseline_commit")  rounds: $rounds  benchtime: $benchtime" >&2
 
-git -C "$root" worktree add --force "$work/baseline" "$baseline" >/dev/null 2>&1 ||
-	git -C "$work/baseline" checkout --force "$baseline" >/dev/null 2>&1
+git -C "$root" worktree add --force --detach "$work/baseline" "$baseline_commit" >/dev/null 2>&1 ||
+	git -C "$work/baseline" checkout --force "$baseline_commit" >/dev/null 2>&1
 
 (cd "$root/tests/stdlib" && GOEXPERIMENT=simd "$gotip" test -c -o "$work/new.test" .)
 (cd "$work/baseline/tests/stdlib" && GOEXPERIMENT=simd "$gotip" test -c -o "$work/old.test" .)
