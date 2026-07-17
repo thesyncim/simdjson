@@ -268,7 +268,10 @@ return r.Err()
 
 `Reader.Bytes`, zero-copy decodes, and cursor strings alias the rolling
 buffer and stay valid only until the next `Next`; `SetMaxValueBytes` bounds
-buffer growth on untrusted input.
+buffer growth on untrusted input. Configure a reader before the first `Next`
+or `DecodeNext`; later configuration changes are rejected. `Close` is
+idempotent and terminal. Reader work stays on the caller's goroutine and does
+not create background workers.
 
 </details>
 

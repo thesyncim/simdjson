@@ -242,20 +242,17 @@ func TestProbeReaderMaxValueEnforcedBelowBufferSize(t *testing.T) {
 	}
 }
 
-// A limit set after reading started must apply to later values (it does,
-// within the buffer-geometry caveat probed above).
-func TestProbeReaderMaxValueSetAfterStart(t *testing.T) {
-	big := `{"k":"` + strings.Repeat("a", 10_000) + `"}`
-	r := NewReaderSize(strings.NewReader(`{"a":1}`+"\n"+big+"\n"), 512)
+// Reader configuration freezes when input consumption begins.
+func TestProbeReaderMaxValueRejectedAfterStart(t *testing.T) {
+	r := NewReaderSize(strings.NewReader(`{"a":1}`+"\n"+`{"a":2}`+"\n"), 512)
 	if !r.Next() {
 		t.Fatalf("first value: %v", r.Err())
 	}
-	r.SetMaxValueBytes(1024)
-	if r.Next() {
-		t.Fatal("oversized value delivered")
+	if err := r.SetMaxValueBytes(1); !errors.Is(err, ErrReaderStarted) {
+		t.Fatalf("SetMaxValueBytes = %v, want ErrReaderStarted", err)
 	}
-	if r.Err() == nil || !strings.Contains(r.Err().Error(), "limit") {
-		t.Fatalf("expected limit error, got %v", r.Err())
+	if !r.Next() || string(r.Bytes()) != `{"a":2}` {
+		t.Fatalf("second value = %q, Err = %v", r.Bytes(), r.Err())
 	}
 }
 

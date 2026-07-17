@@ -18,10 +18,12 @@ import (
 // costs one compacting copy of its partial prefix; everything else is read
 // straight into place, and steady-state operation allocates nothing once
 // the buffer has grown to the largest value seen (bounded by
-// SetMaxValueBytes). A Reader is not safe for concurrent use.
+// SetMaxValueBytes). All reads and decoding happen on the caller's goroutine;
+// Reader does not start background workers and is not safe for concurrent use.
 type Reader struct {
-	in  io.Reader
-	buf []byte
+	in    io.Reader
+	buf   []byte
+	state readerState
 
 	pos int // scan position within buf
 	end int // valid bytes end within buf
@@ -38,14 +40,31 @@ type Reader struct {
 	eof      bool
 	hasValue bool
 	err      error
-
-	// pipe drives the optional pipelined mode (SetPipelined). When non-nil,
-	// Next pulls framed, validated values from a worker goroutine that reads
-	// one batch ahead, and buf/valStart/valEnd alias the current batch buffer
-	// so Bytes, Cursor, DecodeFrom, and DecodeNext work unchanged. It is nil for
-	// the default single-goroutine Reader, which pays nothing for it.
-	pipe *pipeline
 }
+
+// readerState makes configuration mutable only before the first read and Close
+// a terminal transition.
+type readerState uint8
+
+const (
+	readerConfigured readerState = iota
+	readerStarted
+	readerClosed
+)
+
+// ReaderOptions configures a Reader before input consumption begins. A zero
+// BufferSize uses the default, and a zero MaxValueBytes leaves value size
+// unbounded.
+type ReaderOptions struct {
+	BufferSize    int
+	MaxValueBytes int
+}
+
+// ErrReaderStarted reports a configuration change after reading began.
+var ErrReaderStarted = errors.New("simdjson: reader already started")
+
+// ErrReaderClosed reports an operation that requires an open Reader.
+var ErrReaderClosed = errors.New("simdjson: reader closed")
 
 // valueFrame resumably locates the end of one JSON value across buffer refills.
 // It advances a cursor through newly available bytes only, keeping O(1) state,
@@ -201,7 +220,7 @@ const defaultReaderSize = 64 << 10
 
 // NewReader returns a Reader with the default buffer size.
 func NewReader(in io.Reader) *Reader {
-	return NewReaderSize(in, defaultReaderSize)
+	return &Reader{in: in, buf: make([]byte, defaultReaderSize)}
 }
 
 // NewReaderSize is NewReader with an explicit initial buffer size. The
@@ -213,45 +232,81 @@ func NewReaderSize(in io.Reader, size int) *Reader {
 	return &Reader{in: in, buf: make([]byte, size)}
 }
 
+// NewReaderWithOptions returns a configured Reader without reading from in.
+// Invalid negative sizes are rejected; positive buffer sizes below 512 bytes
+// are rounded up to preserve the Reader's minimum working capacity.
+func NewReaderWithOptions(in io.Reader, options ReaderOptions) (*Reader, error) {
+	if options.BufferSize < 0 {
+		return nil, fmt.Errorf("simdjson: negative Reader buffer size %d", options.BufferSize)
+	}
+	if options.MaxValueBytes < 0 {
+		return nil, fmt.Errorf("simdjson: negative Reader value limit %d", options.MaxValueBytes)
+	}
+	size := options.BufferSize
+	if size == 0 {
+		size = defaultReaderSize
+	}
+	if size < 512 {
+		size = 512
+	}
+	return &Reader{
+		in:       in,
+		buf:      make([]byte, size),
+		maxValue: options.MaxValueBytes,
+	}, nil
+}
+
 // SetMaxValueBytes bounds the size of a single value; a longer value stops
 // the stream with an error instead of growing the buffer without limit.
-// Zero, the default, means no bound.
-func (r *Reader) SetMaxValueBytes(n int) {
+// Zero, the default, means no bound. Configuration changes after the first
+// Next or DecodeNext are rejected with ErrReaderStarted; changes after Close
+// are rejected with ErrReaderClosed.
+func (r *Reader) SetMaxValueBytes(n int) error {
+	if n < 0 {
+		return fmt.Errorf("simdjson: negative Reader value limit %d", n)
+	}
+	if err := r.configurationError(); err != nil {
+		return err
+	}
 	r.maxValue = n
+	return nil
 }
 
-// SetPipelined enables (or, with false, disables before the first Next)
-// pipelined framing: a worker goroutine reads and validates the next batch of
-// values while the caller decodes the current one, overlapping read latency
-// and framing with the caller's decode work. Everything else is unchanged —
-// Next, Bytes, Cursor, InputOffset, Err, DecodeFrom, and DecodeNext behave
-// identically and yield the same value sequence and errors — so pipelining is
-// a drop-in switch, not a new API.
-//
-// A pipelined Reader owns a goroutine and must be released with Close when
-// abandoned before the end of the stream; draining it to completion also
-// releases it. It pays off when the source has real read latency or the
-// per-value decode is substantial; on a zero-latency source feeding a trivial
-// decode it only adds handoff overhead, so leave it off there. Call it before
-// the first Next; a pipelined Reader is not safe for concurrent use.
-func (r *Reader) SetPipelined(on bool) {
-	if !on {
-		r.pipe = nil
-		return
-	}
-	if r.pipe == nil {
-		r.pipe = newPipeline(r.in, len(r.buf), r.maxValue)
+func (r *Reader) configurationError() error {
+	switch r.state {
+	case readerStarted:
+		return ErrReaderStarted
+	case readerClosed:
+		return ErrReaderClosed
+	default:
+		return nil
 	}
 }
 
-// Close releases the worker goroutine of a pipelined Reader. It is safe to
-// call at any point, is idempotent, and is a no-op on a non-pipelined Reader.
-// After Close, Next returns false. Close does not report stream errors; use
-// Err for those.
+// startReading performs the configured-to-started transition before the first
+// input operation.
+func (r *Reader) startReading() bool {
+	switch r.state {
+	case readerConfigured:
+		r.state = readerStarted
+		return true
+	case readerStarted:
+		return true
+	default:
+		return false
+	}
+}
+
+// Close transitions a Reader to its terminal state. It is safe to call at any
+// point and is idempotent. After Close, Bytes is nil and every Next or
+// DecodeNext returns false. Close does not report stream errors; use Err for
+// those.
 func (r *Reader) Close() error {
-	if r.pipe != nil {
-		r.pipe.close()
+	if r.state == readerClosed {
+		return nil
 	}
+	r.state = readerClosed
+	r.hasValue = false
 	return nil
 }
 
@@ -281,6 +336,9 @@ func (r *Reader) Bytes() []byte {
 // validity window; owned decoders copy and are safe to retain.
 func DecodeFrom[T any](r *Reader, dec Decoder[T], dst *T) error {
 	if !r.hasValue {
+		if r.state == readerClosed {
+			return ErrReaderClosed
+		}
 		if r.err != nil {
 			return r.err
 		}
@@ -296,18 +354,8 @@ func DecodeFrom[T any](r *Reader, dec Decoder[T], dst *T) error {
 // error; Err distinguishes the two. After a true result, Bytes and InputOffset
 // describe the decoded value.
 func DecodeNext[T any](r *Reader, dec Decoder[T], dst *T) bool {
-	if r.pipe != nil {
-		// The worker already framed and validated the value, so this is a plain
-		// advance plus decode with no boundary scan on the caller's goroutine.
-		if !r.pipeNext() {
-			return false
-		}
-		if err := dec.Decode(r.buf[r.valStart:r.valEnd], dst); err != nil {
-			r.err = fmt.Errorf("simdjson: value at input offset %d: %w", r.consumed+int64(r.valStart), err)
-			r.hasValue = false
-			return false
-		}
-		return true
+	if !r.startReading() {
+		return false
 	}
 	if r.err != nil {
 		return false
@@ -383,8 +431,8 @@ func DecodeNext[T any](r *Reader, dec Decoder[T], dst *T) bool {
 // Next advances to the next value in the stream. It returns false at the
 // end of the stream or on error; Err distinguishes the two.
 func (r *Reader) Next() bool {
-	if r.pipe != nil {
-		return r.pipeNext()
+	if !r.startReading() {
+		return false
 	}
 	if r.err != nil {
 		return false
