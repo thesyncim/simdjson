@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -442,6 +443,47 @@ func TestMapEncodeAllocationFree(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("populated map encode allocated %.1f times per run, want 0", allocs)
 	}
+}
+
+// TestInterfaceContainersEncodeAllocationFree guards the concrete-value boxes
+// used for maps and slices reached through any. The boxes and concrete map
+// scratch are warmed once, then every later encode must reuse them.
+func TestInterfaceContainersEncodeAllocationFree(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector instruments allocation and disables pool reuse")
+	}
+	type doc struct {
+		Value any `json:"value"`
+	}
+	value := doc{Value: map[string]any{
+		"items": []any{"one", float64(2), true, nil, map[string]any{"nested": "map"}},
+		"name":  "example",
+	}}
+	enc, err := CompileEncoder[doc](EncoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := json.Marshal(&value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 0, len(want))
+	if buf, err = enc.AppendJSON(buf[:0], &value); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, want) {
+		t.Fatalf("interface encode differs:\n got %s\nwant %s", buf, want)
+	}
+	allocs := testing.AllocsPerRun(200, func() {
+		buf, err = enc.AppendJSON(buf[:0], &value)
+		if err != nil {
+			panic(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("interface container encode allocated %.1f times per run, want 0", allocs)
+	}
+	runtime.KeepAlive(buf)
 }
 
 func TestMapDecodeMergesLikeStdlib(t *testing.T) {

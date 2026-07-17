@@ -194,24 +194,23 @@ func TestEncoderScratchTinyAfterOversizedMapAllocs(t *testing.T) {
 }
 
 func TestEncoderScratchDropsOversizedDynamicMap(t *testing.T) {
+	type dynamicMap map[int]any
 	type document struct {
 		Anchor  map[int]uint64 `json:"anchor"`
 		Dynamic any            `json:"dynamic"`
 	}
-	tinyDynamic := map[int]any{1: "one", 2: nil}
+	tinyDynamic := dynamicMap{1: "one", 2: nil}
 	tiny := document{Anchor: map[int]uint64{1: 1}, Dynamic: tinyDynamic}
 	enc, err := CompileEncoder[document](EncoderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	scratch, pool := dedicatedEncoderScratch(&enc)
 	if _, err := enc.AppendJSON(make([]byte, 0, 96), &tiny); err != nil {
 		t.Fatal(err)
 	}
-	warmDynamic := scratch.dynamicValueBacking.Cap()
 
 	n := oversizedEncoderMapLen(unsafe.Sizeof(any(nil)))
-	hugeMap := make(map[int]any, n)
+	hugeMap := make(dynamicMap, n)
 	for i := 0; i < n; i++ {
 		hugeMap[i] = i
 	}
@@ -226,15 +225,60 @@ func TestEncoderScratchDropsOversizedDynamicMap(t *testing.T) {
 	huge.Dynamic = nil
 	hugeMap = nil
 	out = nil
-	runtime.GC()
 
-	returned := pool.Get().(*encoderScratch)
-	assertEncoderScratchBudgets(t, returned)
-	if returned.dynamicValueBacking.Cap() != warmDynamic {
-		t.Fatalf("oversized dynamic map replaced warm backing: cap=%d, want %d",
-			returned.dynamicValueBacking.Cap(), warmDynamic)
+	// Inspect one concrete-type box directly. A sync.Pool may move or discard
+	// entries across a GC or race instrumentation, but a box that survives must
+	// keep its bounded warm buffers instead of replacing them with an oversized
+	// observation.
+	entry, err := dynamicEncodeBoxFor(reflect.TypeOf(tinyDynamic), true)
+	if err != nil {
+		t.Fatal(err)
 	}
-	pool.Put(returned)
+	box := entry.pool.New().(*dynamicEncodeBox)
+	state := encodeState{dst: make([]byte, 0, 96), escapeHTML: true, depth: 1}
+	if err := state.encodeMapValue(entry.node, reflect.ValueOf(tinyDynamic), box); err != nil {
+		t.Fatal(err)
+	}
+	warmEntries := cap(box.mapEntries)
+	warmArena := cap(box.mapKeyArena)
+	warmBacking := box.mapBacking.Cap()
+
+	hugeMap = make(dynamicMap, n)
+	for i := 0; i < n; i++ {
+		hugeMap[i] = i
+	}
+	state = encodeState{escapeHTML: true, depth: 1}
+	if err := state.encodeMapValue(entry.node, reflect.ValueOf(hugeMap), box); err != nil {
+		t.Fatal(err)
+	}
+	if cap(box.mapEntries) != warmEntries || cap(box.mapKeyArena) != warmArena {
+		t.Fatalf("oversized dynamic map replaced warm map scratch: entries=%d/%d arena=%d/%d",
+			cap(box.mapEntries), warmEntries, cap(box.mapKeyArena), warmArena)
+	}
+	if box.mapBacking.Cap() != warmBacking {
+		t.Fatalf("oversized dynamic map replaced warm backing: cap=%d, want %d",
+			box.mapBacking.Cap(), warmBacking)
+	}
+}
+
+func TestDynamicEncodeBoxRetentionBound(t *testing.T) {
+	type small [64]byte
+	type oversized [encoderValueBackingRetentionBytes + 1]byte
+
+	smallEntry, err := dynamicEncodeBoxFor(reflect.TypeFor[small](), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !smallEntry.retainBox {
+		t.Fatal("small dynamic value box is not reusable")
+	}
+	oversizedEntry, err := dynamicEncodeBoxFor(reflect.TypeFor[oversized](), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oversizedEntry.retainBox {
+		t.Fatal("oversized dynamic value box may be retained")
+	}
 }
 
 // FuzzEncoderScratchRetentionSequence interleaves tiny maps with at most one

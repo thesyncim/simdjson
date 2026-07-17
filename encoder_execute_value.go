@@ -18,8 +18,19 @@ import (
 var dynamicEncodeNodes sync.Map
 
 type dynamicEncodeEntry struct {
-	node *typedNode
-	err  error
+	node      *typedNode
+	err       error
+	retainBox bool
+	pool      sync.Pool
+}
+
+type dynamicEncodeBox struct {
+	value       reflect.Value
+	mapKey      reflect.Value
+	mapEntries  []mapEncodeEntry
+	mapKeyArena []byte
+	mapIter     *reflect.MapIter
+	mapBacking  reflect.Value
 }
 
 type dynamicEncodeKey struct {
@@ -38,9 +49,34 @@ func dynamicEncodeNode(typ reflect.Type, escapeHTML bool) (*typedNode, error) {
 	if err == nil {
 		computeEncPtrMarshaler(node, make(map[*typedNode]bool))
 	}
-	entry, _ := dynamicEncodeNodes.LoadOrStore(key, &dynamicEncodeEntry{node: node, err: err})
+	candidate := &dynamicEncodeEntry{node: node, err: err}
+	if err == nil {
+		candidate.retainBox = typ.Size() <= encoderValueBackingRetentionBytes
+		candidate.pool.New = func() any {
+			box := &dynamicEncodeBox{value: reflect.New(typ)}
+			if typ.Kind() == reflect.Map {
+				box.mapKey = reflect.New(typ.Key()).Elem()
+			}
+			return box
+		}
+	}
+	entry, _ := dynamicEncodeNodes.LoadOrStore(key, candidate)
 	cached := entry.(*dynamicEncodeEntry)
 	return cached.node, cached.err
+}
+
+func dynamicEncodeBoxFor(typ reflect.Type, escapeHTML bool) (*dynamicEncodeEntry, error) {
+	key := dynamicEncodeKey{typ: typ, escapeHTML: escapeHTML}
+	if entry, ok := dynamicEncodeNodes.Load(key); ok {
+		cached := entry.(*dynamicEncodeEntry)
+		return cached, cached.err
+	}
+	if _, err := dynamicEncodeNode(typ, escapeHTML); err != nil {
+		return nil, err
+	}
+	entry, _ := dynamicEncodeNodes.Load(key)
+	cached := entry.(*dynamicEncodeEntry)
+	return cached, cached.err
 }
 
 // encodeAny encodes the concrete value stored in an empty interface,
@@ -82,15 +118,32 @@ func (e *encodeState) encodeDynamicValue(value reflect.Value) error {
 	if e.depth >= defaultMaxDepth {
 		return &EncodeError{Reason: "maximum nesting depth exceeded"}
 	}
-	node, err := dynamicEncodeNode(value.Type(), e.escapeHTML)
+	entry, err := dynamicEncodeBoxFor(value.Type(), e.escapeHTML)
 	if err != nil {
 		return &EncodeError{Reason: err.Error()}
 	}
-	box := reflect.New(value.Type())
-	box.Elem().Set(value)
+	var box *dynamicEncodeBox
+	if entry.retainBox {
+		box = entry.pool.Get().(*dynamicEncodeBox)
+	} else {
+		box = entry.pool.New().(*dynamicEncodeBox)
+	}
+	box.value.Elem().Set(value)
 	e.depth++
-	encodeErr := e.encodeNonAddressable(node, box.UnsafePointer())
+	var encodeErr error
+	if entry.node.kind == typedMap {
+		encodeErr = e.encodeMapValue(entry.node, box.value.Elem(), box)
+	} else {
+		encodeErr = e.encodeNonAddressable(entry.node, box.value.UnsafePointer())
+	}
 	e.depth--
+	box.value.Elem().SetZero()
+	if box.mapKey.IsValid() {
+		box.mapKey.SetZero()
+	}
+	if entry.retainBox {
+		entry.pool.Put(box)
+	}
 	return encodeErr
 }
 
@@ -125,6 +178,14 @@ func (e *encodeState) encodeNonAddressableMarshaler(node *typedNode, src unsafe.
 // addressable element before encoding.
 func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	mapValue := reflect.NewAt(node.typ, src).Elem()
+	return e.encodeMapValue(node, mapValue, nil)
+}
+
+// encodeMapValue is the shared map encoder for addressable compiled values and
+// non-addressable maps reached through interfaces. A dynamic key box belongs
+// to the concrete-type pool entry, so interface maps need no per-call reflect
+// allocation while preserving the addressability rules of encoding/json.
+func (e *encodeState) encodeMapValue(node *typedNode, mapValue reflect.Value, dynamic *dynamicEncodeBox) error {
 	if mapValue.IsNil() {
 		e.dst = append(e.dst, "null"...)
 		return nil
@@ -133,9 +194,7 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		return &EncodeError{Reason: "maximum nesting depth exceeded"}
 	}
 	mapLen := mapValue.Len()
-	if mapLen > node.encScratchLimit && e.scratch != nil {
-		return e.encodeMapOneShot(node, src)
-	}
+	retainScratch := mapLen <= node.encScratchLimit
 	e.depth++
 	numericKeys := !node.mapKeyTextEncode && (node.mapKeyKind == mapKeyInt || node.mapKeyKind == mapKeyUint)
 	stringKeys := !node.mapKeyTextEncode && node.mapKeyKind == mapKeyString
@@ -149,7 +208,15 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	var keyArena []byte
 	var iterator *reflect.MapIter
 	scratch := e.scratch
-	if scratch != nil {
+	useDynamicScratch := dynamic != nil && retainScratch
+	if useDynamicScratch {
+		entries = dynamic.mapEntries[:0]
+		keyArena = dynamic.mapKeyArena[:0]
+		iterator = dynamic.mapIter
+		dynamic.mapEntries = nil
+		dynamic.mapKeyArena = nil
+		dynamic.mapIter = nil
+	} else if scratch != nil && retainScratch {
 		entries = scratch.mapEntries[:0]
 		keyArena = scratch.mapKeyArena[:0]
 		iterator = scratch.mapIter
@@ -172,12 +239,29 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	// MapIter.Value allocates a fresh value per entry. Independent slots keep a
 	// value that recurses into the same map type correct.
 	var keyBox reflect.Value
-	if scratch != nil && node.encMapKey >= 0 {
+	if dynamic != nil {
+		keyBox = dynamic.mapKey
+	}
+	if keyBox.IsValid() {
+		// The concrete-type pool owns this box for the duration of the dynamic
+		// encode, including recursive maps of the same key type.
+	} else if scratch != nil && node.encMapKey >= 0 {
 		keyBox = scratch.marshalers[node.encMapKey].value
 	} else {
 		keyBox = reflect.New(node.typ.Key()).Elem()
 	}
-	backing := e.takeValueBacking(node.encBacking, node.elem.typ, mapLen)
+	var backing reflect.Value
+	if useDynamicScratch {
+		backing = dynamic.mapBacking
+		dynamic.mapBacking = reflect.Value{}
+		if !backing.IsValid() || backing.Len() < mapLen {
+			backing = reflect.MakeSlice(reflect.SliceOf(node.elem.typ), mapLen, mapLen)
+		}
+	} else if retainScratch {
+		backing = e.takeValueBacking(node.encBacking, node.elem.typ, mapLen)
+	} else {
+		backing = reflect.MakeSlice(reflect.SliceOf(node.elem.typ), mapLen, mapLen)
+	}
 
 	// mapValue remains GC-visible while the iterator is bound. releaseMapScratch
 	// unbinds pooled iterators before they can outlive this operation.
@@ -219,8 +303,8 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 			keyBox.SetIterKey(iterator)
 			name, err := mapKeyName(node, keyBox)
 			if err != nil {
-				e.releaseValueBackingPrefix(node.encBacking, backing, node.elem.typ, len(entries))
-				e.releaseMapScratch(entries, keyArena, iterator)
+				e.releaseMapValueBacking(node, backing, dynamic, useDynamicScratch, len(entries))
+				e.releaseMapScratch(entries, keyArena, iterator, dynamic, useDynamicScratch)
 				e.depth--
 				return &EncodeError{Reason: err.Error()}
 			}
@@ -253,31 +337,30 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 			// Clone: numeric key names alias the pooled arena, and the
 			// error must outlive this call's ownership of it.
 			name := strings.Clone(entries[i].name)
-			e.releaseValueBacking(node.encBacking, backing, node.elem.typ)
-			e.releaseMapScratch(entries, keyArena, iterator)
+			e.releaseMapValueBacking(node, backing, dynamic, useDynamicScratch, mapLen)
+			e.releaseMapScratch(entries, keyArena, iterator, dynamic, useDynamicScratch)
 			e.depth--
 			return prependEncodePathField(err, name)
 		}
 	}
 	e.dst = append(e.dst, '}')
-	e.releaseValueBacking(node.encBacking, backing, node.elem.typ)
-	e.releaseMapScratch(entries, keyArena, iterator)
+	e.releaseMapValueBacking(node, backing, dynamic, useDynamicScratch, mapLen)
+	e.releaseMapScratch(entries, keyArena, iterator, dynamic, useDynamicScratch)
 	e.depth--
 	return nil
 }
 
-// encodeMapOneShot isolates an exceptional map from the bounded pooled state.
-func (e *encodeState) encodeMapOneShot(node *typedNode, src unsafe.Pointer) error {
-	scratch := e.scratch
-	e.scratch = nil
-	err := e.encodeMap(node, src)
-	e.scratch = scratch
-	return err
-}
-
 // releaseMapScratch returns bounded working state to the scratch and records the
 // largest dirty prefix for one typed clear at operation reset.
-func (e *encodeState) releaseMapScratch(entries []mapEncodeEntry, keyArena []byte, iterator *reflect.MapIter) {
+func (e *encodeState) releaseMapScratch(entries []mapEncodeEntry, keyArena []byte, iterator *reflect.MapIter, dynamic *dynamicEncodeBox, useDynamic bool) {
+	if useDynamic {
+		clear(entries)
+		dynamic.mapEntries = entries[:0]
+		dynamic.mapKeyArena = keyArena[:0]
+		iterator.Reset(reflect.Value{})
+		dynamic.mapIter = iterator
+		return
+	}
 	scratch := e.scratch
 	if scratch == nil || scratch.mapEntries != nil {
 		return
@@ -297,6 +380,17 @@ func (e *encodeState) releaseMapScratch(entries []mapEncodeEntry, keyArena []byt
 	if scratch.mapIter == nil {
 		iterator.Reset(reflect.Value{})
 		scratch.mapIter = iterator
+	}
+}
+
+func (e *encodeState) releaseMapValueBacking(node *typedNode, backing reflect.Value, dynamic *dynamicEncodeBox, useDynamic bool, used int) {
+	if useDynamic {
+		clearEncoderValueBacking(backing, used)
+		dynamic.mapBacking = backing
+		return
+	}
+	if backing.Len() <= node.encScratchLimit {
+		e.releaseValueBackingPrefix(node.encBacking, backing, node.elem.typ, used)
 	}
 }
 
