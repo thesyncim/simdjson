@@ -733,11 +733,7 @@ func (cursor *decoderCursor) decodeCompiledStructStructuralSlow(node *typedNode,
 			var handled bool
 			key, matched, ok, handled, err = cursor.nextObjectFieldStructural(first, field)
 			if !handled {
-				if field != nil {
-					key, matched, ok, err = cursor.nextObjectFieldExpectedSlow(first, field)
-				} else {
-					key, ok, err = cursor.NextObjectField(first)
-				}
+				key, matched, ok, err = cursor.nextObjectFieldRawStructural(first, field)
 			}
 		}
 		if err != nil {
@@ -1030,4 +1026,24 @@ func resetMissingTypedFields(node *typedNode, dst unsafe.Pointer, seen uint64) {
 		}
 		resetTyped(field.node, unsafe.Add(target, field.offset))
 	}
+}
+
+// nextObjectFieldRawStructural is the escaped-key fallback. The raw key parser
+// must see the colon that the structural tape deliberately omits, so it uses
+// ordinary whitespace scanning and then realigns the tape on the value start.
+//
+//go:noinline
+func (cursor *decoderCursor) nextObjectFieldRawStructural(first bool, field *typedField) (key string, matched, ok bool, err error) {
+	structuralActive := cursor.state.structuralActive
+	cursor.state.structuralActive = false
+	if field != nil {
+		key, matched, ok, err = cursor.nextObjectFieldExpectedSlow(first, field)
+	} else {
+		key, ok, err = cursor.NextObjectField(first)
+	}
+	cursor.state.structuralActive = structuralActive
+	if err == nil && ok && structuralActive {
+		_ = cursor.state.structural.position(cursor.i, len(cursor.src))
+	}
+	return key, matched, ok, err
 }

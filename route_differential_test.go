@@ -1,0 +1,227 @@
+package simdjson
+
+import (
+	"bytes"
+	"encoding/json"
+	"reflect"
+	"strings"
+	"testing"
+	"unsafe"
+
+	simdkernels "github.com/thesyncim/simdjson/simd"
+)
+
+// decodeRoute is one forced implementation of the same semantic operation.
+// Keeping route selection in test code lets the production dispatch remain
+// branch-free while preventing heuristics from silently dropping coverage.
+type decodeRoute struct {
+	name   string
+	decode func([]byte) (any, error)
+}
+
+func compareDecodeRoutes(t *testing.T, fixtures [][]byte, routes []decodeRoute, exactErrors bool) {
+	t.Helper()
+	if len(routes) < 2 {
+		t.Fatal("route comparison needs at least two implementations")
+	}
+	for _, fixture := range fixtures {
+		src := bytes.Clone(fixture)
+		t.Run(string(src), func(t *testing.T) {
+			want, wantErr := routes[0].decode(bytes.Clone(src))
+			for _, route := range routes[1:] {
+				got, gotErr := route.decode(bytes.Clone(src))
+				if (gotErr == nil) != (wantErr == nil) {
+					t.Fatalf("%s acceptance differs from %s: got %v, want %v", route.name, routes[0].name, gotErr, wantErr)
+				}
+				if gotErr != nil {
+					if exactErrors && (reflect.TypeOf(gotErr) != reflect.TypeOf(wantErr) || gotErr.Error() != wantErr.Error()) {
+						t.Fatalf("%s error differs from %s: got %T %q, want %T %q",
+							route.name, routes[0].name, gotErr, gotErr, wantErr, wantErr)
+					}
+					continue
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("%s value differs from %s: got %#v, want %#v", route.name, routes[0].name, got, want)
+				}
+			}
+		})
+	}
+}
+
+// decodeCursorRoute bypasses Decoder.Decode's size heuristic and runs the
+// ordinary compiled cursor directly.
+func decodeCursorRoute[T any](plan Decoder[T], src []byte, dst *T) error {
+	cursor := newDecoderCursor(src, plan.options)
+	cursor.skipSpace()
+	var err error
+	switch plan.root.kind {
+	case typedStruct:
+		err = cursor.decodeCompiledStruct(plan.root, unsafe.Pointer(dst))
+	case typedSlice:
+		err = cursor.decodeCompiledSlice(plan.root, unsafe.Pointer(dst))
+	case typedArray:
+		err = cursor.decodeCompiledArray(plan.root, unsafe.Pointer(dst))
+	case typedPointer:
+		err = cursor.decodeCompiledPointer(plan.root, unsafe.Pointer(dst))
+	case typedMap:
+		err = cursor.decodeCompiledMap(plan.root, unsafe.Pointer(dst))
+	default:
+		err = cursor.decodeCompiled(plan.root, unsafe.Pointer(dst))
+	}
+	if err != nil {
+		return err
+	}
+	return cursor.Finish()
+}
+
+type routeRecord struct {
+	ID     int64      `json:"id"`
+	Active bool       `json:"active"`
+	Name   string     `json:"name"`
+	Note   string     `json:"note"`
+	Scores [3]float64 `json:"scores"`
+}
+
+func TestTypedDecodeForcedRouteParity(t *testing.T) {
+	if !simdkernels.Stage1StreamEnabled() {
+		t.Skip("structural decoder kernel not built")
+	}
+	owned, err := CompileDecoder[routeRecord](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroCopy, err := CompileDecoder[routeRecord](DecoderOptions{ZeroCopy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !owned.structural || owned.root.decShape != typedDecShapeRecordFloat64x3 {
+		t.Fatalf("fixture lost structural specialization: structural=%v shape=%v", owned.structural, owned.root.decShape)
+	}
+
+	genericRoot := *owned.root
+	genericRoot.structuralFast = false
+	genericRoot.decShape = typedDecShapeNone
+	generic := owned
+	generic.root = &genericRoot
+
+	routes := []decodeRoute{
+		{name: "compiled cursor", decode: func(src []byte) (any, error) {
+			var out routeRecord
+			err := decodeCursorRoute(owned, src, &out)
+			return out, err
+		}},
+		{name: "structural specialization", decode: func(src []byte) (any, error) {
+			var out routeRecord
+			err := owned.decodeStructural(src, &out)
+			return out, err
+		}},
+		{name: "generic structural loop", decode: func(src []byte) (any, error) {
+			var out routeRecord
+			err := generic.decodeStructural(src, &out)
+			return out, err
+		}},
+		{name: "automatic owned", decode: func(src []byte) (any, error) {
+			var out routeRecord
+			err := owned.Decode(src, &out)
+			return out, err
+		}},
+		{name: "automatic zero-copy", decode: func(src []byte) (any, error) {
+			var out routeRecord
+			err := zeroCopy.Decode(src, &out)
+			return out, err
+		}},
+	}
+
+	valid := [][]byte{
+		[]byte(`{"id":7,"active":true,"name":"alpha","note":"plain","scores":[1.5,-2,3e4]}`),
+		[]byte(` { "scores" : [0,1,2], "note":"plain text", "name":"beta", "active":false, "id":-9 } `),
+		[]byte(` { "scores" : [0,1,2], "note":"line\ntext", "name":"beta", "active":false, "id":-9 } `),
+		[]byte(` { "scores" : [0,1,2], "note":"plain text", "name":"βeta", "active":false, "id":-9 } `),
+		[]byte(`{"id":-9,"active":false,"name":"beta","note":"line\ntext","scores":[0,1,2]}`),
+		[]byte(`{"id":-9,"active":false,"name":"βeta","note":"plain","scores":[0,1,2]}`),
+		[]byte(` { "scores" : [0,1,2], "note":"line\ntext", "name":"βeta", "active":false, "id":-9 } `),
+		[]byte(`{"id":1,"id":2,"active":true,"name":"first","name":"last","note":"x","scores":[1,2,3]}`),
+		[]byte(`{"id":5,"active":true,"name":"escaped\u0020name","note":"x","scores":[1,2,3],"unknown":{"x":1}}`),
+		[]byte(`null`),
+	}
+	large := []byte("{\n  \"scores\": [0,1,2],\n  \"note\": \"line\\ntext\",\n  \"name\": \"beta\",\n  \"active\": false,\n  \"padding\": \"" +
+		strings.Repeat("x", 5000) + "\",\n  \"id\": -9\n}")
+	if len(large) < 4096 || !decoderStructuralWorthwhile(large) {
+		t.Fatal("large fixture no longer forces automatic structural decoding")
+	}
+	valid = append(valid, large)
+	compareDecodeRoutes(t, valid, append(routes, decodeRoute{name: "encoding/json", decode: func(src []byte) (any, error) {
+		var out routeRecord
+		err := json.Unmarshal(src, &out)
+		return out, err
+	}}), false)
+
+	invalid := [][]byte{
+		[]byte(`{"id":"bad","active":true,"name":"x","note":"y","scores":[1,2,3]}`),
+		[]byte(`{"id":1,"active":true,"name":"x","note":"y","scores":[1,"bad",3]}`),
+		[]byte(`{"id":9223372036854775808,"active":true,"name":"x","note":"y","scores":[1,2,3]}`),
+		[]byte(`{"id":1,"active":true,"name":"x","note":"y","scores":[1,2`),
+	}
+	compareDecodeRoutes(t, invalid, routes[:4], true)
+}
+
+func TestTypedDecodeOwnedAndZeroCopyLifetime(t *testing.T) {
+	owned, err := CompileDecoder[routeRecord](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroCopy, err := CompileDecoder[routeRecord](DecoderOptions{ZeroCopy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedSrc := []byte(`{"id":1,"active":true,"name":"alpha","note":"plain","scores":[1,2,3]}`)
+	zeroSrc := bytes.Clone(ownedSrc)
+	var ownedValue, zeroValue routeRecord
+	if err := decodeCursorRoute(owned, ownedSrc, &ownedValue); err != nil {
+		t.Fatal(err)
+	}
+	if err := decodeCursorRoute(zeroCopy, zeroSrc, &zeroValue); err != nil {
+		t.Fatal(err)
+	}
+	copy(ownedSrc[bytes.Index(ownedSrc, []byte("alpha")):], "xxxxx")
+	copy(zeroSrc[bytes.Index(zeroSrc, []byte("alpha")):], "xxxxx")
+	if ownedValue.Name != "alpha" {
+		t.Fatalf("owned string changed after source mutation: %q", ownedValue.Name)
+	}
+	if zeroValue.Name != "xxxxx" {
+		t.Fatalf("zero-copy string did not expose its documented alias: %q", zeroValue.Name)
+	}
+}
+
+func TestHookAndCompiledForcedRouteParity(t *testing.T) {
+	hookDecoder, err := CompileDecoder[hookPerson](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiledDecoder, err := CompileDecoder[hookPersonPlain](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := []decodeRoute{
+		{name: "compiled", decode: func(src []byte) (any, error) {
+			var out hookPersonPlain
+			err := compiledDecoder.Decode(src, &out)
+			return out, err
+		}},
+		{name: "hook", decode: func(src []byte) (any, error) {
+			var out hookPerson
+			err := hookDecoder.Decode(src, &out)
+			return projectHook(out), err
+		}},
+		{name: "encoding/json", decode: func(src []byte) (any, error) {
+			var out hookPersonPlain
+			err := json.Unmarshal(src, &out)
+			return out, err
+		}},
+	}
+	fixtures := make([][]byte, 0, len(adversarialHookDocs()))
+	for _, text := range adversarialHookDocs() {
+		fixtures = append(fixtures, []byte(text))
+	}
+	compareDecodeRoutes(t, fixtures, routes, false)
+}
