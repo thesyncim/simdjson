@@ -1,14 +1,17 @@
 package simd
 
-import "unsafe"
+import (
+	"math/bits"
+	"unsafe"
+)
 
-func stage2EightDigits(x uint64) bool {
+func stage2NonDigitMask8(x uint64) uint64 {
 	const (
 		add  = uint64(0x4646464646464646)
 		sub  = uint64(0x3030303030303030)
 		high = uint64(0x8080808080808080)
 	)
-	return ((x+add)|(x-sub))&high == 0
+	return ((x + add) | (x - sub)) & high
 }
 
 // Stage2IndexPositionsFused keeps the common object and array transitions in
@@ -31,6 +34,7 @@ func Stage2IndexPositionsFused(base *byte, n int, positions []uint32, slab *[Sta
 	// Keep resumable quote state in one register; the entry index matters only
 	// while the high-word resume flag is set.
 	stringState := uint64(st.StringEntry) | uint64(st.InString)<<32
+	objectStringFast := st.ObjectStringFast
 	inObj := prev & 8
 	pi := 0
 	var j, cls, members, entryIndex, scope, parent, next, isKey uint64
@@ -242,6 +246,37 @@ writeString:
 	}
 	goto dispatch
 
+writeObjectString:
+	// String-dominant object documents can finish the value and its following
+	// delimiter from one packed position load. Chunk-boundary pairs keep using
+	// the resumable string path.
+	if len(positions)-pi < 2 {
+		isKey = 0
+		goto writeString
+	}
+	if entryOff>>4 >= uint64(entCap) {
+		bad |= Stage2IndexFull
+		goto done
+	}
+	next = *(*uint64)(unsafe.Add(posp, uintptr(pi)*4))
+	parent = next & uint64(^uint32(0))
+	scope = next >> 32
+	if *(*byte)(unsafe.Add(basep, uintptr(parent))) != '"' {
+		bad |= 1
+		goto done
+	}
+	d = *(*byte)(unsafe.Add(basep, uintptr(scope)))
+	p = unsafe.Add(entryp, uintptr(entryOff))
+	*(*uint64)(p) = j | (parent+1)<<32
+	*(*uint64)(unsafe.Add(p, 8)) = 1 | uint64(Stage2IndexInfoString)<<32
+	entryOff += 16
+	pi += 2
+	j = scope
+	c = d
+	prev = 96 | inObj
+	key = 0
+	goto fusedObjectDelimiterKnown
+
 writeScalar:
 	if entryOff>>4 >= uint64(entCap) {
 		bad |= Stage2IndexFull
@@ -284,8 +319,13 @@ writeScalar:
 			scan++
 		} else if '1' <= d && d <= '9' {
 			scan++
-			if scan+8 <= n && stage2EightDigits(*(*uint64)(unsafe.Add(basep, scan))) {
-				scan += 8
+			if scan+8 <= n {
+				invalid := stage2NonDigitMask8(*(*uint64)(unsafe.Add(basep, scan)))
+				if invalid == 0 {
+					scan += 8
+				} else {
+					scan += bits.TrailingZeros64(invalid) >> 3
+				}
 			}
 			for ; scan < n; scan++ {
 				d = *(*byte)(unsafe.Add(basep, scan))
@@ -310,7 +350,16 @@ writeScalar:
 				scalarOK = false
 				goto scalarScanned
 			}
-			for scan++; scan < n; scan++ {
+			scan++
+			if scan+8 <= n {
+				invalid := stage2NonDigitMask8(*(*uint64)(unsafe.Add(basep, scan)))
+				if invalid == 0 {
+					scan += 8
+				} else {
+					scan += bits.TrailingZeros64(invalid) >> 3
+				}
+			}
+			for ; scan < n; scan++ {
 				d = *(*byte)(unsafe.Add(basep, scan))
 				if d < '0' || d > '9' {
 					break
@@ -337,7 +386,16 @@ writeScalar:
 					scalarOK = false
 					goto scalarScanned
 				}
-				for scan++; scan < n; scan++ {
+				scan++
+				if scan+8 <= n {
+					invalid := stage2NonDigitMask8(*(*uint64)(unsafe.Add(basep, scan)))
+					if invalid == 0 {
+						scan += 8
+					} else {
+						scan += bits.TrailingZeros64(invalid) >> 3
+					}
+				}
+				for ; scan < n; scan++ {
 					d = *(*byte)(unsafe.Add(basep, scan))
 					if d < '0' || d > '9' {
 						break
@@ -416,6 +474,9 @@ fusedValue:
 fusedValueKnown:
 	switch c {
 	case '"':
+		if objectStringFast != 0 && inObj != 0 {
+			goto writeObjectString
+		}
 		isKey = 0
 		goto writeString
 	case '{':
@@ -439,6 +500,7 @@ fusedObjectComma:
 	j = uint64(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
 	c = *(*byte)(unsafe.Add(basep, uintptr(j)))
 	pi++
+fusedObjectDelimiterKnown:
 	if c == ',' {
 		count++
 		prev = 88

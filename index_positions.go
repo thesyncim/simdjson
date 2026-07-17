@@ -82,6 +82,11 @@ func buildIndexPositions(src []byte, storage []IndexEntry) (entries []IndexEntry
 		) {
 			return nil, false
 		}
+		if block == 0 {
+			if meta.EmitCount >= 64 && meta.InStrCount > 6*meta.EmitCount {
+				grammar.ObjectStringFast = 1
+			}
+		}
 		if !consume(block, count, written) {
 			return nil, false
 		}

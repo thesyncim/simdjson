@@ -62,6 +62,9 @@ type Stage2IndexState struct {
 	// position chunks so string ends can be patched directly.
 	StringEntry uint32
 	InString    uint32
+	// ObjectStringFast enables the complete object string-value
+	// superinstruction for documents whose stage-1 sample is string dominant.
+	ObjectStringFast uint64
 }
 
 // Stage2IndexReset puts st in the document-start state. The caller's
