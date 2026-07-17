@@ -1688,67 +1688,87 @@ func (cursor *decoderCursor) decodeCompiledArrayStructural(node *typedNode, dst 
 
 var oneDigitFractions = [...]float64{0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9}
 
-// shortStructuralFloatAt parses the compact one-digit forms common in fixed
-// numeric tuples. The structural caller has already proved the delimiter
-// positions, so limit replaces the generic document-bound and delimiter
-// checks. Stage 1 rejects illegal control bytes and emits any hidden scalar
-// start, which makes an accepted whitespace tail exact for this tape shape.
+// shortStructuralFloatAt classifies the exact compact one-digit forms by
+// their tape-proved width. Uncommon whitespace and wider forms return to the
+// caller's full transactional decoder.
 func shortStructuralFloatAt(base unsafe.Pointer, start, limit int) (float64, bool) {
-	if start >= limit {
+	width := limit - start
+	if width <= 0 {
 		return 0, false
 	}
 	word := loadUint64LE(unsafe.Add(base, start))
-	negative := byte(word) == '-'
-	if negative {
-		word >>= 8
-		start++
-	}
-	digit := byte(word) - '0'
-	if digit > 9 {
-		return 0, false
-	}
-	value := float64(digit)
-	word >>= 8
-	start++
-	if start != limit {
-		switch byte(word) {
-		case '.':
-			fraction := byte(word>>8) - '0'
-			if fraction > 9 {
-				return 0, false
-			}
-			value += oneDigitFractions[fraction]
-			word >>= 16
-			start += 2
-		case 'e', 'E':
-			word >>= 8
-			start++
-			exponentNegative := false
-			if sign := byte(word); sign == '+' || sign == '-' {
-				exponentNegative = sign == '-'
-				word >>= 8
-				start++
-			}
-			exponent := byte(word) - '0'
-			if exponent > 9 {
-				return 0, false
-			}
-			if exponentNegative {
-				value /= anyPow10[exponent]
-			} else {
-				value *= anyPow10[exponent]
-			}
-			word >>= 8
-			start++
+	if width > 5 {
+		switch {
+		case byte(word>>8) <= ' ':
+			width = 1
+		case byte(word>>16) <= ' ':
+			width = 2
+		case byte(word>>24) <= ' ':
+			width = 3
+		case byte(word>>32) <= ' ':
+			width = 4
+		case byte(word>>40) <= ' ':
+			width = 5
+		default:
+			return 0, false
 		}
 	}
-	if start != limit && byte(word) > ' ' {
-		return 0, false
+	b0, b1 := byte(word), byte(word>>8)
+	d0, d1 := b0-'0', b1-'0'
+	switch width {
+	case 1:
+		if d0 <= 9 {
+			return float64(d0), true
+		}
+	case 2:
+		if b0 == '-' && d1 <= 9 {
+			return -float64(d1), true
+		}
+	case 3:
+		b2 := byte(word >> 16)
+		d2 := b2 - '0'
+		if d0 <= 9 && d2 <= 9 {
+			switch {
+			case b1 == '.':
+				return float64(d0) + oneDigitFractions[d2], true
+			case b1|0x20 == 'e':
+				return float64(d0) * anyPow10[d2], true
+			}
+		}
+	case 4:
+		b2, b3 := byte(word>>16), byte(word>>24)
+		d3 := b3 - '0'
+		if b0 == '-' && d1 <= 9 && d3 <= 9 {
+			switch {
+			case b2 == '.':
+				return -(float64(d1) + oneDigitFractions[d3]), true
+			case b2|0x20 == 'e':
+				return -float64(d1) * anyPow10[d3], true
+			}
+		}
+		if d0 <= 9 && b1|0x20 == 'e' && (b2 == '+' || b2 == '-') && d3 <= 9 {
+			value := float64(d0)
+			if b2 == '-' {
+				value /= anyPow10[d3]
+			} else {
+				value *= anyPow10[d3]
+			}
+			return value, true
+		}
+	case 5:
+		b2, b3, b4 := byte(word>>16), byte(word>>24), byte(word>>32)
+		d4 := b4 - '0'
+		if b0 == '-' && d1 <= 9 && b2|0x20 == 'e' && (b3 == '+' || b3 == '-') && d4 <= 9 {
+			value := float64(d1)
+			if b3 == '-' {
+				value /= anyPow10[d4]
+			} else {
+				value *= anyPow10[d4]
+			}
+			return -value, true
+		}
 	}
-	if negative {
-		value = -value
-	}
-	return value, true
+	return 0, false
 }
 
 func decodeCompiledFloat64Array3Structural(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
