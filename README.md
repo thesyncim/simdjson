@@ -493,7 +493,7 @@ and runtime dispatch.
 ## Performance
 
 The current publication is measured from clean library revision
-`a48608811500b6d5abc2279465181e8c4b394e4c` on an Apple M4 Max, one CPU, with
+`47bd858b21563f5c2ad009074779f6543f2bc910` on an Apple M4 Max, one CPU, with
 six 300 ms samples per row and pinned Go revision
 `03845e30f7b73d1703bd8c21017297f6eecb76d6`. Each contract runs in a fresh
 process so allocator-heavy dynamic decode cannot perturb later groups. Lower
@@ -502,12 +502,12 @@ Go `encoding/json` corpus payloads.
 
 | Operation | Contract | vs stdlib | vs fastest rival | vs native Sonic | SIMD vs pure Go |
 |---|---|---:|---:|---:|---:|
-| Validate | Strict JSON + UTF-8 | **2.92x** | **2.57x** | **1.24x** | **1.647x** |
-| Typed decode | Owned strings | **4.00x** | **1.72x** | **1.73x** | **1.104x** |
-| Dynamic decode | Owned `any` tree | **3.62x** | **1.84x** | **1.13x** | **1.067x** |
-| Encode | Owned output | **2.45x** | **1.43x** | **2.63x** | **1.490x** |
-| Encode | Reused output buffer | **4.61x** | **2.69x** | — | **1.791x** |
-| Parse + full walk | Complete semantic traversal | **5.80x** | — | — | **1.200x** |
+| Validate | Strict JSON + UTF-8 | **3.14x** | **2.86x** | **1.37x** | **1.800x** |
+| Typed decode | Owned strings | **4.09x** | **1.80x** | **1.69x** | **1.129x** |
+| Dynamic decode | Owned `any` tree | **3.59x** | **1.85x** | **1.12x** | **1.056x** |
+| Encode | Owned output | **2.47x** | **1.40x** | **2.53x** | **1.283x** |
+| Encode | Reused output buffer | **4.75x** | **2.69x** | — | **1.518x** |
+| Parse + full walk | Complete semantic traversal | **6.03x** | — | — | **1.232x** |
 
 The fastest-rival column chooses the best compatible result per payload from
 go-json, Segment, jsoniter, and fastjson, all built with the pinned Go tip.
@@ -517,8 +517,8 @@ uses Go 1.26.4 in an isolated module because it falls back on Go tip; its
 syntax-only `Valid` is not contract-equivalent to strict UTF-8 validation and
 is excluded from fastest-rival selection.
 
-The same corpus puts `encoding/json/v2` behind by 3.22x on typed decode, 2.01x
-on dynamic decode, and 2.32x on owned encode. Reusable structural-index
+The same corpus puts `encoding/json/v2` behind by 3.29x on typed decode, 1.97x
+on dynamic decode, and 2.31x on owned encode. Reusable structural-index
 construction is part of the regular benchmark gate and remains zero-allocation.
 
 [Current per-corpus results, allocations, hook cost, SIMD uplift, and exact commands](benchmarks/README.md).

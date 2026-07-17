@@ -12,7 +12,7 @@ toolchain:
 
 | Component | Revision |
 |---|---|
-| simdjson | `a48608811500b6d5abc2279465181e8c4b394e4c` (`dirty=false`) |
+| simdjson | `47bd858b21563f5c2ad009074779f6543f2bc910` (`dirty=false`) |
 | Go | `go1.27-devel_03845e30`, commit `03845e30f7b73d1703bd8c21017297f6eecb76d6` |
 | Machine | Apple M4 Max, `darwin/arm64`, one CPU |
 | Samples | six samples per row, 300 ms each, median reported |
@@ -51,15 +51,15 @@ libraries' rows.
 
 | Operation | vs `encoding/json` | vs fastest compatible rival | SIMD vs pure Go |
 |---|---:|---:|---:|
-| Strict validation | **2.916x** | **2.569x** | **1.647x** |
-| Typed owned decode | **4.002x** | **1.722x** | **1.104x** |
-| Dynamic owned decode | **3.621x** | **1.842x** | **1.067x** |
-| Owned encode | **2.453x** | **1.431x** | **1.490x** |
-| Compiled encode reuse | **4.608x** | **2.689x** | **1.791x** |
-| Parse + complete walk | **5.799x** | — | **1.200x** |
+| Strict validation | **3.141x** | **2.856x** | **1.800x** |
+| Typed owned decode | **4.094x** | **1.804x** | **1.129x** |
+| Dynamic owned decode | **3.590x** | **1.845x** | **1.056x** |
+| Owned encode | **2.470x** | **1.400x** | **1.283x** |
+| Compiled encode reuse | **4.746x** | **2.689x** | **1.518x** |
+| Parse + complete walk | **6.026x** | — | **1.232x** |
 
 These are aggregate results, not a claim that every payload is won. In
-particular, owned encode is 3% behind go-json on CITM and 2% behind Segment on
+particular, owned encode is 7% behind go-json on CITM and Segment on
 Synthea. Compiled reuse leads the compatible rival on every payload.
 
 ## Per-corpus results
@@ -68,13 +68,13 @@ Synthea. Compiled reuse leads the compatible rival on every payload.
 
 | Corpus | `encoding/json` | simdjson | Rival | Rival time | vs stdlib | vs rival |
 |---|---:|---:|---|---:|---:|---:|
-| Canada geometry | 270.0 us | **130.1 us** | fastjson | 209.2 us | **2.08x** | **1.61x** |
-| CITM catalog | 762.1 us | **444.5 us** | fastjson | 864.7 us | **1.71x** | **1.95x** |
-| Go source | 1.408 ms | **956.0 us** | Segment | 1.190 ms | **1.47x** | **1.24x** |
-| Escaped strings | 55.6 us | **4.4 us** | Segment | 56.3 us | **12.61x** | **12.77x** |
-| Unicode strings | 18.0 us | **3.3 us** | fastjson | 7.1 us | **5.48x** | **2.17x** |
-| Synthea FHIR | 1.033 ms | **449.0 us** | fastjson | 1.290 ms | **2.30x** | **2.87x** |
-| Twitter status | 365.9 us | **169.8 us** | fastjson | 405.0 us | **2.16x** | **2.39x** |
+| Canada geometry | 224.2 us | **120.3 us** | fastjson | 219.1 us | **1.86x** | **1.82x** |
+| CITM catalog | 756.7 us | **354.3 us** | fastjson | 870.5 us | **2.14x** | **2.46x** |
+| Go source | 1.306 ms | **945.2 us** | Segment | 1.207 ms | **1.38x** | **1.28x** |
+| Escaped strings | 55.3 us | **4.4 us** | Segment | 55.6 us | **12.48x** | **12.54x** |
+| Unicode strings | 20.1 us | **3.2 us** | fastjson | 7.1 us | **6.21x** | **2.18x** |
+| Synthea FHIR | 1.009 ms | **360.7 us** | fastjson | 1.271 ms | **2.80x** | **3.52x** |
+| Twitter status | 365.0 us | **144.2 us** | fastjson | 406.0 us | **2.53x** | **2.81x** |
 
 Valid input allocates zero bytes and zero objects.
 
@@ -82,25 +82,25 @@ Valid input allocates zero bytes and zero objects.
 
 | Corpus | `encoding/json` | simdjson | Rival | Rival time | vs stdlib | vs rival |
 |---|---:|---:|---|---:|---:|---:|
-| Canada geometry | 1.352 ms | **192.9 us** | Segment | 779.6 us | **7.01x** | **4.04x** |
-| CITM catalog | 2.580 ms | **953.8 us** | go-json | 1.277 ms | **2.71x** | **1.34x** |
-| Go source | 6.526 ms | **1.636 ms** | Segment | 2.241 ms | **3.99x** | **1.37x** |
-| Escaped strings | 202.3 us | **36.4 us** | go-json | 67.1 us | **5.56x** | **1.85x** |
-| Unicode strings | 41.6 us | **8.1 us** | go-json | 13.6 us | **5.14x** | **1.68x** |
-| Synthea FHIR | 3.911 ms | **1.583 ms** | go-json | 1.980 ms | **2.47x** | **1.25x** |
-| Twitter status | 1.395 ms | **453.9 us** | go-json | 708.5 us | **3.07x** | **1.56x** |
+| Canada geometry | 1.240 ms | **187.0 us** | Segment | 769.7 us | **6.63x** | **4.12x** |
+| CITM catalog | 2.551 ms | **790.1 us** | go-json | 1.261 ms | **3.23x** | **1.60x** |
+| Go source | 6.353 ms | **1.357 ms** | Segment | 2.237 ms | **4.68x** | **1.65x** |
+| Escaped strings | 196.7 us | **36.8 us** | go-json | 65.4 us | **5.34x** | **1.78x** |
+| Unicode strings | 41.7 us | **8.4 us** | go-json | 13.7 us | **4.97x** | **1.63x** |
+| Synthea FHIR | 3.929 ms | **1.637 ms** | go-json | 2.075 ms | **2.40x** | **1.27x** |
+| Twitter status | 1.366 ms | **452.8 us** | go-json | 706.5 us | **3.02x** | **1.56x** |
 
 ### Dynamic owned decode
 
 | Corpus | `encoding/json` | simdjson | Rival | Rival time | vs stdlib | vs rival |
 |---|---:|---:|---|---:|---:|---:|
-| Canada geometry | 3.166 ms | **934.9 us** | go-json | 1.899 ms | **3.39x** | **2.03x** |
-| CITM catalog | 7.792 ms | **2.553 ms** | jsoniter | 4.476 ms | **3.05x** | **1.75x** |
-| Go source | 18.108 ms | **4.744 ms** | go-json | 9.812 ms | **3.82x** | **2.07x** |
-| Escaped strings | 216.8 us | **32.3 us** | go-json | 76.0 us | **6.70x** | **2.35x** |
-| Unicode strings | 55.1 us | **13.1 us** | go-json | 21.1 us | **4.21x** | **1.62x** |
-| Synthea FHIR | 11.652 ms | **4.222 ms** | jsoniter | 6.881 ms | **2.76x** | **1.63x** |
-| Twitter status | 3.489 ms | **1.316 ms** | go-json | 2.080 ms | **2.65x** | **1.58x** |
+| Canada geometry | 2.980 ms | **949.6 us** | go-json | 1.876 ms | **3.14x** | **1.98x** |
+| CITM catalog | 7.994 ms | **2.435 ms** | jsoniter | 4.558 ms | **3.28x** | **1.87x** |
+| Go source | 18.813 ms | **4.715 ms** | go-json | 9.938 ms | **3.99x** | **2.11x** |
+| Escaped strings | 216.9 us | **33.7 us** | go-json | 75.2 us | **6.43x** | **2.23x** |
+| Unicode strings | 54.0 us | **13.5 us** | go-json | 21.4 us | **4.02x** | **1.59x** |
+| Synthea FHIR | 11.702 ms | **4.286 ms** | jsoniter | 7.075 ms | **2.73x** | **1.65x** |
+| Twitter status | 3.543 ms | **1.335 ms** | go-json | 2.128 ms | **2.65x** | **1.59x** |
 
 Dynamic `any` values use ordinary Go interface construction. There is no
 hand-built interface header or runtime layout dependency. That keeps the
@@ -124,42 +124,44 @@ manipulation.
 
 | Corpus | stdlib | Owned | Compiled reuse | Rival | Rival time |
 |---|---:|---:|---:|---|---:|
-| Canada geometry | 641.7 us | **402.2 us** | **313.4 us** | Segment | 528.7 us |
-| CITM catalog | 1.071 ms | 416.8 us | **211.4 us** | go-json | **404.3 us** |
-| Go source | 3.316 ms | **1.317 ms** | **691.2 us** | Segment | 1.411 ms |
-| Escaped strings | 22.1 us | **7.7 us** | **3.7 us** | jsoniter | 22.7 us |
-| Unicode strings | 22.2 us | **7.7 us** | **3.7 us** | jsoniter | 22.8 us |
-| Synthea FHIR | 6.022 ms | 2.098 ms | **1.047 ms** | Segment | **2.055 ms** |
-| Twitter status | 742.0 us | **337.7 us** | **177.2 us** | go-json | 359.0 us |
+| Canada geometry | 630.2 us | **394.4 us** | **307.6 us** | Segment | 522.7 us |
+| CITM catalog | 1.078 ms | 414.6 us | **204.8 us** | go-json | **386.5 us** |
+| Go source | 3.331 ms | **1.336 ms** | **683.3 us** | Segment | 1.355 ms |
+| Escaped strings | 22.2 us | **7.5 us** | **3.4 us** | jsoniter | 21.9 us |
+| Unicode strings | 22.7 us | **7.5 us** | **3.5 us** | jsoniter | 22.5 us |
+| Synthea FHIR | 6.002 ms | 2.157 ms | **1.042 ms** | Segment | **2.013 ms** |
+| Twitter status | 752.9 us | **348.5 us** | **176.0 us** | Segment | 355.1 us |
 
 ### Parse and complete walk
 
 | Corpus | stdlib `any` + walk | simdjson parse + walk | Lead |
 |---|---:|---:|---:|
-| Canada geometry | 3.054 ms | **870.5 us** | **3.51x** |
-| CITM catalog | 8.432 ms | **1.075 ms** | **7.84x** |
-| Go source | 19.229 ms | **4.340 ms** | **4.43x** |
-| Escaped strings | 207.4 us | **44.5 us** | **4.66x** |
-| Unicode strings | 51.2 us | **8.6 us** | **5.93x** |
-| Synthea FHIR | 12.723 ms | **1.364 ms** | **9.33x** |
-| Twitter status | 3.770 ms | **538.0 us** | **7.01x** |
+| Canada geometry | 2.988 ms | **861.0 us** | **3.47x** |
+| CITM catalog | 8.481 ms | **1.035 ms** | **8.20x** |
+| Go source | 19.062 ms | **4.205 ms** | **4.53x** |
+| Escaped strings | 212.7 us | **44.4 us** | **4.79x** |
+| Unicode strings | 51.7 us | **8.6 us** | **6.04x** |
+| Synthea FHIR | 12.707 ms | **1.277 ms** | **9.95x** |
+| Twitter status | 3.820 ms | **491.8 us** | **7.77x** |
 
 ### Reusable structural index
 
 `BuildIndex` validates the input and builds a caller-owned navigable tape.
 Correctly sized entry storage is reused; all rows allocate zero bytes and zero
 objects. This benchmark is included in both the regular publication runner and
-the before/after performance gate.
+the before/after performance gate. The production index and stage-2 machines
+are Go-native SIMD or portable Go; the repository contains no assembly path or
+safety build variant.
 
 | Corpus | Time | Throughput |
 |---|---:|---:|
-| Canada geometry | **132.5 us** | **2.04 GB/s** |
-| CITM catalog | **445.9 us** | **3.87 GB/s** |
-| Go source | **992.7 us** | **1.95 GB/s** |
-| Escaped strings | **4.8 us** | **8.79 GB/s** |
-| Unicode strings | **3.6 us** | **5.11 GB/s** |
-| Synthea FHIR | **504.2 us** | **3.98 GB/s** |
-| Twitter status | **173.5 us** | **3.64 GB/s** |
+| Canada geometry | **124.2 us** | **2.18 GB/s** |
+| CITM catalog | **402.1 us** | **4.30 GB/s** |
+| Go source | **874.3 us** | **2.22 GB/s** |
+| Escaped strings | **4.8 us** | **8.84 GB/s** |
+| Unicode strings | **3.5 us** | **5.16 GB/s** |
+| Synthea FHIR | **445.4 us** | **4.51 GB/s** |
+| Twitter status | **158.0 us** | **4.00 GB/s** |
 
 ## Native hook cost
 
@@ -170,10 +172,10 @@ receivers and allocates nothing after warmup.
 
 | Case | Interpreter | Native hook | Hook / interpreter | Bytes/op | Allocs/op |
 |---|---:|---:|---:|---:|---:|
-| Decode small | 45.0 ns | 131.1 ns | 2.91x | 144 | 2 |
-| Decode 1,024 records | 71.4 us | 165.6 us | 2.32x | 147,456 | 2,048 |
-| Encode small | 36.2 ns | **33.3 ns** | 0.92x | 0 | 0 |
-| Encode 1,024 records | 39.7 us | **39.0 us** | 0.98x | 12 | 0 |
+| Decode small | 45.7 ns | 131.4 ns | 2.87x | 144 | 2 |
+| Decode 1,024 records | 70.6 us | 166.7 us | 2.36x | 147,456 | 2,048 |
+| Encode small | 36.1 ns | **32.8 ns** | 0.91x | 0 | 0 |
+| Encode 1,024 records | 40.5 us | **39.6 us** | 0.98x | 13 | 0 |
 
 The remaining decode tax is explicit and bounded: two allocations per actual
 hook invocation, not per field. Recovering it further must retain the
@@ -188,27 +190,28 @@ counts are reported alongside the geomean.
 
 | Path | SIMD wins | Geomean uplift |
 |---|---:|---:|
-| Validation | 6/7 | **1.647x** |
-| Dynamic owned | 5/7 | **1.067x** |
-| Dynamic zero-copy | 5/7 | **1.082x** |
-| Parse + complete walk | 6/7 | **1.200x** |
-| Typed owned | 4/7 | **1.104x** |
-| Typed zero-copy | 3/7 | **1.141x** |
-| Encode owned | 7/7 | **1.490x** |
-| Encode compiled reuse | 5/7 | **1.791x** |
+| Validation | 6/7 | **1.800x** |
+| Dynamic owned | 3/7 | **1.056x** |
+| Dynamic zero-copy | 3/7 | **1.065x** |
+| Parse + complete walk | 6/7 | **1.232x** |
+| Typed owned | 6/7 | **1.129x** |
+| Typed zero-copy | 5/7 | **1.161x** |
+| Encode owned | 7/7 | **1.283x** |
+| Encode compiled reuse | 7/7 | **1.518x** |
+| Reusable structural index | 7/7 | **1.754x** |
 
 ## Additional Go context
 
 `encoding/json/v2` is built from the same pinned Go tip with
 `GOEXPERIMENT=jsonv2`. Geometric means of v2 time divided by simdjson time are
-3.220x for typed owned decode, 2.009x for dynamic owned decode, and 2.316x for
+3.292x for typed owned decode, 1.971x for dynamic owned decode, and 2.308x for
 owned encode.
 
 Sonic v1.15.2 is measured in the isolated `legacy` module with Go 1.26.4
 because it falls back to `encoding/json` on Go tip. Sonic time divided by
-simdjson time is 1.732x for typed owned decode, 1.126x for dynamic owned decode,
-and 2.626x for owned encode. Sonic's syntax-only validation accepts invalid
-UTF-8, so its 1.238x ratio is context, not a contract-equivalent headline.
+simdjson time is 1.687x for typed owned decode, 1.121x for dynamic owned decode,
+and 2.534x for owned encode. Sonic's syntax-only validation accepts invalid
+UTF-8, so its 1.374x ratio is context, not a contract-equivalent headline.
 
 ## Reproduce
 

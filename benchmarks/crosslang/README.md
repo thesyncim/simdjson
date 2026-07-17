@@ -26,13 +26,14 @@ conversion, complete traversal, and digest construction are inside it.
 
 The runner compares every C++ and Go digest and exits with an error before
 publication if any pair differs. It also refuses a dirty repository by default,
-pins C++ simdjson 4.6.4, and verifies the downloaded amalgamation by SHA-256.
+and pins C++ simdjson 4.6.4 at git commit
+`1bcf71bd85059ab6574ea1159de9298dcc1212c5`.
 
 ## Current release-candidate result
 
 | Component | Revision |
 |---|---|
-| Go simdjson | `a48608811500b6d5abc2279465181e8c4b394e4c` (`dirty=false`) |
+| Go simdjson | `47bd858b21563f5c2ad009074779f6543f2bc910` (`dirty=false`) |
 | Go compiler | `go1.27-devel_03845e30`, `GOEXPERIMENT=simd` |
 | C++ simdjson | 4.6.4, arm64 implementation, clang 21 |
 | Machine | Apple M4 Max, single thread |
@@ -42,13 +43,13 @@ reported.
 
 | Corpus | Digest | C++ | Go |
 |---|---|---:|---:|
-| Canada geometry | `99bfa84117bedba4` | **362.3 us** | 970.7 us |
-| CITM catalog | `aa5480c889a90335` | **1.007 ms** | 1.341 ms |
-| Go source | `143678d948841678` | **3.312 ms** | 4.947 ms |
-| Escaped strings | `ceb1fff950644c35` | 69.7 us | **49.4 us** |
-| Unicode strings | `ceb1fff950644c35` | **22.6 us** | 40.3 us |
-| Synthea FHIR | `3d3241a500faabe1` | **1.840 ms** | 3.819 ms |
-| Twitter status | `7fd8ebd3db991240` | **683.8 us** | 1.300 ms |
+| Canada geometry | `99bfa84117bedba4` | **359.2 us** | 953.6 us |
+| CITM catalog | `aa5480c889a90335` | **997.7 us** | 1.316 ms |
+| Go source | `143678d948841678` | **3.265 ms** | 4.994 ms |
+| Escaped strings | `ceb1fff950644c35` | 69.4 us | **43.7 us** |
+| Unicode strings | `ceb1fff950644c35` | **22.6 us** | 46.5 us |
+| Synthea FHIR | `3d3241a500faabe1` | **1.834 ms** | 3.532 ms |
+| Twitter status | `7fd8ebd3db991240` | **680.7 us** | 1.253 ms |
 
 The identical digest for the two string fixtures is expected: they decode to
 the same semantic value even though one source uses escapes and the other uses
@@ -57,7 +58,7 @@ costs.
 
 ## Reproduce
 
-The runner requires `clang++`, `cargo`, `curl`, `zstd`, git, and the pinned Go
+The runner requires `clang++`, `cargo`, `zstd`, git, and the pinned Go
 binary:
 
 ```sh
@@ -65,6 +66,5 @@ TIP_GO="$HOME/sdk/simdjson-gotip/bin/go" ./benchmarks/crosslang/run.sh
 ```
 
 It prints the exact repository commit, dirty status, toolchains, implementation
-selection, per-row digests, and timings. C++ simdjson defaults to 4.6.4; an
-overridden version is a different benchmark record and must be labelled as
-such.
+selection, per-row digests, and timings. C++ and Rust dependency revisions are
+pinned; changing them creates a different benchmark record.

@@ -15,13 +15,13 @@ Apple M4 Max, one CPU, Go 1.26.4, six 300 ms samples per row, median reported:
 
 | Corpus | Typed owned | Dynamic owned | Owned encode | Syntax-only `Valid` |
 |---|---:|---:|---:|---:|
-| Canada geometry | 444.8 us | 831.8 us | 803.3 us | 191.0 us |
-| CITM catalog | 1.525 ms | 3.192 ms | 977.0 us | 778.5 us |
-| Go source | 4.213 ms | 7.091 ms | 4.558 ms | 1.553 ms |
-| Escaped strings | 33.1 us | 33.8 us | 20.7 us | 3.3 us |
-| Unicode strings | 12.2 us | 14.6 us | 20.6 us | 1.7 us |
-| Synthea FHIR | 3.358 ms | 5.673 ms | 8.802 ms | 855.4 us |
-| Twitter status | 767.7 us | 1.159 ms | 597.7 us | 235.7 us |
+| Canada geometry | 438.6 us | 852.3 us | 799.7 us | 191.1 us |
+| CITM catalog | 1.436 ms | 3.230 ms | 961.1 us | 786.8 us |
+| Go source | 3.380 ms | 7.040 ms | 3.977 ms | 1.551 ms |
+| Escaped strings | 32.4 us | 34.0 us | 20.5 us | 3.4 us |
+| Unicode strings | 12.0 us | 13.7 us | 20.5 us | 1.7 us |
+| Synthea FHIR | 2.842 ms | 5.652 ms | 8.213 ms | 859.9 us |
+| Twitter status | 754.5 us | 1.235 ms | 584.5 us | 235.9 us |
 
 Sonic's `Valid` accepts invalid UTF-8, so that column is not equivalent to
 simdjson's strict validation contract. It is reported only as implementation
