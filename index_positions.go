@@ -37,7 +37,7 @@ func buildIndexPositions(src []byte, storage []IndexEntry) (entries []IndexEntry
 			recs[i].EscInStr = meta.EscInStr[i]
 			recs[i].InStr = meta.InStr[i]
 			if meta.NonASCII&(1<<i) != 0 {
-				if utf8RunStart >= 0 && current-utf8RunEnd > 8 {
+				if utf8RunStart >= 0 && current-utf8RunEnd > validUTF8CoalesceBlocks {
 					if !validUTF8Fast(src[utf8RunStart*64 : utf8RunEnd*64]) {
 						return false
 					}

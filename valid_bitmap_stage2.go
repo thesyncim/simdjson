@@ -106,7 +106,7 @@ func validBitmapStreamedAsm(src []byte) (valid, decided bool) {
 			// are still cache-warm; see validBitmapPerBlock for the
 			// coalescing rationale.
 			if rec.NonASCII {
-				if utf8RunStart >= 0 && block-utf8RunEnd > 8 {
+				if utf8RunStart >= 0 && block-utf8RunEnd > validUTF8CoalesceBlocks {
 					if !validUTF8Fast(src[utf8RunStart*64 : utf8RunEnd*64]) {
 						return false, true
 					}

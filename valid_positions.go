@@ -81,7 +81,7 @@ func validPositionsCommitted(src []byte, numberMode uint8) bool {
 		for i := 0; i < count; i++ {
 			current := block + i
 			if meta.NonASCII&(1<<i) != 0 {
-				if utf8RunStart >= 0 && current-utf8RunEnd > 8 {
+				if utf8RunStart >= 0 && current-utf8RunEnd > validUTF8CoalesceBlocks {
 					if !validUTF8Fast(src[utf8RunStart*64 : utf8RunEnd*64]) {
 						return false
 					}
@@ -109,7 +109,7 @@ func validPositionsCommitted(src []byte, numberMode uint8) bool {
 			&tail[0], 1, uint32(fullBlocks*64), &stream, positions[:], &meta,
 		)
 		if meta.NonASCII&1 != 0 {
-			if utf8RunStart >= 0 && fullBlocks-utf8RunEnd > 8 {
+			if utf8RunStart >= 0 && fullBlocks-utf8RunEnd > validUTF8CoalesceBlocks {
 				if !validUTF8Fast(src[utf8RunStart*64 : utf8RunEnd*64]) {
 					return false
 				}

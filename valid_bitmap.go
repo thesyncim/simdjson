@@ -74,6 +74,11 @@ const (
 	// a wider run so its state remains in locals across more blocks. Sampling
 	// retains the four-block cadence above, preserving the routing boundary.
 	validBitmapStreamChunkGo = 32
+
+	// Adjacent non-ASCII runs absorb short ASCII gaps to amortize SIMD UTF-8
+	// setup without rereading large sparse spans. Two blocks is the measured
+	// crossover on arm64 for the multilingual Twitter corpus.
+	validUTF8CoalesceBlocks = 2
 )
 
 const (
@@ -221,11 +226,11 @@ func validBitmapPerBlock(src []byte) (valid, decided bool) {
 		// still cache-warm, instead of a second full pass over the document.
 		// A multi-byte sequence cannot cross a pure-ASCII block (every lead
 		// and continuation byte has the high bit set), so a maximal run
-		// validates as an independent slice. Runs separated by at most eight
-		// ASCII blocks coalesce — ASCII is valid UTF-8, so validating the gap
-		// is harmless and caps per-run kernel setup on alternating layouts.
+		// validates as an independent slice. Nearby runs coalesce through the
+		// measured ASCII-gap threshold above; validating that gap is harmless
+		// and amortizes per-run kernel setup on alternating layouts.
 		if m.NonASCII {
-			if utf8RunStart >= 0 && block-utf8RunEnd > 8 {
+			if utf8RunStart >= 0 && block-utf8RunEnd > validUTF8CoalesceBlocks {
 				if !validUTF8Fast(src[utf8RunStart*64 : utf8RunEnd*64]) {
 					return false, true
 				}
@@ -346,7 +351,7 @@ func validBitmapStreamed(src []byte) (valid, decided bool) {
 			// are still cache-warm; see validBitmapPerBlock for the
 			// coalescing rationale.
 			if rec.NonASCII {
-				if utf8RunStart >= 0 && block-utf8RunEnd > 8 {
+				if utf8RunStart >= 0 && block-utf8RunEnd > validUTF8CoalesceBlocks {
 					if !validUTF8Fast(src[utf8RunStart*64 : utf8RunEnd*64]) {
 						return false, true
 					}
