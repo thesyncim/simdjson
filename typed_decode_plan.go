@@ -7,6 +7,7 @@ const (
 	typedDecShapeInt64String
 	typedDecShapeSliceStruct
 	typedDecShapeRecord
+	typedDecShapeRecordFloat64x3
 )
 
 func compileTypedDecShape(fields []typedField) typedDecShape {
@@ -22,6 +23,10 @@ func compileTypedDecShape(fields []typedField) typedDecShape {
 		if fields[0].op == typedOpInt64 && fields[1].op == typedOpBool &&
 			fields[2].op == typedOpString && fields[3].op == typedOpString &&
 			fields[4].op == typedOpArray {
+			array := fields[4].node
+			if array.length == 3 && array.elem != nil && array.elem.kind == typedFloat && array.elem.bits == 64 {
+				return typedDecShapeRecordFloat64x3
+			}
 			return typedDecShapeRecord
 		}
 	}

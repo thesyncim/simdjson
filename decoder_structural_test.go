@@ -103,7 +103,7 @@ type structuralRecordInt struct {
 
 func structuralRecordIntJSON(token string) []byte {
 	return []byte("{\n\"id\":" + token +
-		",\"active\":true,\"name\":\"record\",\"message\":\"" + strings.Repeat("x", 256) +
+		",\"active\":true,\"name\":\"record\",\"message\":\"" + strings.Repeat("x", 5000) +
 		"\",\"scores\":[1,2.5,-3e4]\n}")
 }
 
@@ -111,6 +111,9 @@ func TestStructuralRecordIntegerFastPathAndFallback(t *testing.T) {
 	decoder, err := CompileDecoder[structuralRecordInt](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if decoder.root.decShape != typedDecShapeRecordFloat64x3 {
+		t.Fatalf("record shape = %d, want float64x3 superinstruction", decoder.root.decShape)
 	}
 	if !decoder.structural {
 		t.Fatal("record shape was not marked for structural decoding")
@@ -125,7 +128,7 @@ func TestStructuralRecordIntegerFastPathAndFallback(t *testing.T) {
 		if err := decoder.Decode(src, &got); err != nil {
 			t.Fatalf("Decode(%d): %v", want, err)
 		}
-		if got.ID != want || !got.Active || got.Name != "record" || len(got.Message) != 256 ||
+		if got.ID != want || !got.Active || got.Name != "record" || len(got.Message) != 5000 ||
 			got.Scores != [3]float64{1, 2.5, -3e4} {
 			t.Fatalf("Decode(%d) produced %+v", want, got)
 		}
@@ -136,6 +139,14 @@ func TestStructuralRecordIntegerFastPathAndFallback(t *testing.T) {
 		if err := decoder.Decode(structuralRecordIntJSON(token), &got); err == nil {
 			t.Fatalf("Decode accepted malformed or overflowing integer %q", token)
 		}
+	}
+
+	malformedBool := []byte(strings.Replace(
+		string(structuralRecordIntJSON("1")), `"active":true`, `"active":truex`, 1,
+	))
+	var got structuralRecordInt
+	if err := decoder.Decode(malformedBool, &got); err == nil {
+		t.Fatal("Decode accepted malformed boolean continuation")
 	}
 }
 
