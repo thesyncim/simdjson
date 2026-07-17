@@ -64,11 +64,11 @@ func TestEncoderScratchDropsOversizedMap(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		scratch, pool := dedicatedEncoderScratch(&enc)
 		_, err = enc.AppendJSON(make([]byte, 0, 32), &tiny)
 		if err != nil {
 			t.Fatal(err)
 		}
-		scratch, pool := dedicatedEncoderScratch(&enc)
 		warmEntries := cap(scratch.mapEntries)
 		warmBacking := scratch.valueBacking.Cap()
 
@@ -108,11 +108,11 @@ func TestEncoderScratchDropsOversizedMap(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		scratch, pool := dedicatedEncoderScratch(&enc)
 		_, err = enc.AppendJSON(make([]byte, 0, 32), &tiny)
 		if err != nil {
 			t.Fatal(err)
 		}
-		scratch, pool := dedicatedEncoderScratch(&enc)
 		warmEntries := cap(scratch.mapEntries)
 		warmArena := cap(scratch.mapKeyArena)
 		warmBacking := scratch.valueBacking.Cap()
@@ -204,10 +204,10 @@ func TestEncoderScratchDropsOversizedDynamicMap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	scratch, pool := dedicatedEncoderScratch(&enc)
 	if _, err := enc.AppendJSON(make([]byte, 0, 96), &tiny); err != nil {
 		t.Fatal(err)
 	}
-	scratch, pool := dedicatedEncoderScratch(&enc)
 	warmDynamic := scratch.dynamicValueBacking.Cap()
 
 	n := oversizedEncoderMapLen(unsafe.Sizeof(any(nil)))
