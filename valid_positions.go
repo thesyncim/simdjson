@@ -63,7 +63,8 @@ func validPositionsCommitted(src []byte, numberMode uint8, coarseNonASCII bool) 
 	var grammar simdkernels.Stage2State
 	simdkernels.Stage2Reset(&grammar)
 	var kinds [simdkernels.Stage2KindsLen]byte
-	var positions [simdkernels.Stage1ChunkBlocks*64 + 64]uint32
+	const consumeBlocks = 4 * simdkernels.Stage1ChunkBlocks
+	var positions [consumeBlocks*64 + 64]uint32
 	var meta simdkernels.Stage1ValidMeta
 	utf8RunStart, utf8RunEnd := -1, 0
 	skipEscape := -1
@@ -87,36 +88,41 @@ func validPositionsCommitted(src []byte, numberMode uint8, coarseNonASCII bool) 
 		return true
 	}
 
-	for block := 0; block < fullBlocks; block += simdkernels.Stage1ChunkBlocks {
-		count := min(simdkernels.Stage1ChunkBlocks, fullBlocks-block)
+	for batch := 0; batch < fullBlocks; batch += consumeBlocks {
 		written := 0
-		if coarseNonASCII {
-			written = simdkernels.Stage1ValidBlocksCoarse(
-				(*byte)(unsafe.Add(base, block*64)), count, uint32(block*64), &stream, positions[:], &meta,
-			)
-			if meta.NonASCII != 0 {
-				meta.NonASCII = sparseNonASCIIMask(unsafe.Add(base, block*64), count)
-			}
-		} else {
-			written = simdkernels.Stage1ValidBlocks(
-				(*byte)(unsafe.Add(base, block*64)), count, uint32(block*64), &stream, positions[:], &meta,
-			)
-		}
-		for i := 0; i < count; i++ {
-			current := block + i
-			if meta.NonASCII&(1<<i) != 0 {
-				if utf8RunStart >= 0 && current-utf8RunEnd > validUTF8CoalesceBlocks {
-					if !validUTF8Fast(src[utf8RunStart*64 : utf8RunEnd*64]) {
-						return false
-					}
-					utf8RunStart = current
-				} else if utf8RunStart < 0 {
-					utf8RunStart = current
+		batchEnd := min(batch+consumeBlocks, fullBlocks)
+		for block := batch; block < batchEnd; block += simdkernels.Stage1ChunkBlocks {
+			count := min(simdkernels.Stage1ChunkBlocks, batchEnd-block)
+			chunkWritten := 0
+			if coarseNonASCII {
+				chunkWritten = simdkernels.Stage1ValidBlocksCoarse(
+					(*byte)(unsafe.Add(base, block*64)), count, uint32(block*64), &stream, positions[written:], &meta,
+				)
+				if meta.NonASCII != 0 {
+					meta.NonASCII = sparseNonASCIIMask(unsafe.Add(base, block*64), count)
 				}
-				utf8RunEnd = current + 1
+			} else {
+				chunkWritten = simdkernels.Stage1ValidBlocks(
+					(*byte)(unsafe.Add(base, block*64)), count, uint32(block*64), &stream, positions[written:], &meta,
+				)
 			}
-			if esc := meta.EscInStr[i]; esc != 0 && validBitmapEscapes(src, n, current*64, esc, &skipEscape) {
-				return false
+			written += chunkWritten
+			for i := 0; i < count; i++ {
+				current := block + i
+				if meta.NonASCII&(1<<i) != 0 {
+					if utf8RunStart >= 0 && current-utf8RunEnd > validUTF8CoalesceBlocks {
+						if !validUTF8Fast(src[utf8RunStart*64 : utf8RunEnd*64]) {
+							return false
+						}
+						utf8RunStart = current
+					} else if utf8RunStart < 0 {
+						utf8RunStart = current
+					}
+					utf8RunEnd = current + 1
+				}
+				if esc := meta.EscInStr[i]; esc != 0 && validBitmapEscapes(src, n, current*64, esc, &skipEscape) {
+					return false
+				}
 			}
 		}
 		if !consume(written) {
