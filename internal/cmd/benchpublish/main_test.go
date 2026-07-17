@@ -52,13 +52,18 @@ func TestPublicationRendersEverySurface(t *testing.T) {
 	}
 	for name, rendered := range map[string][]byte{
 		"headline":  renderHeadlineSVG(p),
-		"corpus":    renderCorpusSVG(p),
 		"simd":      renderSIMDSVG(p),
 		"crosslang": renderCrosslangSVG(p),
 	} {
 		text := string(rendered)
 		if !strings.HasPrefix(text, "<svg ") || !strings.Contains(text, "<title") || strings.Contains(text, `\"`) {
 			t.Fatalf("%s is not clean accessible SVG", name)
+		}
+	}
+	for _, chart := range corpusTimeCharts {
+		rendered := string(renderCorpusTimesSVG(p, chart))
+		if !strings.HasPrefix(rendered, "<svg ") || !strings.Contains(rendered, "<title") || strings.Contains(rendered, `\"`) {
+			t.Fatalf("%s is not clean accessible SVG", chart.File)
 		}
 	}
 }

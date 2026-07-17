@@ -52,13 +52,14 @@ Six approximately 300 ms samples are taken per operation; the median is reported
 | Synthea FHIR | `3d3241a500faabe1` | 1.838083 ms | **1.603395 ms** | **1.146x** |
 | Twitter status | `7fd8ebd3db991240` | 680.820 us | **624.488 us** | **1.090x** |
 
-![Go speedup over C++ semantic traversal](chart.svg)
+![Absolute C++ and Go semantic-traversal time](chart.svg)
 
-`Go speedup` is C++ time divided by Go time. `1x` is equal performance;
-values above `1x` mean Go is faster. The raw medians remain in the adjacent
-columns. The identical digest for the two string fixtures is expected: they
-decode to the same semantic value even though one source uses escapes and the
-other uses literal Unicode.
+The chart uses absolute median time and lower bars are faster; each corpus has
+its own vertical scale so small inputs stay visible. `Go speedup` in the table
+is C++ time divided by Go time. Values above `1x` mean Go is faster, and the
+raw medians remain in the adjacent columns. The identical digest for the two
+string fixtures is expected: they decode to the same semantic value even
+though one source uses escapes and the other uses literal Unicode.
 <!-- benchpublish:cross-language:end -->
 
 ## Reproduce

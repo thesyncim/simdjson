@@ -555,11 +555,12 @@ better; speedups are geometric means across the seven exact 6.33 MiB Go
 | Compiled encode reuse | Reused output buffer | **4.77x** | **2.73x** | — | **1.496x** |
 | Parse + complete walk | Complete semantic traversal | **6.33x** | — | — | **1.222x** |
 
-![Geometric-mean performance comparison](benchmarks/charts/headline.svg)
+![Absolute time for one complete corpus pass](benchmarks/charts/headline.svg)
 
-Every plotted value is baseline time divided by simdjson time: `1x` is equal
-performance, and larger values mean simdjson is faster. SIMD uplift stays in
-the table above and has a dedicated chart in the detailed results.
+The chart shows absolute time to process all seven payloads once. It sums the
+per-file medians without converting them to ratios; lower bars are faster. The
+table keeps geometric means so small and large payloads receive equal weight
+in the aggregate comparison.
 
 The fastest-rival column chooses the best compatible result per payload from
 go-json, Segment, jsoniter, and fastjson, all built with the pinned Go tip.

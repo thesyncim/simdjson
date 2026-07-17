@@ -32,10 +32,11 @@ capacity preparation, and correctness checks happen before the timer.
 | Compiled encode reuse | **4.767x** | **2.728x** | **1.496x** |
 | Parse + complete walk | **6.328x** | — | **1.222x** |
 
-![Headline geometric-mean speedups](charts/headline.svg)
+![Absolute time for one complete corpus pass](charts/headline.svg)
 
-Read each bar as baseline time divided by simdjson time. The `1x` line is
-equal performance; longer bars are faster.
+The chart sums the seven per-file median times and shows the absolute time to
+complete one full corpus pass; lower bars are faster. The table uses
+geometric-mean ratios so every payload has equal aggregate weight.
 
 The rival is the fastest compatible per-payload result from go-json, Segment,
 jsoniter, or fastjson. Aggregate leads do not imply a win on every payload.
@@ -54,7 +55,11 @@ jsoniter, or fastjson. Aggregate leads do not imply a win on every payload.
 | Synthea FHIR | 1.041 ms | **365.5 us** | fastjson | 1.268 ms | **2.85x** | **3.47x** |
 | Twitter status | 372.1 us | **145.3 us** | fastjson | 393.0 us | **2.56x** | **2.70x** |
 
-Valid input allocates zero bytes and zero objects.
+![Absolute strict-validation time by corpus](charts/validation-times.svg)
+
+Each vertical pair is one measured payload with its own scale; the labels are
+absolute median times and lower bars are faster. Valid input allocates zero
+bytes and zero objects.
 
 ### Typed owned decode
 
@@ -68,6 +73,11 @@ Valid input allocates zero bytes and zero objects.
 | Synthea FHIR | 3.970 ms | **1.696 ms** | go-json | 2.027 ms | **2.34x** | **1.19x** |
 | Twitter status | 1.403 ms | **469.0 us** | go-json | 709.0 us | **2.99x** | **1.51x** |
 
+![Absolute typed-decode time by corpus](charts/typed-decode-times.svg)
+
+Each corpus keeps its measured time rather than converting the bars to a
+ratio.
+
 ### Dynamic owned decode
 
 | Corpus | `encoding/json` | simdjson | Rival | Rival time | vs stdlib | vs rival |
@@ -79,6 +89,11 @@ Valid input allocates zero bytes and zero objects.
 | Unicode strings | 55.8 us | **13.0 us** | go-json | 21.1 us | **4.30x** | **1.63x** |
 | Synthea FHIR | 11.485 ms | **4.203 ms** | jsoniter | 6.952 ms | **2.73x** | **1.65x** |
 | Twitter status | 3.514 ms | **1.323 ms** | go-json | 2.107 ms | **2.66x** | **1.59x** |
+
+![Absolute dynamic-decode time by corpus](charts/dynamic-decode-times.svg)
+
+Each corpus keeps its measured time rather than converting the bars to a
+ratio.
 
 Dynamic `any` values use ordinary Go interface construction. The current
 allocation profile is:
@@ -105,6 +120,14 @@ allocation profile is:
 | Synthea FHIR | 6.118 ms | 3.458 ms | **1.047 ms** | Segment | **2.007 ms** |
 | Twitter status | 756.4 us | 527.8 us | **175.4 us** | go-json | **355.4 us** |
 
+![Absolute owned-encode time by corpus](charts/owned-encode-times.svg)
+
+![Absolute compiled-encode-reuse time by corpus](charts/compiled-encode-times.svg)
+
+The two charts separate owned output from caller-buffer reuse. Every corpus
+has its own vertical scale and retains the absolute median labels.
+
+
 ### Parse and complete walk
 
 | Corpus | stdlib `any` + walk | simdjson parse + walk | Lead |
@@ -117,10 +140,10 @@ allocation profile is:
 | Synthea FHIR | 12.625 ms | **1.284 ms** | **9.83x** |
 | Twitter status | 3.715 ms | **491.0 us** | **7.57x** |
 
-![Per-corpus speedup over encoding/json](charts/corpus-speedups.svg)
+![Absolute parse-and-complete-walk time by corpus](charts/walk-times.svg)
 
-Each cell is `encoding/json` time divided by simdjson time for that exact
-operation and payload. `1x` is equal performance; larger values are faster.
+Every vertical pair shows the absolute time to complete the same
+parse-and-walk task; lower bars are faster.
 
 ### Reusable structural index
 
@@ -167,10 +190,11 @@ contract, and one CPU.
 | Encode compiled reuse | 5/7 | **1.496x** |
 | Reusable structural index | 6/7 | **1.745x** |
 
-![SIMD uplift by path](charts/simd-uplift.svg)
+![Absolute SIMD and portable-Go completion time](charts/simd-uplift.svg)
 
-Each bar is portable-Go time divided by SIMD time. `1x` is equal
-performance; values above `1x` are a SIMD win.
+Each pair is the absolute time for one pass over all seven payloads. Pairs use
+independent vertical scales so small paths remain legible; labels preserve the
+measured time and lower bars are faster.
 
 ## Additional Go context
 
@@ -178,10 +202,10 @@ performance; values above `1x` are a SIMD win.
 simdjson time is 3.293x for typed owned decode, 1.987x for dynamic owned decode,
 and 1.748x for owned encode.
 
-Sonic is measured with `go1.26.4 darwin/arm64` because its native path does not support
-the pinned Go tip. Sonic time divided by simdjson time is 1.657x for typed
-owned decode, 1.119x for dynamic owned decode, and 1.963x for owned encode. Its
-syntax-only validation result (1.364x) is context, not a strict-UTF-8 peer.
+Sonic is measured with `go1.26.4 darwin/arm64`. Its native path does not support the pinned Go
+tip. Sonic time divided by simdjson time is 1.657x for typed owned decode,
+1.119x for dynamic owned decode, and 1.963x for owned encode. Its syntax-only
+validation result (1.364x) is context, not a strict-UTF-8 peer.
 <!-- benchpublish:go-publication:end -->
 
 ## Reproduce

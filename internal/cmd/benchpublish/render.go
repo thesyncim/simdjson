@@ -60,8 +60,10 @@ func renderPublication(root string, publication Publication) (map[string][]byte,
 		files[replacement.path] = updated
 	}
 	files[filepath.Join(root, "benchmarks", "charts", "headline.svg")] = renderHeadlineSVG(publication)
-	files[filepath.Join(root, "benchmarks", "charts", "corpus-speedups.svg")] = renderCorpusSVG(publication)
 	files[filepath.Join(root, "benchmarks", "charts", "simd-uplift.svg")] = renderSIMDSVG(publication)
+	for _, chart := range corpusTimeCharts {
+		files[filepath.Join(root, "benchmarks", "charts", chart.File)] = renderCorpusTimesSVG(publication, chart)
+	}
 	files[filepath.Join(root, "benchmarks", "crosslang", "chart.svg")] = renderCrosslangSVG(publication)
 	return files, nil
 }
@@ -128,8 +130,8 @@ func renderMainSummary(p Publication) string {
 		fmt.Fprintf(&out, "| %s | %s | **%.2fx** | %s | %s | **%.3fx** |\n",
 			label, spec.Contract, stdlib, formatRatioCell(rival, 2), formatRatioCell(sonic, 2), simd)
 	}
-	out.WriteString("\n![Geometric-mean performance comparison](benchmarks/charts/headline.svg)\n\n")
-	out.WriteString("Every plotted value is baseline time divided by simdjson time: `1x` is equal\nperformance, and larger values mean simdjson is faster. SIMD uplift stays in\nthe table above and has a dedicated chart in the detailed results.\n\n")
+	out.WriteString("\n![Absolute time for one complete corpus pass](benchmarks/charts/headline.svg)\n\n")
+	out.WriteString("The chart shows absolute time to process all seven payloads once. It sums the\nper-file medians without converting them to ratios; lower bars are faster. The\ntable keeps geometric means so small and large payloads receive equal weight\nin the aggregate comparison.\n\n")
 	out.WriteString("The fastest-rival column chooses the best compatible result per payload from\ngo-json, Segment, jsoniter, and fastjson, all built with the pinned Go tip.\nNative Sonic uses its stable supported toolchain in an isolated module; its\nsyntax-only `Valid` result is context rather than a strict-validation peer.\n\n")
 	fmt.Fprintf(&out, "The same corpus puts `encoding/json/v2` behind by %.2fx on typed decode, %.2fx\non dynamic decode, and %.2fx on owned encode. Reusable structural-index\nconstruction is part of the regular benchmark gate and remains zero-allocation.\n\n",
 		variantGeomean(p, "jsonv2", "BenchmarkStdlibCorpusJSONV2", "typed-reused", "jsonv2", headlineOperations[1]),
@@ -151,16 +153,19 @@ func renderGoPublication(p Publication) string {
 		fmt.Fprintf(&out, "| %s | **%.3fx** | %s | **%.3fx** |\n", spec.Label,
 			operationGeomean(p, spec, "stdlib"), formatRatioCell(operationGeomean(p, spec, "rival"), 3), operationGeomean(p, spec, "simd"))
 	}
-	out.WriteString("\n![Headline geometric-mean speedups](charts/headline.svg)\n\n")
-	out.WriteString("Read each bar as baseline time divided by simdjson time. The `1x` line is\nequal performance; longer bars are faster.\n\n")
+	out.WriteString("\n![Absolute time for one complete corpus pass](charts/headline.svg)\n\n")
+	out.WriteString("The chart sums the seven per-file median times and shows the absolute time to\ncomplete one full corpus pass; lower bars are faster. The table uses\ngeometric-mean ratios so every payload has equal aggregate weight.\n\n")
 	out.WriteString("The rival is the fastest compatible per-payload result from go-json, Segment,\njsoniter, or fastjson. Aggregate leads do not imply a win on every payload.\n\n")
 	out.WriteString("## Per-corpus results\n\n### Strict validation\n\n")
 	renderComparisonTable(&out, p, headlineOperations[0])
-	out.WriteString("\nValid input allocates zero bytes and zero objects.\n\n### Typed owned decode\n\n")
+	out.WriteString("\n![Absolute strict-validation time by corpus](charts/validation-times.svg)\n\n")
+	out.WriteString("Each vertical pair is one measured payload with its own scale; the labels are\nabsolute median times and lower bars are faster. Valid input allocates zero\nbytes and zero objects.\n\n### Typed owned decode\n\n")
 	renderComparisonTable(&out, p, headlineOperations[1])
-	out.WriteString("\n### Dynamic owned decode\n\n")
+	out.WriteString("\n![Absolute typed-decode time by corpus](charts/typed-decode-times.svg)\n\n")
+	out.WriteString("Each corpus keeps its measured time rather than converting the bars to a\nratio.\n\n### Dynamic owned decode\n\n")
 	renderComparisonTable(&out, p, headlineOperations[2])
-	out.WriteString("\nDynamic `any` values use ordinary Go interface construction. The current\nallocation profile is:\n\n| Corpus | Bytes/op | Allocs/op |\n|---|---:|---:|\n")
+	out.WriteString("\n![Absolute dynamic-decode time by corpus](charts/dynamic-decode-times.svg)\n\n")
+	out.WriteString("Each corpus keeps its measured time rather than converting the bars to a\nratio.\n\nDynamic `any` values use ordinary Go interface construction. The current\nallocation profile is:\n\n| Corpus | Bytes/op | Allocs/op |\n|---|---:|---:|\n")
 	for _, corpus := range corpusOrder {
 		metric := p.mustMetric("simd", benchmarkName("BenchmarkStdlibCorpus", corpus, "dynamic-owned", "simdjson-owned"))
 		fmt.Fprintf(&out, "| %s | %s | %s |\n", corpusLabels[corpus], formatInteger(metric.BytesPerOp), formatInteger(metric.AllocsPerOp))
@@ -180,14 +185,17 @@ func renderGoPublication(p Publication) string {
 		}
 		fmt.Fprintf(&out, "| %s | %s | %s | **%s** | %s | %s |\n", corpusLabels[corpus], formatDuration(stdlib.NsPerOp), ownedCell, formatDuration(reuse.NsPerOp), rivalName, rivalCell)
 	}
+	out.WriteString("\n![Absolute owned-encode time by corpus](charts/owned-encode-times.svg)\n\n")
+	out.WriteString("![Absolute compiled-encode-reuse time by corpus](charts/compiled-encode-times.svg)\n\n")
+	out.WriteString("The two charts separate owned output from caller-buffer reuse. Every corpus\nhas its own vertical scale and retains the absolute median labels.\n\n")
 	out.WriteString("\n### Parse and complete walk\n\n| Corpus | stdlib `any` + walk | simdjson parse + walk | Lead |\n|---|---:|---:|---:|\n")
 	for _, corpus := range corpusOrder {
 		stdlib := metricFor(p, "simd", corpus, "dom", "encoding-json")
 		ours := metricFor(p, "simd", corpus, "dom", "simdjson")
 		fmt.Fprintf(&out, "| %s | %s | **%s** | **%.2fx** |\n", corpusLabels[corpus], formatDuration(stdlib.NsPerOp), formatDuration(ours.NsPerOp), stdlib.NsPerOp/ours.NsPerOp)
 	}
-	out.WriteString("\n![Per-corpus speedup over encoding/json](charts/corpus-speedups.svg)\n\n")
-	out.WriteString("Each cell is `encoding/json` time divided by simdjson time for that exact\noperation and payload. `1x` is equal performance; larger values are faster.\n\n")
+	out.WriteString("\n![Absolute parse-and-complete-walk time by corpus](charts/walk-times.svg)\n\n")
+	out.WriteString("Every vertical pair shows the absolute time to complete the same\nparse-and-walk task; lower bars are faster.\n\n")
 	out.WriteString("### Reusable structural index\n\n`BuildIndex` validates the input and builds a caller-owned navigable tape.\nCorrectly sized storage is reused; every row allocates zero bytes and objects.\n\n| Corpus | Time | Throughput |\n|---|---:|---:|\n")
 	for _, corpus := range corpusOrder {
 		metric := p.mustMetric("index-simd", benchmarkName("BenchmarkStdlibCorpusNativeParse", corpus, "", "simdjson-index-reused"))
@@ -203,13 +211,13 @@ func renderGoPublication(p Publication) string {
 		wins, uplift := simdControl(p, control)
 		fmt.Fprintf(&out, "| %s | %d/7 | **%.3fx** |\n", control.Label, wins, uplift)
 	}
-	out.WriteString("\n![SIMD uplift by path](charts/simd-uplift.svg)\n\n")
-	out.WriteString("Each bar is portable-Go time divided by SIMD time. `1x` is equal\nperformance; values above `1x` are a SIMD win.\n\n## Additional Go context\n\n")
+	out.WriteString("\n![Absolute SIMD and portable-Go completion time](charts/simd-uplift.svg)\n\n")
+	out.WriteString("Each pair is the absolute time for one pass over all seven payloads. Pairs use\nindependent vertical scales so small paths remain legible; labels preserve the\nmeasured time and lower bars are faster.\n\n## Additional Go context\n\n")
 	fmt.Fprintf(&out, "`encoding/json/v2` is built from the pinned Go tip. Its time divided by\nsimdjson time is %.3fx for typed owned decode, %.3fx for dynamic owned decode,\nand %.3fx for owned encode.\n\n",
 		variantGeomean(p, "jsonv2", "BenchmarkStdlibCorpusJSONV2", "typed-reused", "jsonv2", headlineOperations[1]),
 		variantGeomean(p, "jsonv2", "BenchmarkStdlibCorpusJSONV2", "dynamic-owned", "jsonv2", headlineOperations[2]),
 		variantGeomean(p, "jsonv2", "BenchmarkStdlibCorpusJSONV2", "encode", "jsonv2", headlineOperations[3]))
-	fmt.Fprintf(&out, "Sonic is measured with `%s` because its native path does not support\nthe pinned Go tip. Sonic time divided by simdjson time is %.3fx for typed\nowned decode, %.3fx for dynamic owned decode, and %.3fx for owned encode. Its\nsyntax-only validation result (%.3fx) is context, not a strict-UTF-8 peer.\n",
+	fmt.Fprintf(&out, "Sonic is measured with `%s`. Its native path does not support the pinned Go\ntip. Sonic time divided by simdjson time is %.3fx for typed owned decode,\n%.3fx for dynamic owned decode, and %.3fx for owned encode. Its syntax-only\nvalidation result (%.3fx) is context, not a strict-UTF-8 peer.\n",
 		p.Metadata.LegacyVersion,
 		operationGeomean(p, headlineOperations[1], "sonic"), operationGeomean(p, headlineOperations[2], "sonic"), operationGeomean(p, headlineOperations[3], "sonic"), operationGeomean(p, headlineOperations[0], "sonic"))
 	return out.String()
@@ -248,8 +256,8 @@ func renderCrossLanguage(p Publication) string {
 		}
 		fmt.Fprintf(&out, "| %s | `%s` | %s | %s | **%.3fx** |\n", corpusLabels[corpus], cpp.Digest, cppCell, goCell, cpp.NsPerOp/goResult.NsPerOp)
 	}
-	out.WriteString("\n![Go speedup over C++ semantic traversal](chart.svg)\n\n")
-	out.WriteString("`Go speedup` is C++ time divided by Go time. `1x` is equal performance;\nvalues above `1x` mean Go is faster. The raw medians remain in the adjacent\ncolumns. The identical digest for the two string fixtures is expected: they\ndecode to the same semantic value even though one source uses escapes and the\nother uses literal Unicode.\n")
+	out.WriteString("\n![Absolute C++ and Go semantic-traversal time](chart.svg)\n\n")
+	out.WriteString("The chart uses absolute median time and lower bars are faster; each corpus has\nits own vertical scale so small inputs stay visible. `Go speedup` in the table\nis C++ time divided by Go time. Values above `1x` mean Go is faster, and the\nraw medians remain in the adjacent columns. The identical digest for the two\nstring fixtures is expected: they decode to the same semantic value even\nthough one source uses escapes and the other uses literal Unicode.\n")
 	return out.String()
 }
 
