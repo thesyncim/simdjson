@@ -16,7 +16,7 @@ benchstat=${BENCHSTAT:-"$HOME/go/bin/benchstat"}
 baseline=HEAD
 rounds=8
 benchtime=250ms
-pattern='BenchmarkHighLevelCorpus/.*/(valid|decode-typed|decode-any|encode)/simdjson'
+pattern='BenchmarkHighLevelCorpus/.*/(valid|index|decode-typed|decode-any|encode-typed)/simdjson'
 
 while getopts b:n:t: flag; do
 	case $flag in

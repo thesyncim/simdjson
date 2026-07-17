@@ -1,14 +1,34 @@
-# Stable-toolchain competitor benchmarks
+# Native stable-toolchain controls
 
-This nested module benchmarks native implementations that do not build under
-the Go tip toolchain required by simdjson. It deliberately does not import simdjson.
+This isolated module measures competitors that do not build natively with the
+Go tip compiler required by simdjson. It deliberately does not import the
+simdjson module.
 
-Sonic v1.15.2 supports Go 1.26 but selects an `encoding/json` fallback on Go
-1.27 tip. The module therefore contains a mechanical copy of the pinned Go-tip
-corpus models and reads the same compressed payloads as the main comparison
-module. `scripts/check-stdlib-corpus.sh` verifies both model copies.
+Sonic v1.15.2 selects an `encoding/json` fallback on Go 1.27 tip, so its native
+arm64 implementation is built here with Go 1.26.4. The module reads the same
+seven compressed payloads and uses mechanical copies of the same concrete
+models. `scripts/check-stdlib-corpus.sh` verifies those copies.
 
-The published exact-corpus run used Go 1.26.4 on Apple M4 Max:
+## Current corpus control
+
+Apple M4 Max, one CPU, Go 1.26.4, six 300 ms samples per row, median reported:
+
+| Corpus | Typed owned | Dynamic owned | Owned encode | Syntax-only `Valid` |
+|---|---:|---:|---:|---:|
+| Canada geometry | 444.8 us | 831.8 us | 803.3 us | 191.0 us |
+| CITM catalog | 1.525 ms | 3.192 ms | 977.0 us | 778.5 us |
+| Go source | 4.213 ms | 7.091 ms | 4.558 ms | 1.553 ms |
+| Escaped strings | 33.1 us | 33.8 us | 20.7 us | 3.3 us |
+| Unicode strings | 12.2 us | 14.6 us | 20.6 us | 1.7 us |
+| Synthea FHIR | 3.358 ms | 5.673 ms | 8.802 ms | 855.4 us |
+| Twitter status | 767.7 us | 1.159 ms | 597.7 us | 235.7 us |
+
+Sonic's `Valid` accepts invalid UTF-8, so that column is not equivalent to
+simdjson's strict validation contract. It is reported only as implementation
+context. Compiler and standard-library revisions also differ; main benchmark
+tables keep these rows out of same-toolchain fastest-rival selection.
+
+## Reproduce
 
 ```sh
 GOTOOLCHAIN=go1.26.4 go test -run='^$' \
@@ -16,26 +36,6 @@ GOTOOLCHAIN=go1.26.4 go test -run='^$' \
   -benchmem -benchtime=300ms -count=6 -cpu=1 .
 ```
 
-It benchmarks native validation, owned dynamic decode, typed reused decode in
-`ConfigStd` and `ConfigFastest`, and encode. Go 1.26 and Go tip timings are
-reported in separate columns because compiler and standard-library revisions
-differ.
-
-Medians of five samples, shown as `time / allocs-op`:
-
-| Sonic configuration | Small | Medium | Large |
-|---|---:|---:|---:|
-| `ConfigFastest`, zero-copy | 187.9 ns / 4 | 5.74 us / 6 | 170.5 us / 6 |
-| `ConfigStd`, owned strings | 233.0 ns / 5 | 7.82 us / 71 | 227.9 us / 2,055 |
-
-Reused destinations:
-
-| Sonic configuration | Medium | Large |
-|---|---:|---:|
-| `ConfigFastest`, zero-copy | 5.63 us / 3 | 166.6 us / 3 |
-| `ConfigStd`, owned strings | 7.75 us / 68 | 233.2 us / 2,052 |
-
-Other benchmark groups retain native validation, `any` materialization,
-16-digit arrays, and public `Node.LoadAll` coverage. `Node.LoadAll` is not
-treated as index-equivalent because nested containers may remain validated raw
-nodes.
+The default `../run-comparison.sh` invokes the same contract one operation
+group per fresh process. Other benchmarks in this module are exploratory and
+are not part of the release publication.

@@ -7,6 +7,8 @@ import (
 	"github.com/thesyncim/simdjson"
 )
 
+var corpusIndexLen int
+
 func BenchmarkHighLevelCorpus(b *testing.B) {
 	for _, name := range Names {
 		src, err := Read(name)
@@ -28,6 +30,22 @@ func BenchmarkHighLevelCorpus(b *testing.B) {
 					if !simdjson.Valid(src) {
 						b.Fatal("invalid corpus input")
 					}
+				}
+			})
+			need, err := simdjson.RequiredIndexEntries(src)
+			if err != nil {
+				b.Fatal(err)
+			}
+			indexStorage := make([]simdjson.IndexEntry, need)
+			b.Run("index/simdjson-reused", func(b *testing.B) {
+				b.ReportAllocs()
+				b.SetBytes(int64(len(src)))
+				for b.Loop() {
+					index, err := simdjson.BuildIndex(src, indexStorage)
+					if err != nil {
+						b.Fatal(err)
+					}
+					corpusIndexLen = index.Len()
 				}
 			})
 			b.Run("decode-any/encoding-json", func(b *testing.B) {

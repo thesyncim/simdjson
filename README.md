@@ -17,6 +17,17 @@ all other accelerated kernels are Go-native SIMD or portable Go.
 > `GOEXPERIMENT=simd` to enable the Go-native SIMD kernels. The same Go tip
 > compiler builds portable fallbacks when the experiment is omitted.
 
+The repository is governed by four priorities, in this order:
+
+1. exact JSON behavior and compatibility;
+2. memory-safe, GC-visible ownership in the default build;
+3. the fastest path as the ordinary path, without safety or tuning knobs; and
+4. small, composable APIs backed by unified implementations.
+
+Performance changes must preserve the correctness and lifetime gates. Safety
+fixes are measured immediately so avoidable cost can be recovered with typed,
+runtime-managed ownership rather than hidden pointers or runtime-layout tricks.
+
 [Install](#install) | [Quick start](#quick-start) | [Usage](#usage) | [Performance](#performance) | [Contracts](#compatibility-and-contracts) | [SIMD package](#simd-package) | [Reproduce](#reproduce-benchmarks)
 
 ## Install
@@ -310,8 +321,10 @@ func (e Event) MarshalSimdJSON(w simdjson.Appender) simdjson.Appender {
 ```
 
 Safety is not a build option. Every build constructs hook interfaces through
-the Go runtime. Decode hooks receive a heap-backed receiver shadow and cursor
-copy; the cursor is invalidated on return. Encode hooks use ordinary Go
+the Go runtime. Decode hooks receive a heap-backed receiver shadow and one
+heap object that owns its cursor copy; the cursor is invalidated on return.
+That is a fixed two-allocation cost per decode hook call, independent of the
+number of fields. Encode hooks use ordinary Go
 ownership: addressable values expose their real GC-visible receiver, while
 non-addressable value receivers get an ordinary value copy. This preserves
 pointer identity and retention safety without a per-hook receiver allocation.
@@ -480,42 +493,38 @@ and runtime dispatch.
 
 ## Performance
 
-Apple M4 Max, one CPU, six 300 ms samples, exact 6.33 MiB Go
-`encoding/json` corpus. Lower time is better; the table reports geometric-mean
-speedup across all seven payloads.
+The current publication is measured from clean library revision
+`a48608811500b6d5abc2279465181e8c4b394e4c` on an Apple M4 Max, one CPU, with
+six 300 ms samples per row and pinned Go revision
+`03845e30f7b73d1703bd8c21017297f6eecb76d6`. Each contract runs in a fresh
+process so allocator-heavy dynamic decode cannot perturb later groups. Lower
+time is better; speedups are geometric means across the seven exact 6.33 MiB
+Go `encoding/json` corpus payloads.
 
 | Operation | Contract | vs stdlib | vs fastest rival | vs native Sonic | SIMD vs pure Go |
 |---|---|---:|---:|---:|---:|
-| Validate | Strict JSON + UTF-8 | **2.89x** | **2.60x** | **1.25x** | **1.718x** |
-| Typed decode | Owned strings | **5.10x** | **2.06x** | **2.08x** | **1.159x** |
-| Dynamic decode | Owned `any` tree | **4.48x** | **2.01x** | **1.40x** | **1.121x** |
-| Encode | Owned output | **3.39x** | **2.06x** | **3.91x** | **1.720x** |
-| Encode | Reused output buffer | **3.76x** | **2.29x** | — | **1.791x** |
+| Validate | Strict JSON + UTF-8 | **2.92x** | **2.57x** | **1.24x** | **1.647x** |
+| Typed decode | Owned strings | **4.00x** | **1.72x** | **1.73x** | **1.104x** |
+| Dynamic decode | Owned `any` tree | **3.62x** | **1.84x** | **1.13x** | **1.067x** |
+| Encode | Owned output | **2.45x** | **1.43x** | **2.63x** | **1.490x** |
+| Encode | Reused output buffer | **4.61x** | **2.69x** | — | **1.791x** |
+| Parse + full walk | Complete semantic traversal | **5.80x** | — | — | **1.200x** |
 
-Every stdlib row and every rival row wins all seven payloads, owned encode
-included. Comparisons use the same Go tip compiler and do
-not mix owned and source-backed results. The Sonic column compares against
-native Sonic v1.15.2 compiled with the previous stable Go (1.26.4) in an
-isolated module, because Sonic falls back to `encoding/json` on Go tip; it is
-excluded from the fastest-rival column, its `Valid` is syntax-only where ours
-also enforces UTF-8, and it has no reused-buffer `Marshal` counterpart. The
-SIMD column compares the same code, compiler, and corpus with and without
-`GOEXPERIMENT=simd`.
+The fastest-rival column chooses the best compatible result per payload from
+go-json, Segment, jsoniter, and fastjson, all built with the pinned Go tip.
+Owned encode is slightly behind the fastest rival on CITM and Synthea, so the
+geometric-mean lead is not presented as a universal win. Native Sonic v1.15.2
+uses Go 1.26.4 in an isolated module because it falls back on Go tip; its
+syntax-only `Valid` is not contract-equivalent to strict UTF-8 validation and
+is excluded from fastest-rival selection.
 
-The upcoming `encoding/json/v2` (`GOEXPERIMENT=jsonv2`) trails on the same
-corpus by 3.9x on typed decode, 2.5x on dynamic decode, and 3.3x on owned
-`Marshal` — see [the v2 table](benchmarks/README.md#encodingjsonv2).
+The same corpus puts `encoding/json/v2` behind by 3.22x on typed decode, 2.01x
+on dynamic decode, and 2.32x on owned encode. Reusable structural-index
+construction is part of the regular benchmark gate and remains zero-allocation.
 
-The Validate row was refreshed on 2026-07-17 on the current build; decode and
-encode rows retain the pinned 2026-07-14 snapshot because those paths did not
-change. See the
-[per-corpus tables](benchmarks/README.md#published-corpus-snapshot) for the
-refreshed validation, Parse/DOM, and reusable structural-index rows.
-
-[Full per-corpus results, allocations, SIMD uplift, versions, and exact commands](benchmarks/README.md#published-corpus-snapshot).
-For context beyond Go — C++ simdjson and Rust serde_json/simd-json on the
-same corpus and machine — see the
-[cross-language benchmarks](benchmarks/README.md#cross-language-context).
+[Current per-corpus results, allocations, hook cost, SIMD uplift, and exact commands](benchmarks/README.md).
+The [cross-language benchmark](benchmarks/crosslang/README.md) publishes only
+the enforced parse-plus-semantic-digest contract as a direct comparison.
 
 ## Compatibility and contracts
 
@@ -578,8 +587,8 @@ during package initialization:
 | amd64 with AVX2 | 32-byte AVX2 | AVX 16-digit reduction | Scalar SWAR |
 | Other build or CPU | Scalar Go | Scalar Go | Scalar SWAR |
 
-[Kernel benchmark results](benchmarks/README.md#simd-kernel-snapshot) use
-guarded public APIs and report zero allocations.
+Kernel microbenchmarks live in the root and comparison modules; release claims
+use the end-to-end corpus contracts in the [benchmark record](benchmarks/README.md).
 
 ## Correctness and safety
 

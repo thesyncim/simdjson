@@ -6,31 +6,100 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 tip_go=$TIP_GO
 legacy_go=${LEGACY_GO:-go}
 legacy_toolchain=${LEGACY_GOTOOLCHAIN:-go1.26.4}
-bench=${BENCH:-.}
-benchtime=${BENCHTIME:-1s}
-count=${COUNT:-5}
+benchtime=${BENCHTIME:-300ms}
+count=${COUNT:-6}
 jsonv2_bench=${JSONV2_BENCH:-^BenchmarkParseTypedJSONV2}
 
-printf '\nGo tip pure Go benchmarks\n'
+repo=$(CDPATH= cd -- "$root/.." && pwd)
+commit=$(git -C "$repo" rev-parse HEAD)
+dirty=$(git -C "$repo" status --porcelain --untracked-files=normal)
+if [ -n "$dirty" ] && [ "${ALLOW_DIRTY:-0}" != 1 ]; then
+	echo "refusing to publish from a dirty tree; commit the candidate or set ALLOW_DIRTY=1 for a development run" >&2
+	exit 1
+fi
+printf 'repository commit=%s dirty=%s\n' "$commit" "$([ -n "$dirty" ] && printf true || printf false)"
+"$tip_go" version
+
+# BENCH keeps the broad exploratory runner available. The default publication
+# path below isolates every corpus contract in a fresh process so allocator and
+# GC state from dynamic decoding cannot perturb later DOM or encode groups.
+if [ -n "${BENCH:-}" ]; then
+	bench=$BENCH
+	printf '\nGo tip pure Go exploratory benchmarks\n'
+	(
+		cd "$root"
+		"$tip_go" test -run='^$' -bench="$bench" -benchmem -benchtime="$benchtime" -count="$count"
+	)
+
+	printf '\nGo tip SIMD exploratory benchmarks\n'
+	(
+		cd "$root"
+		GOEXPERIMENT=simd "$tip_go" test -run='^$' -bench="$bench" -benchmem -benchtime="$benchtime" -count="$count"
+	)
+
+	printf '\nGo tip encoding/json/v2 exploratory benchmarks\n'
+	(
+		cd "$root"
+		GOEXPERIMENT=simd,jsonv2 "$tip_go" test -run='^$' -bench="$jsonv2_bench" -benchmem -benchtime="$benchtime" -count="$count"
+	)
+
+	printf '\nGo 1.26 native compatibility exploratory benchmarks\n'
+	(
+		cd "$root/legacy"
+		GOTOOLCHAIN="$legacy_toolchain" "$legacy_go" test -run='^$' -bench="$bench" -benchmem -benchtime="$benchtime" -count="$count"
+	)
+	exit 0
+fi
+
+printf '\nGo tip SIMD exact corpus, one process per contract\n'
+for group in valid dynamic-owned dom typed-reused encode; do
 (
 	cd "$root"
-	"$tip_go" test -run='^$' -bench="$bench" -benchmem -benchtime="$benchtime" -count="$count"
+	GOEXPERIMENT=simd "$tip_go" test -run='^$' \
+		-bench="^BenchmarkStdlibCorpus$/^.*$/${group}$" \
+		-benchmem -benchtime="$benchtime" -count="$count" -cpu=1
 )
+done
 
-printf '\nGo tip SIMD benchmarks\n'
+printf '\nGo tip pure Go controls, one process per contract\n'
+for spec in 'valid:simdjson' 'dynamic-owned:simdjson-.*' 'dom:simdjson' 'typed-reused:simdjson-.*' 'encode:simdjson-.*'; do
+	group=${spec%%:*}
+	leaf=${spec#*:}
 (
 	cd "$root"
-	GOEXPERIMENT=simd "$tip_go" test -run='^$' -bench="$bench" -benchmem -benchtime="$benchtime" -count="$count"
+	"$tip_go" test -run='^$' \
+		-bench="^BenchmarkStdlibCorpus$/^.*$/${group}$/${leaf}$" \
+		-benchmem -benchtime="$benchtime" -count="$count" -cpu=1
 )
+done
 
-printf '\nGo tip encoding/json/v2 benchmarks\n'
+printf '\nReusable structural index, SIMD and pure Go\n'
 (
 	cd "$root"
-	GOEXPERIMENT=simd,jsonv2 "$tip_go" test -run='^$' -bench="$jsonv2_bench" -benchmem -benchtime="$benchtime" -count="$count"
+	GOEXPERIMENT=simd "$tip_go" test -run='^$' \
+		-bench='^BenchmarkStdlibCorpusNativeParse$/^.*$/^simdjson-index-reused$' \
+		-benchmem -benchtime="$benchtime" -count="$count" -cpu=1
+	"$tip_go" test -run='^$' \
+		-bench='^BenchmarkStdlibCorpusNativeParse$/^.*$/^simdjson-index-reused$' \
+		-benchmem -benchtime="$benchtime" -count="$count" -cpu=1
 )
 
-printf '\nGo 1.26 native compatibility benchmarks\n'
+printf '\nGo tip encoding/json/v2 exact corpus\n'
+for group in dynamic-owned typed-reused encode; do
+(
+	cd "$root"
+	GOEXPERIMENT=simd,jsonv2 "$tip_go" test -run='^$' \
+		-bench="^BenchmarkStdlibCorpusJSONV2$/^.*$/${group}$" \
+		-benchmem -benchtime="$benchtime" -count="$count" -cpu=1
+)
+done
+
+printf '\nGo 1.26 native Sonic exact corpus\n'
+for group in valid dynamic-owned typed-reused encode; do
 (
 	cd "$root/legacy"
-	GOTOOLCHAIN="$legacy_toolchain" "$legacy_go" test -run='^$' -bench="$bench" -benchmem -benchtime="$benchtime" -count="$count"
+	GOTOOLCHAIN="$legacy_toolchain" "$legacy_go" test -run='^$' \
+		-bench="^BenchmarkStdlibCorpusNativeSonic$/^.*$/${group}$" \
+		-benchmem -benchtime="$benchtime" -count="$count" -cpu=1
 )
+done
