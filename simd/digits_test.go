@@ -72,6 +72,35 @@ func TestDigitClassifiersRejectEveryByte(t *testing.T) {
 	}
 }
 
+func TestStage2EightDigitsMatchesBytewise(t *testing.T) {
+	const digits = uint64(0x3535353535353535)
+	for value := range 256 {
+		want := '0' <= byte(value) && byte(value) <= '9'
+		for lane := range 8 {
+			shift := uint(lane * 8)
+			x := digits&^(uint64(0xff)<<shift) | uint64(value)<<shift
+			if got := stage2EightDigits(x); got != want {
+				t.Fatalf("lane %d byte %#02x = %v, want %v", lane, value, got, want)
+			}
+		}
+	}
+
+	state := uint64(0x243f6a8885a308d3)
+	for range 1_000_000 {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		want := true
+		for lane := range 8 {
+			c := byte(state >> uint(lane*8))
+			want = want && '0' <= c && c <= '9'
+		}
+		if got := stage2EightDigits(state); got != want {
+			t.Fatalf("stage2EightDigits(%#016x) = %v, want %v", state, got, want)
+		}
+	}
+}
+
 func TestStore16Digits(t *testing.T) {
 	values := []uint64{0, 1, 9, 10, 99, 100, 9999, 10000, 99999999, 100000000, 9999999999999999}
 	state := uint64(0x243f6a8885a308d3)

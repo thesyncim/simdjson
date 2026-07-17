@@ -2,9 +2,8 @@
 
 package simd
 
-// Stage2Enabled reports whether this build provides the hand-written
-// grammar machine. Builds without it — non-arm64, -race, and
-// simdjson_safehooks — keep the portable walk.
+// Stage2Enabled reports whether this build provides the legacy bitmap grammar
+// machine. Production validation uses the packed-position machine instead.
 func Stage2Enabled() bool { return false }
 
 // Stage2Walk is unreachable on builds without the machine; callers must

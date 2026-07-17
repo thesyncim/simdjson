@@ -19,7 +19,7 @@ func Stage2WalkGo(base *byte, emit []uint64, kinds *[Stage2KindsLen]byte, scalar
 	return stage2LoopGo(base, emit, kinds, scalars, st)
 }
 
-// stage2LoopGo mirrors the assembly machine's direct state transitions and
+// stage2LoopGo implements the bitmap machine's direct state transitions and
 // object superinstructions. All unchecked writes are bounded by Stage2WalkGo's
 // emit-bit capacity check; kind indexes are masked into the fixed slab.
 func stage2LoopGo(base *byte, emit []uint64, kinds *[Stage2KindsLen]byte, scalars []uint32, st *Stage2State) int {

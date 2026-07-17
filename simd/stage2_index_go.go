@@ -2,6 +2,15 @@ package simd
 
 import "unsafe"
 
+func stage2EightDigits(x uint64) bool {
+	const (
+		add  = uint64(0x4646464646464646)
+		sub  = uint64(0x3030303030303030)
+		high = uint64(0x8080808080808080)
+	)
+	return ((x+add)|(x-sub))&high == 0
+}
+
 // Stage2IndexPositionsFused keeps the common object and array transitions in
 // one straight-line machine. A complete string pair is consumed together, and
 // object keys additionally fuse their colon, removing three dispatches from
@@ -274,7 +283,11 @@ writeScalar:
 		if d == '0' {
 			scan++
 		} else if '1' <= d && d <= '9' {
-			for scan++; scan < n; scan++ {
+			scan++
+			if scan+8 <= n && stage2EightDigits(*(*uint64)(unsafe.Add(basep, scan))) {
+				scan += 8
+			}
+			for ; scan < n; scan++ {
 				d = *(*byte)(unsafe.Add(basep, scan))
 				if d < '0' || d > '9' {
 					break
@@ -341,9 +354,7 @@ writeScalar:
 scalarScanned:
 	if scalarOK && scan < n {
 		d = *(*byte)(unsafe.Add(basep, scan))
-		switch d {
-		case ' ', '\t', '\n', '\r', ',', ':', '{', '}', '[', ']':
-		default:
+		if stage2ScalarEnd[d] == 0 {
 			scalarOK = false
 		}
 	}

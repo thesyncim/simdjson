@@ -1,12 +1,9 @@
 package simd
 
-// Stage-2 grammar machine: a resumable consumer of the stage-1 emit masks
-// that judges JSON token grammar — pair legality, container kind and depth
-// matching, comma and closer placement — and records scalar-start
-// positions for the caller to validate. On arm64 (without -race or
-// simdjson_safehooks) the machine is the hand-written direct-threaded
-// walker in stage2_arm64.s; elsewhere Stage2Enabled reports false and the
-// caller keeps its portable walk.
+// Stage-2 grammar state and tables are shared by the Go-native packed-position
+// validator, cursor, and production index machines. They judge token-pair
+// legality, container kind and depth matching, comma and closer placement,
+// and legal document endings while consuming each stage-1 position once.
 //
 // The grammar lives in three small tables shared by every build:
 //
@@ -28,8 +25,7 @@ package simd
 
 // Stage2MaxDepth is the machine's container depth limit. It must equal
 // the validator's walk limit; the caller asserts the equality at compile
-// time. The assembly hardcodes Stage2MaxDepth+1 as its headroom counter
-// seed.
+// time.
 const Stage2MaxDepth = 10000
 
 // Stage2KindsLen sizes the container-kind slab: a power of two above
@@ -92,9 +88,8 @@ func Stage2Finish(st *Stage2State) bool {
 	return bad == 0
 }
 
-// stage2ClsOff is the dispatch displacement table: the machine's handler
-// slot base is its loop symbol + 128, and each class handler occupies one
-// 128-byte slot in class-code order.
+// stage2ClsOff maps each source byte to its class in a 128-stride encoding;
+// stage2Class below compacts the same canonical mapping for Go dispatch.
 var stage2ClsOff = func() (t [256]uint64) {
 	for i := range t {
 		var cls uint64
@@ -121,12 +116,21 @@ var stage2ClsOff = func() (t [256]uint64) {
 	return
 }()
 
-// stage2Class is the compact Go-machine companion to stage2ClsOff. The
-// assembly needs byte offsets into its handler grid; Go's dense switch wants
-// the class itself. Keeping both tables avoids a shift in the token loop.
+// stage2Class is the compact Go-machine companion to stage2ClsOff. Go's dense
+// switches and pair-table indexes want the class itself.
 var stage2Class = func() (t [256]uint8) {
 	for i := range t {
 		t[i] = uint8(stage2ClsOff[i] >> 7)
+	}
+	return
+}()
+
+// stage2ScalarEnd marks bytes that may terminate a JSON literal or number.
+// A byte outside the document needs no table entry; the scanner handles EOF
+// before consulting this table.
+var stage2ScalarEnd = func() (t [256]uint8) {
+	for _, c := range [...]byte{' ', '\t', '\n', '\r', ',', ':', '{', '}', '[', ']'} {
+		t[c] = 1
 	}
 	return
 }()
