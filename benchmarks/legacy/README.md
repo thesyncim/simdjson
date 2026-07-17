@@ -11,6 +11,7 @@ models. `scripts/check-stdlib-corpus.sh` verifies those copies.
 
 ## Current corpus control
 
+<!-- benchpublish:legacy-control:start -->
 Apple M4 Max, one CPU, Go 1.26.4, six 300 ms samples per row, median reported:
 
 | Corpus | Typed owned | Dynamic owned | Owned encode | Syntax-only `Valid` |
@@ -27,6 +28,7 @@ Sonic's `Valid` accepts invalid UTF-8, so that column is not equivalent to
 simdjson's strict validation contract. It is reported only as implementation
 context. Compiler and standard-library revisions also differ; main benchmark
 tables keep these rows out of same-toolchain fastest-rival selection.
+<!-- benchpublish:legacy-control:end -->
 
 ## Reproduce
 

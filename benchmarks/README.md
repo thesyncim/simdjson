@@ -7,6 +7,7 @@ graph.
 
 ## Publication record
 
+<!-- benchpublish:go-publication:start -->
 Every table in this document comes from the same clean library revision and
 toolchain:
 
@@ -212,6 +213,7 @@ because it falls back to `encoding/json` on Go tip. Sonic time divided by
 simdjson time is 1.687x for typed owned decode, 1.121x for dynamic owned decode,
 and 2.534x for owned encode. Sonic's syntax-only validation accepts invalid
 UTF-8, so its 1.374x ratio is context, not a contract-equivalent headline.
+<!-- benchpublish:go-publication:end -->
 
 ## Reproduce
 

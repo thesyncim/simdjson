@@ -19,6 +19,9 @@ if [ -n "$dirty" ] && [ "${ALLOW_DIRTY:-0}" != 1 ]; then
 fi
 printf 'repository commit=%s dirty=%s\n' "$commit" "$([ -n "$dirty" ] && printf true || printf false)"
 "$tip_go" version
+printf 'go-commit=%s\n' "$(git -C "$("$tip_go" env GOROOT)" rev-parse HEAD)"
+printf 'legacy-go='
+GOTOOLCHAIN="$legacy_toolchain" "$legacy_go" version
 
 # BENCH keeps the broad exploratory runner available. The default publication
 # path below isolates every corpus contract in a fresh process so allocator and
@@ -52,6 +55,7 @@ if [ -n "${BENCH:-}" ]; then
 fi
 
 printf '\nGo tip SIMD exact corpus, one process per contract\n'
+printf 'benchmark-variant=simd\n'
 for group in valid dynamic-owned dom typed-reused encode; do
 (
 	cd "$root"
@@ -62,6 +66,7 @@ for group in valid dynamic-owned dom typed-reused encode; do
 done
 
 printf '\nGo tip pure Go controls, one process per contract\n'
+printf 'benchmark-variant=pure\n'
 for spec in 'valid:simdjson' 'dynamic-owned:simdjson-.*' 'dom:simdjson' 'typed-reused:simdjson-.*' 'encode:simdjson-.*'; do
 	group=${spec%%:*}
 	leaf=${spec#*:}
@@ -76,15 +81,18 @@ done
 printf '\nReusable structural index, SIMD and pure Go\n'
 (
 	cd "$root"
+	printf 'benchmark-variant=index-simd\n'
 	GOEXPERIMENT=simd "$tip_go" test -run='^$' \
 		-bench='^BenchmarkStdlibCorpusNativeParse$/^.*$/^simdjson-index-reused$' \
 		-benchmem -benchtime="$benchtime" -count="$count" -cpu=1
+	printf 'benchmark-variant=index-pure\n'
 	"$tip_go" test -run='^$' \
 		-bench='^BenchmarkStdlibCorpusNativeParse$/^.*$/^simdjson-index-reused$' \
 		-benchmem -benchtime="$benchtime" -count="$count" -cpu=1
 )
 
 printf '\nGo tip encoding/json/v2 exact corpus\n'
+printf 'benchmark-variant=jsonv2\n'
 for group in dynamic-owned typed-reused encode; do
 (
 	cd "$root"
@@ -95,6 +103,7 @@ for group in dynamic-owned typed-reused encode; do
 done
 
 printf '\nGo 1.26 native Sonic exact corpus\n'
+printf 'benchmark-variant=sonic\n'
 for group in valid dynamic-owned typed-reused encode; do
 (
 	cd "$root/legacy"

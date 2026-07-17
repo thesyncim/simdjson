@@ -538,6 +538,7 @@ and runtime dispatch.
 
 ## Performance
 
+<!-- benchpublish:main-summary:start -->
 The current publication is measured from clean library revision
 `47bd858b21563f5c2ad009074779f6543f2bc910` on an Apple M4 Max, one CPU, with
 six 300 ms samples per row and pinned Go revision
@@ -570,6 +571,7 @@ construction is part of the regular benchmark gate and remains zero-allocation.
 [Current per-corpus results, allocations, hook cost, SIMD uplift, and exact commands](benchmarks/README.md).
 The [cross-language benchmark](benchmarks/crosslang/README.md) publishes only
 the enforced parse-plus-semantic-digest contract as a direct comparison.
+<!-- benchpublish:main-summary:end -->
 
 ## Compatibility and contracts
 

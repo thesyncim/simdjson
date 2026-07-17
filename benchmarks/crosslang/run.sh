@@ -75,8 +75,8 @@ go_contract_out=$(
 	cd "$dir/.."
 	GOTOOLCHAIN=local GOEXPERIMENT="$go_experiment" "$tip_go" run ./crosslang/go_contract "$corpus"
 )
-printf '%s\n' "$cpp_contract_out"
-printf '%s\n' "$go_contract_out"
+printf 'benchmark-implementation=cpp\n%s\n' "$cpp_contract_out"
+printf 'benchmark-implementation=go\n%s\n' "$go_contract_out"
 
 contract_digests() {
 	printf '%s\n' "$1" | awk '/contract=parse\+semantic-digest/ {

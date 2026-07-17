@@ -31,6 +31,7 @@ and pins C++ simdjson 4.6.4 at git commit
 
 ## Current release-candidate result
 
+<!-- benchpublish:cross-language:start -->
 | Component | Revision |
 |---|---|
 | Go simdjson | `8080e2117f36ca5d58c86383afe710be4d7993cf` (`dirty=false`) |
@@ -55,6 +56,7 @@ The identical digest for the two string fixtures is expected: they decode to
 the same semantic value even though one source uses escapes and the other uses
 literal Unicode. That is also why the two rows have very different parsing
 costs.
+<!-- benchpublish:cross-language:end -->
 
 ## Reproduce
 
