@@ -16,7 +16,11 @@ cpp_tag=v4.6.4
 cpp_commit=1bcf71bd85059ab6574ea1159de9298dcc1212c5
 cpp_src="$cache/simdjson-$cpp_tag"
 
-for tool in clang++ cargo zstd awk git; do
+required_tools="clang++ zstd awk git"
+if [ "${CONTRACT_ONLY:-0}" != 1 ]; then
+	required_tools="$required_tools cargo"
+fi
+for tool in $required_tools; do
 	if ! command -v "$tool" >/dev/null 2>&1; then
 		echo "required tool is unavailable: $tool" >&2
 		exit 1
@@ -60,15 +64,17 @@ if [ "$actual_commit" != "$cpp_commit" ]; then
 fi
 
 cppflags="-O3 -DNDEBUG -march=native -std=c++20"
-clang++ $cppflags -I"$cpp_src/singleheader" -o "$build/bench_simdjson" \
-	"$dir/bench_simdjson.cpp" "$cpp_src/singleheader/simdjson.cpp"
-clang++ $cppflags -I"$cpp_src/singleheader" -o "$build/bench_stage1" \
-	"$dir/bench_stage1.cpp" "$cpp_src/singleheader/simdjson.cpp"
 clang++ $cppflags -I"$cpp_src/singleheader" -o "$build/bench_contract" \
 	"$dir/bench_contract.cpp" "$cpp_src/singleheader/simdjson.cpp"
 
-"$build/bench_simdjson" "$corpus"
-"$build/bench_stage1" "$corpus"
+if [ "${CONTRACT_ONLY:-0}" != 1 ]; then
+	clang++ $cppflags -I"$cpp_src/singleheader" -o "$build/bench_simdjson" \
+		"$dir/bench_simdjson.cpp" "$cpp_src/singleheader/simdjson.cpp"
+	clang++ $cppflags -I"$cpp_src/singleheader" -o "$build/bench_stage1" \
+		"$dir/bench_stage1.cpp" "$cpp_src/singleheader/simdjson.cpp"
+	"$build/bench_simdjson" "$corpus"
+	"$build/bench_stage1" "$corpus"
+fi
 
 cpp_contract_out=$("$build/bench_contract" "$corpus")
 go_contract_out=$(
@@ -92,5 +98,7 @@ if [ "$cpp_digests" != "$go_digests" ]; then
 fi
 echo "cross-language semantic digests match"
 
-RUSTFLAGS="-C target-cpu=native" cargo run --release --locked \
-	--manifest-path "$dir/rustbench/Cargo.toml" -- "$corpus"
+if [ "${CONTRACT_ONLY:-0}" != 1 ]; then
+	RUSTFLAGS="-C target-cpu=native" cargo run --release --locked \
+		--manifest-path "$dir/rustbench/Cargo.toml" -- "$corpus"
+fi

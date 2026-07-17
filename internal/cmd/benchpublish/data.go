@@ -78,6 +78,71 @@ func (p Publication) validate() error {
 			return fmt.Errorf("missing or mismatched cross-language result for %s", corpus)
 		}
 	}
+	if err := p.validateSurfaces(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p Publication) validateSurfaces() error {
+	require := func(variant, name string) error {
+		if _, ok := p.metric(variant, name); !ok {
+			return fmt.Errorf("missing benchmark %s/%s", variant, name)
+		}
+		return nil
+	}
+	for _, corpus := range corpusOrder {
+		for _, spec := range headlineOperations {
+			for _, required := range []struct{ variant, impl string }{
+				{variant: "simd", impl: "encoding-json"},
+				{variant: "simd", impl: spec.Impl},
+				{variant: "pure", impl: spec.Impl},
+			} {
+				if err := require(required.variant, benchmarkName("BenchmarkStdlibCorpus", corpus, spec.Group, required.impl)); err != nil {
+					return err
+				}
+			}
+			if spec.Group != "dom" {
+				if name, _ := fastestRival(p, corpus, spec.Group); name == "—" {
+					return fmt.Errorf("missing compatible rival for %s/%s", corpus, spec.Group)
+				}
+			}
+		}
+		for _, spec := range []struct{ variant, group, impl string }{
+			{variant: "simd", group: "dynamic-owned", impl: "simdjson-zero-copy"},
+			{variant: "pure", group: "dynamic-owned", impl: "simdjson-zero-copy"},
+			{variant: "simd", group: "typed-reused", impl: "simdjson-zero-copy"},
+			{variant: "pure", group: "typed-reused", impl: "simdjson-zero-copy"},
+		} {
+			if err := require(spec.variant, benchmarkName("BenchmarkStdlibCorpus", corpus, spec.group, spec.impl)); err != nil {
+				return err
+			}
+		}
+		indexName := benchmarkName("BenchmarkStdlibCorpusNativeParse", corpus, "", "simdjson-index-reused")
+		if err := require("index-simd", indexName); err != nil {
+			return err
+		}
+		if err := require("index-pure", indexName); err != nil {
+			return err
+		}
+		for _, group := range []string{"valid", "dynamic-owned", "typed-reused", "encode"} {
+			if err := require("sonic", benchmarkName("BenchmarkStdlibCorpusNativeSonic", corpus, group, sonicImplementation(group))); err != nil {
+				return err
+			}
+		}
+		for _, group := range []string{"dynamic-owned", "typed-reused", "encode"} {
+			if err := require("jsonv2", benchmarkName("BenchmarkStdlibCorpusJSONV2", corpus, group, "jsonv2")); err != nil {
+				return err
+			}
+		}
+	}
+	for _, benchmark := range []string{"BenchmarkHookDecodeSmall", "BenchmarkHookDecodeLarge", "BenchmarkHookEncodeSmall", "BenchmarkHookEncodeLarge"} {
+		for _, implementation := range []string{"interpreter", "hook"} {
+			if err := require("hooks", benchmark+"/"+implementation); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 

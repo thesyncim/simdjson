@@ -28,10 +28,14 @@ BENCHTIME="$benchtime" COUNT="$count" TIP_GO="$TIP_GO" \
 		-benchmem -benchtime="$benchtime" -count="$count" -cpu=1 .
 ) >"$work/hooks.txt" 2>&1
 
-TIP_GO="$TIP_GO" "$dir/crosslang/run.sh" >"$work/crosslang.txt" 2>&1
+TIP_GO="$TIP_GO" CONTRACT_ONLY=1 "$dir/crosslang/run.sh" >"$work/crosslang.txt" 2>&1
 
 (
 	cd "$root"
+	mode=-write
+	if [ "${VERIFY_ONLY:-0}" = 1 ]; then
+		mode=-verify
+	fi
 	GOTOOLCHAIN=local "$TIP_GO" run ./internal/cmd/benchpublish \
-		-input "$work" -count "$count" -benchtime "$benchtime" -write
+		-input "$work" -count "$count" -benchtime "$benchtime" "$mode"
 )

@@ -124,7 +124,7 @@ func testPublication() Publication {
 		add("index-simd", indexName, 80)
 		add("index-pure", indexName, 120)
 		for _, group := range []string{"valid", "dynamic-owned", "typed-reused", "encode"} {
-			add("sonic", benchmarkName("BenchmarkStdlibCorpusNativeSonic", corpus, group, "Sonic-native"), 180)
+			add("sonic", benchmarkName("BenchmarkStdlibCorpusNativeSonic", corpus, group, sonicImplementation(group)), 180)
 		}
 		for _, group := range []string{"dynamic-owned", "typed-reused", "encode"} {
 			add("jsonv2", benchmarkName("BenchmarkStdlibCorpusJSONV2", corpus, group, "jsonv2"), 250)

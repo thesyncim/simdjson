@@ -274,7 +274,14 @@ func metricFor(p Publication, variant, corpus, group, impl string) Metrics {
 }
 
 func legacyMetric(p Publication, corpus, group string) Metrics {
-	return p.mustMetric("sonic", benchmarkName("BenchmarkStdlibCorpusNativeSonic", corpus, group, "Sonic-native"))
+	return p.mustMetric("sonic", benchmarkName("BenchmarkStdlibCorpusNativeSonic", corpus, group, sonicImplementation(group)))
+}
+
+func sonicImplementation(group string) string {
+	if group == "typed-reused" {
+		return "Sonic-native-owned"
+	}
+	return "Sonic-native"
 }
 
 func fastestRival(p Publication, corpus, group string) (string, Metrics) {
