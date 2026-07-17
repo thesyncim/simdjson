@@ -1,0 +1,183 @@
+package simdjson
+
+import (
+	"bytes"
+	"reflect"
+	"testing"
+)
+
+// ---------------------------------------------------------------------------
+// iterators. Order, duplicates, early stop, empty containers,
+// whitespace-heavy documents, and Index iterator agreement.
+// ---------------------------------------------------------------------------
+
+func TestIterationSemantics(t *testing.T) {
+	src := []byte(" { \"b\" : 1 ,\n\t\"a\" : [ true , null ] ,\r\"b\" : \"x\" } ")
+
+	// EachObject must deliver every member, duplicates included, in order.
+	var keys []string
+	var vals []string
+	if err := EachObject(src, func(key string, value RawValue) error {
+		keys = append(keys, key)
+		vals = append(vals, string(value.Bytes()))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(keys, []string{"b", "a", "b"}) {
+		t.Errorf("EachObject keys = %q", keys)
+	}
+	if !reflect.DeepEqual(vals, []string{"1", "[ true , null ]", `"x"`}) {
+		t.Errorf("EachObject values = %q", vals)
+	}
+
+	// Value tree retains both duplicates in order.
+	value, err := Parse(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members, ok := value.Object()
+	if !ok || len(members) != 3 {
+		t.Fatalf("Object() = %v, %v", members, ok)
+	}
+	for i, wantKey := range []string{"b", "a", "b"} {
+		if members[i].Key != wantKey {
+			t.Errorf("member %d key = %q, want %q", i, members[i].Key, wantKey)
+		}
+	}
+	if got, _ := value.Get("b"); got.Kind() != String {
+		t.Errorf("Value.Get(b) kind = %v, want last-wins String", got.Kind())
+	}
+
+	// Index ObjectIter agrees, both pull styles.
+	root := mustBuildIndex(t, src).Root()
+	iter, ok := root.ObjectIter()
+	if !ok {
+		t.Fatal("ObjectIter")
+	}
+	var iterKeys []string
+	for {
+		key, val, ok := iter.Next()
+		if !ok {
+			break
+		}
+		kb, _ := key.AppendText(nil)
+		iterKeys = append(iterKeys, string(kb))
+		if val.Kind() == Invalid {
+			t.Error("iterator value invalid")
+		}
+	}
+	if !reflect.DeepEqual(iterKeys, keys) {
+		t.Errorf("ObjectIter keys = %q, EachObject keys = %q", iterKeys, keys)
+	}
+	cursor, _ := root.ObjectIter()
+	var cursorKeys []string
+	for ; cursor.Valid(); cursor = cursor.Advance() {
+		key, _ := cursor.Current()
+		kb, _ := key.AppendText(nil)
+		cursorKeys = append(cursorKeys, string(kb))
+	}
+	if !reflect.DeepEqual(cursorKeys, keys) {
+		t.Errorf("ObjectIter cursor keys = %q, want %q", cursorKeys, keys)
+	}
+
+	// Early stop: sentinel error must be returned as-is and stop iteration.
+	stopErr := errIterationStop
+	calls := 0
+	err = EachObject(src, func(string, RawValue) error {
+		calls++
+		if calls == 2 {
+			return stopErr
+		}
+		return nil
+	})
+	if err != stopErr || calls != 2 {
+		t.Errorf("early stop: err = %v, calls = %d", err, calls)
+	}
+
+	// Empty containers with whitespace.
+	if err := EachArray([]byte(" [ \n ] "), func(int, RawValue) error {
+		t.Error("callback on empty array")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := EachObject([]byte(" { \t } "), func(string, RawValue) error {
+		t.Error("callback on empty object")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wrong container kinds.
+	if err := EachArray([]byte(`{"a":1}`), nil); err == nil {
+		t.Error("EachArray accepted an object")
+	}
+	if err := EachObject([]byte(`[1]`), nil); err == nil {
+		t.Error("EachObject accepted an array")
+	}
+
+	// EachArray element raw spans are exact even with whitespace padding.
+	var elems []string
+	if err := EachArray([]byte("[ 1 , [ 2 ] , \"s\" ]"), func(_ int, v RawValue) error {
+		elems = append(elems, string(v.Bytes()))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(elems, []string{"1", "[ 2 ]", `"s"`}) {
+		t.Errorf("EachArray elements = %q", elems)
+	}
+
+	// ArrayIter and FlatArrayIter agree on a flat array.
+	flatSrc := []byte(`[1,"two",null,true,[],{}]`)
+	flatRoot := mustBuildIndex(t, flatSrc).Root()
+	gen, _ := flatRoot.ArrayIter()
+	flat, flatOK := flatRoot.FlatArrayIter()
+	if !flatOK {
+		t.Fatal("FlatArrayIter rejected flat array")
+	}
+	for {
+		a, aOK := gen.Next()
+		b, bOK := flat.Next()
+		if aOK != bOK {
+			t.Fatal("iterator lengths differ")
+		}
+		if !aOK {
+			break
+		}
+		if !bytes.Equal(a.Raw().Bytes(), b.Raw().Bytes()) {
+			t.Errorf("flat/general element mismatch: %q vs %q", a.Raw().Bytes(), b.Raw().Bytes())
+		}
+	}
+	if _, ok := mustBuildIndex(t, []byte(`[[1]]`)).Root().FlatArrayIter(); ok {
+		t.Error("FlatArrayIter accepted a nested array")
+	}
+}
+
+var errIterationStop = &PointerError{Pointer: "stop", Message: "sentinel"}
+
+// Minimal repro for the empty-object Get checkptr fault: when the empty object
+// is the last tape entry and storage is exactly sized, Node.Get computed a
+// one-past-the-end *IndexEntry before checking the member count. Under
+// -race/checkptr instrumentation this is a fatal "converted pointer straddles
+// multiple allocations" crash; without instrumentation it silently violates
+// the unsafe.Pointer contract.
+func TestEmptyObjectGetAtTapeEnd(t *testing.T) {
+	index, err := BuildIndex([]byte(`{}`), make([]IndexEntry, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := index.Root().Get("k"); ok {
+		t.Fatal("Get on empty object returned ok")
+	}
+
+	// Same shape one level down, reached through a pointer.
+	index, err = BuildIndex([]byte(`{"a":{}}`), make([]IndexEntry, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := index.Pointer("/a/x"); ok || err != nil {
+		t.Fatalf("Pointer(/a/x) = %v, %v", ok, err)
+	}
+}

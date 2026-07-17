@@ -1,6 +1,6 @@
 package simdjson
 
-// Adversarial differential probes for the encoder: every test compares
+// Compatibility contracts for the encoder: every test compares
 // simdjson.Marshal / CompileEncoder[T]().AppendJSON against encoding/json
 // byte for byte, and error-vs-error, on surfaces the existing suites do not
 // cover.
@@ -15,9 +15,9 @@ import (
 	"time"
 )
 
-// probeBoth encodes v with stdlib and both simdjson entry points and reports
+// checkEncoderParity encodes v with stdlib and both simdjson entry points and reports
 // any acceptance or byte divergence.
-func probeBoth[T any](t *testing.T, label string, v T) {
+func checkEncoderParity[T any](t *testing.T, label string, v T) {
 	t.Helper()
 	want, wantErr := json.Marshal(&v)
 
@@ -52,34 +52,34 @@ func probeBoth[T any](t *testing.T, label string, v T) {
 // flag from the field's Kind but the marshaler encoders ignore it, so the
 // custom output is emitted unquoted.
 
-type probeQuotedJSONMarshaler int
+type contractQuotedJSONMarshaler int
 
-func (q probeQuotedJSONMarshaler) MarshalJSON() ([]byte, error) {
+func (q contractQuotedJSONMarshaler) MarshalJSON() ([]byte, error) {
 	return fmt.Appendf(nil, "%d", int(q)), nil
 }
 
-type probeQuotedTextMarshaler int
+type contractQuotedTextMarshaler int
 
-func (q probeQuotedTextMarshaler) MarshalText() ([]byte, error) {
+func (q contractQuotedTextMarshaler) MarshalText() ([]byte, error) {
 	return fmt.Appendf(nil, "t%d", int(q)), nil
 }
 
-func TestProbeStringOptionOnMarshalers(t *testing.T) {
+func TestStringOptionOnMarshalers(t *testing.T) {
 	type jm struct {
-		Q probeQuotedJSONMarshaler `json:"q,string"`
+		Q contractQuotedJSONMarshaler `json:"q,string"`
 	}
-	probeBoth(t, "json marshaler with ,string", jm{Q: 7})
+	checkEncoderParity(t, "json marshaler with ,string", jm{Q: 7})
 
 	type tm struct {
-		Q probeQuotedTextMarshaler `json:"q,string"`
+		Q contractQuotedTextMarshaler `json:"q,string"`
 	}
-	probeBoth(t, "text marshaler with ,string", tm{Q: 7})
+	checkEncoderParity(t, "text marshaler with ,string", tm{Q: 7})
 
 	type jmOmit struct {
-		Q probeQuotedJSONMarshaler `json:"q,string,omitempty"`
+		Q contractQuotedJSONMarshaler `json:"q,string,omitempty"`
 	}
-	probeBoth(t, "json marshaler ,string,omitempty zero", jmOmit{})
-	probeBoth(t, "json marshaler ,string,omitempty nonzero", jmOmit{Q: 3})
+	checkEncoderParity(t, "json marshaler ,string,omitempty zero", jmOmit{})
+	checkEncoderParity(t, "json marshaler ,string,omitempty nonzero", jmOmit{Q: 3})
 }
 
 // ---------------------------------------------------------------------------
@@ -87,29 +87,29 @@ func TestProbeStringOptionOnMarshalers(t *testing.T) {
 // one level below a non-addressable value (map value, interface contents).
 // stdlib's condAddrEncoder checks CanAddr per value at encode time.
 
-type probeStructWithPOM struct {
+type contractStructWithPOM struct {
 	M pointerOnlyMarshaler `json:"m"`
 }
 
-type probeTextPOM struct {
+type contractTextPOM struct {
 	Value int `json:"value"`
 }
 
-func (*probeTextPOM) MarshalText() ([]byte, error) { return []byte("ptr-text"), nil }
+func (*contractTextPOM) MarshalText() ([]byte, error) { return []byte("ptr-text"), nil }
 
 // ---------------------------------------------------------------------------
 // 3. Map keys through TextMarshaler: nil pointer keys, string-kind keys that
 // also implement TextMarshaler, ordering by marshaled form, key errors.
 
-type probePtrTextKey struct{ N int }
+type contractPtrTextKey struct{ N int }
 
-func (k *probePtrTextKey) MarshalText() ([]byte, error) {
+func (k *contractPtrTextKey) MarshalText() ([]byte, error) {
 	return fmt.Appendf(nil, "p%d", k.N), nil
 }
 
-type probeErrKey struct{}
+type contractErrKey struct{}
 
-func (probeErrKey) MarshalText() ([]byte, error) { return nil, fmt.Errorf("key boom") }
+func (contractErrKey) MarshalText() ([]byte, error) { return nil, fmt.Errorf("key boom") }
 
 func marshalBothWithRecover[T any](t *testing.T, v T) (got []byte, gotErr error, gotPanic any, want []byte, wantErr error, wantPanic any) {
 	t.Helper()
@@ -124,8 +124,8 @@ func marshalBothWithRecover[T any](t *testing.T, v T) (got []byte, gotErr error,
 	return
 }
 
-func TestProbeNilPointerTextMarshalerMapKey(t *testing.T) {
-	v := map[*probePtrTextKey]int{nil: 1, {N: 2}: 3}
+func TestNilPointerTextMarshalerMapKey(t *testing.T) {
+	v := map[*contractPtrTextKey]int{nil: 1, {N: 2}: 3}
 	got, gotErr, gotPanic, want, wantErr, wantPanic := marshalBothWithRecover(t, v)
 	if (gotPanic != nil) != (wantPanic != nil) {
 		t.Errorf("nil ptr text key: panic differs: simdjson=%v stdlib=%v", gotPanic, wantPanic)
@@ -140,21 +140,21 @@ func TestProbeNilPointerTextMarshalerMapKey(t *testing.T) {
 	}
 }
 
-func TestProbeMapKeyEdges(t *testing.T) {
+func TestMapKeyEdges(t *testing.T) {
 	// Single entry: with multiple entries both libraries emit duplicate
 	// "SHOULD-NOT-BE-USED" keys in nondeterministic order under jsonv2.
-	probeBoth(t, "string-kind key implementing TextMarshaler",
+	checkEncoderParity(t, "string-kind key implementing TextMarshaler",
 		map[stringTextKey]int{"raw": 5})
-	probeBoth(t, "text keys sorted by marshaled form",
+	checkEncoderParity(t, "text keys sorted by marshaled form",
 		map[textKey]int{{A: 10, B: 0}: 1, {A: 2, B: 0}: 2, {A: 1, B: 99}: 3})
-	probeBoth(t, "int8 keys with negatives",
+	checkEncoderParity(t, "int8 keys with negatives",
 		map[int8]int{-128: 1, -1: 2, 0: 3, 127: 4, 10: 5, 2: 6})
-	probeBoth(t, "uintptr keys",
+	checkEncoderParity(t, "uintptr keys",
 		map[uintptr]string{0: "a", 18446744073709551615: "b", 7: "c"})
-	probeBoth(t, "erroring text key", map[probeErrKey]int{{}: 1})
-	probeBoth(t, "NaN value under sorted keys", map[string]float64{"a": 1, "b": math.NaN()})
-	probeBoth(t, "+Inf map value", map[string]float64{"x": math.Inf(1)})
-	probeBoth(t, "text key with invalid utf8", map[textKey]int{{A: -1, B: -2}: 9})
+	checkEncoderParity(t, "erroring text key", map[contractErrKey]int{{}: 1})
+	checkEncoderParity(t, "NaN value under sorted keys", map[string]float64{"a": 1, "b": math.NaN()})
+	checkEncoderParity(t, "+Inf map value", map[string]float64{"x": math.Inf(1)})
+	checkEncoderParity(t, "text key with invalid utf8", map[textKey]int{{A: -1, B: -2}: 9})
 }
 
 // ---------------------------------------------------------------------------
@@ -162,44 +162,44 @@ func TestProbeMapKeyEdges(t *testing.T) {
 // stdlib only base64-encodes byte slices whose element type has no
 // Marshaler/TextMarshaler methods.
 
-type probeCustomByte uint8
+type contractCustomByte uint8
 
-func (b probeCustomByte) MarshalJSON() ([]byte, error) {
+func (b contractCustomByte) MarshalJSON() ([]byte, error) {
 	return fmt.Appendf(nil, "%d", int(b)+1), nil
 }
 
-type probeCustomTextByte uint8
+type contractCustomTextByte uint8
 
-func (b probeCustomTextByte) MarshalText() ([]byte, error) {
+func (b contractCustomTextByte) MarshalText() ([]byte, error) {
 	return fmt.Appendf(nil, "x%d", int(b)), nil
 }
 
-func TestProbeCustomByteSliceElements(t *testing.T) {
+func TestCustomByteSliceElements(t *testing.T) {
 	type doc struct {
-		B []probeCustomByte `json:"b"`
+		B []contractCustomByte `json:"b"`
 	}
-	probeBoth(t, "custom-marshaler byte slice", doc{B: []probeCustomByte{1, 2}})
+	checkEncoderParity(t, "custom-marshaler byte slice", doc{B: []contractCustomByte{1, 2}})
 
 	type tdoc struct {
-		B []probeCustomTextByte `json:"b"`
+		B []contractCustomTextByte `json:"b"`
 	}
-	probeBoth(t, "custom-text byte slice", tdoc{B: []probeCustomTextByte{1, 2}})
+	checkEncoderParity(t, "custom-text byte slice", tdoc{B: []contractCustomTextByte{1, 2}})
 
 	type adoc struct {
 		B [2]byte `json:"b"`
 	}
-	probeBoth(t, "byte array stays numeric", adoc{B: [2]byte{1, 2}})
+	checkEncoderParity(t, "byte array stays numeric", adoc{B: [2]byte{1, 2}})
 
 	type named struct {
 		B namedBlob `json:"b"`
 	}
-	probeBoth(t, "plain named byte slice stays base64", named{B: namedBlob{1, 2}})
+	checkEncoderParity(t, "plain named byte slice stays base64", named{B: namedBlob{1, 2}})
 }
 
 // ---------------------------------------------------------------------------
 // 5. omitempty over every kind, including the zero-length array quirk.
 
-type probeZeroArray struct {
+type contractZeroArray struct {
 	A [0]int         `json:"a,omitempty"`
 	B [2]int         `json:"b,omitempty"`
 	C struct{}       `json:"c,omitempty"`
@@ -214,107 +214,107 @@ type probeZeroArray struct {
 	L float32        `json:"l,omitempty"`
 }
 
-func TestProbeOmitemptyKinds(t *testing.T) {
+func TestOmitemptyKinds(t *testing.T) {
 	zero := 0
-	probeBoth(t, "all zero omitempty", probeZeroArray{})
-	probeBoth(t, "zero pointer target kept", probeZeroArray{E: &zero})
-	probeBoth(t, "interface holding zero kept", probeZeroArray{D: 0})
-	probeBoth(t, "empty-but-non-nil map omitted", probeZeroArray{G: map[string]int{}})
-	probeBoth(t, "empty slice omitted", probeZeroArray{H: []int{}})
-	probeBoth(t, "quoted string non-empty", probeZeroArray{K: "x"})
-	probeBoth(t, "negative zero float32 omitted", probeZeroArray{L: float32(math.Copysign(0, -1))})
+	checkEncoderParity(t, "all zero omitempty", contractZeroArray{})
+	checkEncoderParity(t, "zero pointer target kept", contractZeroArray{E: &zero})
+	checkEncoderParity(t, "interface holding zero kept", contractZeroArray{D: 0})
+	checkEncoderParity(t, "empty-but-non-nil map omitted", contractZeroArray{G: map[string]int{}})
+	checkEncoderParity(t, "empty slice omitted", contractZeroArray{H: []int{}})
+	checkEncoderParity(t, "quoted string non-empty", contractZeroArray{K: "x"})
+	checkEncoderParity(t, "negative zero float32 omitted", contractZeroArray{L: float32(math.Copysign(0, -1))})
 
 	type omitTime struct {
 		T time.Time `json:"t,omitempty"`
 	}
-	probeBoth(t, "zero time not omitted", omitTime{})
+	checkEncoderParity(t, "zero time not omitted", omitTime{})
 
 	type omitIface struct {
 		S fmt.Stringer `json:"s,omitempty"`
 	}
-	probeBoth(t, "nil non-empty interface omitted", omitIface{})
+	checkEncoderParity(t, "nil non-empty interface omitted", omitIface{})
 }
 
 // ---------------------------------------------------------------------------
 // 6. Struct shape edge cases: dominance, duplicate tags, NoNameTag,
 // unexported with tags, embedded duplication annihilation.
 
-type probeTaggedWins struct {
+type contractTaggedWins struct {
 	A    int `json:"name"`
 	B    int `json:"other"` // does not collide
 	Name int
 }
 
-type probeNoName struct {
+type contractNoName struct {
 	V int `json:",omitempty"`
 	W int `json:","`
 }
 
-type probeUnexportedTag struct {
+type contractUnexportedTag struct {
 	v int
 	W int `json:"w"`
 }
 
-type probeDupA struct {
+type contractDupA struct {
 	V int `json:"v"`
 }
-type probeWrapX struct{ probeDupA }
-type probeWrapY struct{ probeDupA }
-type probeDupOuter struct {
-	probeWrapX
-	probeWrapY
+type contractWrapX struct{ contractDupA }
+type contractWrapY struct{ contractDupA }
+type contractDupOuter struct {
+	contractWrapX
+	contractWrapY
 	Own int `json:"own"`
 }
 
-type probeL3 struct{ probeDupA }
-type probeL2a struct{ probeL3 }
-type probeL2b struct{ probeL3 }
-type probeDeepDup struct {
-	probeL2a
-	probeL2b
+type contractL3 struct{ contractDupA }
+type contractL2a struct{ contractL3 }
+type contractL2b struct{ contractL3 }
+type contractDeepDup struct {
+	contractL2a
+	contractL2b
 	Own int `json:"own"`
 }
 
-type probeShallow struct {
-	probeWrapX     // provides v at depth 2
-	V          int `json:"v"` // depth 1 wins
+type contractShallow struct {
+	contractWrapX     // provides v at depth 2
+	V             int `json:"v"` // depth 1 wins
 }
 
-type probeSameDepthTagged struct {
-	probeTagV   // tagged v at depth 2
-	probePlainV // untagged field named V at depth 2
+type contractSameDepthTagged struct {
+	contractTagV   // tagged v at depth 2
+	contractPlainV // untagged field named V at depth 2
 }
-type probeTagV struct {
+type contractTagV struct {
 	T int `json:"v"`
 }
-type probePlainV struct {
+type contractPlainV struct {
 	V int
 }
 
-type probeIfaceEmbed struct {
+type contractIfaceEmbed struct {
 	fmt.Stringer
 	N int `json:"n"`
 }
 
 // Embedded pointer to unexported struct type: encode reads through it.
-type probeUnexpPtrEmbed struct {
+type contractUnexpPtrEmbed struct {
 	*hidden
 	Top int `json:"top"`
 }
 
-func TestProbeUnexportedPointerEmbed(t *testing.T) {
-	probeBoth(t, "nil unexported embedded pointer", probeUnexpPtrEmbed{Top: 1})
-	probeBoth(t, "set unexported embedded pointer", probeUnexpPtrEmbed{hidden: &hidden{Inner: "i"}, Top: 2})
+func TestUnexportedPointerEmbed(t *testing.T) {
+	checkEncoderParity(t, "nil unexported embedded pointer", contractUnexpPtrEmbed{Top: 1})
+	checkEncoderParity(t, "set unexported embedded pointer", contractUnexpPtrEmbed{hidden: &hidden{Inner: "i"}, Top: 2})
 }
 
 // Promoted MarshalJSON from an embedded type takes over the whole struct.
-type probeEmbedsTime struct {
+type contractEmbedsTime struct {
 	time.Time
 	Ignored int `json:"ignored"`
 }
 
-func TestProbePromotedMarshalerTakesOver(t *testing.T) {
-	probeBoth(t, "struct embedding time.Time", probeEmbedsTime{
+func TestPromotedMarshalerTakesOver(t *testing.T) {
+	checkEncoderParity(t, "struct embedding time.Time", contractEmbedsTime{
 		Time:    time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 		Ignored: 42,
 	})
@@ -324,22 +324,22 @@ func TestProbePromotedMarshalerTakesOver(t *testing.T) {
 // 7. Deep non-cyclic pointer nesting: stdlib Marshal has no depth limit,
 // only cycle detection over identical pointers.
 
-type probeChain struct {
-	Next *probeChain `json:"next,omitempty"`
-	V    int         `json:"v,omitempty"`
+type contractChain struct {
+	Next *contractChain `json:"next,omitempty"`
+	V    int            `json:"v,omitempty"`
 }
 
-func buildProbeChain(depth int) *probeChain {
-	head := &probeChain{V: 1}
+func buildContractChain(depth int) *contractChain {
+	head := &contractChain{V: 1}
 	for range depth {
-		head = &probeChain{Next: head}
+		head = &contractChain{Next: head}
 	}
 	return head
 }
 
-func TestProbeDeepPointerNesting(t *testing.T) {
+func TestDeepPointerNesting(t *testing.T) {
 	for _, depth := range []int{500, 9000, 12000} {
-		v := buildProbeChain(depth)
+		v := buildContractChain(depth)
 		want, wantErr := json.Marshal(v)
 		got, gotErr := Marshal(v)
 		if (gotErr == nil) != (wantErr == nil) {
@@ -352,7 +352,7 @@ func TestProbeDeepPointerNesting(t *testing.T) {
 	}
 
 	// Actual cycle: both must error rather than hang.
-	a := &probeChain{}
+	a := &contractChain{}
 	a.Next = a
 	_, gotErr := Marshal(a)
 	_, wantErr := json.Marshal(a)
@@ -366,24 +366,24 @@ func TestProbeDeepPointerNesting(t *testing.T) {
 // JSON, invalid UTF-8 (documented strictness carve-out), U+2028 raw bytes,
 // HTML specials; TextMarshaler with invalid UTF-8; panicking marshalers.
 
-type probeRawOut struct{ Out string }
+type contractRawOut struct{ Out string }
 
-func (r probeRawOut) MarshalJSON() ([]byte, error) {
+func (r contractRawOut) MarshalJSON() ([]byte, error) {
 	if r.Out == "<nil>" {
 		return nil, nil
 	}
 	return []byte(r.Out), nil
 }
 
-type probeTextOut struct{ Out string }
+type contractTextOut struct{ Out string }
 
-func (r probeTextOut) MarshalText() ([]byte, error) { return []byte(r.Out), nil }
+func (r contractTextOut) MarshalText() ([]byte, error) { return []byte(r.Out), nil }
 
-type probePanicMarshaler struct{}
+type contractPanicMarshaler struct{}
 
-func (probePanicMarshaler) MarshalJSON() ([]byte, error) { panic("marshaler exploded") }
+func (contractPanicMarshaler) MarshalJSON() ([]byte, error) { panic("marshaler exploded") }
 
-func TestProbeMarshalerOutputShapes(t *testing.T) {
+func TestMarshalerOutputShapes(t *testing.T) {
 	outputs := []string{
 		"<nil>",                          // nil slice
 		"",                               // empty
@@ -403,21 +403,21 @@ func TestProbeMarshalerOutputShapes(t *testing.T) {
 	}
 	for _, out := range outputs {
 		type doc struct {
-			V probeRawOut `json:"v"`
+			V contractRawOut `json:"v"`
 		}
-		probeBoth(t, fmt.Sprintf("marshaler output %q", out), doc{V: probeRawOut{Out: out}})
+		checkEncoderParity(t, fmt.Sprintf("marshaler output %q", out), doc{V: contractRawOut{Out: out}})
 	}
 }
 
-func TestProbeMarshalerInvalidUTF8CarveOut(t *testing.T) {
+func TestMarshalerInvalidUTF8CarveOut(t *testing.T) {
 	// Documented strictness divergence: simdjson validates MarshalJSON output
 	// as strict JSON including UTF-8; stdlib's compact() does not examine
 	// string contents. Both must at least be deterministic; record whichever
 	// way each library goes so the divergence stays exactly the carve-out.
 	type doc struct {
-		V probeRawOut `json:"v"`
+		V contractRawOut `json:"v"`
 	}
-	v := doc{V: probeRawOut{Out: "\"\xff\""}}
+	v := doc{V: contractRawOut{Out: "\"\xff\""}}
 	want, wantErr := json.Marshal(&v)
 	got, gotErr := Marshal(&v)
 	if wantErr != nil {
@@ -431,18 +431,18 @@ func TestProbeMarshalerInvalidUTF8CarveOut(t *testing.T) {
 	}
 }
 
-// TestProbeMarshalerLoneSurrogateRejected pins the deliberate encode/decode
+// TestMarshalerLoneSurrogateRejected pins the deliberate encode/decode
 // symmetry documented in the README: a MarshalJSON or json.RawMessage emitting
 // a lone \uXXXX surrogate is rejected, because simdjson also rejects that byte
 // sequence on decode. stdlib passes it through (and substitutes U+FFFD when it
 // reads it back). Emitting it here would produce JSON simdjson cannot itself
 // consume, so rejection keeps the round trip consistent.
-func TestProbeMarshalerLoneSurrogateRejected(t *testing.T) {
+func TestMarshalerLoneSurrogateRejected(t *testing.T) {
 	type doc struct {
-		V probeRawOut `json:"v"`
+		V contractRawOut `json:"v"`
 	}
 	for _, out := range []string{`"\ud83d"`, `"\udc00"`, `"a\ud800b"`} {
-		v := doc{V: probeRawOut{Out: out}}
+		v := doc{V: contractRawOut{Out: out}}
 		if _, err := Marshal(&v); err == nil {
 			t.Errorf("Marshal accepted lone-surrogate marshaler output %q; expected rejection (encode/decode symmetry)", out)
 		}
@@ -453,18 +453,18 @@ func TestProbeMarshalerLoneSurrogateRejected(t *testing.T) {
 	}
 }
 
-func TestProbeTextMarshalerInvalidUTF8(t *testing.T) {
+func TestTextMarshalerInvalidUTF8(t *testing.T) {
 	type doc struct {
-		V probeTextOut `json:"v"`
+		V contractTextOut `json:"v"`
 	}
 	for _, out := range []string{"\xff", "a\xffb", "\xed\xa0\x80", "ok\xc3"} {
-		probeBoth(t, fmt.Sprintf("text marshaler output %q", out), doc{V: probeTextOut{Out: out}})
+		checkEncoderParity(t, fmt.Sprintf("text marshaler output %q", out), doc{V: contractTextOut{Out: out}})
 	}
 }
 
-func TestProbePanickingMarshalerPropagates(t *testing.T) {
+func TestPanickingMarshalerPropagates(t *testing.T) {
 	type doc struct {
-		V probePanicMarshaler `json:"v"`
+		V contractPanicMarshaler `json:"v"`
 	}
 	v := doc{}
 	_, _, gotPanic, _, _, wantPanic := marshalBothWithRecover(t, v)
@@ -476,7 +476,7 @@ func TestProbePanickingMarshalerPropagates(t *testing.T) {
 // ---------------------------------------------------------------------------
 // 9. json.Number literal acceptance parity.
 
-func TestProbeNumberLiterals(t *testing.T) {
+func TestNumberLiterals(t *testing.T) {
 	literals := []string{
 		"", "0", "-0", "1", "-1", "0.5", "1.", ".5", "-", "+1", "01", "0123",
 		"1e", "1e+", "1E5", "1e-0", "1e309", "1e999", "-1.5e-300",
@@ -487,18 +487,18 @@ func TestProbeNumberLiterals(t *testing.T) {
 		N json.Number `json:"n"`
 	}
 	for _, lit := range literals {
-		probeBoth(t, fmt.Sprintf("number literal %q", lit), doc{N: json.Number(lit)})
+		checkEncoderParity(t, fmt.Sprintf("number literal %q", lit), doc{N: json.Number(lit)})
 	}
 	// json.Number inside any and as map value.
 	for _, lit := range []string{"5.5", "1e", ""} {
-		probeBoth(t, fmt.Sprintf("any number %q", lit), any(json.Number(lit)))
-		probeBoth(t, fmt.Sprintf("map number %q", lit), map[string]json.Number{"k": json.Number(lit)})
+		checkEncoderParity(t, fmt.Sprintf("any number %q", lit), any(json.Number(lit)))
+		checkEncoderParity(t, fmt.Sprintf("map number %q", lit), map[string]json.Number{"k": json.Number(lit)})
 	}
 	type qdoc struct {
 		N json.Number `json:"n,string"`
 	}
-	probeBoth(t, "quoted empty number", qdoc{})
-	probeBoth(t, "quoted number", qdoc{N: "5.5"})
+	checkEncoderParity(t, "quoted empty number", qdoc{})
+	checkEncoderParity(t, "quoted number", qdoc{N: "5.5"})
 }
 
 // ---------------------------------------------------------------------------
@@ -517,7 +517,7 @@ func stdlibNoHTML(t *testing.T, v any) []byte {
 	return bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
 }
 
-func TestProbeLongStringSpecialOffsets(t *testing.T) {
+func TestLongStringSpecialOffsets(t *testing.T) {
 	specials := []string{"\"", "\\", "\x00", "\x1f", "\n", "\x7f", "<", ">", "&",
 		" ", " ", "\xff", "\xed\xa0\x80", "é", "日"}
 	lengths := []int{17, 31, 32, 33, 47, 63, 64, 65, 100, 127, 128, 129}
@@ -554,7 +554,7 @@ func TestProbeLongStringSpecialOffsets(t *testing.T) {
 	}
 }
 
-func TestProbeControlBytesAllValues(t *testing.T) {
+func TestControlBytesAllValues(t *testing.T) {
 	enc, err := CompileEncoder[string](EncoderOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -573,36 +573,36 @@ func TestProbeControlBytesAllValues(t *testing.T) {
 // 11. any/interface contents: RawMessage compaction, typed nils, exotic
 // nesting.
 
-type probeValueMarshalerStruct struct{}
+type contractValueMarshalerStruct struct{}
 
-func (probeValueMarshalerStruct) MarshalJSON() ([]byte, error) { return []byte(`"vm"`), nil }
+func (contractValueMarshalerStruct) MarshalJSON() ([]byte, error) { return []byte(`"vm"`), nil }
 
-func TestProbeAnyContents(t *testing.T) {
-	probeBoth(t, "raw message inside any compacts", any(json.RawMessage("{\"x\" : 1 }")))
-	probeBoth(t, "nil raw message inside any", any(json.RawMessage(nil)))
-	probeBoth(t, "empty raw message inside any", any(json.RawMessage{}))
-	probeBoth(t, "typed nil plain pointer", any((*int)(nil)))
-	probeBoth(t, "typed nil pointer with value-receiver marshaler", any((*probeValueMarshalerStruct)(nil)))
-	probeBoth(t, "typed nil pointer with pointer-receiver marshaler", any((*retainingCustomReceiver)(nil)))
-	probeBoth(t, "typed nil map", any(map[string]int(nil)))
-	probeBoth(t, "typed nil slice", any([]int(nil)))
-	probeBoth(t, "nil interface in slice", []any{nil, 1, "x"})
-	probeBoth(t, "float32 inside any", any(float32(1.5)))
-	probeBoth(t, "uint64 max inside any", any(uint64(math.MaxUint64)))
-	probeBoth(t, "map with exotic keys inside any", any(map[string]any{
+func TestAnyContents(t *testing.T) {
+	checkEncoderParity(t, "raw message inside any compacts", any(json.RawMessage("{\"x\" : 1 }")))
+	checkEncoderParity(t, "nil raw message inside any", any(json.RawMessage(nil)))
+	checkEncoderParity(t, "empty raw message inside any", any(json.RawMessage{}))
+	checkEncoderParity(t, "typed nil plain pointer", any((*int)(nil)))
+	checkEncoderParity(t, "typed nil pointer with value-receiver marshaler", any((*contractValueMarshalerStruct)(nil)))
+	checkEncoderParity(t, "typed nil pointer with pointer-receiver marshaler", any((*retainingCustomReceiver)(nil)))
+	checkEncoderParity(t, "typed nil map", any(map[string]int(nil)))
+	checkEncoderParity(t, "typed nil slice", any([]int(nil)))
+	checkEncoderParity(t, "nil interface in slice", []any{nil, 1, "x"})
+	checkEncoderParity(t, "float32 inside any", any(float32(1.5)))
+	checkEncoderParity(t, "uint64 max inside any", any(uint64(math.MaxUint64)))
+	checkEncoderParity(t, "map with exotic keys inside any", any(map[string]any{
 		" ": 1, "<&>": 2, "": 3, "\x01": 4, "é": 5,
 	}))
-	probeBoth(t, "text-marshaler map inside any", any(map[textKey]bool{{A: 1, B: 2}: true}))
-	probeBoth(t, "raw message nested in map in any", any(map[string]any{
+	checkEncoderParity(t, "text-marshaler map inside any", any(map[textKey]bool{{A: 1, B: 2}: true}))
+	checkEncoderParity(t, "raw message nested in map in any", any(map[string]any{
 		"r": json.RawMessage(" [ 1 ,2] "),
 	}))
-	probeBoth(t, "chan inside nested any errors", any(map[string]any{"c": make(chan int)}))
+	checkEncoderParity(t, "chan inside nested any errors", any(map[string]any{"c": make(chan int)}))
 }
 
 // ---------------------------------------------------------------------------
 // 12. time.Time parity across zones, precision, and error acceptance.
 
-func TestProbeTimeParity(t *testing.T) {
+func TestTimeParity(t *testing.T) {
 	zones := []*time.Location{
 		time.UTC,
 		time.FixedZone("plus", 5*3600+1800),
@@ -624,11 +624,11 @@ func TestProbeTimeParity(t *testing.T) {
 	for _, loc := range zones {
 		for _, ts := range base {
 			v := doc{T: ts.In(loc)}
-			probeBoth(t, fmt.Sprintf("time %v in %v", ts, loc), v)
+			checkEncoderParity(t, fmt.Sprintf("time %v in %v", ts, loc), v)
 		}
 	}
 	// Monotonic-clock-carrying time.
-	probeBoth(t, "time.Now monotonic", struct {
+	checkEncoderParity(t, "time.Now monotonic", struct {
 		T time.Time `json:"t"`
 	}{T: time.Now()})
 }
@@ -637,7 +637,7 @@ func TestProbeTimeParity(t *testing.T) {
 // 13. Float spellings at documented thresholds (exact spot checks on top of
 // the random differential suites).
 
-func TestProbeFloatThresholds(t *testing.T) {
+func TestFloatThresholds(t *testing.T) {
 	values := []float64{
 		1e20, 1e21, 9.999999999999997e20, 1.0000000000000001e21,
 		1e-6, 1e-7, 9.999999999999999e-7,
@@ -655,12 +655,12 @@ func TestProbeFloatThresholds(t *testing.T) {
 		if math.IsInf(float64(g), 0) {
 			g = 0
 		}
-		probeBoth(t, fmt.Sprintf("float %g", f), doc{F: f, G: g})
+		checkEncoderParity(t, fmt.Sprintf("float %g", f), doc{F: f, G: g})
 	}
-	probeBoth(t, "NaN top-level field errors", struct {
+	checkEncoderParity(t, "NaN top-level field errors", struct {
 		F float64 `json:"f"`
 	}{F: math.NaN()})
-	probeBoth(t, "float32 quoted threshold", struct {
+	checkEncoderParity(t, "float32 quoted threshold", struct {
 		G float32 `json:"g,string"`
 	}{G: 1e21})
 }
@@ -668,7 +668,7 @@ func TestProbeFloatThresholds(t *testing.T) {
 // ---------------------------------------------------------------------------
 // 14. AppendJSON error-path contract: length-unchanged result, prefix intact.
 
-func TestProbeAppendJSONErrorPathPreservesPrefix(t *testing.T) {
+func TestAppendJSONErrorPathPreservesPrefix(t *testing.T) {
 	type doc struct {
 		A string  `json:"a"`
 		F float64 `json:"f"`
@@ -697,10 +697,10 @@ func TestProbeAppendJSONErrorPathPreservesPrefix(t *testing.T) {
 // 14b. Pinpoint the encoder depth threshold for pointer chains and show the
 // decode->encode asymmetry: a document simdjson decodes cannot be re-encoded.
 
-func TestProbeDepthThresholdAndRoundTrip(t *testing.T) {
+func TestDepthThresholdAndRoundTrip(t *testing.T) {
 	// Each list node costs two depth units in the encoder (pointer + struct).
 	for _, tc := range []struct{ nodes int }{{4999}, {5000}, {5001}, {6000}} {
-		v := buildProbeChain(tc.nodes - 1) // total nodes = tc.nodes
+		v := buildContractChain(tc.nodes - 1) // total nodes = tc.nodes
 		_, wantErr := json.Marshal(v)
 		_, gotErr := Marshal(v)
 		t.Logf("nodes=%d simdjson err=%v stdlib err=%v", tc.nodes, gotErr != nil, wantErr != nil)
@@ -718,12 +718,12 @@ func TestProbeDepthThresholdAndRoundTrip(t *testing.T) {
 		sb.WriteString(`}`)
 	}
 	src := []byte(sb.String())
-	var head probeChain
+	var head contractChain
 	if err := Unmarshal(src, &head); err != nil {
 		t.Fatalf("simdjson failed to decode depth-%d doc: %v", depth, err)
 	}
 	_, gotErr := Marshal(&head)
-	var stdHead probeChain
+	var stdHead contractChain
 	if err := json.Unmarshal(src, &stdHead); err != nil {
 		t.Fatalf("stdlib failed to decode: %v", err)
 	}
@@ -736,18 +736,20 @@ func TestProbeDepthThresholdAndRoundTrip(t *testing.T) {
 // ---------------------------------------------------------------------------
 // 14c. More map key classifications.
 
-type probeIntTextKey int
+type contractIntTextKey int
 
-func (k probeIntTextKey) MarshalText() ([]byte, error) { return fmt.Appendf(nil, "i%d", int(k)), nil }
+func (k contractIntTextKey) MarshalText() ([]byte, error) {
+	return fmt.Appendf(nil, "i%d", int(k)), nil
+}
 
-type probePtrOnlyTextStringKey string
+type contractPtrOnlyTextStringKey string
 
-func (k *probePtrOnlyTextStringKey) MarshalText() ([]byte, error) { return []byte("PTRONLY"), nil }
+func (k *contractPtrOnlyTextStringKey) MarshalText() ([]byte, error) { return []byte("PTRONLY"), nil }
 
 // ---------------------------------------------------------------------------
 // 14d. DisableHTMLEscaping parity for field names and NaN inside any.
 
-func TestProbeDisableHTMLEscapingFieldNames(t *testing.T) {
+func TestDisableHTMLEscapingFieldNames(t *testing.T) {
 	type doc struct {
 		A string `json:"a<b"`
 		B string `json:"c&d"`
@@ -764,10 +766,10 @@ func TestProbeDisableHTMLEscapingFieldNames(t *testing.T) {
 	}
 }
 
-func TestProbeNaNInsideAny(t *testing.T) {
-	probeBoth(t, "NaN inside any", any(math.NaN()))
-	probeBoth(t, "Inf inside []any", []any{1.0, math.Inf(-1)})
-	probeBoth(t, "NaN float32 field", struct {
+func TestNaNInsideAny(t *testing.T) {
+	checkEncoderParity(t, "NaN inside any", any(math.NaN()))
+	checkEncoderParity(t, "Inf inside []any", []any{1.0, math.Inf(-1)})
+	checkEncoderParity(t, "NaN float32 field", struct {
 		F float32 `json:"f"`
 	}{F: float32(math.NaN())})
 }
@@ -775,14 +777,14 @@ func TestProbeNaNInsideAny(t *testing.T) {
 // ---------------------------------------------------------------------------
 // 15. Top-level scalars and containers via the generic entry point.
 
-func TestProbeTopLevelValues(t *testing.T) {
-	probeBoth(t, "top-level string with specials", "a\"b\\c\ncontrol\x01<&> end")
-	probeBoth(t, "top-level negative zero", math.Copysign(0, -1))
-	probeBoth(t, "top-level nil byte slice", []byte(nil))
-	probeBoth(t, "top-level empty byte slice", []byte{})
-	probeBoth(t, "top-level byte slice", []byte{0, 1, 254, 255})
-	probeBoth(t, "top-level nil map", map[string]int(nil))
-	probeBoth(t, "top-level bool", true)
-	probeBoth(t, "top-level json.RawMessage", json.RawMessage(` {"a": 1} `))
-	probeBoth(t, "top-level pointer to pointer", func() **int { x := 5; p := &x; return &p }())
+func TestTopLevelValues(t *testing.T) {
+	checkEncoderParity(t, "top-level string with specials", "a\"b\\c\ncontrol\x01<&> end")
+	checkEncoderParity(t, "top-level negative zero", math.Copysign(0, -1))
+	checkEncoderParity(t, "top-level nil byte slice", []byte(nil))
+	checkEncoderParity(t, "top-level empty byte slice", []byte{})
+	checkEncoderParity(t, "top-level byte slice", []byte{0, 1, 254, 255})
+	checkEncoderParity(t, "top-level nil map", map[string]int(nil))
+	checkEncoderParity(t, "top-level bool", true)
+	checkEncoderParity(t, "top-level json.RawMessage", json.RawMessage(` {"a": 1} `))
+	checkEncoderParity(t, "top-level pointer to pointer", func() **int { x := 5; p := &x; return &p }())
 }

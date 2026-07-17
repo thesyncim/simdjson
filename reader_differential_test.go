@@ -39,10 +39,10 @@ func compact(t *testing.T, b []byte) []byte {
 	return append([]byte(nil), buf.Bytes()...)
 }
 
-// TestAuditStreamOracle feeds valid concatenated JSON streams through the Reader
+// TestStreamOracle feeds valid concatenated JSON streams through the Reader
 // (both Next and DecodeNext, at multiple buffer sizes and chunk framings) and
 // checks the value sequence matches encoding/json's json.Decoder.
-func TestAuditStreamOracle(t *testing.T) {
+func TestStreamOracle(t *testing.T) {
 	r := rand.New(rand.NewSource(0x57DEA))
 	valueGens := []func(*rand.Rand) string{
 		func(r *rand.Rand) string { return "123" },
@@ -138,4 +138,3 @@ func checkReaderSeq(t *testing.T, data []byte, size int, want [][]byte, useDecod
 		}
 	}
 }
-

@@ -5,14 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"math/rand"
 	"reflect"
 	"strings"
 	"testing"
 )
 
-type probeOwnedDoc struct {
+type ownedContractDocument struct {
 	S string            `json:"s"`
 	N json.Number       `json:"n"`
 	A any               `json:"a"`
@@ -21,12 +20,12 @@ type probeOwnedDoc struct {
 	B []byte            `json:"b"`
 }
 
-// TestProbeOwnedModeNeverAliasesCallerSrc proves owned-mode decodes never
+// TestOwnedModeNeverAliasesCallerSrc proves owned-mode decodes never
 // alias caller src. Each case decodes every retaining kind with default
 // (owned) options, scribbles the source buffer, and checks the result byte
 // for byte against encoding/json. The field order varies per case so each
 // retaining kind gets to be the first ownSource trigger.
-func TestProbeOwnedModeNeverAliasesCallerSrc(t *testing.T) {
+func TestOwnedModeNeverAliasesCallerSrc(t *testing.T) {
 	cases := []struct {
 		name string
 		body string
@@ -40,11 +39,11 @@ func TestProbeOwnedModeNeverAliasesCallerSrc(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			src := []byte(tc.body)
-			var want probeOwnedDoc
+			var want ownedContractDocument
 			if err := json.Unmarshal(src, &want); err != nil {
 				t.Fatalf("reference: %v", err)
 			}
-			var got probeOwnedDoc
+			var got ownedContractDocument
 			if err := Unmarshal(src, &got); err != nil {
 				t.Fatalf("Unmarshal: %v", err)
 			}
@@ -60,7 +59,7 @@ func TestProbeOwnedModeNeverAliasesCallerSrc(t *testing.T) {
 }
 
 // Top-level retaining shapes: any, map, slice-of-string.
-func TestProbeOwnedTopLevelShapes(t *testing.T) {
+func TestOwnedTopLevelShapes(t *testing.T) {
 	{
 		src := []byte(`{"k":"clean","e":"a` + jsonUnicodeEscape("0042") + `c","nested":[1,"two"]}`)
 		var want, got any
@@ -111,10 +110,10 @@ func TestProbeOwnedTopLevelShapes(t *testing.T) {
 	}
 }
 
-// TestProbeAnyArenaBlockSwitch proves dynamic (any) values that materialize
+// TestAnyArenaBlockSwitch proves dynamic (any) values that materialize
 // many escaped strings survive arena block switches inside the dynamic parse,
 // and that later escaped typed strings append after — not over — them.
-func TestProbeAnyArenaBlockSwitch(t *testing.T) {
+func TestAnyArenaBlockSwitch(t *testing.T) {
 	// One escaped string long enough to matter, repeated enough times inside
 	// the any value to cross several 2 KiB arena blocks (stringArenaSeed).
 	esc := strings.Repeat(jsonUnicodeEscape("00e9")+"unit", 30) // ~150 decoded bytes each
@@ -177,7 +176,7 @@ func TestProbeAnyArenaBlockSwitch(t *testing.T) {
 
 // Interleave typed escaped strings and any values so the arena alternates
 // between cursor-side and parser-side appends across block switches.
-func TestProbeInterleavedTypedAndDynamicEscapes(t *testing.T) {
+func TestInterleavedTypedAndDynamicEscapes(t *testing.T) {
 	type pair struct {
 		S string `json:"s"`
 		A any    `json:"a"`
@@ -219,10 +218,10 @@ func TestProbeInterleavedTypedAndDynamicEscapes(t *testing.T) {
 	}
 }
 
-// TestProbeEscapedMapKeysArena proves escaped map keys retained by the result
+// TestEscapedMapKeysArena proves escaped map keys retained by the result
 // map survive later escaped strings — keys and values alike — appending to the
 // arena.
-func TestProbeEscapedMapKeysArena(t *testing.T) {
+func TestEscapedMapKeysArena(t *testing.T) {
 	var b strings.Builder
 	b.WriteByte('{')
 	const n = 80
@@ -279,11 +278,11 @@ func TestProbeEscapedMapKeysArena(t *testing.T) {
 	}
 }
 
-// TestProbeQuotedFieldTransientArena proves that quoted (",string") fields
+// TestQuotedFieldTransientArena proves that quoted (",string") fields
 // whose inner content is escaped — which use a transient arena region — do not
 // leave the decoded result aliasing that region once later escaped strings
 // reuse it.
-func TestProbeQuotedFieldTransientArena(t *testing.T) {
+func TestQuotedFieldTransientArena(t *testing.T) {
 	type doc struct {
 		Born string      `json:"born"` // escaped: creates the arena
 		Q    string      `json:"q,string"`
@@ -319,7 +318,7 @@ func TestProbeQuotedFieldTransientArena(t *testing.T) {
 
 // Escaped base64: the []byte result decodes out of the transient region and
 // must be a private copy.
-func TestProbeBytesFromEscapedBase64(t *testing.T) {
+func TestBytesFromEscapedBase64(t *testing.T) {
 	type doc struct {
 		Born string `json:"born"`
 		B    []byte `json:"b"`
@@ -348,15 +347,15 @@ func TestProbeBytesFromEscapedBase64(t *testing.T) {
 	}
 }
 
-// probeChunkReader hands out src in fixed-size chunks so a streaming Reader
+// contractChunkReader hands out src in fixed-size chunks so a streaming Reader
 // sees values split across arbitrarily small reads.
-type probeChunkReader struct {
+type contractChunkReader struct {
 	data  []byte
 	chunk int
 	pos   int
 }
 
-func (r *probeChunkReader) Read(p []byte) (int, error) {
+func (r *contractChunkReader) Read(p []byte) (int, error) {
 	if r.pos >= len(r.data) {
 		return 0, io.EOF
 	}
@@ -400,10 +399,10 @@ func buildStreamDocs(t *testing.T, count int) ([]byte, []streamRec) {
 	return b.Bytes(), want
 }
 
-// TestProbeStreamDecodeNextSplitValues drives the streaming Reader over values
+// TestStreamDecodeNextSplitValues drives the streaming Reader over values
 // split across arbitrarily small reads, exercising the retry, compaction, and
 // growth paths. Each decoded value is checked inside its validity window.
-func TestProbeStreamDecodeNextSplitValues(t *testing.T) {
+func TestStreamDecodeNextSplitValues(t *testing.T) {
 	data, want := buildStreamDocs(t, 25)
 	for _, zeroCopy := range []bool{false, true} {
 		dec, err := CompileDecoder[streamRec](DecoderOptions{ZeroCopy: zeroCopy, Replace: true})
@@ -411,7 +410,7 @@ func TestProbeStreamDecodeNextSplitValues(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, chunk := range []int{1, 2, 3, 7, 64, len(data)} {
-			r := NewReaderSize(&probeChunkReader{data: data, chunk: chunk}, 512)
+			r := NewReaderSize(&contractChunkReader{data: data, chunk: chunk}, 512)
 			var got streamRec
 			i := 0
 			for DecodeNext(r, dec, &got) {
@@ -436,13 +435,13 @@ func TestProbeStreamDecodeNextSplitValues(t *testing.T) {
 
 // Owned decodes must survive subsequent Next/DecodeNext calls that rewrite
 // the rolling buffer.
-func TestProbeStreamOwnedRetentionAcrossNext(t *testing.T) {
+func TestStreamOwnedRetentionAcrossNext(t *testing.T) {
 	data, want := buildStreamDocs(t, 25)
 	dec, err := CompileDecoder[streamRec](DecoderOptions{Replace: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := NewReaderSize(&probeChunkReader{data: data, chunk: 3}, 512)
+	r := NewReaderSize(&contractChunkReader{data: data, chunk: 3}, 512)
 	var retained []streamRec
 	var cur streamRec
 	for DecodeNext(r, dec, &cur) {
@@ -463,7 +462,7 @@ func TestProbeStreamOwnedRetentionAcrossNext(t *testing.T) {
 }
 
 // Bytes across buffer growth and compaction, checked inside the window.
-func TestProbeReaderBytesGrowAndCompact(t *testing.T) {
+func TestReaderBytesGrowAndCompact(t *testing.T) {
 	var docs [][]byte
 	var stream bytes.Buffer
 	for i := 0; i < 12; i++ {
@@ -473,7 +472,7 @@ func TestProbeReaderBytesGrowAndCompact(t *testing.T) {
 		stream.WriteByte('\n')
 	}
 	for _, chunk := range []int{1, 5, 511, stream.Len()} {
-		r := NewReaderSize(&probeChunkReader{data: stream.Bytes(), chunk: chunk}, 512)
+		r := NewReaderSize(&contractChunkReader{data: stream.Bytes(), chunk: chunk}, 512)
 		i := 0
 		for r.Next() {
 			if !bytes.Equal(r.Bytes(), docs[i]) {
@@ -490,12 +489,12 @@ func TestProbeReaderBytesGrowAndCompact(t *testing.T) {
 	}
 }
 
-// TestProbeUnmarshalAnySlabIsolation exercises the dynamic decoder's slab
+// TestUnmarshalAnySlabIsolation exercises the dynamic decoder's slab
 // arena. Arrays
 // with 1..10 elements drive slab slot handoff, append growth past the
 // 4-element slot capacity, and slab replacement; the whole tree is compared
 // against encoding/json.
-func TestProbeUnmarshalAnySlabIsolation(t *testing.T) {
+func TestUnmarshalAnySlabIsolation(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 	var build func(depth int) string
 	build = func(depth int) string {
@@ -539,11 +538,11 @@ func TestProbeUnmarshalAnySlabIsolation(t *testing.T) {
 	}
 }
 
-// TestProbeParseValueRetentionAcrossPoolReuse proves Parse AST retention:
+// TestParseValueRetentionAcrossPoolReuse proves Parse AST retention:
 // values from an earlier ParseOptions call stay intact while the tape pool is
 // reused by later parses and after the original source is scribbled (owned
 // mode).
-func TestProbeParseValueRetentionAcrossPoolReuse(t *testing.T) {
+func TestParseValueRetentionAcrossPoolReuse(t *testing.T) {
 	src := []byte(`{"a":"alpha","e":"b` + jsonUnicodeEscape("00e9") + `ta","n":42.5,"arr":[1,"two",{"deep":"d"}]}`)
 	var wantJSON map[string]any
 	if err := json.Unmarshal(src, &wantJSON); err != nil {
@@ -576,146 +575,5 @@ func TestProbeParseValueRetentionAcrossPoolReuse(t *testing.T) {
 	}
 	if !reflect.DeepEqual(gotBack, wantJSON) {
 		t.Fatalf("retained Value corrupted:\ngot  %#v\nwant %#v", gotBack, wantJSON)
-	}
-}
-
-// TestProbeEncodeMapErrorPathStability probes the pooled encoder scratch: an
-// error Path built from the pooled numeric-key arena must survive later
-// encodes that rewrite that arena. TestProbeEncoderScratchConcurrency covers
-// the companion property that concurrent encodes through one compiled encoder
-// do not cross-talk.
-func TestProbeEncodeMapErrorPathStability(t *testing.T) {
-	type doc struct {
-		M map[int]float64 `json:"m"`
-	}
-	enc, err := CompileEncoder[doc](EncoderOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	bad := doc{M: map[int]float64{1234567: math.NaN()}}
-	_, err = enc.AppendJSON(nil, &bad)
-	if err == nil {
-		t.Fatal("want error for NaN map value")
-	}
-	encErr, ok := err.(*EncodeError)
-	if !ok {
-		t.Fatalf("want *EncodeError, got %T", err)
-	}
-	pathBefore := encErr.Path
-	// Rewrite the pooled key arena with different digits many times.
-	good := doc{M: map[int]float64{7654321: 1, 999: 2, 88: 3}}
-	for i := 0; i < 32; i++ {
-		if _, err := enc.AppendJSON(nil, &good); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if encErr.Path != pathBefore || !strings.Contains(pathBefore, "1234567") {
-		t.Fatalf("error path mutated by pooled arena reuse: before %q after %q", pathBefore, encErr.Path)
-	}
-}
-
-func TestProbeEncoderScratchConcurrency(t *testing.T) {
-	type doc struct {
-		M map[string]int  `json:"m"`
-		N map[int]string  `json:"n"`
-		A any             `json:"a"`
-		S staticMarshaler `json:"s"`
-	}
-	enc, err := CompileEncoder[doc](EncoderOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	const workers = 8
-	done := make(chan error, workers)
-	for w := 0; w < workers; w++ {
-		go func(w int) {
-			v := doc{
-				M: map[string]int{fmt.Sprintf("k%d", w): w},
-				N: map[int]string{w * 1111: fmt.Sprintf("v%d", w)},
-				A: map[string]bool{fmt.Sprintf("a%d", w): true},
-				S: staticMarshaler{V: w},
-			}
-			want := fmt.Sprintf(`{"m":{"k%d":%d},"n":{"%d":"v%d"},"a":{"a%d":true},"s":"static"}`, w, w, w*1111, w, w)
-			for i := 0; i < 500; i++ {
-				out, err := enc.AppendJSON(nil, &v)
-				if err != nil {
-					done <- err
-					return
-				}
-				if string(out) != want {
-					done <- fmt.Errorf("worker %d: got %s want %s", w, out, want)
-					return
-				}
-			}
-			done <- nil
-		}(w)
-	}
-	for w := 0; w < workers; w++ {
-		if err := <-done; err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-// TestProbeDifferentialEscapeBattery is a differential battery over
-// escape-dense documents decoded into an any/map/string-bearing struct in both
-// ownership modes, compared against encoding/json.
-func TestProbeDifferentialEscapeBattery(t *testing.T) {
-	type doc struct {
-		A string            `json:"a"`
-		B any               `json:"b"`
-		C map[string]string `json:"c"`
-		D []any             `json:"d"`
-		E string            `json:"e"`
-	}
-	rng := rand.New(rand.NewSource(1234))
-	escapes := []string{
-		jsonUnicodeEscape("0041"), jsonUnicodeEscape("00e9"), jsonUnicodeEscape("20ac"),
-		jsonUnicodeEscape("d834") + jsonUnicodeEscape("dd1e"),
-		`\n`, `\t`, `\\`, `\"`, `\/`,
-	}
-	randString := func() string {
-		var b strings.Builder
-		n := rng.Intn(12)
-		for i := 0; i < n; i++ {
-			if rng.Intn(2) == 0 {
-				b.WriteString(escapes[rng.Intn(len(escapes))])
-			} else {
-				b.WriteString("ab")
-			}
-		}
-		return b.String()
-	}
-	decOwned, err := CompileDecoder[doc](DecoderOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	decZero, err := CompileDecoder[doc](DecoderOptions{ZeroCopy: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for round := 0; round < 400; round++ {
-		src := []byte(fmt.Sprintf(
-			`{"a":"%s","b":{"k%s":"%s","n":[1,"%s",2.5]},"c":{"%s":"%s","x":"%s"},"d":["%s",7,"%s"],"e":"%s"}`,
-			randString(), randString(), randString(), randString(),
-			"K"+randString(), randString(), randString(),
-			randString(), randString(), randString()))
-		var want doc
-		if err := json.Unmarshal(src, &want); err != nil {
-			continue // generator made something encoding/json rejects; skip
-		}
-		var gotOwned, gotZero doc
-		if err := decOwned.Decode(src, &gotOwned); err != nil {
-			t.Fatalf("round %d owned: %v\nsrc %s", round, err, src)
-		}
-		if err := decZero.Decode(src, &gotZero); err != nil {
-			t.Fatalf("round %d zerocopy: %v\nsrc %s", round, err, src)
-		}
-		if !reflect.DeepEqual(gotOwned, want) {
-			t.Fatalf("round %d owned mismatch:\nsrc  %s\ngot  %#v\nwant %#v", round, src, gotOwned, want)
-		}
-		if !reflect.DeepEqual(gotZero, want) {
-			t.Fatalf("round %d zerocopy mismatch:\nsrc  %s\ngot  %#v\nwant %#v", round, src, gotZero, want)
-		}
 	}
 }

@@ -57,7 +57,7 @@ func bareNodeOutlivesValue() (Node, Node) {
 	return name.Node(), id.Node()
 }
 
-func TestAuditGCBareNodeOutlivesValue(t *testing.T) {
+func TestGCBareNodeOutlivesValue(t *testing.T) {
 	name, id := bareNodeOutlivesValue()
 	churnHeap()
 	if got, ok := name.StringBytes(); !ok || string(got) != "item-150-payload" {
@@ -80,7 +80,7 @@ func arrayIterOutlivesValue() ArrayIter {
 	return it
 }
 
-func TestAuditGCArrayIterOutlivesValue(t *testing.T) {
+func TestGCArrayIterOutlivesValue(t *testing.T) {
 	it := arrayIterOutlivesValue()
 	churnHeap()
 	count := 0
@@ -115,7 +115,7 @@ func rawOutlivesValue() RawValue {
 	return elem.Node().Raw()
 }
 
-func TestAuditGCRawOutlivesValue(t *testing.T) {
+func TestGCRawOutlivesValue(t *testing.T) {
 	raw := rawOutlivesValue()
 	churnHeap()
 	want := `{"id":99,"name":"item-99-payload","tags":["x","y","z"]}`
@@ -139,7 +139,7 @@ func textStringOutlivesValue() (string, string) {
 	return ut, et
 }
 
-func TestAuditGCTextStringOutlivesValue(t *testing.T) {
+func TestGCTextStringOutlivesValue(t *testing.T) {
 	u, e := textStringOutlivesValue()
 	churnHeap()
 	if u != "plain-source-bytes" {
@@ -150,10 +150,10 @@ func TestAuditGCTextStringOutlivesValue(t *testing.T) {
 	}
 }
 
-// TestAuditGCZeroCopyStaleData documents the ZeroCopy contract: mutating the
+// TestGCZeroCopyStaleData documents the ZeroCopy contract: mutating the
 // caller's buffer changes what a held Node reads (stale data), but stays in
 // bounds (memory-safe). This is a contract check, not a bug hunt.
-func TestAuditGCZeroCopyStaleData(t *testing.T) {
+func TestGCZeroCopyStaleData(t *testing.T) {
 	src := []byte(`{"k":"originalvalue"}`)
 	v, err := ParseOptions(src, Options{ZeroCopy: true})
 	if err != nil {

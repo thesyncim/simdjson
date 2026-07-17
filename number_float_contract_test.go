@@ -74,7 +74,7 @@ func diffFloat32(t *testing.T, s string) {
 	}
 }
 
-func TestAuditFloatPowersOfTen(t *testing.T) {
+func TestFloatPowersOfTen(t *testing.T) {
 	for exp := -348; exp <= 348; exp++ {
 		for _, mant := range []string{"1", "2", "5", "9", "1234567890123456", "9999999999999999", "12345678901234567", "18446744073709551615"} {
 			s := mant + "e" + strconv.Itoa(exp)
@@ -85,7 +85,7 @@ func TestAuditFloatPowersOfTen(t *testing.T) {
 	}
 }
 
-func TestAuditFloatMantissaBoundaries(t *testing.T) {
+func TestFloatMantissaBoundaries(t *testing.T) {
 	// 18/19/20-digit mantissa boundaries where truncation tracking matters.
 	mants := []string{
 		"9007199254740991",  // 2^53-1
@@ -93,9 +93,9 @@ func TestAuditFloatMantissaBoundaries(t *testing.T) {
 		"9007199254740993",  // 2^53+1 (not representable)
 		"18014398509481984", // 2^54
 		"1234567890123456",
-		"12345678901234567",  // 17 digits
-		"123456789012345678",  // 18 digits
-		"1234567890123456789", // 19 digits
+		"12345678901234567",    // 17 digits
+		"123456789012345678",   // 18 digits
+		"1234567890123456789",  // 19 digits
 		"12345678901234567890", // 20 digits
 		"99999999999999999999",
 		"10000000000000000001",
@@ -114,7 +114,7 @@ func TestAuditFloatMantissaBoundaries(t *testing.T) {
 	}
 }
 
-func TestAuditFloatSpecializedShapes(t *testing.T) {
+func TestFloatSpecializedShapes(t *testing.T) {
 	// DD.dddddddd and DDD.ddddddddddddd geographic shapes plus 0.ffff shapes.
 	r := rand.New(rand.NewSource(0xF10A7))
 	for i := 0; i < 200000; i++ {
@@ -152,7 +152,7 @@ func TestAuditFloatSpecializedShapes(t *testing.T) {
 	}
 }
 
-func TestAuditFloatSubnormals(t *testing.T) {
+func TestFloatSubnormals(t *testing.T) {
 	// Smallest subnormals and the subnormal/normal boundary.
 	for _, s := range []string{
 		"5e-324", "4.9e-324", "2.5e-324", "1e-323", "2e-308", "2.2250738585072014e-308",

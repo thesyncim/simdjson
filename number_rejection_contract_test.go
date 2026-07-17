@@ -7,11 +7,11 @@ import (
 	"testing"
 )
 
-// TestAuditNumberRejectionParity generates number-ish strings (many malformed)
+// TestNumberRejectionParity generates number-ish strings (many malformed)
 // and checks that the typed float64/int64/uint64 decoders and dynamic any
 // decoding agree
 // with encoding/json on both acceptance AND the decoded value.
-func TestAuditNumberRejectionParity(t *testing.T) {
+func TestNumberRejectionParity(t *testing.T) {
 	r := rand.New(rand.NewSource(0xBADF00D))
 	alphabet := []byte("0123456789+-.eE ")
 	for i := 0; i < 400000; i++ {

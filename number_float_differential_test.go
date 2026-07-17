@@ -7,9 +7,9 @@ import (
 	"testing"
 )
 
-// TestAuditFloatHeavy is a high-volume random differential across every float64
+// TestFloatHeavy is a high-volume random differential across every float64
 // decode path. Run with -count to extend. It is deliberately expensive.
-func TestAuditFloatHeavy(t *testing.T) {
+func TestFloatHeavy(t *testing.T) {
 	if testing.Short() {
 		t.Skip("heavy")
 	}

@@ -8,9 +8,9 @@ import (
 	"testing"
 )
 
-// TestAuditFusedInt64Slice checks the fused []int64 decoder against
+// TestFusedInt64Slice checks the fused []int64 decoder against
 // encoding/json across adversarial delimiter, null, and whitespace framings.
-func TestAuditFusedInt64Slice(t *testing.T) {
+func TestFusedInt64Slice(t *testing.T) {
 	cases := []string{
 		`[]`, `[ ]`, `[1]`, `[1,2,3]`, `[ 1 , 2 , 3 ]`,
 		`[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17]`, // grow past initial cap
@@ -66,9 +66,9 @@ func diffUint64Slice(t *testing.T, s string) {
 	}
 }
 
-// TestAuditFusedSliceReuse decodes into a reused destination and checks the
+// TestFusedSliceReuse decodes into a reused destination and checks the
 // result equals a fresh decode: no stale elements survive from the prior value.
-func TestAuditFusedSliceReuse(t *testing.T) {
+func TestFusedSliceReuse(t *testing.T) {
 	dec, err := CompileDecoder[[]int64](DecoderOptions{Replace: true})
 	if err != nil {
 		t.Fatal(err)
@@ -105,9 +105,9 @@ func TestAuditFusedSliceReuse(t *testing.T) {
 	}
 }
 
-// TestAuditFusedSliceFuzz random-differentials the three fused scalar slice
+// TestFusedSliceFuzz random-differentials the three fused scalar slice
 // decoders against encoding/json with adversarial spacing and delimiters.
-func TestAuditFusedSliceFuzz(t *testing.T) {
+func TestFusedSliceFuzz(t *testing.T) {
 	r := rand.New(rand.NewSource(0x5CA1))
 	spaces := []string{"", " ", "  ", "\t", "\n", "\r\n", " \t "}
 	sp := func() string { return spaces[r.Intn(len(spaces))] }

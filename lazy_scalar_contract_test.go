@@ -6,13 +6,13 @@ import (
 	"testing"
 )
 
-// TestAuditLazyScalarKernelParity pins the lazy scalar readers — Node.Float64,
+// TestLazyScalarKernelParity pins the lazy scalar readers — Node.Float64,
 // Node.Int64, RawValue.Float64, and RawValue.Int64 — against strconv on the
 // boundary spellings where the in-house number kernels and strconv can disagree:
 // int64 limits, signed zero, subnormals, the 19/20-digit mantissa edge, the
 // exact-conversion envelope, and out-of-range magnitudes. Every reader must
 // reach strconv's exact value and its accept/reject verdict.
-func TestAuditLazyScalarKernelParity(t *testing.T) {
+func TestLazyScalarKernelParity(t *testing.T) {
 	spellings := []string{
 		// Plain integers around the int64 and uint64 limits.
 		"0", "-0", "1", "-1", "10", "100",

@@ -21,11 +21,11 @@ var validParitySeeds = []string{
 	`[]`, `{}`, `""`,
 }
 
-// TestAuditValidateParity mutates valid JSON by byte flips, insertions, and
+// TestValidateParity mutates valid JSON by byte flips, insertions, and
 // deletions, then checks Parse, dynamic Unmarshal, and Validate all agree with json.Valid
 // on acceptance. A structural parser bug that accepts invalid input (or rejects
 // valid input) shows up as a mismatch here.
-func TestAuditValidateParity(t *testing.T) {
+func TestValidateParity(t *testing.T) {
 	r := rand.New(rand.NewSource(0x5A11D))
 	structural := []byte(`{}[]",:0123456789.eEtfn-+ \/`)
 	check := func(b []byte) {

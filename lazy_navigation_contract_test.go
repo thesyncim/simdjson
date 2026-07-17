@@ -21,9 +21,9 @@ func canonicalMarshal(v any) []byte {
 	return bytes.TrimRight(buf.Bytes(), "\n")
 }
 
-// TestAuditLazyGetLastOccurrence verifies duplicate-key Get returns the last
+// TestLazyGetLastOccurrence verifies duplicate-key Get returns the last
 // value, matching encoding/json's map semantics.
-func TestAuditLazyGetLastOccurrence(t *testing.T) {
+func TestLazyGetLastOccurrence(t *testing.T) {
 	cases := []struct {
 		doc  string
 		key  string
@@ -53,9 +53,9 @@ func TestAuditLazyGetLastOccurrence(t *testing.T) {
 	}
 }
 
-// TestAuditLazyEmptyContainers exercises the empty-object/array tape edge that
+// TestLazyEmptyContainers exercises the empty-object/array tape edge that
 // the Get and iterator arithmetic must not step past.
-func TestAuditLazyEmptyContainers(t *testing.T) {
+func TestLazyEmptyContainers(t *testing.T) {
 	docs := []string{
 		`{}`, `[]`, `{"a":{}}`, `{"a":[]}`, `[[],{}]`, `[{},{},{}]`,
 		`{"a":{},"b":{},"c":[]}`, `[[[]]]`, `{"x":{"y":{}}}`,
@@ -78,11 +78,11 @@ func TestAuditLazyEmptyContainers(t *testing.T) {
 	}
 }
 
-// TestAuditLazyNavigateFuzz builds canonical documents (unique keys, canonical
+// TestLazyNavigateFuzz builds canonical documents (unique keys, canonical
 // numbers/strings, no HTML escapes), so the library's spelling-preserving
 // AppendJSON must reproduce the input byte for byte, and the dynamic trees must
 // round-trip through the same canonical serializer.
-func TestAuditLazyNavigateFuzz(t *testing.T) {
+func TestLazyNavigateFuzz(t *testing.T) {
 	r := rand.New(rand.NewSource(0x1A2F))
 	for i := 0; i < 80000; i++ {
 		native := randNative(r, 0)
@@ -112,10 +112,10 @@ func TestAuditLazyNavigateFuzz(t *testing.T) {
 	}
 }
 
-// TestAuditLazyPointerFuzz walks random pointers into canonical documents and
+// TestLazyPointerFuzz walks random pointers into canonical documents and
 // compares the resolved value's AppendJSON against the canonical marshaling of
 // the corresponding stdlib-navigated sub-value.
-func TestAuditLazyPointerFuzz(t *testing.T) {
+func TestLazyPointerFuzz(t *testing.T) {
 	r := rand.New(rand.NewSource(0xB0B))
 	for i := 0; i < 60000; i++ {
 		native := randNative(r, 0)
