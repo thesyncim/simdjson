@@ -84,7 +84,8 @@ var (
 // A DecodeCursor is only ever obtained as the argument to UnmarshalSimdJSON
 // and must not be retained past that call.
 type DecodeCursor struct {
-	d *decoderCursor
+	d     *decoderCursor
+	state decoderCursor
 }
 
 // Appender is the public face of the encoder inside a MarshalSimdJSON body: a

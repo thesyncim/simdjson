@@ -93,9 +93,9 @@ func (r *hookAllocRecord) MarshalSimdJSON(w Appender) Appender {
 }
 
 // TestHookDecodeAllocationBound guards the always-safe hook dispatch against
-// accidental per-field boxing. The receiver and DecodeCursor each live on the
-// heap by contract, so a small fixed delta is expected; it must not scale with
-// the fields decoded by the body.
+// accidental per-field boxing. The receiver shadow and DecodeCursor each live
+// on the heap by contract, so a fixed two-allocation delta is expected; it must
+// not scale with the fields decoded by the body.
 func TestHookDecodeAllocationBound(t *testing.T) {
 	hookDec, err := CompileDecoder[hookAllocRecord](DecoderOptions{ZeroCopy: true})
 	if err != nil {
@@ -125,8 +125,8 @@ func TestHookDecodeAllocationBound(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if delta := hookAllocs - plainAllocs; delta < 0 || delta > 4 {
-		t.Fatalf("hook decode allocated %v/op vs reflection %v/op: fixed safety delta exceeds 4", hookAllocs, plainAllocs)
+	if delta := hookAllocs - plainAllocs; delta < 0 || delta > 2 {
+		t.Fatalf("hook decode allocated %v/op vs reflection %v/op: fixed safety delta exceeds 2", hookAllocs, plainAllocs)
 	}
 }
 
