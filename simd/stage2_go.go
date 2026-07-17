@@ -565,6 +565,28 @@ fusedValue:
 		prev = 96 | inObj
 		key = 0
 		goto fusedComma
+	case '{':
+		pi++
+		depth++
+		if depth > Stage2MaxDepth {
+			bad |= 1
+		}
+		*(*byte)(unsafe.Add(kindp, uintptr(uint64(depth)&(Stage2KindsLen-1)))) = 8
+		inObj = 8
+		prev = 8
+		key = 8
+		goto fusedKey
+	case '[':
+		pi++
+		depth++
+		if depth > Stage2MaxDepth {
+			bad |= 1
+		}
+		*(*byte)(unsafe.Add(kindp, uintptr(uint64(depth)&(Stage2KindsLen-1)))) = 0
+		inObj = 0
+		prev = 16
+		key = 0
+		goto fusedArrayValue
 	default:
 		cls = uint64(stage2Class[c])
 		if cls != stage2ccS {
