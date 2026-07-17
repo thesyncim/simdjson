@@ -13,8 +13,8 @@ type CodecOptions struct {
 
 // Codec bundles a compiled encoder and decoder for one type so the
 // allocation-free paths are the obvious ones: Append reuses caller buffers,
-// Marshal presizes from a per-codec running size hint instead of the global
-// per-type cache, and EncodeTo and DecodeFrom plug directly into the
+// Marshal presizes from a per-codec bounded recent-size estimate instead of
+// the global per-type cache, and EncodeTo and DecodeFrom plug directly into the
 // streaming Writer and Reader. Compile it once and use it concurrently.
 type Codec[T any] struct {
 	enc  Encoder[T]
@@ -57,22 +57,46 @@ func (c Codec[T]) AppendJSON(dst []byte, src *T) ([]byte, error) {
 	return c.enc.AppendJSON(dst, src)
 }
 
-// Marshal encodes src into a new buffer presized by the codec's running
-// size hint, so steady-state calls allocate exactly one right-sized result.
+// Marshal encodes src into a new buffer presized by the codec's bounded recent
+// output-size estimate. Stable calls allocate one right-sized result without
+// allowing one exceptional value to determine every later allocation.
 func (c Codec[T]) Marshal(src *T) ([]byte, error) {
 	if c.hint == nil {
 		return nil, fmt.Errorf("simdjson: zero Codec")
 	}
-	hint := c.hint.Load()
-	if hint < 64 {
-		hint = 64
-	}
-	out, err := c.enc.AppendJSON(make([]byte, 0, hint), src)
+	out, err := c.enc.AppendJSON(make([]byte, 0, loadMarshalSizeHint(c.hint)), src)
 	if err != nil {
 		return nil, err
 	}
-	if size := uint64(len(out)); size > c.hint.Load() {
-		c.hint.Store(size)
+	observed := uint64(len(out))
+	stored := c.hint.Load()
+	if observed == stored {
+		return out, nil
+	}
+	if observed > marshalSizeHintMax {
+		observed = marshalSizeHintMax
+	}
+	// Advance one bounded step per observation and retry failed concurrent
+	// updates. A smaller observation replaces the estimate immediately.
+	for {
+		current := stored
+		if current < marshalSizeHintMin {
+			current = marshalSizeHintMin
+		}
+		next := observed
+		if next > current {
+			growthLimit := current * marshalSizeHintGrowth
+			if growthLimit > marshalSizeHintMax {
+				growthLimit = marshalSizeHintMax
+			}
+			if next > growthLimit {
+				next = growthLimit
+			}
+		}
+		if stored == next || c.hint.CompareAndSwap(stored, next) {
+			break
+		}
+		stored = c.hint.Load()
 	}
 	return out, nil
 }

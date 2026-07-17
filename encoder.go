@@ -112,8 +112,9 @@ type cachedEncoder[T any] struct {
 
 // Marshal encodes src like encoding/json.Marshal, including HTML escaping.
 // The encoder for each source type is compiled once and cached for the
-// process lifetime, along with a running output-size hint that presizes the
-// result buffer. Hot paths that encode one type repeatedly should call
+// process lifetime, along with a bounded recent output-size estimate that
+// presizes the result buffer without retaining an adversarial maximum. Hot
+// paths that encode one type repeatedly should call
 // CompileEncoder once and reuse the returned Encoder with AppendJSON to
 // recycle output buffers.
 func Marshal[T any](src *T) ([]byte, error) {
@@ -125,16 +126,39 @@ func Marshal[T any](src *T) ([]byte, error) {
 	if cached.err != nil {
 		return nil, cached.err
 	}
-	hint := cached.sizeHint.Load()
-	if hint < 64 {
-		hint = 64
-	}
-	out, err := cached.encoder.AppendJSON(make([]byte, 0, hint), src)
+	out, err := cached.encoder.AppendJSON(make([]byte, 0, loadMarshalSizeHint(&cached.sizeHint)), src)
 	if err != nil {
 		return nil, err
 	}
-	if size := uint64(len(out)); size > cached.sizeHint.Load() {
-		cached.sizeHint.Store(size)
+	observed := uint64(len(out))
+	stored := cached.sizeHint.Load()
+	if observed == stored {
+		return out, nil
+	}
+	if observed > marshalSizeHintMax {
+		observed = marshalSizeHintMax
+	}
+	// Advance one bounded step per observation and retry failed concurrent
+	// updates. A smaller observation replaces the estimate immediately.
+	for {
+		current := stored
+		if current < marshalSizeHintMin {
+			current = marshalSizeHintMin
+		}
+		next := observed
+		if next > current {
+			growthLimit := current * marshalSizeHintGrowth
+			if growthLimit > marshalSizeHintMax {
+				growthLimit = marshalSizeHintMax
+			}
+			if next > growthLimit {
+				next = growthLimit
+			}
+		}
+		if stored == next || cached.sizeHint.CompareAndSwap(stored, next) {
+			break
+		}
+		stored = cached.sizeHint.Load()
 	}
 	return out, nil
 }
