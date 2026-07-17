@@ -97,6 +97,107 @@ func TestStage1IndexBlocksMatchesRecordPipeline(t *testing.T) {
 	}
 }
 
+func TestStage1IndexBlocksMetaMatchesGeneric(t *testing.T) {
+	rng := rand.New(rand.NewSource(0x4d455441))
+	alphabet := []byte("{}[],:\"\\ truefalsenull0123456789\n\t\rabcdefghijklmnopqrstuvwxyz")
+	for trial := 0; trial < 200; trial++ {
+		blocks := 1 + rng.Intn(67)
+		src := make([]byte, blocks*64)
+		if _, err := rng.Read(src); err != nil {
+			t.Fatal(err)
+		}
+		for i := range src {
+			if rng.Intn(4) != 0 {
+				src[i] = alphabet[rng.Intn(len(alphabet))]
+			}
+		}
+
+		var generic, specialized Stage1IndexStream
+		var records Stage1Stream
+		for block, chunk := 0, 0; block < blocks; chunk++ {
+			count := 1 + rng.Intn(Stage1ChunkBlocks)
+			if count > blocks-block {
+				count = blocks - block
+			}
+			base := uint32(block * 64)
+			genericOut := make([]uint32, count*64+64)
+			specializedOut := make([]uint32, count*64+64)
+
+			meta := Stage1IndexMeta{
+				NonASCII:   ^uint32(0),
+				Sample:     chunk&1 == 0,
+				WsCount:    ^uint32(0),
+				EmitCount:  ^uint32(0),
+				InStrCount: ^uint32(0),
+				EscCount:   ^uint32(0),
+			}
+			for i := range meta.EscInStr {
+				meta.EscInStr[i] = ^uint64(0)
+				meta.InStr[i] = ^uint64(0)
+			}
+			genericMeta := meta
+			genericN := stage1IndexBlocks(
+				&src[block*64], count, base, &generic, genericOut, stage1IndexFull, nil, &genericMeta,
+			)
+			specializedN := Stage1IndexBlocksMeta(
+				&src[block*64], count, base, &specialized, specializedOut, &meta,
+			)
+			if specializedN != genericN || !reflect.DeepEqual(specializedOut[:specializedN], genericOut[:genericN]) {
+				t.Fatalf("trial %d chunk %d index mismatch\ngot  %v\nwant %v",
+					trial, chunk, specializedOut[:specializedN], genericOut[:genericN])
+			}
+			if specialized != generic {
+				t.Fatalf("trial %d chunk %d state mismatch: specialized=%+v generic=%+v",
+					trial, chunk, specialized, generic)
+			}
+
+			var recs [Stage1ChunkBlocks]Stage1Rec
+			Stage1BlocksGP(&src[block*64], count, &records, &recs)
+			var nonASCII, wsCount, emitCount, inStrCount, escCount uint32
+			for i := 0; i < count; i++ {
+				rec := &recs[i]
+				var masks Stage1Masks
+				offset := (block + i) * 64
+				Stage1Block((*[64]byte)(src[offset:offset+64]), &masks)
+				if meta.EscInStr[i] != rec.EscInStr || meta.InStr[i] != rec.InStr {
+					t.Fatalf("trial %d chunk %d block %d metadata mismatch: got esc=%016x str=%016x want esc=%016x str=%016x",
+						trial, chunk, i, meta.EscInStr[i], meta.InStr[i], rec.EscInStr, rec.InStr)
+				}
+				if rec.NonASCII {
+					nonASCII |= 1 << i
+				}
+				wsCount += uint32(bits.OnesCount64(masks.Whitespace))
+				emitCount += uint32(bits.OnesCount64(rec.Emit))
+				inStrCount += uint32(bits.OnesCount64(rec.InStr))
+				escCount += uint32(bits.OnesCount64(rec.EscInStr))
+			}
+			if meta.NonASCII != nonASCII {
+				t.Fatalf("trial %d chunk %d non-ASCII mismatch: got %032b want %032b",
+					trial, chunk, meta.NonASCII, nonASCII)
+			}
+			if meta.NonASCII != genericMeta.NonASCII || meta.WsCount != genericMeta.WsCount ||
+				meta.EmitCount != genericMeta.EmitCount || meta.InStrCount != genericMeta.InStrCount ||
+				meta.EscCount != genericMeta.EscCount {
+				t.Fatalf("trial %d chunk %d generic metadata mismatch: specialized=%+v generic=%+v",
+					trial, chunk, meta, genericMeta)
+			}
+			if meta.Sample != (chunk&1 == 0) {
+				t.Fatalf("trial %d chunk %d sample flag changed", trial, chunk)
+			}
+			if !meta.Sample {
+				wsCount, emitCount, inStrCount, escCount = 0, 0, 0, 0
+			}
+			if meta.WsCount != wsCount || meta.EmitCount != emitCount ||
+				meta.InStrCount != inStrCount || meta.EscCount != escCount {
+				t.Fatalf("trial %d chunk %d density mismatch: got ws=%d emit=%d str=%d esc=%d want ws=%d emit=%d str=%d esc=%d",
+					trial, chunk, meta.WsCount, meta.EmitCount, meta.InStrCount, meta.EscCount,
+					wsCount, emitCount, inStrCount, escCount)
+			}
+			block += count
+		}
+	}
+}
+
 func TestStage1CursorBlocksOmitsOnlyColons(t *testing.T) {
 	rng := rand.New(rand.NewSource(0xc01051))
 	alphabet := []byte("{}[],:\"\\ truefalsenull0123456789\n\t\rabcdefghijklmnopqrstuvwxyz")
