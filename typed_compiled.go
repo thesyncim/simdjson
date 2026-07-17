@@ -1510,6 +1510,71 @@ func (cursor *decoderCursor) decodeCompiledArrayStructural(node *typedNode, dst 
 	}
 }
 
+var oneDigitFractions = [...]float64{0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9}
+
+// shortStructuralFloatAt parses the compact one-digit forms common in fixed
+// numeric tuples. The structural caller has already proved the delimiter
+// positions, so limit replaces the generic document-bound and delimiter
+// checks. Stage 1 rejects illegal control bytes and emits any hidden scalar
+// start, which makes an accepted whitespace tail exact for this tape shape.
+func shortStructuralFloatAt(base unsafe.Pointer, start, limit int) (float64, bool) {
+	if start >= limit {
+		return 0, false
+	}
+	word := loadUint64LE(unsafe.Add(base, start))
+	negative := byte(word) == '-'
+	if negative {
+		word >>= 8
+		start++
+	}
+	digit := byte(word) - '0'
+	if digit > 9 {
+		return 0, false
+	}
+	value := float64(digit)
+	word >>= 8
+	start++
+	if start != limit {
+		switch byte(word) {
+		case '.':
+			fraction := byte(word>>8) - '0'
+			if fraction > 9 {
+				return 0, false
+			}
+			value += oneDigitFractions[fraction]
+			word >>= 16
+			start += 2
+		case 'e', 'E':
+			word >>= 8
+			start++
+			exponentNegative := false
+			if sign := byte(word); sign == '+' || sign == '-' {
+				exponentNegative = sign == '-'
+				word >>= 8
+				start++
+			}
+			exponent := byte(word) - '0'
+			if exponent > 9 {
+				return 0, false
+			}
+			if exponentNegative {
+				value /= anyPow10[exponent]
+			} else {
+				value *= anyPow10[exponent]
+			}
+			word >>= 8
+			start++
+		}
+	}
+	if start != limit && byte(word) > ' ' {
+		return 0, false
+	}
+	if negative {
+		value = -value
+	}
+	return value, true
+}
+
 func decodeCompiledFloat64Array3Structural(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
 	tape := &cursor.state.structural
 	positions := tape.positions
@@ -1527,25 +1592,26 @@ func decodeCompiledFloat64Array3Structural(cursor *decoderCursor, node *typedNod
 	third := int(positions[token+5])
 	closePosition := int(positions[token+6])
 	if fastByteAt(base, comma1) != ',' || fastByteAt(base, comma2) != ',' ||
-		fastByteAt(base, closePosition) != ']' {
+		fastByteAt(base, closePosition) != ']' || first+8 > len(src) ||
+		second+8 > len(src) || third+8 > len(src) {
 		return decodeCompiledFloat64ArrayStructural(cursor, node, dst)
 	}
 	values := (*[3]float64)(dst)
-	value, _, ok := shortTypedFloatAt(base, len(src), first)
+	value, ok := shortStructuralFloatAt(base, first, comma1)
 	if !ok {
 		tape.index = token
 		cursor.i = start
 		return decodeCompiledFloat64ArrayStructural(cursor, node, dst)
 	}
 	values[0] = value
-	value, _, ok = shortTypedFloatAt(base, len(src), second)
+	value, ok = shortStructuralFloatAt(base, second, comma2)
 	if !ok {
 		tape.index = token
 		cursor.i = start
 		return decodeCompiledFloat64ArrayStructural(cursor, node, dst)
 	}
 	values[1] = value
-	value, _, ok = shortTypedFloatAt(base, len(src), third)
+	value, ok = shortStructuralFloatAt(base, third, closePosition)
 	if !ok {
 		tape.index = token
 		cursor.i = start
@@ -1649,7 +1715,7 @@ func decodeCompiledFloat64ArrayStructural(cursor *decoderCursor, node *typedNode
 						}
 					}
 				}
-				if short {
+				if short && typedNumberEnd(base, len(src), i) {
 					if negative {
 						value = -value
 					}
@@ -1659,13 +1725,16 @@ func decodeCompiledFloat64ArrayStructural(cursor *decoderCursor, node *typedNode
 				}
 			}
 			end, value, exact, ok := scanTypedFloat64(base, len(src), position)
-			if ok && exact {
+			if ok && exact && typedNumberEnd(base, len(src), end) {
 				*element = value
 				cursor.i = end
 				continue
 			}
 			if err := cursor.Float(element); err != nil {
 				return prependDecodePathIndex(err, index)
+			}
+			if !typedNumberEnd(base, len(src), cursor.i) {
+				return cursor.err(cursor.i, "invalid character after number")
 			}
 		} else if err := cursor.Skip(); err != nil {
 			return err

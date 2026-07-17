@@ -41,6 +41,7 @@ func TestStructuralFloatArray3MatchesStrconv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pad := strings.Repeat("x", 5000)
 	for offset := 0; offset < len(texts); offset += 3 {
 		parts := [3]string{"0", "0", "0"}
 		var want [3]float64
@@ -53,7 +54,10 @@ func TestStructuralFloatArray3MatchesStrconv(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		src := []byte("{\n\"values\":[" + parts[0] + "," + parts[1] + "," + parts[2] + "],\"pad\":\"x\"\n}")
+		src := []byte("{\n\"values\":[" + parts[0] + "," + parts[1] + "," + parts[2] + "],\"pad\":\"" + pad + "\"\n}")
+		if len(src) < 4096 || !decoderStructuralWorthwhile(src) {
+			t.Fatal("float tuple did not select structural decoding")
+		}
 		var got document
 		if err := decoder.Decode(src, &got); err != nil {
 			t.Fatalf("Decode(%q): %v", src, err)
@@ -64,6 +68,27 @@ func TestStructuralFloatArray3MatchesStrconv(t *testing.T) {
 					src, index, got.Values[index], math.Float64bits(got.Values[index]),
 					want[index], math.Float64bits(want[index]))
 			}
+		}
+	}
+}
+
+func TestStructuralFloatArray3RejectsMalformed(t *testing.T) {
+	type document struct {
+		Values [3]float64 `json:"values"`
+		Pad    string     `json:"pad"`
+	}
+	decoder, err := CompileDecoder[document](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pad := strings.Repeat("x", 5000)
+	for _, token := range []string{
+		"1x", "1 x", "2.5x", "-3e4x", "01", "1.", "1e", "1e+", "1\v", "1\x00",
+	} {
+		src := []byte("{\n\"values\":[" + token + ",2.5,-3e4],\"pad\":\"" + pad + "\"\n}")
+		var got document
+		if err := decoder.Decode(src, &got); err == nil {
+			t.Fatalf("Decode accepted malformed tuple number %q", token)
 		}
 	}
 }
