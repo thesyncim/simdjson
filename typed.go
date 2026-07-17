@@ -486,11 +486,12 @@ type typedNode struct {
 	// decode into it and its entries re-emit at the struct's own level. It
 	// is nil for every struct without one, so structs pay nothing for the
 	// feature they do not use.
-	inlineMap  *typedInlineMap
-	allSet     uint64
-	encScratch int32
-	encMapKey  int32
-	encBacking encoderBackingSlot
+	inlineMap       *typedInlineMap
+	allSet          uint64
+	encScratch      int32
+	encMapKey       int32
+	encBacking      encoderBackingSlot
+	encScratchLimit int
 }
 
 // typedInlineMap describes a struct's ",inline" map[string]T catch-all: where
@@ -505,8 +506,9 @@ type typedInlineMap struct {
 	// allocation per member; values collect into a pooled backing slice so each
 	// gets independent storage. It is -1 when no scratch is reserved (dynamic
 	// interface plans).
-	encKey     int32
-	encBacking encoderBackingSlot
+	encKey          int32
+	encBacking      encoderBackingSlot
+	encScratchLimit int
 }
 
 // typedField is one struct member of a compiled decode plan. The key fields
@@ -576,6 +578,7 @@ func (c *typedCompiler) compileInlineMap(node *typedNode, structType reflect.Typ
 	inline := &typedInlineMap{
 		offset: offset, mapType: mapType, elem: elem, sorted: !c.inlineUnsorted,
 		encKey: -1, encBacking: noEncoderBackingSlot,
+		encScratchLimit: encoderMapScratchLimit(mapType.Elem()),
 	}
 	// Reuse the same pooled scratch as encodeMap: one map iterator and entry
 	// slice per encode, plus a reserved key box and a pooled value backing, so
@@ -758,6 +761,7 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 			return err
 		}
 		node.elem = elem
+		node.encScratchLimit = encoderMapScratchLimit(typ.Elem())
 	case reflect.Struct:
 		node.kind = typedStruct
 		node.op = typedOpStruct

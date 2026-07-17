@@ -3,7 +3,55 @@ package simdjson
 import (
 	"reflect"
 	"sync"
+	"unsafe"
 )
+
+const (
+	// Pooled encoder resources have independent byte budgets. Compiled map
+	// plans use the lowest applicable element-count limit, so an exceptional
+	// map borrows none of the pooled resources and cannot replace warm scratch.
+	encoderMapEntriesRetentionBytes   = 512 << 10
+	encoderMapKeyArenaRetentionBytes  = 512 << 10
+	encoderValueBackingRetentionBytes = 512 << 10
+)
+
+func clearEncoderValueBacking(backing reflect.Value, used int) {
+	if !backing.IsValid() || used <= 0 {
+		return
+	}
+	if used > backing.Len() {
+		used = backing.Len()
+	}
+	if used == backing.Len() {
+		backing.Clear()
+	} else {
+		// Slicing a reflect.Value allocates a header on the pinned toolchain.
+		// Small-after-large cleanup must scale with current use, so clear the
+		// populated typed elements directly when only a prefix is dirty.
+		for i := 0; i < used; i++ {
+			backing.Index(i).SetZero()
+		}
+	}
+}
+
+func encoderValueBackingLimit(elemType reflect.Type) int {
+	elemSize := elemType.Size()
+	if elemSize == 0 {
+		return int(^uint(0) >> 1)
+	}
+	return int(uintptr(encoderValueBackingRetentionBytes) / elemSize)
+}
+
+func encoderMapScratchLimit(elemType reflect.Type) int {
+	entryLimit := int(uintptr(encoderMapEntriesRetentionBytes) / unsafe.Sizeof(mapEncodeEntry{}))
+	valueLimit := encoderValueBackingLimit(elemType)
+	// Numeric keys use at most 20 bytes each. The entry limit is lower than
+	// the key-arena limit at that width, so it also bounds the arena.
+	if valueLimit < entryLimit {
+		return valueLimit
+	}
+	return entryLimit
+}
 
 type encoderMarshalerScratch struct {
 	value reflect.Value
@@ -16,9 +64,10 @@ type encoderScratch struct {
 	// sorted map encoding does not allocate per map. Ownership transfers
 	// to one encodeMap call at a time; nested maps fall back to fresh
 	// allocations.
-	mapEntries  []mapEncodeEntry
-	mapKeyArena []byte
-	mapIter     *reflect.MapIter
+	mapEntries     []mapEncodeEntry
+	mapEntriesUsed int
+	mapKeyArena    []byte
+	mapIter        *reflect.MapIter
 	// valueBacking is the direct fast-path slot for plans with exactly one map
 	// element type. Plans with multiple types use valueBackings instead. Every
 	// slot is compile-time-assigned and fixed-type. A taken slot is invalid
@@ -39,9 +88,12 @@ func (s *encoderScratch) reset() {
 	for i := range s.marshalers {
 		s.marshalers[i].value.SetZero()
 	}
-	// Entries hold key strings and reflect values from the encoded maps;
-	// drop those references before the scratch returns to the pool.
-	clear(s.mapEntries[:cap(s.mapEntries)])
+	// Clear only the largest prefix populated during this operation. Sequential
+	// maps may overwrite it repeatedly, but cleanup happens once before pooling.
+	clear(s.mapEntries[:s.mapEntriesUsed])
+	s.mapEntriesUsed = 0
+	s.mapEntries = s.mapEntries[:0]
+	s.mapKeyArena = s.mapKeyArena[:0]
 }
 
 func newEncoderScratchPool(types []reflect.Type, backingSlots int, hasMap bool) *sync.Pool {

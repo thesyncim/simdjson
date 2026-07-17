@@ -64,15 +64,19 @@ func TestEncoderScratchPoolPoisoning(t *testing.T) {
 	cases := []scratchPoisonDoc{
 		v,
 		{
-			Ints:    map[string]int{},
-			Strings: map[string]string{},
-			Ptrs:    map[string]*uint64{},
-			Dynamic: map[string]any{},
+			Ints:    map[string]int{"one": 1},
+			Strings: map[string]string{"one": "one"},
+			Ptrs:    map[string]*uint64{"one": &a},
+			Dynamic: map[string]any{"one": map[string]*uint64{"one": &a}},
 			Custom:  scratchPoisonMarshaler{Text: "empty"},
 		},
 	}
 	for round := range cases {
-		poisonEncoderScratch(t, scratch)
+		dirty := 3
+		if round == 1 {
+			dirty = 1
+		}
+		poisonEncoderScratch(t, scratch, dirty)
 		pool.Put(scratch)
 		stackSink := forceStackMovement(48+round, 17+round)
 		runtime.GC()
@@ -98,7 +102,7 @@ func TestEncoderScratchPoolPoisoning(t *testing.T) {
 	}
 }
 
-func poisonEncoderScratch(t *testing.T, scratch *encoderScratch) {
+func poisonEncoderScratch(t *testing.T, scratch *encoderScratch, dirty int) {
 	t.Helper()
 	for i := range scratch.marshalers {
 		poisonSettableValue(scratch.marshalers[i].value, i+1)
@@ -111,14 +115,16 @@ func poisonEncoderScratch(t *testing.T, scratch *encoderScratch) {
 				value: reflect.ValueOf(fmt.Sprintf("stale-%d", i)),
 			}
 		}
+		// The used count records the dirty prefix independently of capacity.
 		scratch.mapEntries = entries[:0]
+		scratch.mapEntriesUsed = len(entries)
 	}
 	scratch.mapKeyArena = append(scratch.mapKeyArena[:0], "poison-key-arena"...)
 	for i := range scratch.valueBackings {
-		poisonBacking(scratch.valueBackings[i], i+17)
+		poisonBacking(scratch.valueBackings[i], dirty, i+17)
 	}
-	poisonBacking(scratch.valueBacking, 41)
-	poisonBacking(scratch.dynamicValueBacking, 59)
+	poisonBacking(scratch.valueBacking, dirty, 41)
+	poisonBacking(scratch.dynamicValueBacking, dirty, 59)
 
 	staleMap := map[string]int{"poison": 99}
 	staleValue := reflect.ValueOf(staleMap)
@@ -130,11 +136,14 @@ func poisonEncoderScratch(t *testing.T, scratch *encoderScratch) {
 	runtime.KeepAlive(staleMap)
 }
 
-func poisonBacking(backing reflect.Value, seed int) {
+func poisonBacking(backing reflect.Value, dirty, seed int) {
 	if !backing.IsValid() {
 		return
 	}
-	for i := 0; i < backing.Len(); i++ {
+	if dirty > backing.Len() {
+		dirty = backing.Len()
+	}
+	for i := 0; i < dirty; i++ {
 		poisonSettableValue(backing.Index(i), seed+i)
 	}
 }
@@ -183,6 +192,9 @@ func assertEncoderScratchCleared(t *testing.T, scratch *encoderScratch) {
 		if entry.name != "" || entry.value.IsValid() {
 			t.Fatalf("map entry slot %d retained a name or reflect value", i)
 		}
+	}
+	if scratch.mapEntriesUsed != 0 {
+		t.Fatalf("map entry scratch retained dirty count %d", scratch.mapEntriesUsed)
 	}
 	for i := range scratch.valueBackings {
 		assertBackingCleared(t, scratch.valueBackings[i], i)

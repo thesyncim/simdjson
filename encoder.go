@@ -442,6 +442,9 @@ func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsa
 	}
 	elem := inline.elem
 	mapLen := mapValue.Len()
+	if mapLen > inline.encScratchLimit && e.scratch != nil {
+		return e.encodeInlineMembersOneShot(inline, structPtr, first)
+	}
 
 	var entries []mapEncodeEntry
 	var keyArena []byte
@@ -513,6 +516,17 @@ func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsa
 	return retErr
 }
 
+// encodeInlineMembersOneShot keeps an exceptional map from borrowing or
+// replacing the bounded scratch. The recursive call sees nil scratch and runs
+// the ordinary implementation with operation-local storage.
+func (e *encodeState) encodeInlineMembersOneShot(inline *typedInlineMap, structPtr unsafe.Pointer, first *bool) error {
+	scratch := e.scratch
+	e.scratch = nil
+	err := e.encodeInlineMembers(inline, structPtr, first)
+	e.scratch = scratch
+	return err
+}
+
 // takeValueBacking borrows one compile-time-assigned, fixed-element-type slot
 // with room for at least n values. Different map types use different slots, so
 // a heterogeneous struct does not discard and reallocate one polymorphic
@@ -551,24 +565,15 @@ func (e *encodeState) takeValueBacking(slot encoderBackingSlot, elemType reflect
 	return reflect.MakeSlice(reflect.SliceOf(elemType), n, n)
 }
 
-// releaseValueBacking clears every slot, so the pool never pins a map value,
-// then returns the backing for reuse with its grown length. Clearing the full
-// value also makes cleanup independent of how far map collection progressed:
-// success, early key errors, and deliberately poisoned empty-map scratch all
-// establish the same invariant.
+// releaseValueBacking clears a fully populated backing and returns it to its
+// fixed-type slot. Oversized maps never reach this path.
 func (e *encodeState) releaseValueBacking(slot encoderBackingSlot, backing reflect.Value, elemType reflect.Type) {
-	if backing.Len() > 0 {
-		// Clear through reflect so pointer-bearing element types use the GC's
-		// typed write barriers. Treating this storage as []byte and clearing it
-		// would incorrectly select the pointer-free memclr path.
-		// Clear the full stored length: reflect.Value.Slice creates an escaping
-		// slice header on current toolchains, while Clear on the original value
-		// remains allocation-free.
-		backing.Clear()
-	}
 	scratch := e.scratch
 	if scratch == nil {
 		return
+	}
+	if backing.Len() > 0 {
+		backing.Clear()
 	}
 	if slot < 0 {
 		if scratch.dynamicValueBackingElem != nil {
@@ -587,6 +592,35 @@ func (e *encodeState) releaseValueBacking(slot encoderBackingSlot, backing refle
 	}
 	if scratch.valueBackings[slot].IsValid() {
 		return // a nested map already restored a backing; drop this one
+	}
+	scratch.valueBackings[slot] = backing
+}
+
+// releaseValueBackingPrefix is the malformed-key path: only values collected
+// before the error are dirty, so cleanup must not scale with retained length.
+func (e *encodeState) releaseValueBackingPrefix(slot encoderBackingSlot, backing reflect.Value, elemType reflect.Type, used int) {
+	scratch := e.scratch
+	if scratch == nil {
+		return
+	}
+	clearEncoderValueBacking(backing, used)
+	if slot < 0 {
+		if scratch.dynamicValueBackingElem != nil {
+			return
+		}
+		scratch.dynamicValueBacking = backing
+		scratch.dynamicValueBackingElem = elemType
+		return
+	}
+	if scratch.valueBackings == nil {
+		if scratch.valueBacking.IsValid() {
+			return
+		}
+		scratch.valueBacking = backing
+		return
+	}
+	if scratch.valueBackings[slot].IsValid() {
+		return
 	}
 	scratch.valueBackings[slot] = backing
 }
@@ -1161,8 +1195,13 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	if e.depth >= defaultMaxDepth {
 		return &EncodeError{Reason: "maximum nesting depth exceeded"}
 	}
-	e.depth++
 	mapLen := mapValue.Len()
+	if mapLen > node.encScratchLimit && e.scratch != nil {
+		return e.encodeMapOneShot(node, src)
+	}
+	e.depth++
+	numericKeys := !node.mapKeyTextEncode && (node.mapKeyKind == mapKeyInt || node.mapKeyKind == mapKeyUint)
+	stringKeys := !node.mapKeyTextEncode && node.mapKeyKind == mapKeyString
 	// The entry list, numeric-key arena, and iterator come from the per-call
 	// scratch so sorted map encoding does not allocate per map. Ownership moves
 	// to this call while it runs; a nested map sees them taken and allocates its
@@ -1184,9 +1223,11 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	if cap(entries) < mapLen {
 		entries = make([]mapEncodeEntry, 0, mapLen)
 	}
-	numericKeys := !node.mapKeyTextEncode && (node.mapKeyKind == mapKeyInt || node.mapKeyKind == mapKeyUint)
-	if numericKeys && cap(keyArena) < mapLen*20 && mapLen <= int(^uint(0)>>1)/20 {
-		keyArena = make([]byte, 0, mapLen*20)
+	if numericKeys && mapLen <= int(^uint(0)>>1)/20 {
+		required := mapLen * 20
+		if cap(keyArena) < required {
+			keyArena = make([]byte, 0, required)
+		}
 	}
 
 	// Copy each key into a reserved box with SetIterKey and each value into its
@@ -1209,10 +1250,10 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		iterator.Reset(mapValue)
 	}
 
-	for slot := 0; iterator.Next(); slot++ {
-		keyBox.SetIterKey(iterator)
-		var name string
-		if numericKeys {
+	switch {
+	case numericKeys:
+		for slot := 0; iterator.Next(); slot++ {
+			keyBox.SetIterKey(iterator)
 			start := len(keyArena)
 			if node.mapKeyKind == mapKeyInt {
 				value := keyBox.Int()
@@ -1224,20 +1265,32 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 			} else {
 				keyArena = appendCompactUint(keyArena, keyBox.Uint())
 			}
-			name = unsafe.String(unsafe.SliceData(keyArena[start:]), len(keyArena)-start)
-		} else {
-			var err error
-			name, err = mapKeyName(node, keyBox)
+			name := unsafe.String(unsafe.SliceData(keyArena[start:]), len(keyArena)-start)
+			valueSlot := backing.Index(slot)
+			valueSlot.SetIterValue(iterator)
+			entries = append(entries, mapEncodeEntry{name: name, value: valueSlot})
+		}
+	case stringKeys:
+		for slot := 0; iterator.Next(); slot++ {
+			keyBox.SetIterKey(iterator)
+			valueSlot := backing.Index(slot)
+			valueSlot.SetIterValue(iterator)
+			entries = append(entries, mapEncodeEntry{name: keyBox.String(), value: valueSlot})
+		}
+	default:
+		for slot := 0; iterator.Next(); slot++ {
+			keyBox.SetIterKey(iterator)
+			name, err := mapKeyName(node, keyBox)
 			if err != nil {
-				e.releaseValueBacking(node.encBacking, backing, node.elem.typ)
+				e.releaseValueBackingPrefix(node.encBacking, backing, node.elem.typ, len(entries))
 				e.releaseMapScratch(entries, keyArena, iterator)
 				e.depth--
 				return &EncodeError{Reason: err.Error()}
 			}
+			valueSlot := backing.Index(slot)
+			valueSlot.SetIterValue(iterator)
+			entries = append(entries, mapEncodeEntry{name: name, value: valueSlot})
 		}
-		valueSlot := backing.Index(slot)
-		valueSlot.SetIterValue(iterator)
-		entries = append(entries, mapEncodeEntry{name: name, value: valueSlot})
 	}
 	slices.SortFunc(entries, func(a, b mapEncodeEntry) int { return strings.Compare(a.name, b.name) })
 
@@ -1276,14 +1329,32 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	return nil
 }
 
-// releaseMapScratch returns encodeMap's working state to the scratch,
-// keeping grown capacity for the next map. The iterator is unbound first
-// so the pool never keeps the encoded map alive.
+// encodeMapOneShot isolates an exceptional map from the bounded pooled state.
+func (e *encodeState) encodeMapOneShot(node *typedNode, src unsafe.Pointer) error {
+	scratch := e.scratch
+	e.scratch = nil
+	err := e.encodeMap(node, src)
+	e.scratch = scratch
+	return err
+}
+
+// releaseMapScratch returns bounded working state to the scratch and records the
+// largest dirty prefix for one typed clear at operation reset.
 func (e *encodeState) releaseMapScratch(entries []mapEncodeEntry, keyArena []byte, iterator *reflect.MapIter) {
 	scratch := e.scratch
 	if scratch == nil || scratch.mapEntries != nil {
 		return
 	}
+	used := len(entries)
+	if scratch.mapEntriesUsed > used {
+		used = scratch.mapEntriesUsed
+		if used > cap(entries) {
+			// A smaller nested backing must not inherit the outer backing's dirty
+			// prefix. Leave this slot open so the outer release restores it.
+			return
+		}
+	}
+	scratch.mapEntriesUsed = used
 	scratch.mapEntries = entries[:0]
 	scratch.mapKeyArena = keyArena[:0]
 	if scratch.mapIter == nil {
