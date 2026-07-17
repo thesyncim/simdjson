@@ -50,7 +50,7 @@ jobs:
         run: $RUNNER_TEMP/gotip/bin/go vet -unsafeptr=false ./...
 
       - name: Race
-        run: $RUNNER_TEMP/gotip/bin/go test -race -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
+        run: $RUNNER_TEMP/gotip/bin/go test -race -skip 'Alloc|ZeroCost|StaysOnStack|TestParseFloat64' ./...
         env:
           GOEXPERIMENT: simd
 
@@ -58,7 +58,7 @@ jobs:
         run: >-
           "$RUNNER_TEMP/gotip/bin/go" test
           -gcflags=all=-d=checkptr=2
-          -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
+          -skip 'Alloc|ZeroCost|StaysOnStack|TestParseFloat64' ./...
         env:
           GOEXPERIMENT: simd
 

@@ -1,69 +1,68 @@
 # Cross-language corpus benchmarks
 
-`run.sh` measures C++ simdjson and Rust serde_json/simd-json over the exact
-seven-payload corpus used by the Go benchmarks: same files, same machine,
-single thread, six ~300 ms samples per operation, medians reported. It needs
-`clang++`, `cargo`, `zstd`, and a Go tip checkout for the corpus files, and
-builds with full optimization (`-O3 -DNDEBUG -march=native`;
-`RUSTFLAGS="-C target-cpu=native"`, LTO, one codegen unit).
+This harness runs native JSON front ends over the exact seven payloads used by
+the Go benchmark module. It is same-machine context, not a single-contract
+leaderboard: each output representation is different.
 
-Cross-language rows are context, not a scoreboard: each library exposes a
-different memory model, so no two rows do identical work. The notes below
-name the closest Go contract for each.
+## Snapshot
 
-## Snapshot (Apple M4 Max, 2026-07-14)
+Apple M4 Max, one thread, regenerated 2026-07-16.
 
-C++ simdjson 4.6.4 (arm64 kernels), Rust serde_json 1 / simd-json 0.15.1
-(NEON), Go rows from the published corpus snapshot on the same machine.
+- Go: `go1.27-devel_03845e30`, `GOEXPERIMENT=simd`
+- C++ simdjson 4.6.4, commit
+  `1bcf71bd85059ab6574ea1159de9298dcc1212c5`, arm64 backend
+- Rust serde_json 1.0.228 and simd-json 0.15.1 from the committed lockfile
+- C++: `-O3 -DNDEBUG -march=native`
+- Rust: `target-cpu=native`, LTO, one codegen unit
 
-### Document parse, GB/s of input
+Throughput is decimal GB/s of input; higher is better.
 
-"DOM parse" builds simdjson's tape plus unescaped string arena with a reused
-parser — more than validation, less than materializing per-node values.
-simd-json borrowed aliases strings into a scratch copy of the input, closest
-to our source-backed contract; serde_json `Value` and our dynamic `any` tree
-both build fully owned trees, but Rust stores scalars inline in an enum while
-Go boxes each number in an interface.
-
-The bolded value wins the row; the winner among the three tree-building
-contenders (simd-json borrowed, serde_json, Go dynamic) is marked with a
-dagger since the parse-only and validate-only columns do less work per byte.
-
-| Corpus | C++ DOM parse | simd-json borrowed | serde_json `Value` | Go dynamic `any` | Go typed owned | Go strict validate |
+| Corpus | Go strict validate | Go reused `Index` | C++ stage 1 | C++ DOM parse | simd-json borrowed | serde_json `Value` |
 |---|---:|---:|---:|---:|---:|---:|
-| Canada geometry | 1.60 | 0.56 | 0.56† | 0.39 | 1.57 | **2.14** |
-| CITM catalog | **4.94** | 1.41† | 0.86 | 1.02 | 2.77 | 2.83 |
-| Go source | 1.96 | 0.75† | 0.39 | 0.59 | 1.80 | **2.07** |
-| Escaped strings | 0.88 | 0.60 | 0.93 | 1.61† | 1.49 | **9.74** |
-| Unicode strings | 4.84 | 2.93† | 1.33 | 2.08 | 3.22 | **5.63** |
-| Synthea FHIR | **5.00** | 1.28† | 0.58 | 0.80 | 1.54 | 3.14 |
-| Twitter status | **4.37** | 1.42† | 0.57 | 0.72 | 1.80 | 2.78 |
+| Canada geometry | 2.06 | 2.07 | 6.47 | 1.59 | 0.51 | 0.54 |
+| CITM catalog | 4.42 | 3.83 | 9.63 | 4.97 | 1.30 | 0.81 |
+| Go source | 2.14 | 2.10 | 5.71 | 1.97 | 0.74 | 0.36 |
+| Escaped strings | 9.75 | 9.14 | 10.27 | 0.86 | 0.60 | 0.93 |
+| Unicode strings | 5.74 | 5.35 | 6.25 | 4.84 | 2.92 | 1.26 |
+| Synthea FHIR | 4.54 | 4.13 | 9.67 | 4.97 | 1.19 | 0.52 |
+| Twitter status | 3.70 | 3.55 | 8.60 | 4.40 | 1.39 | 0.54 |
 
-- C++ simdjson's two-stage tape parse is the fastest JSON front-end measured
-  here: 4.4–5.0 GB/s on object-dense payloads, ahead of even our
-  validation-only scan. Its lead inverts on number-dense and escape-dense
-  input, where our validate runs 1.3–11x ahead of its parse.
-- Our typed decode — which fills real Go structs, a step no other row
-  performs — beats serde_json's dynamic `Value` and simd-json borrowed on
-  every payload, and outruns even the C++ tape parse on number-dense
-  geometry.
-- The Go dynamic rows trail the Rust dynamic rows mostly because Go boxes
-  every scalar in an `any`; the typed and source-backed APIs are the fast
-  paths in this library.
+## Contracts
 
-### Serialization, GB/s of output
+- **Go strict validate** checks grammar and UTF-8 and produces no
+  representation.
+- **Go reused Index** checks grammar and UTF-8 and writes exact source ranges,
+  kinds, counts, and subtree links into caller-owned 16-byte entries. It leaves
+  number conversion and string unescaping on demand.
+- **C++ stage 1** emits structural indexes only. It does not run the grammar or
+  build a tape, so it is intentionally not compared as a complete parser.
+- **C++ DOM parse** builds simdjson's native tape, parses numbers, and maintains
+  its string arena with a reused parser.
+- **simd-json borrowed** mutates a scratch copy and may borrow strings from it.
+- **serde_json Value** materializes Rust's dynamic value tree.
 
-C++ serializes its parsed tape (strings copy straight from the arena); serde
-serializes a `Value` tree; the Go row marshals native structs, formatting
-times and floats from their binary form.
+The closest native front-end comparison is Go `Index` versus C++ DOM parse,
+but it is still not identical work. Across all seven files, Go records a
+95.7 us timing geomean and C++ 129.6 us, or 3.82 versus 2.82 GB/s. That
+geomean is driven by Go's large lead on escaped strings. C++ is still faster on
+the object-dense rows: 1.30x on CITM, 1.20x on FHIR, and 1.24x on Twitter.
+Those three rows are the remaining structural performance target.
 
-| Corpus | C++ `to_string` | serde_json `to_writer` | Go compiled reuse |
-|---|---:|---:|---:|
-| CITM catalog | 1.31 | 1.52 | **2.53** |
-| Twitter status | 1.58 | 1.77 | **2.84** |
-| Synthea FHIR | **1.65** | 1.42 | 1.11 |
-| Go source | 0.98 | 1.23 | **2.96** |
+## Reproduce
 
-Go leads except Synthea, where the C++ row replays pre-parsed date strings
-from its tape while the Go row formats 2,191 `time.Time` values from native
-form — different work with the same output.
+The script downloads C++ simdjson only when the pinned checkout is absent,
+verifies its commit, compiles the C++ harness, and runs Rust with
+`cargo --locked`.
+
+```sh
+./benchmarks/crosslang/run.sh
+```
+
+Requirements: `clang++`, `cargo`, `zstd`, and the pinned Go corpus already
+materialized by the repository scripts. Each harness performs warmup and six
+roughly 300 ms samples per operation, reporting medians.
+
+Raw C++ output includes both stage-1-only and DOM parse timing. Raw Rust output
+includes serde parse/encode and simd-json owned/borrowed parse timing. Keeping
+the raw modes visible makes it possible to compare a specific contract without
+turning unlike representations into a winner claim.

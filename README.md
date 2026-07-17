@@ -479,50 +479,56 @@ and runtime dispatch.
 
 ## Performance
 
-Apple M4 Max, one CPU, six 300 ms samples, exact 6.33 MiB Go
-`encoding/json` corpus. Lower time is better; the table reports geometric-mean
-speedup across all seven payloads.
+Apple M4 Max, one CPU, six 300 ms samples, exact 6.33 MiB Go standard-library
+corpus. Times are geometric means across all seven payloads; lower is better.
+A ratio in parentheses is the competitor time divided by simdjson time.
 
-| Operation | Contract | vs stdlib | vs fastest rival | vs native Sonic | SIMD vs pure Go |
-|---|---|---:|---:|---:|---:|
-| Validate | Strict JSON + UTF-8 | **2.51x** | **2.28x** | **1.06x** | **1.497x** |
-| Typed decode | Owned strings | **5.10x** | **2.06x** | **2.08x** | **1.159x** |
-| Dynamic decode | Owned `any` tree | **4.48x** | **2.01x** | **1.40x** | **1.121x** |
-| Encode | Owned output | **3.39x** | **2.06x** | **3.91x** | **1.720x** |
-| Encode | Reused output buffer | **3.76x** | **2.29x** | — | **1.791x** |
+| Owned operation | simdjson SIMD | `encoding/json` | Fastest third-party Go | simdjson pure Go | Native Sonic 1.15.2 |
+|---|---:|---:|---:|---:|---:|
+| Strict validate | **90.0 us** | 252.6 us (2.81x) | fastjson 260.4 us (2.89x) | 151.1 us (1.68x) | 111.9 us (1.24x)* |
+| Typed decode, reused destination | **240.1 us** | 953.7 us (3.97x) | go-json 438.2 us (1.82x) | 276.1 us (1.15x) | 405.4 us (1.69x) |
+| Dynamic `any` decode | **565.3 us** | 2.030 ms (3.59x) | go-json 1.085 ms (1.92x) | 618.5 us (1.09x) | 619.9 us (1.10x) |
+| Marshal | **171.6 us** | 445.8 us (2.60x) | Segment 260.9 us (1.52x) | 231.7 us (1.35x) | 480.0 us (2.80x) |
 
-Every stdlib row and every rival row wins all seven payloads, owned encode
-included. Comparisons use the same Go tip compiler and do
-not mix owned and source-backed results. The Sonic column compares against
-native Sonic v1.15.2 compiled with the previous stable Go (1.26.4) in an
-isolated module, because Sonic falls back to `encoding/json` on Go tip; it is
-excluded from the fastest-rival column, its `Valid` is syntax-only where ours
-also enforces UTF-8, and it has no reused-buffer `Marshal` counterpart. The
-SIMD column compares the same code, compiler, and corpus with and without
-`GOEXPERIMENT=simd`.
+All same-process columns use the pinned Go tip compiler. Sonic is compiled in
+the isolated benchmark module with Go 1.26.4 because it falls back to
+`encoding/json` on Go tip. Its `Valid` result is marked with an asterisk
+because Sonic documents that it does not reject invalid UTF-8; simdjson's
+90.0 us row checks both strict JSON syntax and UTF-8.
 
-The upcoming `encoding/json/v2` (`GOEXPERIMENT=jsonv2`) trails on the same
-corpus by 3.9x on typed decode, 2.5x on dynamic decode, and 3.3x on owned
-`Marshal` — see [the v2 table](benchmarks/README.md#encodingjsonv2).
+The ownership contract is held constant in the headline table: decoded strings
+and encoded output are independent of the input. Faster contracts are reported
+separately instead of being mixed into the leaderboard:
 
-The Validate row was refreshed on 2026-07-15 on the current build; the decode
-and encode rows, the native-Sonic column, and the SIMD-versus-pure column for
-those rows are the pinned 2026-07-14 snapshot. The 2026-07-15 regeneration ran
-under heavy background machine load: the zero-allocation paths (validation and
-the reused-buffer encoder) reproduced or beat their published times, but every
-path that allocates a fresh owned tree or output buffer inflated in lockstep
-for simdjson and the competitors alike — allocator and memory-bandwidth
-contention rather than a code change, since same-process leads held steady
-through it. The published owned-allocation absolutes are therefore kept as the
-honest idle-machine figures for this same build, and will be re-pinned from an
-idle window. See the
-[per-corpus tables](benchmarks/README.md#published-corpus-snapshot) for the
-refreshed validation and new Parse/DOM rows.
+| Additional path | SIMD | Pure Go | Comparison |
+|---|---:|---:|---:|
+| Typed source-backed decode | **180.2 us** | 214.1 us | Sonic source-backed 270.7 us |
+| Compiled append into reused buffer | **98.1 us** | 147.1 us | fresh Segment Marshal 260.9 us |
+| Parse plus complete DOM walk | **546.5 us** | 642.4 us | stdlib owned `any` tree plus walk 2.118 ms |
+| Reused structural `BuildIndex` | **95.7 us** | - | C++ DOM parse 129.6 us |
 
-[Full per-corpus results, allocations, SIMD uplift, versions, and exact commands](benchmarks/README.md#published-corpus-snapshot).
-For context beyond Go — C++ simdjson and Rust serde_json/simd-json on the
-same corpus and machine — see the
-[cross-language benchmarks](benchmarks/README.md#cross-language-context).
+The last two comparisons are context, not equivalent representations:
+simdjson's DOM and `Index` retain source ranges and decode scalars on demand,
+while stdlib builds an owned interface tree and C++ simdjson builds its native
+tape, parses numbers, and owns an unescaped-string arena. C++ remains
+1.20-1.30x faster on the three object-dense payloads; the seven-payload
+geomean favors the Go index by 1.35x because Go leads on geometry, Go source,
+Unicode, and escaped strings. See the
+[cross-language contract table](benchmarks/crosslang/README.md).
+
+The upcoming `encoding/json/v2` is slower on these same owned contracts by
+3.11x on typed decode, 1.93x on dynamic decode, and 2.43x on Marshal.
+
+The production index now contains no assembly. Against the removed arm64
+assembly baseline, the Go tip SIMD implementation is 7.65% faster in
+seven-payload geomean, has no row more than 2.0% slower, and remains
+zero-allocation with caller-provided storage.
+
+These numbers were regenerated on 2026-07-16 from code commit `e0d1941`
+using `go1.27-devel_03845e30`. The complete per-contract results, dependency
+versions, raw commands, minio/simdjson-go platform note, and the removed
+assembly comparison are in the
+[benchmark report](benchmarks/README.md).
 
 ## Compatibility and contracts
 
@@ -621,9 +627,9 @@ TIP_GO="$HOME/sdk/simdjson-gotip/bin/go"
 GOEXPERIMENT=simd "$TIP_GO" test ./...
 "$TIP_GO" vet -unsafeptr=false ./...
 GOEXPERIMENT=simd "$TIP_GO" test -race \
-  -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
+  -skip 'Alloc|ZeroCost|StaysOnStack|TestParseFloat64' ./...
 GOEXPERIMENT=simd "$TIP_GO" test -gcflags='all=-d=checkptr=2' \
-  -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
+  -skip 'Alloc|ZeroCost|StaysOnStack|TestParseFloat64' ./...
 ./scripts/check-stdlib-corpus.sh "$TIP_GO"
 ```
 
