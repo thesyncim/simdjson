@@ -4,7 +4,7 @@ package simd
 // that judges JSON token grammar — pair legality, container kind and depth
 // matching, comma and closer placement — and records scalar-start
 // positions for the caller to validate. On arm64 (without -race or
-// simdjson_safehooks) the machine is the hand-written direct-threaded
+// race instrumentation) the machine is the hand-written direct-threaded
 // walker in stage2_arm64.s; elsewhere Stage2Enabled reports false and the
 // caller keeps its portable walk.
 //

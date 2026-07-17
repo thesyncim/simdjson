@@ -56,3 +56,38 @@ func TestEncodeMapScratchReuse(t *testing.T) {
 		}
 	}
 }
+
+// TestMapEncodeLocalSourceAllocationBound guards the cost of keeping a local
+// document visible to escape analysis across reflective map iteration. One
+// small operation-lifetime allocation is the deliberate safety ceiling; map
+// size and pooled scratch reuse must not add per-entry allocations.
+func TestMapEncodeLocalSourceAllocationBound(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector instruments allocation and disables pool reuse")
+	}
+	type document struct {
+		M map[string]*uint64 `json:"m"`
+		S string             `json:"s"`
+	}
+	a, b := uint64(1), uint64(2)
+	shared := map[string]*uint64{"a": &a, "b": &b, "nil": nil}
+	enc, err := CompileEncoder[document](EncoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 0, 96)
+	value := document{M: shared, S: "warm"}
+	if buffer, err = enc.AppendJSON(buffer[:0], &value); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(200, func() {
+		local := document{M: shared, S: "stack"}
+		buffer, err = enc.AppendJSON(buffer[:0], &local)
+		if err != nil {
+			panic(err)
+		}
+	})
+	if allocs > 1 {
+		t.Fatalf("encoding a local map document allocated %.1f times per run, want <=1", allocs)
+	}
+}

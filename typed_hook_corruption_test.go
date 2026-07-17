@@ -9,13 +9,11 @@ import (
 	"testing"
 )
 
-// This file is the corruption gate for the method-hook tier. The hook dispatch
-// uses two unsafe mechanisms — an itab rebind (two word stores that reconstruct
-// an interface) and a noescape-laundered DecodeCursor/Appender — that fall squarely
-// in this package's known heap-corruption hazard class: a heap object holding a
-// pointer the GC cannot see, or a pointer into a goroutine stack that dangles
-// when the stack moves. -race MASKS this class (it changes scheduling and
-// allocation), so these tests run WITHOUT -race and drive the collector hard:
+// This file is the corruption gate for the method-hook tier. Decode receivers
+// and DecodeCursor state are heap-backed; addressable encode receivers use
+// ordinary GC-visible pointers. The collector must see every reference while
+// goroutine stacks move and calls run concurrently.
+// These tests drive that lifetime contract under aggressive GC:
 //
 //	GOGC=1 GOEXPERIMENT=simd gotip test -run TestHookCorruption -count=5 -cpu=1,4,8 ./
 //
@@ -279,20 +277,22 @@ type gcReceiverPayload struct {
 	fill [256]byte
 }
 
-// gcReceiverProbe proves the receiver pointer stored in the itab data word is a
-// GC-visible root for the whole call. The body allocates a payload reachable
+const gcReceiverTag = 0x5144_4a53_4d49_53
+
+// gcReceiverProbe proves the heap-backed receiver is a GC-visible root for the
+// whole call. The body allocates a payload reachable
 // only through the receiver, drops every other reference, forces several GCs
 // with intervening allocation, and re-reads the payload through the receiver.
-// If the itab rebind (or the noescape laundering of dst) hid the receiver from
-// the collector, the payload's memory would be swept and reused and the re-read
-// would not match the sentinel.
+// If dispatch failed to keep the receiver visible to the collector, the
+// payload could be swept and reused and the re-read would not match the
+// sentinel.
 type gcReceiverProbe struct {
 	payload *gcReceiverPayload
 	ok      bool
 }
 
 func newGCReceiverPayload() *gcReceiverPayload {
-	p := &gcReceiverPayload{tag: layoutProbeTag}
+	p := &gcReceiverPayload{tag: gcReceiverTag}
 	for i := range p.fill {
 		p.fill[i] = byte(i)
 	}
@@ -316,7 +316,7 @@ func (p *gcReceiverProbe) UnmarshalSimdJSON(c *DecodeCursor) error {
 		runtime.KeepAlive(churn)
 	}
 	pl := p.payload
-	good := pl.tag == layoutProbeTag
+	good := pl.tag == gcReceiverTag
 	for i := range pl.fill {
 		if pl.fill[i] != byte(i) {
 			good = false
@@ -327,8 +327,8 @@ func (p *gcReceiverProbe) UnmarshalSimdJSON(c *DecodeCursor) error {
 	return nil
 }
 
-// TestHookGCReceiverVisibility proves the receiver pointer stored in the itab
-// data word is scanned and kept alive for the whole call, so a payload
+// TestHookGCReceiverVisibility proves the receiver is scanned and kept alive
+// for the whole call, so a payload
 // reachable only through the receiver survives collections during the body.
 func TestHookGCReceiverVisibility(t *testing.T) {
 	dec, err := CompileDecoder[gcReceiverProbe](DecoderOptions{})
@@ -341,7 +341,7 @@ func TestHookGCReceiverVisibility(t *testing.T) {
 			t.Fatal(err)
 		}
 		if !p.ok {
-			t.Fatalf("iter %d: receiver-reachable payload was corrupted across GC (receiver not scanned through itab data word)", i)
+			t.Fatalf("iter %d: receiver-reachable payload was corrupted across GC", i)
 		}
 	}
 }

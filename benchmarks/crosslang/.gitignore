@@ -5,3 +5,5 @@ corpus/
 rustbench/target/
 rustbench/Cargo.lock
 bench_stage1
+bench_contract
+*.download

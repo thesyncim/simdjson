@@ -36,10 +36,9 @@ type boolValue interface {
 
 // decoderFlags carries the per-decode switches. All but two mirror
 // DecoderOptions; decoderSourceOwned records that ownSource already copied
-// the input, and decoderExpectedSlow latches after the first miss of the
-// packed-key fast match, routing the rest of the decode through the fused
-// slow matcher — order misses tend to repeat, so re-probing every member
-// would pay for nothing.
+// the input, and decoderExpectedSlow latches after the first semantic-order
+// miss of the packed-key matcher. Formatting whitespace is handled by the
+// packed path and does not trip the latch.
 type decoderFlags uint8
 
 const (

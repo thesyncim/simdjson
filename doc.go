@@ -38,12 +38,13 @@
 // Types implementing json.Marshaler, json.Unmarshaler,
 // encoding.TextMarshaler, or encoding.TextUnmarshaler — including time.Time —
 // are dispatched through those interfaces like encoding/json. Ordinary plans
-// remain stack eligible. Pointer-receiver methods use a heap-backed shadow that
+// remain stack eligible. Decode methods use a heap-backed receiver shadow that
 // is copied back before return, so a retained receiver cannot become a stale
-// stack pointer. The shadow is a shallow Go copy and does not preserve receiver
-// pointer identity after the method returns. Hot types can instead implement
-// the simdjson-native [UnmarshalerSimd] and [MarshalerSimd] hooks, whose
-// [DecodeCursor] and [Appender] expose the kernels the compiled codecs use.
+// stack pointer. The simdjson-native [UnmarshalerSimd] also receives a
+// heap-backed [DecodeCursor] that is invalidated after return. All encode
+// methods follow ordinary Go ownership: addressable values expose their real
+// GC-visible receiver, preserving pointer identity without an allocation,
+// while non-addressable value receivers get a value copy.
 //
 // # Validation and selection
 //

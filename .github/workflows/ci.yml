@@ -47,10 +47,10 @@ jobs:
         run: ./scripts/check-stdlib-corpus.sh "$RUNNER_TEMP/gotip/bin/go"
 
       - name: Vet
-        run: $RUNNER_TEMP/gotip/bin/go vet -unsafeptr=false ./...
+        run: $RUNNER_TEMP/gotip/bin/go vet ./...
 
       - name: Race
-        run: $RUNNER_TEMP/gotip/bin/go test -race -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
+        run: $RUNNER_TEMP/gotip/bin/go test -race -skip 'Alloc|TestParseFloat64' ./...
         env:
           GOEXPERIMENT: simd
 
@@ -58,8 +58,17 @@ jobs:
         run: >-
           "$RUNNER_TEMP/gotip/bin/go" test
           -gcflags=all=-d=checkptr=2
-          -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
+          -skip 'Alloc|TestParseFloat64' ./...
         env:
+          GOEXPERIMENT: simd
+
+      - name: Lifetime stress
+        run: >-
+          "$RUNNER_TEMP/gotip/bin/go" test
+          -run '^Test(EncoderScratchPoolPoisoning|DynamicMapScratchIsPlanIndependent|EncodeHookArrayUsesStableSourcePointers|HookReceiverLifetimes|HookRetentionTrapAfterPanic)$'
+          -count=10 -cpu=1,4,8 .
+        env:
+          GOGC: 1
           GOEXPERIMENT: simd
 
       - name: Cross-compile other Linux architecture
@@ -74,6 +83,7 @@ jobs:
         run: |
           $RUNNER_TEMP/gotip/bin/go test -run='^$' -fuzz='^FuzzTypedDecoderMatchesStdlib$' -fuzztime=60s .
           $RUNNER_TEMP/gotip/bin/go test -run='^$' -fuzz='^FuzzEncoderMatchesStdlib$' -fuzztime=60s .
+          $RUNNER_TEMP/gotip/bin/go test -run='^$' -fuzz='^FuzzEncoderScratchOperationSequence$' -fuzztime=30s .
         env:
           GOEXPERIMENT: simd
 

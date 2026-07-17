@@ -1,4 +1,4 @@
-//go:build arm64 && !race && !simdjson_safehooks
+//go:build arm64 && !race
 
 package simd
 

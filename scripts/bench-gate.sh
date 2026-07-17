@@ -11,8 +11,8 @@
 # with GOEXPERIMENT=simd; results land under $TMPDIR/simdjson-bench-gate.
 set -eu
 
-gotip=${GOTIP:-/Users/thesyncim/go/bin/gotip}
-benchstat=${BENCHSTAT:-/Users/thesyncim/go/bin/benchstat}
+gotip=${GOTIP:-"$HOME/sdk/simdjson-gotip/bin/go"}
+benchstat=${BENCHSTAT:-"$HOME/go/bin/benchstat"}
 baseline=HEAD
 rounds=8
 benchtime=250ms
@@ -32,6 +32,15 @@ shift $((OPTIND - 1))
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 work=${TMPDIR:-/tmp}/simdjson-bench-gate
 mkdir -p "$work"
+
+if [ ! -x "$gotip" ]; then
+	echo "pinned Go toolchain is not executable: $gotip (set GOTIP to override)" >&2
+	exit 1
+fi
+if [ ! -x "$benchstat" ]; then
+	echo "benchstat is not executable: $benchstat (set BENCHSTAT to override)" >&2
+	exit 1
+fi
 
 echo "baseline: $(git -C "$root" rev-parse --short "$baseline")  rounds: $rounds  benchtime: $benchtime" >&2
 

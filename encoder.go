@@ -67,15 +67,18 @@ func CompileEncoder[T any](opts EncoderOptions) (Encoder[T], error) {
 	return Encoder[T]{
 		root:       root,
 		escapeHTML: escapeHTML,
-		scratch:    newEncoderScratchPool(compiler.encScratchTypes, compiler.encHasMap),
+		scratch: newEncoderScratchPool(
+			compiler.encScratchTypes, compiler.encBackingSlots, compiler.encHasMap,
+		),
 	}, nil
 }
 
 // AppendJSON appends src encoded as compact JSON to dst. The backing storage of
 // dst must not overlap storage reachable from src. Ordinary compiled sources
-// remain stack eligible. Pointer-receiver custom methods use a heap-backed
-// receiver copied back before AppendJSON returns. On error AppendJSON returns
-// dst unchanged in length, but its unused capacity may contain partial output.
+// remain stack eligible unless an addressable custom method can retain its
+// receiver; in that case ordinary escape analysis keeps caller storage alive.
+// On error AppendJSON returns dst unchanged in length, but its unused capacity
+// may contain partial output.
 func (plan Encoder[T]) AppendJSON(dst []byte, src *T) ([]byte, error) {
 	if plan.root == nil {
 		return dst, fmt.Errorf("simdjson: zero Encoder")
@@ -268,7 +271,7 @@ func (e *encodeState) encodeKind(node *typedNode, src unsafe.Pointer, kind typed
 	case typedTime:
 		return e.encodeTime(src)
 	case typedIface:
-		value := reflect.NewAt(node.typ, noescape(src)).Elem()
+		value := reflect.NewAt(node.typ, src).Elem()
 		if value.IsNil() {
 			e.dst = append(e.dst, "null"...)
 			return nil
@@ -433,7 +436,7 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 // the encode correct even when a value recurses into the same catch-all type.
 // String keys alias the live map's own storage, so names need no arena.
 func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsafe.Pointer, first *bool) error {
-	mapValue := reflect.NewAt(inline.mapType, noescape(unsafe.Add(structPtr, inline.offset))).Elem()
+	mapValue := reflect.NewAt(inline.mapType, unsafe.Add(structPtr, inline.offset)).Elem()
 	if mapValue.IsNil() || mapValue.Len() == 0 {
 		return nil
 	}
@@ -462,23 +465,15 @@ func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsa
 	} else {
 		keyBox = reflect.New(inline.mapType.Key()).Elem()
 	}
-	backing := e.takeValueBacking(elem.typ, mapLen)
+	backing := e.takeValueBacking(inline.encBacking, elem.typ, mapLen)
 
-	// A reflect.MapIter that lives on the heap — the pooled one, or a fresh one
-	// that escapes to the pool on release — must not hold mapValue's noescape'd
-	// pointer into the source struct on the stack; a stack move mid-iteration
-	// would dangle it and corrupt the heap. Bind it to a heap header word
-	// instead. Without a scratch pool the fresh iterator stays stack-local and
-	// moves with mapValue, so it binds directly. See heapBoundMapValue.
-	if scratch != nil {
-		hb := e.heapBoundMapValue(inline.mapType, mapValue)
-		if iterator == nil {
-			iterator = hb.MapRange()
-		} else {
-			iterator.Reset(hb)
-		}
-	} else {
+	// mapValue remains visible to escape analysis and the GC for the full
+	// iteration. The pooled iterator is unbound before release, so it cannot
+	// retain this operation's source afterward.
+	if iterator == nil {
 		iterator = mapValue.MapRange()
+	} else {
+		iterator.Reset(mapValue)
 	}
 
 	for slot := 0; iterator.Next(); slot++ {
@@ -487,7 +482,6 @@ func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsa
 		keyBox.SetIterKey(iterator)
 		entries = append(entries, mapEncodeEntry{name: keyBox.String(), value: valueSlot})
 	}
-	usedSlots := len(entries)
 	if inline.sorted {
 		slices.SortFunc(entries, func(a, b mapEncodeEntry) int { return strings.Compare(a.name, b.name) })
 	}
@@ -514,47 +508,87 @@ func (e *encodeState) encodeInlineMembers(inline *typedInlineMap, structPtr unsa
 			break
 		}
 	}
-	e.releaseValueBacking(backing, elem.typ, usedSlots)
+	e.releaseValueBacking(inline.encBacking, backing, elem.typ)
 	e.releaseMapScratch(entries, keyArena, iterator)
 	return retErr
 }
 
-// takeValueBacking borrows the scratch's reused value backing with room for at
-// least n elements, growing or re-typing the slice as needed. The returned
-// slice keeps its full length, so the caller indexes slots [0, n) directly and
-// never reslices (Value.Slice would allocate a fresh header). A nested map or
-// catch-all sees the backing already taken and allocates its own; the reserved
-// backing is restored by releaseValueBacking.
-func (e *encodeState) takeValueBacking(elemType reflect.Type, n int) reflect.Value {
+// takeValueBacking borrows one compile-time-assigned, fixed-element-type slot
+// with room for at least n values. Different map types use different slots, so
+// a heterogeneous struct does not discard and reallocate one polymorphic
+// backing on every encode. The returned slice keeps its full length, avoiding
+// a reflect.Value.Slice header allocation. Recursive use of the same map node
+// sees its slot taken and falls back to a fresh backing for that depth.
+func (e *encodeState) takeValueBacking(slot encoderBackingSlot, elemType reflect.Type, n int) reflect.Value {
 	scratch := e.scratch
-	if scratch != nil && scratch.valueBackingElem == elemType && scratch.valueBacking.IsValid() && scratch.valueBacking.Len() >= n {
-		backing := scratch.valueBacking
-		scratch.valueBacking = reflect.Value{}
-		scratch.valueBackingElem = nil
-		return backing
+	if scratch != nil && slot < 0 {
+		if scratch.dynamicValueBackingElem == elemType &&
+			scratch.dynamicValueBacking.IsValid() && scratch.dynamicValueBacking.Len() >= n {
+			backing := scratch.dynamicValueBacking
+			scratch.dynamicValueBacking = reflect.Value{}
+			scratch.dynamicValueBackingElem = nil
+			return backing
+		}
+		// A different dynamic element type may replace only an already-cleared
+		// backing. Drop both fields together so no stale type/value pairing can
+		// be observed by recursive interface encoding.
+		scratch.dynamicValueBacking = reflect.Value{}
+		scratch.dynamicValueBackingElem = nil
 	}
-	if scratch != nil {
-		scratch.valueBacking = reflect.Value{}
-		scratch.valueBackingElem = nil
+	if scratch != nil && slot >= 0 {
+		var backing reflect.Value
+		if scratch.valueBackings == nil {
+			backing = scratch.valueBacking
+			scratch.valueBacking = reflect.Value{}
+		} else {
+			backing = scratch.valueBackings[slot]
+			scratch.valueBackings[slot] = reflect.Value{}
+		}
+		if backing.IsValid() && backing.Len() >= n {
+			return backing
+		}
 	}
 	return reflect.MakeSlice(reflect.SliceOf(elemType), n, n)
 }
 
-// releaseValueBacking clears the used slots, so the pool never pins the last
-// map's values, then returns the backing for reuse with its grown length. The
-// tail past used stays zero across calls, so clearing only [0, used) is enough;
-// zeroing the element bytes is a valid nil state for any type.
-func (e *encodeState) releaseValueBacking(backing reflect.Value, elemType reflect.Type, used int) {
-	if used > 0 {
-		base := backing.Index(0).Addr().UnsafePointer()
-		clear(unsafe.Slice((*byte)(base), uintptr(used)*elemType.Size()))
+// releaseValueBacking clears every slot, so the pool never pins a map value,
+// then returns the backing for reuse with its grown length. Clearing the full
+// value also makes cleanup independent of how far map collection progressed:
+// success, early key errors, and deliberately poisoned empty-map scratch all
+// establish the same invariant.
+func (e *encodeState) releaseValueBacking(slot encoderBackingSlot, backing reflect.Value, elemType reflect.Type) {
+	if backing.Len() > 0 {
+		// Clear through reflect so pointer-bearing element types use the GC's
+		// typed write barriers. Treating this storage as []byte and clearing it
+		// would incorrectly select the pointer-free memclr path.
+		// Clear the full stored length: reflect.Value.Slice creates an escaping
+		// slice header on current toolchains, while Clear on the original value
+		// remains allocation-free.
+		backing.Clear()
 	}
 	scratch := e.scratch
-	if scratch == nil || scratch.valueBackingElem != nil {
+	if scratch == nil {
+		return
+	}
+	if slot < 0 {
+		if scratch.dynamicValueBackingElem != nil {
+			return // a nested dynamic map already restored the bounded slot
+		}
+		scratch.dynamicValueBacking = backing
+		scratch.dynamicValueBackingElem = elemType
+		return
+	}
+	if scratch.valueBackings == nil {
+		if scratch.valueBacking.IsValid() {
+			return // a nested map already restored a backing; drop this one
+		}
+		scratch.valueBacking = backing
+		return
+	}
+	if scratch.valueBackings[slot].IsValid() {
 		return // a nested map already restored a backing; drop this one
 	}
-	scratch.valueBacking = backing
-	scratch.valueBackingElem = elemType
+	scratch.valueBackings[slot] = backing
 }
 
 // encodeSimpleStructPairs runs a simple struct's pair program. The caller
@@ -1115,33 +1149,11 @@ func (e *encodeState) encodeNonAddressableMarshaler(node *typedNode, src unsafe.
 	return err
 }
 
-// heapBoundMapValue rebinds a map reflect.Value onto the pooled scratch's
-// heap-resident header word so the reflect.MapIter can hold it safely.
-//
-// mapValue is built from a noescape'd source pointer, so its internal pointer
-// aliases the source struct on the goroutine stack. reflect.MapIter.Reset (and
-// Value.MapRange) copy that value into the iterator, and the iterator lives on
-// the heap: the pooled one always, and a fresh one too, since it escapes to the
-// pool when released. A heap object may not hold a pointer into a stack: when
-// the stack later moves — which a preemption or a GOMAXPROCS transition during
-// the iteration loop can force — the runtime rewrites stack-resident pointers
-// but not the iterator's copy, leaving it dangling and corrupting the heap.
-// Copying the map header (a single reference word that already points at heap
-// map storage) into the scratch's stable header word and rebuilding the value
-// from there keeps the iterator's reference heap-to-heap, stable across any
-// stack move, without allocating: the word lives in the pool alongside the
-// iterator it feeds. Both the fresh and pooled bind paths use it, so a
-// stack-sourced map is never iterated through a stack pointer.
-func (e *encodeState) heapBoundMapValue(mapType reflect.Type, mapValue reflect.Value) reflect.Value {
-	e.scratch.mapHeader = mapValue.UnsafePointer()
-	return reflect.NewAt(mapType, noescape(unsafe.Pointer(&e.scratch.mapHeader))).Elem()
-}
-
 // encodeMap writes a map with string keys as an object with byte-sorted
 // members, matching encoding/json. Values are copied into one reusable
 // addressable element before encoding.
 func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
-	mapValue := reflect.NewAt(node.typ, noescape(src)).Elem()
+	mapValue := reflect.NewAt(node.typ, src).Elem()
 	if mapValue.IsNil() {
 		e.dst = append(e.dst, "null"...)
 		return nil
@@ -1187,23 +1199,14 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 	} else {
 		keyBox = reflect.New(node.typ.Key()).Elem()
 	}
-	backing := e.takeValueBacking(node.elem.typ, mapLen)
+	backing := e.takeValueBacking(node.encBacking, node.elem.typ, mapLen)
 
-	// A reflect.MapIter that lives on the heap — the pooled one, or a fresh one
-	// that escapes to the pool on release — must not hold mapValue's noescape'd
-	// pointer into the source struct on the stack; a stack move mid-iteration
-	// would dangle it and corrupt the heap. Bind it to a heap header word
-	// instead. Without a scratch pool the fresh iterator stays stack-local and
-	// moves with mapValue, so it binds directly. See heapBoundMapValue.
-	if scratch != nil {
-		hb := e.heapBoundMapValue(node.typ, mapValue)
-		if iterator == nil {
-			iterator = hb.MapRange()
-		} else {
-			iterator.Reset(hb)
-		}
-	} else {
+	// mapValue remains GC-visible while the iterator is bound. releaseMapScratch
+	// unbinds pooled iterators before they can outlive this operation.
+	if iterator == nil {
 		iterator = mapValue.MapRange()
+	} else {
+		iterator.Reset(mapValue)
 	}
 
 	for slot := 0; iterator.Next(); slot++ {
@@ -1226,7 +1229,7 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 			var err error
 			name, err = mapKeyName(node, keyBox)
 			if err != nil {
-				e.releaseValueBacking(backing, node.elem.typ, slot)
+				e.releaseValueBacking(node.encBacking, backing, node.elem.typ)
 				e.releaseMapScratch(entries, keyArena, iterator)
 				e.depth--
 				return &EncodeError{Reason: err.Error()}
@@ -1236,7 +1239,6 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 		valueSlot.SetIterValue(iterator)
 		entries = append(entries, mapEncodeEntry{name: name, value: valueSlot})
 	}
-	usedSlots := len(entries)
 	slices.SortFunc(entries, func(a, b mapEncodeEntry) int { return strings.Compare(a.name, b.name) })
 
 	// The value type is loop invariant, so the non-addressable dispatch is
@@ -1261,14 +1263,14 @@ func (e *encodeState) encodeMap(node *typedNode, src unsafe.Pointer) error {
 			// Clone: numeric key names alias the pooled arena, and the
 			// error must outlive this call's ownership of it.
 			name := strings.Clone(entries[i].name)
-			e.releaseValueBacking(backing, node.elem.typ, usedSlots)
+			e.releaseValueBacking(node.encBacking, backing, node.elem.typ)
 			e.releaseMapScratch(entries, keyArena, iterator)
 			e.depth--
 			return prependEncodePathField(err, name)
 		}
 	}
 	e.dst = append(e.dst, '}')
-	e.releaseValueBacking(backing, node.elem.typ, usedSlots)
+	e.releaseValueBacking(node.encBacking, backing, node.elem.typ)
 	e.releaseMapScratch(entries, keyArena, iterator)
 	e.depth--
 	return nil
@@ -1418,9 +1420,9 @@ func typedValueIsEmpty(node *typedNode, src unsafe.Pointer) bool {
 	case typedPointer:
 		return *(*unsafe.Pointer)(src) == nil
 	case typedMap:
-		return reflect.NewAt(node.typ, noescape(src)).Elem().Len() == 0
+		return reflect.NewAt(node.typ, src).Elem().Len() == 0
 	case typedAny, typedIface:
-		return reflect.NewAt(node.typ, noescape(src)).Elem().IsNil()
+		return reflect.NewAt(node.typ, src).Elem().IsNil()
 	default:
 		return false
 	}

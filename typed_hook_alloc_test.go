@@ -92,19 +92,11 @@ func (r *hookAllocRecord) MarshalSimdJSON(w Appender) Appender {
 	return w.RawByte('}')
 }
 
-// TestHookDecodeZeroAllocDelta proves the hook decode dispatch adds no
-// allocation over the reflection path: the itab rebind and the noescape-
-// laundered DecodeCursor keep the dispatch off the heap, so a hook-carrying type
-// allocates exactly what its plain twin does. It is the delta, not the absolute
-// count, that matters — the single unavoidable allocation is the shared decode-
-// entry cost, which both paths pay. Catching a nonzero delta is what would
-// surface the DecodeCursor-escape regression the prototype hit (+292 allocs/op).
-// Under -race the safe dispatch boxes a reflect receiver, so the assertion is
-// scoped to the fast build.
-func TestHookDecodeZeroAllocDelta(t *testing.T) {
-	if hookSafeDispatch {
-		t.Skip("safe/-race build reroutes hooks through reflect dispatch, which allocates")
-	}
+// TestHookDecodeAllocationBound guards the always-safe hook dispatch against
+// accidental per-field boxing. The receiver and DecodeCursor each live on the
+// heap by contract, so a small fixed delta is expected; it must not scale with
+// the fields decoded by the body.
+func TestHookDecodeAllocationBound(t *testing.T) {
 	hookDec, err := CompileDecoder[hookAllocRecord](DecoderOptions{ZeroCopy: true})
 	if err != nil {
 		t.Fatal(err)
@@ -133,18 +125,15 @@ func TestHookDecodeZeroAllocDelta(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if hookAllocs != plainAllocs {
-		t.Fatalf("hook decode allocated %v/op vs reflection %v/op: the hook dispatch must add zero allocations (DecodeCursor must not escape)", hookAllocs, plainAllocs)
+	if delta := hookAllocs - plainAllocs; delta < 0 || delta > 4 {
+		t.Fatalf("hook decode allocated %v/op vs reflection %v/op: fixed safety delta exceeds 4", hookAllocs, plainAllocs)
 	}
 }
 
-// TestHookEncodeZeroAlloc proves the hook encode dispatch allocates nothing on
-// the fast build when appending into a pre-grown buffer: the Appender travels
-// by value and the itab rebind is allocation-free.
-func TestHookEncodeZeroAlloc(t *testing.T) {
-	if hookSafeDispatch {
-		t.Skip("safe/-race build reroutes hooks through reflect dispatch, which allocates")
-	}
+// TestHookEncodeAllocationBound proves that an addressable encode receiver is
+// exposed through an ordinary GC-visible interface without a detached shadow
+// or allocation while the Appender reuses caller-owned output storage.
+func TestHookEncodeAllocationBound(t *testing.T) {
 	enc, err := CompileEncoder[hookAllocRecord](EncoderOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -168,7 +157,42 @@ func TestHookEncodeZeroAlloc(t *testing.T) {
 	}
 }
 
-// TestHookNonUserZeroCost is the A/B that a type WITHOUT hooks is unaffected:
+// encodeLocalHookArray deliberately creates addressable source storage in its
+// own frame. Hook dispatch may expose element pointers to user code, so the
+// compiler must retain this array as one operation-lifetime object; the number
+// of elements must not turn that single escape into per-hook allocations.
+//
+//go:noinline
+func encodeLocalHookArray(enc Encoder[[8]hookAllocRecord], dst []byte) ([]byte, error) {
+	var src [8]hookAllocRecord
+	for i := range src {
+		src[i] = hookAllocRecord{ID: int64(i), Active: i&1 == 0, Name: "local", Score: float64(i)}
+	}
+	return enc.AppendJSON(dst, &src)
+}
+
+func TestHookEncodeLocalSourceAllocationBound(t *testing.T) {
+	enc, err := CompileEncoder[[8]hookAllocRecord](EncoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 0, 768)
+	buf, err = encodeLocalHookArray(enc, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(200, func() {
+		buf, err = encodeLocalHookArray(enc, buf[:0])
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 1 {
+		t.Fatalf("eight local encode hooks allocated %v/op, want <=1 operation-lifetime source escape", allocs)
+	}
+}
+
+// TestHookNonUserAllocationBound is the A/B that a type WITHOUT hooks is unaffected:
 // its decode and encode allocate exactly as the plain reflection path does,
 // with no per-call cost introduced by the hook machinery. hookAllocRecord's
 // plain twin has the identical layout but no hooks.
@@ -179,10 +203,7 @@ type hookAllocRecordPlain struct {
 	Score  float64 `json:"score"`
 }
 
-func TestHookNonUserZeroCost(t *testing.T) {
-	if hookSafeDispatch {
-		t.Skip("exact alloc counts require the non-race build")
-	}
+func TestHookNonUserAllocationBound(t *testing.T) {
 	dec, err := CompileDecoder[hookAllocRecordPlain](DecoderOptions{ZeroCopy: true})
 	if err != nil {
 		t.Fatal(err)

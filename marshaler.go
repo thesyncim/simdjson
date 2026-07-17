@@ -12,22 +12,30 @@ import (
 // valueInterfaceAt copies T into an interface. Calling a value-receiver method
 // on that interface cannot expose p to user code.
 func valueInterfaceAt(typ reflect.Type, p unsafe.Pointer) any {
-	return reflect.NewAt(typ, noescape(p)).Elem().Interface()
+	return reflect.NewAt(typ, p).Elem().Interface()
+}
+
+// pointerInterfaceAt exposes an addressable caller-owned value through its
+// ordinary *T interface. No pointer is hidden from escape analysis: if user
+// code retains the receiver, the runtime keeps the source storage alive just
+// as it would for a direct Go method call.
+func pointerInterfaceAt(typ reflect.Type, p unsafe.Pointer) any {
+	return reflect.NewAt(typ, p).Interface()
 }
 
 // copiedPointerReceiverAt creates a shallow, heap-backed *T for a call into
 // user code. Pointer-receiver methods may legally retain their receiver;
-// passing p through noescape would leave them holding a stale stack pointer
-// after stack growth.
+// passing the caller's receiver directly would let the method retain storage
+// whose lifetime is owned by the current operation.
 func copiedPointerReceiverAt(typ reflect.Type, p unsafe.Pointer) (any, reflect.Value) {
 	shadow := reflect.New(typ)
-	shadow.Elem().Set(reflect.NewAt(typ, noescape(p)).Elem())
+	shadow.Elem().Set(reflect.NewAt(typ, p).Elem())
 	return shadow.Interface(), shadow
 }
 
 func copiedLoadedPointerReceiverAt(typ reflect.Type, p unsafe.Pointer) (any, reflect.Value) {
 	shadow := reflect.New(typ.Elem())
-	shadow.Elem().Set(reflect.NewAt(typ.Elem(), noescape(p)).Elem())
+	shadow.Elem().Set(reflect.NewAt(typ.Elem(), p).Elem())
 	return shadow.Interface(), shadow
 }
 
@@ -38,11 +46,11 @@ func copyMethodReceiverBack(typ reflect.Type, dst unsafe.Pointer, shadow reflect
 	if typ.Kind() == reflect.Pointer {
 		pointer := *(*unsafe.Pointer)(dst)
 		if pointer != nil {
-			reflect.NewAt(typ.Elem(), noescape(pointer)).Elem().Set(shadow.Elem())
+			reflect.NewAt(typ.Elem(), pointer).Elem().Set(shadow.Elem())
 		}
 		return
 	}
-	reflect.NewAt(typ, noescape(dst)).Elem().Set(shadow.Elem())
+	reflect.NewAt(typ, dst).Elem().Set(shadow.Elem())
 }
 
 // decodeViaUnmarshaler feeds the raw bytes of the next JSON value to the
@@ -139,10 +147,6 @@ func (e *encodeState) encodeMarshaler(node *typedNode, src unsafe.Pointer) error
 		return e.encodeTime(src)
 	}
 	if node.encKind == typedMarshalerSimd {
-		// A pointer-receiver hook cannot run on a non-addressable value; match
-		// encoding/json's condAddrEncoder and fall back to its default encoding
-		// (encNonAddrKind), which the compiler left as the structural kind
-		// unless the value type itself implements the hook.
 		if e.nonAddr && node.encNonAddrKind != typedMarshalerSimd {
 			return e.encodeKind(node, src, node.encNonAddrKind)
 		}
@@ -153,14 +157,16 @@ func (e *encodeState) encodeMarshaler(node *typedNode, src unsafe.Pointer) error
 
 func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, kind typedKind) error {
 	var boxed any
-	var shadow reflect.Value
 	if node.typ.Kind() == reflect.Pointer {
 		pointer := *(*unsafe.Pointer)(src)
 		if pointer == nil {
 			e.dst = append(e.dst, "null"...)
 			return nil
 		}
-		boxed, shadow = copiedLoadedPointerReceiverAt(node.typ, pointer)
+		// T is itself a pointer. Copying that pointer into an ordinary
+		// interface preserves the caller's pointee identity and makes any
+		// retention visible to the GC.
+		boxed = valueInterfaceAt(node.typ, src)
 	} else if node.encNonAddrKind == kind {
 		// The compiler set encNonAddrKind to this marshaler kind exactly
 		// when the value type itself implements the interface, so the
@@ -169,7 +175,7 @@ func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, k
 			boxed = valueInterfaceAt(node.typ, src)
 		} else {
 			slot := &e.scratch.marshalers[node.encScratch]
-			slot.value.Set(reflect.NewAt(node.typ, noescape(src)).Elem())
+			slot.value.Set(reflect.NewAt(node.typ, src).Elem())
 			boxed = slot.boxed
 		}
 	} else if e.nonAddr {
@@ -178,7 +184,10 @@ func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, k
 		// method: it falls back to the default encoding.
 		return e.encodeKind(node, src, node.encNonAddrKind)
 	} else {
-		boxed, shadow = copiedPointerReceiverAt(node.typ, src)
+		// Addressable pointer-receiver marshalers follow direct Go method-call
+		// semantics. The runtime-built interface keeps caller storage alive if
+		// user code retains the receiver; no detached shadow is needed.
+		boxed = pointerInterfaceAt(node.typ, src)
 	}
 
 	if kind == typedMarshalerJSON {
@@ -187,7 +196,6 @@ func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, k
 			return &EncodeError{Reason: "invalid compiled operation"}
 		}
 		data, err := marshaler.MarshalJSON()
-		copyMethodReceiverBack(node.typ, src, shadow)
 		if err != nil {
 			return &EncodeError{Reason: "MarshalJSON: " + err.Error()}
 		}
@@ -210,7 +218,6 @@ func (e *encodeState) encodeMarshalerKind(node *typedNode, src unsafe.Pointer, k
 		return &EncodeError{Reason: "invalid compiled operation"}
 	}
 	text, err := marshaler.MarshalText()
-	copyMethodReceiverBack(node.typ, src, shadow)
 	if err != nil {
 		return &EncodeError{Reason: "MarshalText: " + err.Error()}
 	}

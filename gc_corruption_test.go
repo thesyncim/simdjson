@@ -5,10 +5,10 @@ package simdjson
 // This file extends concurrency_corruption_test.go with cases aimed squarely at
 // the garbage collector: a heap object that transiently holds a pointer into a
 // goroutine stack corrupts the heap only when a stack move relocates that stack
-// mid-use and a GC then scans the stale copy. The map-iterator fix
-// (heapBoundMapValue) is the canonical instance; these tests add an in-process
-// stack-move driver and cover the newer streaming one-pass and zero-copy paths
-// that also thread source pointers through unsafe.
+// mid-use and a GC then scans the stale copy. Map sources now remain visible to
+// escape analysis and pooled iterators are explicitly unbound; these tests add
+// an in-process stack-move driver and cover streaming one-pass and zero-copy
+// paths that also thread source pointers through unsafe.
 //
 // As with the sibling file, -race MASKS this class by perturbing scheduling, so
 // the intended stress invocation is without -race:
@@ -52,8 +52,8 @@ func forceStackMovement(depth int, acc int) int {
 // that also force stack growth and trigger GC between iterations. Each goroutine
 // alternates: build a map on the stack, encode it, force a stack move, and every
 // so often run a GC so the collector scans the (now relocated) stacks and the
-// heap-resident pooled iterators. A regression in heapBoundMapValue surfaces as
-// a fatal "found bad pointer in Go heap" during one of those GCs, or as a value
+// heap-resident pooled iterators. A lifetime regression surfaces as a fatal
+// "found bad pointer in Go heap" during one of those GCs, or as a value
 // mismatch. It complements TestCorruptionCanonicalMapPtr by making the stack
 // move happen in-process rather than relying only on -cpu transitions.
 func TestGCCorruptionMapStackMove(t *testing.T) {

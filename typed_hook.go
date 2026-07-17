@@ -1,37 +1,33 @@
 package simdjson
 
-// Method hooks are the opt-in fast tier for typed decode and encode: the
+// Method hooks are the opt-in custom tier for typed decode and encode: the
 // easyjson MarshalEasyJSON/UnmarshalEasyJSON analog, refined for this package's
 // kernels. A type opts in by implementing [UnmarshalerSimd] or [MarshalerSimd]
-// with signatures that shed everything that makes the standard custom methods
-// slow — no per-call receiver boxing allocation, no output re-validation or
-// compaction, no intermediate buffer. The compiled plan detects the interfaces
-// at compile time and dispatches straight into the method, so a generated (or
-// hand-written) body for a hot inner type captures the full monomorphized
-// ceiling while every surrounding type stays on the zero-codegen compiled path.
+// with signatures that avoid raw-value reparsing, output re-validation and
+// compaction, and intermediate buffers. The compiled plan detects the
+// interfaces at compile time. Decode dispatch owns detached receiver and cursor
+// state; encode dispatch follows ordinary Go receiver ownership.
 //
-// # The no-retention contract
+// # Lifetime contract
 //
 // The [DecodeCursor] passed to UnmarshalSimdJSON and the [Appender] passed to
 // MarshalSimdJSON borrow state that lives on the enclosing decode or encode
-// call's stack. Neither may be retained past the method's return: do not store
-// the DecodeCursor pointer or the Appender in a heap object, a goroutine, or a
-// package variable, and do not capture either in a closure that outlives the
-// call. A hook that only reads scalars, iterates members and elements, and
-// returns (the shape a generator emits) satisfies this automatically. Building
-// with -race, or with the simdjson_safehooks build tag, swaps in a
-// memory-safe dispatch that turns a contract violation into a deterministic
-// panic instead of silent corruption; see typed_hook_safe.go.
+// call. Neither should be retained past the method's return. Decode hooks
+// always receive a heap-backed cursor copy that is invalidated on return, so a
+// retained DecodeCursor deterministically panics instead of aliasing a reused
+// frame. Encode hooks receive an ordinary Appender value; retaining it keeps a
+// caller-owned buffer alive and can race with later buffer reuse, so it remains
+// a usage error rather than an unsafe runtime-layout contract.
 //
 // # Safety
 //
-// The fast dispatch rebuilds the interface value from an itab captured once at
-// compile time, which assumes the two-word runtime interface layout. That
-// assumption is verified at package initialization (see hookLayoutOK); if it
-// does not hold on the running toolchain the package falls back to a correct,
-// slightly slower reflect-based dispatch rather than corrupting memory. The
-// hooks never crash on a layout mismatch and never depend on an unverified
-// unsafe assumption.
+// Decode hook receivers are shallow-copied to heap-backed shadows before user
+// code is called and copied back on return. Encode hooks use normal Go receiver
+// ownership: addressable values expose their GC-visible *T, while
+// non-addressable value receivers get a runtime-owned value copy. Interface
+// values are constructed only by reflection and the Go runtime. There is no
+// unsafe itab rebinding, layout probe, safety build tag, or alternate dispatch
+// mode.
 
 import (
 	"reflect"
@@ -42,13 +38,14 @@ import (
 // itself directly from the cursor, consuming exactly one complete JSON value.
 // It is the simdjson-native counterpart of json.Unmarshaler, but it reads
 // through the decoder's own kernels instead of receiving raw bytes, so there
-// is no re-parse and no per-call allocation.
+// is no re-parse. The always-safe receiver and cursor shadows may allocate when
+// the hook runs.
 //
 // The method must consume exactly one JSON value and leave the cursor
 // positioned immediately after it, exactly as the compiled decoder would.
 // Returning an error aborts the enclosing decode.
 //
-// The DecodeCursor must not be retained past the call; see the no-retention
+// The DecodeCursor must not be retained past the call; see the lifetime
 // contract in this file's package comment.
 type UnmarshalerSimd interface {
 	UnmarshalSimdJSON(c *DecodeCursor) error
@@ -66,7 +63,7 @@ type UnmarshalerSimd interface {
 // escape pass, which is the whole point of the hook. Emitting malformed JSON
 // corrupts the surrounding document, so a generator must emit correct syntax.
 //
-// The Appender must not be retained past the call; see the no-retention
+// The Appender must not be retained past the call; see the lifetime
 // contract in this file's package comment.
 type MarshalerSimd interface {
 	MarshalSimdJSON(w Appender) Appender
@@ -471,91 +468,39 @@ func foldFieldKey(key string) string {
 
 // --- plan dispatch ---------------------------------------------------------
 
-// hookIface mirrors the runtime's two-word non-empty interface value: a pointer
-// to the itab and a pointer to the data. The plan compiler captures the itab
-// for *T -> hook interface once at compile time (via one ordinary assertion on
-// a probe value); dispatch then rebuilds the interface with two word stores,
-// avoiding reflect.NewAt, a runtime type assertion, and any allocation on the
-// per-element hot path. The itab is process-stable, so caching it on the
-// immutable plan is sound. The layout this type assumes is verified at package
-// init by verifyHookLayout; hookLayoutOK gates every use of it.
-type hookIface struct {
-	tab  unsafe.Pointer
-	data unsafe.Pointer
-}
-
-// captureHookTabs records, on the node, the itab words for whichever hook
-// interfaces *typ implements, so later dispatch is two word stores plus the
-// call. It runs at compile time only. When the runtime interface layout failed
-// its init self-test (hookLayoutOK is false) the itabs are left nil and every
-// dispatch takes the reflect fallback, so a layout mismatch degrades to correct
-// and slower rather than unsafe.
-func captureHookTabs(node *typedNode, typ reflect.Type, decode, encode bool) {
-	if !hookLayoutOK {
-		return
-	}
-	probe := reflect.New(typ).Interface()
-	if decode {
-		hook := probe.(UnmarshalerSimd)
-		node.decHookTab = (*hookIface)(unsafe.Pointer(&hook)).tab
-	}
-	if encode {
-		hook := probe.(MarshalerSimd)
-		node.encHookTab = (*hookIface)(unsafe.Pointer(&hook)).tab
-	}
-}
-
-// decodeViaSimdHook decodes the value at dst through its own UnmarshalSimdJSON.
-// On the fast path it rebuilds the *T -> UnmarshalerSimd interface from the
-// compile-time itab with two word stores and one indirect call; the cursor
-// pointer is laundered through noescape so the opaque interface call does not
-// force every enclosing cursor to the heap, which the no-retention contract
-// keeps sound. When the itab is absent (layout self-test failed, or a
-// safe-hooks build) it dispatches through reflect instead — correct and
-// memory-safe even if the body violates the contract.
+// decodeViaSimdHook decodes through a heap-backed receiver shadow. The hook
+// cannot retain a pointer into the caller's stack, and the advanced shadow is
+// copied back before the call returns.
 func (cursor *decoderCursor) decodeViaSimdHook(node *typedNode, dst unsafe.Pointer) error {
-	if node.decHookTab == nil {
-		return cursor.decodeViaSimdHookReflect(node, dst)
-	}
-	return decodeViaSimdHookFast(cursor, node.decHookTab, dst)
-}
-
-// decodeViaSimdHookReflect is the safe, reflect-based decode dispatch: the
-// itab-fallback path and the whole safe-hooks build route through it. It boxes
-// a genuine *T receiver, so the interface value and the pointer it carries are
-// ordinary heap-safe values and a retained DecodeCursor cannot alias freed
-// stack.
-//
-// dst is the real decode destination — the caller's value, or a field within
-// it — alive for the whole call, so laundering it through noescape (the same
-// idiom valueInterfaceAt uses) keeps this reflect branch from forcing every
-// enclosing decode's destination to the heap even in a build where this branch
-// is present but rarely taken.
-func (cursor *decoderCursor) decodeViaSimdHookReflect(node *typedNode, dst unsafe.Pointer) error {
-	hook, ok := reflect.NewAt(node.typ, noescape(dst)).Interface().(UnmarshalerSimd)
+	boxed, shadow := copiedPointerReceiverAt(node.typ, dst)
+	hook, ok := boxed.(UnmarshalerSimd)
 	if !ok {
 		return &DecodeError{Offset: cursor.i, Type: node.typ, Reason: "invalid compiled operation"}
 	}
-	return dispatchDecodeHook(hook, cursor)
+	err := dispatchDecodeHook(hook, cursor)
+	copyMethodReceiverBack(node.typ, dst, shadow)
+	return err
 }
 
-// encodeViaSimdHook encodes the value at src through its own MarshalSimdJSON,
-// splicing the type's own compact JSON with none of the validation and
-// re-escape passes a std-signature marshaler forces. On the fast path the
-// interface is rebuilt from the compile-time itab and the buffer travels by
-// value through the builder and back through the return, so nothing escapes and
-// nothing allocates.
+// encodeViaSimdHook uses ordinary Go receiver ownership. Addressable values
+// expose their real *T through a runtime-built interface, so retaining the
+// receiver safely retains (and aliases) the caller's value without allocating
+// a detached shadow. Non-addressable map/interface values can reach this point
+// only when T itself implements the hook; they receive the normal value copy a
+// Go value-receiver call specifies. Compact output is trusted and spliced
+// without the validation and re-escape passes of json.Marshaler.
 func (e *encodeState) encodeViaSimdHook(node *typedNode, src unsafe.Pointer) error {
-	var w Appender
-	if node.encHookTab == nil {
-		hook, ok := reflect.NewAt(node.typ, noescape(src)).Interface().(MarshalerSimd)
-		if !ok {
-			return &EncodeError{Reason: "invalid compiled operation"}
-		}
-		w = dispatchEncodeHook(hook, Appender{dst: e.dst, escapeHTML: e.escapeHTML})
+	var boxed any
+	if e.nonAddr {
+		boxed = valueInterfaceAt(node.typ, src)
 	} else {
-		w = encodeViaSimdHookFast(node.encHookTab, src, Appender{dst: e.dst, escapeHTML: e.escapeHTML})
+		boxed = pointerInterfaceAt(node.typ, src)
 	}
+	hook, ok := boxed.(MarshalerSimd)
+	if !ok {
+		return &EncodeError{Reason: "invalid compiled operation"}
+	}
+	w := dispatchEncodeHook(hook, Appender{dst: e.dst, escapeHTML: e.escapeHTML})
 	e.dst = w.dst
 	if w.bad {
 		return &EncodeError{Reason: "MarshalSimdJSON: unsupported value"}

@@ -2,12 +2,13 @@
 
 [![ci](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml/badge.svg)](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml)
 
-Strict, high-performance JSON for Go, written entirely in Go. `Unmarshal` and
-`Marshal` are drop-in replacements for their `encoding/json` counterparts;
-compiled per-type codecs, structural indexes, and vector kernels built on Go's
-experimental `simd/archsimd` package supply the speed. The root module has no
-third-party dependencies, generated codecs, assembly, C, `go:linkname`, or
-runtime map-layout assumptions.
+Strict, high-performance JSON for Go. `Unmarshal` and `Marshal` are drop-in
+replacements for their `encoding/json` counterparts; compiled per-type codecs,
+structural indexes, and vector kernels built on Go's experimental
+`simd/archsimd` package supply the speed. The root module has no third-party
+dependencies, generated codecs, C, `go:linkname`, or runtime map-layout
+assumptions. A small existing arm64 stage-2 walker is implemented in assembly;
+all other accelerated kernels are Go-native SIMD or portable Go.
 
 > [!IMPORTANT]
 > **Go tip is required.** simdjson does not currently build with a stable Go
@@ -292,17 +293,13 @@ malformed `json.Number`) return an `EncodeError` with a typed path.
 </details>
 
 <details>
-<summary><b>Hand-written hooks for the last few percent</b></summary>
+<summary><b>Custom marshal/unmarshal hooks</b></summary>
 
-The compiled decoder and encoder already outrun generated code and JIT
-libraries, but a hot type can shed the remaining per-field dispatch by
-implementing `UnmarshalSimdJSON(*DecodeCursor) error` or `MarshalSimdJSON(Appender)
-Appender` — the simdjson-native counterparts of `json.Unmarshaler` and
-`json.Marshaler`. A `DecodeCursor` exposes the same SIMD scalar kernels and object
-and array framing the decoder itself uses; an `Appender` is a by-value builder
-whose output buffer stays in registers. These read ~12–15% and write ~17–27%
-faster than the (already fastest-in-Go) compiled path, at zero allocation, and
-are entirely opt-in: a type without the methods is unaffected.
+A type can decode from the package cursor or append through the package writer
+by implementing `UnmarshalSimdJSON(*DecodeCursor) error` or
+`MarshalSimdJSON(Appender) Appender`. The hooks avoid reparsing raw custom
+marshaler output and are useful for generated or carefully hand-written hot
+types.
 
 ```go
 func (e Event) MarshalSimdJSON(w simdjson.Appender) simdjson.Appender {
@@ -312,14 +309,18 @@ func (e Event) MarshalSimdJSON(w simdjson.Appender) simdjson.Appender {
 }
 ```
 
-Decode bodies read fields through the `DecodeCursor` (`BeginObject`, `Field`/`NextField`,
-`Int64`/`String`/`Bool`/…, `Skip`); see the `DecodeCursor` and `Appender` type
-documentation. A hook body must not retain the `DecodeCursor` or `Appender` past the
-call, and an encode hook must emit valid compact JSON, since its bytes are
-spliced in without re-validation. Build with `-race` or the `simdjson_safehooks`
-tag during development: it runs each body against a heap-copied cursor and turns
-a retained handle into an immediate panic instead of latent corruption. Output
-and decoded values stay byte-identical to `encoding/json`.
+Safety is not a build option. Every build constructs hook interfaces through
+the Go runtime. Decode hooks receive a heap-backed receiver shadow and cursor
+copy; the cursor is invalidated on return. Encode hooks use ordinary Go
+ownership: addressable values expose their real GC-visible receiver, while
+non-addressable value receivers get an ordinary value copy. This preserves
+pointer identity and retention safety without a per-hook receiver allocation.
+If an addressable source was otherwise stack-local, allowing a hook to retain
+one of its receivers may make that source escape once for the whole operation;
+an array does not allocate once per element.
+There is no itab rebinding, layout probe, unsafe fast mode, or safety build tag.
+Hooks must still consume or emit exactly one valid JSON value, and callers must
+not retain an `Appender` across reuse of its caller-owned output buffer.
 
 </details>
 
@@ -485,7 +486,7 @@ speedup across all seven payloads.
 
 | Operation | Contract | vs stdlib | vs fastest rival | vs native Sonic | SIMD vs pure Go |
 |---|---|---:|---:|---:|---:|
-| Validate | Strict JSON + UTF-8 | **2.51x** | **2.28x** | **1.06x** | **1.497x** |
+| Validate | Strict JSON + UTF-8 | **2.89x** | **2.60x** | **1.25x** | **1.718x** |
 | Typed decode | Owned strings | **5.10x** | **2.06x** | **2.08x** | **1.159x** |
 | Dynamic decode | Owned `any` tree | **4.48x** | **2.01x** | **1.40x** | **1.121x** |
 | Encode | Owned output | **3.39x** | **2.06x** | **3.91x** | **1.720x** |
@@ -505,19 +506,11 @@ The upcoming `encoding/json/v2` (`GOEXPERIMENT=jsonv2`) trails on the same
 corpus by 3.9x on typed decode, 2.5x on dynamic decode, and 3.3x on owned
 `Marshal` — see [the v2 table](benchmarks/README.md#encodingjsonv2).
 
-The Validate row was refreshed on 2026-07-15 on the current build; the decode
-and encode rows, the native-Sonic column, and the SIMD-versus-pure column for
-those rows are the pinned 2026-07-14 snapshot. The 2026-07-15 regeneration ran
-under heavy background machine load: the zero-allocation paths (validation and
-the reused-buffer encoder) reproduced or beat their published times, but every
-path that allocates a fresh owned tree or output buffer inflated in lockstep
-for simdjson and the competitors alike — allocator and memory-bandwidth
-contention rather than a code change, since same-process leads held steady
-through it. The published owned-allocation absolutes are therefore kept as the
-honest idle-machine figures for this same build, and will be re-pinned from an
-idle window. See the
+The Validate row was refreshed on 2026-07-17 on the current build; decode and
+encode rows retain the pinned 2026-07-14 snapshot because those paths did not
+change. See the
 [per-corpus tables](benchmarks/README.md#published-corpus-snapshot) for the
-refreshed validation and new Parse/DOM rows.
+refreshed validation, Parse/DOM, and reusable structural-index rows.
 
 [Full per-corpus results, allocations, SIMD uplift, versions, and exact commands](benchmarks/README.md#published-corpus-snapshot).
 For context beyond Go — C++ simdjson and Rust serde_json/simd-json on the
@@ -593,9 +586,16 @@ guarded public APIs and report zero allocations.
 Unsafe code is restricted to measured internal paths: complete guarded blocks
 around vector loads and stores, clamped public scanners with a documented
 `simd.Unchecked` precondition surface, size-proven float and integer stores,
-and typed offsets taken from public `reflect` metadata — never runtime layout
-assumptions. Source-backed APIs require immutable input, and pointer-receiver
-custom methods use GC-safe heap-backed shadows.
+and typed offsets taken from public `reflect` metadata. Source-backed APIs
+require immutable input. Standard and native decode hooks use GC-safe
+heap-backed shadows. Standard and native encode hooks expose real addressable
+receivers through ordinary runtime-built interfaces, so the GC
+tracks retained pointers exactly as it does for a direct Go method call;
+non-addressable value receivers get a value copy. Pooled map storage is cleared
+through typed reflection so pointer-bearing elements retain the GC's write
+barriers; static and dynamic scratch ownership use separate, bounded slot
+spaces. Dynamic interfaces and hook interfaces are constructed only by the Go
+runtime, with no build tag or alternate unsafe dispatch.
 
 The test suite covers all 318 JSONTestSuite parsing cases, the seven pinned
 Go tip payloads with exact concrete models, typed and dynamic differentials
@@ -608,6 +608,10 @@ Correctness fixes that touch a hot path require before-and-after benchmarks.
 A regression is optimized back before merge; correctness is never traded away
 to recover it.
 
+The [safety-first practical priority order](SAFETY_ROADMAP.md) records the
+release freeze, lifetime gates, benchmark contract, and explicitly excluded
+parallel work.
+
 <details>
 <summary><b>Local release gate</b></summary>
 
@@ -619,17 +623,20 @@ TIP_GO="$HOME/sdk/simdjson-gotip/bin/go"
 
 "$TIP_GO" test ./...
 GOEXPERIMENT=simd "$TIP_GO" test ./...
-"$TIP_GO" vet -unsafeptr=false ./...
+"$TIP_GO" vet ./...
 GOEXPERIMENT=simd "$TIP_GO" test -race \
-  -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
+  -skip 'Alloc|TestParseFloat64' ./...
 GOEXPERIMENT=simd "$TIP_GO" test -gcflags='all=-d=checkptr=2' \
-  -skip 'Allocs|StaysOnStack|TestParseFloat64' ./...
+  -skip 'Alloc|TestParseFloat64' ./...
+GOGC=1 GOEXPERIMENT=simd "$TIP_GO" test \
+  -run '^Test(EncoderScratchPoolPoisoning|DynamicMapScratchIsPlanIndependent|EncodeHookArrayUsesStableSourcePointers|HookReceiverLifetimes|HookRetentionTrapAfterPanic)$' \
+  -count=10 -cpu=1,4,8 .
+GOEXPERIMENT=simd "$TIP_GO" test -run='^$' \
+  -fuzz='^FuzzEncoderScratchOperationSequence$' -fuzztime=30s .
 ./scripts/check-stdlib-corpus.sh "$TIP_GO"
 ```
 
-Vet's `unsafeptr` analyzer is disabled only for the documented runtime-style
-pointer-hiding helper in `noescape.go`; all other vet analyzers remain
-enabled.
+The full vet suite, including `unsafeptr`, runs without exceptions.
 
 </details>
 

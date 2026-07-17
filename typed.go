@@ -301,8 +301,6 @@ const (
 	typedMarshalerText
 	typedIface
 	typedTime
-	// The simdjson-native method hooks. A type carrying one of these decodes or
-	// encodes itself through the public DecodeCursor/Appender surface; see typed_hook.go.
 	typedUnmarshalerSimd
 	typedMarshalerSimd
 )
@@ -340,6 +338,13 @@ const (
 	typedOpIface
 )
 
+// encoderBackingSlot is intentionally distinct from the marshaler/key scratch
+// indexes stored beside it. Mixing those two plan-local index spaces would be
+// memory-safe but would silently borrow the wrong reusable value storage.
+type encoderBackingSlot int32
+
+const noEncoderBackingSlot encoderBackingSlot = -1
+
 type typedNode struct {
 	kind             typedKind // decode dispatch
 	encKind          typedKind // encode dispatch
@@ -361,13 +366,6 @@ type typedNode struct {
 	fieldTableMask   uint32
 	encFields        []typedEncField
 	encNameData      []byte
-	// decHookTab and encHookTab hold the *T -> hook-interface itabs captured at
-	// compile time (see captureHookTabs), so a hook dispatch is two word stores
-	// plus the call. They stay nil when the type carries no hook, or when the
-	// interface-layout self-test failed, in which case dispatch falls back to a
-	// safe reflect boxing. See typed_hook.go.
-	decHookTab unsafe.Pointer
-	encHookTab unsafe.Pointer
 	// encClose is what the pair encoder appends after the last member:
 	// a single brace normally, more when fused children close here too.
 	encClose []byte
@@ -398,6 +396,7 @@ type typedNode struct {
 	allSet     uint64
 	encScratch int32
 	encMapKey  int32
+	encBacking encoderBackingSlot
 }
 
 // typedInlineMap describes a struct's ",inline" map[string]T catch-all: where
@@ -412,7 +411,8 @@ type typedInlineMap struct {
 	// allocation per member; values collect into a pooled backing slice so each
 	// gets independent storage. It is -1 when no scratch is reserved (dynamic
 	// interface plans).
-	encKey int32
+	encKey     int32
+	encBacking encoderBackingSlot
 }
 
 // typedField is one struct member of a compiled decode plan. The key fields
@@ -440,6 +440,7 @@ type typedField struct {
 type typedCompiler struct {
 	nodes           map[reflect.Type]*typedNode
 	encScratchTypes []reflect.Type
+	encBackingSlots int
 	encHasMap       bool
 	escapeHTML      bool
 	// dynamic marks plans compiled for interface values at encode time.
@@ -478,7 +479,10 @@ func (c *typedCompiler) compileInlineMap(node *typedNode, structType reflect.Typ
 	if err != nil {
 		return err
 	}
-	inline := &typedInlineMap{offset: offset, mapType: mapType, elem: elem, sorted: !c.inlineUnsorted, encKey: -1}
+	inline := &typedInlineMap{
+		offset: offset, mapType: mapType, elem: elem, sorted: !c.inlineUnsorted,
+		encKey: -1, encBacking: noEncoderBackingSlot,
+	}
 	// Reuse the same pooled scratch as encodeMap: one map iterator and entry
 	// slice per encode, plus a reserved key box and a pooled value backing, so
 	// a populated catch-all encodes without per-member allocation.
@@ -486,6 +490,8 @@ func (c *typedCompiler) compileInlineMap(node *typedNode, structType reflect.Typ
 	if !c.dynamic {
 		inline.encKey = int32(len(c.encScratchTypes))
 		c.encScratchTypes = append(c.encScratchTypes, mapType.Key())
+		inline.encBacking = encoderBackingSlot(c.encBackingSlots)
+		c.encBackingSlots++
 	}
 	node.inlineMap = inline
 	node.encSimple = false
@@ -510,7 +516,10 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 	if node := c.nodes[typ]; node != nil {
 		return node, nil
 	}
-	node := &typedNode{typ: typ, name: typ.String(), size: typ.Size(), encScratch: -1, encMapKey: -1}
+	node := &typedNode{
+		typ: typ, name: typ.String(), size: typ.Size(),
+		encScratch: -1, encMapKey: -1, encBacking: noEncoderBackingSlot,
+	}
 	c.nodes[typ] = node
 
 	if err := c.compileStructural(node, typ, path); err != nil {
@@ -646,6 +655,8 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 			// collect into the pooled valueBacking for independent slots.
 			node.encMapKey = int32(len(c.encScratchTypes))
 			c.encScratchTypes = append(c.encScratchTypes, typ.Key())
+			node.encBacking = encoderBackingSlot(c.encBackingSlots)
+			c.encBackingSlots++
 		}
 		elem, err := c.compile(typ.Elem(), path+"[key]")
 		if err != nil {
@@ -882,12 +893,11 @@ func (c *typedCompiler) applyInterfaceKinds(node *typedNode, typ reflect.Type) b
 	pointerType := reflect.PointerTo(typ)
 	applied := false
 	if pointerType.Implements(unmarshalerSimdReflectType) {
-		// The simdjson-native hook wins over the standard interfaces: a type
-		// implements it precisely to skip their costs. Only the pointer form
-		// is honoured, since the body writes back through the receiver.
+		// Native hooks remain opt-in. Decode uses owned receiver/cursor state;
+		// encode uses ordinary GC-visible receiver ownership. There is no
+		// layout-sensitive fast mode.
 		node.kind = typedUnmarshalerSimd
 		node.op = typedOpUnmarshaler
-		captureHookTabs(node, typ, true, false)
 		applied = true
 	} else if typ.Implements(jsonUnmarshalerReflectType) || pointerType.Implements(jsonUnmarshalerReflectType) {
 		node.kind = typedUnmarshalerJSON
@@ -905,18 +915,11 @@ func (c *typedCompiler) applyInterfaceKinds(node *typedNode, typ reflect.Type) b
 		return true
 	}
 	if pointerType.Implements(marshalerSimdReflectType) {
-		// The native append hook overrides the standard marshaler dispatch for
-		// addressable values. When the value type itself implements the hook
-		// (a value receiver), the non-addressable route can use it too; a
-		// pointer-receiver hook leaves the non-addressable route on its default
-		// encoding, matching encoding/json's condAddrEncoder. Returning here
-		// keeps the standard-marshaler block below from clobbering encKind.
 		node.encKind = typedMarshalerSimd
 		node.encOp = typedOpMarshaler
 		if typ.Implements(marshalerSimdReflectType) {
 			node.encNonAddrKind = typedMarshalerSimd
 		}
-		captureHookTabs(node, typ, false, true)
 		return true
 	}
 	if typ.Implements(jsonMarshalerReflectType) {

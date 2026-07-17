@@ -145,7 +145,7 @@ func buildIndexBitmap(src []byte, storage []IndexEntry) (entries []IndexEntry, o
 
 			// Escape targets inside strings must name a legal escape;
 			// string interiors are otherwise never rescanned.
-			if bad := validBitmapEscapes(src, n, pos, rec.EscInStr, &skipEscape); bad {
+			if rec.EscInStr != 0 && validBitmapEscapes(src, n, pos, rec.EscInStr, &skipEscape) {
 				return nil, false
 			}
 
@@ -278,10 +278,14 @@ func indexBitmapFinish(src []byte, base unsafe.Pointer, n int, entries []IndexEn
 	}
 
 	// Escaped flags: every escape target sits inside some string, and that
-	// string's entry is the last one whose start precedes the target. The
-	// search runs over all entries so far, so strings spanning chunk
-	// boundaries need no carried state.
+	// string's entry is the last one whose start precedes the target. Escape
+	// positions and entry starts are both ordered. Cache the previous owner
+	// while no later entry starts before the next target; repeated escapes in
+	// one string then avoid another random-access search without scanning past
+	// unrelated entries. Each new owner is still located across all entries so
+	// strings crossing a chunk boundary need no carried state.
 	total := int(toOff >> 4)
+	escapeEntry := -1
 	for i := 0; i < cnt; i++ {
 		esc := recs[i].EscInStr
 		if esc == 0 {
@@ -289,19 +293,23 @@ func indexBitmapFinish(src []byte, base unsafe.Pointer, n int, entries []IndexEn
 		}
 		for ; esc != 0; esc &= esc - 1 {
 			p := uint32(chunkPos + i*64 + bits.TrailingZeros64(esc))
-			lo, hi := 0, total
-			for lo < hi {
-				mid := int(uint(lo+hi) >> 1)
-				if entries[mid].start < p {
-					lo = mid + 1
-				} else {
-					hi = mid
+			if escapeEntry < 0 ||
+				(escapeEntry+1 < total && entries[escapeEntry+1].start < p) {
+				lo, hi := 0, total
+				for lo < hi {
+					mid := int(uint(lo+hi) >> 1)
+					if entries[mid].start < p {
+						lo = mid + 1
+					} else {
+						hi = mid
+					}
 				}
+				escapeEntry = lo - 1
 			}
-			if lo == 0 {
+			if escapeEntry < 0 {
 				return false
 			}
-			e := &entries[lo-1]
+			e := &entries[escapeEntry]
 			if e.Kind() != String {
 				return false
 			}

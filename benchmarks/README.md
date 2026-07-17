@@ -45,19 +45,13 @@ These are medians of six 300 ms, single-CPU samples on an Apple M4 Max
 `03845e30f7b73d1703bd8c21017297f6eecb76d6`. Compilation happens before the
 timer. Every result is checked against `encoding/json` before measurement.
 
-> **Strict validation and Parse/DOM refreshed 2026-07-15; other tables retain
-> the 2026-07-14 run.** The validation and Parse/DOM rows were regenerated on
-> the current build under the six-sample protocol. The typed, dynamic, encode,
-> SIMD-versus-pure, native-Sonic, and `encoding/json/v2` tables keep their
-> 2026-07-14 numbers: the 2026-07-15 regeneration ran on a machine under heavy
-> background load, and while the zero-allocation paths (validation and the
-> compiled reused-buffer encoder) reproduced or improved on their published
-> times, every path that allocates a fresh owned tree or output buffer inflated
-> by 20-90% for simdjson *and* for the competitors alike — the signature of
-> allocator and memory-bandwidth contention, not a code change. Same-process
-> leads and ratios held to within a few percent through that contention, so the
-> published absolutes remain the honest idle-machine figures for this same
-> (unregressed) build. They will be re-pinned when an idle window is available.
+> **Strict validation, Parse/DOM, and reusable structural-index rows refreshed
+> 2026-07-17; other tables retain the 2026-07-14 run.** The refreshed rows were
+> regenerated on the current build under the six-sample protocol. Typed,
+> dynamic, encode, and `encoding/json/v2` retain their earlier numbers because
+> those paths did not change. The native-Sonic validation column and the
+> validation SIMD-versus-pure row were also regenerated for like-for-like
+> headline ratios; their other columns retain the earlier run.
 
 "Rival" is the fastest compatible same-toolchain result from go-json v0.10.6,
 Segment encoding v0.5.4, jsoniter v1.1.12, or fastjson v1.6.10. The headline
@@ -113,17 +107,41 @@ index and decodes each scalar on demand as the `Value` walk reaches it, whereas
 the `encoding/json` column materializes a complete owned `any` tree with
 `Unmarshal` and then walks the finished nodes. The comparison measures the
 end-to-end cost of parsing and then reading every value, not two identical data
-structures. Refreshed 2026-07-15.
+structures. Refreshed 2026-07-17.
 
 | Corpus | `encoding/json` any tree + walk | simdjson `Parse` + walk | Lead |
 |---|---:|---:|---:|
-| Canada geometry | 2.803 ms | **1.014 ms** | **2.76x** |
-| CITM catalog | 8.344 ms | **2.262 ms** | **3.69x** |
-| Go source | 18.991 ms | **4.829 ms** | **3.93x** |
-| Escaped strings | 218.9 us | **66.3 us** | **3.30x** |
-| Unicode strings | 56.1 us | **15.7 us** | **3.59x** |
-| Synthea FHIR | 12.420 ms | **3.354 ms** | **3.70x** |
-| Twitter status | 3.838 ms | **960.2 us** | **4.00x** |
+| Canada geometry | 3.074 ms | **876.4 us** | **3.51x** |
+| CITM catalog | 8.384 ms | **1.077 ms** | **7.78x** |
+| Go source | 19.170 ms | **4.171 ms** | **4.60x** |
+| Escaped strings | 211.3 us | **44.1 us** | **4.79x** |
+| Unicode strings | 51.4 us | **8.7 us** | **5.90x** |
+| Synthea FHIR | 12.680 ms | **1.337 ms** | **9.48x** |
+| Twitter status | 3.726 ms | **525.3 us** | **7.09x** |
+
+### Reusable structural index
+
+`BuildIndex` validates the input and builds a caller-owned navigable tape.
+These rows reuse correctly sized entry storage and allocate nothing. Refreshed
+2026-07-17.
+
+| Corpus | Time | Throughput |
+|---|---:|---:|
+| Canada geometry | **130.8 us** | **1.93 GiB/s** |
+| CITM catalog | **440.0 us** | **3.66 GiB/s** |
+| Go source | **944.7 us** | **1.91 GiB/s** |
+| Escaped strings | **4.69 us** | **8.35 GiB/s** |
+| Unicode strings | **3.49 us** | **4.84 GiB/s** |
+| Synthea FHIR | **491.1 us** | **3.81 GiB/s** |
+| Twitter status | **179.5 us** | **3.28 GiB/s** |
+
+Reproduce with:
+
+```sh
+GOEXPERIMENT=simd "$TIP_GO" test -run='^$' \
+  -bench='^BenchmarkStdlibCorpusNativeParse$' \
+  -benchmem -benchtime=300ms -count=6 -cpu=1 .
+```
 
 ### Strict validation
 
@@ -132,13 +150,13 @@ input.
 
 | Corpus | simdjson | Rival | Rival time | Lead |
 |---|---:|---|---:|---:|
-| Canada geometry | **124.9 us** | fastjson | 190.7 us | **1.53x** |
-| CITM catalog | **518.6 us** | fastjson | 811.1 us | **1.56x** |
-| Go source | **931.0 us** | Segment | 1.181 ms | **1.27x** |
-| Escaped strings | **4.4 us** | Segment | 56.4 us | **12.89x** |
-| Unicode strings | **3.2 us** | fastjson | 7.1 us | **2.19x** |
-| Synthea FHIR | **600.8 us** | fastjson | 1.289 ms | **2.14x** |
-| Twitter status | **226.6 us** | fastjson | 391.0 us | **1.73x** |
+| Canada geometry | **131.4 us** | fastjson | 218.7 us | **1.66x** |
+| CITM catalog | **434.8 us** | fastjson | 844.4 us | **1.94x** |
+| Go source | **944.8 us** | Segment | 1.193 ms | **1.26x** |
+| Escaped strings | **4.4 us** | Segment | 60.2 us | **13.67x** |
+| Unicode strings | **3.3 us** | fastjson | 7.0 us | **2.14x** |
+| Synthea FHIR | **438.4 us** | fastjson | 1.263 ms | **2.88x** |
+| Twitter status | **166.3 us** | fastjson | 390.6 us | **2.35x** |
 
 ### Encode
 
@@ -162,7 +180,7 @@ selected once during initialization; short runs may remain scalar or SWAR.
 
 | simdjson path | SIMD wins | Geomean SIMD uplift |
 |---|---:|---:|
-| Validation | 7/7 | **1.436x** |
+| Validation | 6/7 | **1.718x** |
 | Dynamic owned | 7/7 | **1.121x** |
 | Dynamic source-backed | 7/7 | **1.124x** |
 | Typed owned | 6/7 | **1.159x** |
@@ -179,13 +197,13 @@ invalid UTF-8.
 
 | Corpus | Typed owned | Dynamic owned | Encode owned | Syntax-only `Valid` |
 |---|---:|---:|---:|---:|
-| Canada geometry | 443.3 us | 742.7 us | 742.1 us | 185.9 us |
-| CITM catalog | 1.429 ms | 2.589 ms | 814.3 us | 764.9 us |
-| Go source | 3.431 ms | 5.633 ms | 3.538 ms | 1.502 ms |
-| Escaped strings | 31.8 us | 33.2 us | 18.4 us | 3.2 us |
+| Canada geometry | 443.3 us | 742.7 us | 742.1 us | 190.4 us |
+| CITM catalog | 1.429 ms | 2.589 ms | 814.3 us | 787.4 us |
+| Go source | 3.431 ms | 5.633 ms | 3.538 ms | 1.551 ms |
+| Escaped strings | 31.8 us | 33.2 us | 18.4 us | 3.3 us |
 | Unicode strings | 11.0 us | 12.8 us | 18.6 us | 1.7 us |
-| Synthea FHIR | 2.627 ms | 4.320 ms | 6.702 ms | 834.0 us |
-| Twitter status | 715.6 us | 1.005 ms | 542.7 us | 227.9 us |
+| Synthea FHIR | 2.627 ms | 4.320 ms | 6.702 ms | 853.8 us |
+| Twitter status | 715.6 us | 1.005 ms | 542.7 us | 233.6 us |
 
 ### encoding/json/v2
 
@@ -329,6 +347,8 @@ another pinned environment.
 - `ParseAnyNumbers16`: materialization of 1,024 exact 16-digit integers.
 - `ParseNative`: each library's native structural representation.
 - `Index`: simdjson validation plus caller-owned structural index construction.
+- `BenchmarkStdlibCorpusNativeParse`: reusable structural-index construction
+  over the exact seven-payload corpus.
 
 The module pins exact competitor versions in `go.mod` and `go.sum`.
 simdjson-go v0.4.5 remains skipped on arm64 because its implementation requires

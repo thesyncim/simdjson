@@ -114,7 +114,7 @@ func validBitmapStreamedAsm(src []byte) (valid, decided bool) {
 				utf8RunEnd = block + 1
 			}
 
-			if bad := validBitmapEscapes(src, n, pos, rec.EscInStr, &skipEscape); bad {
+			if rec.EscInStr != 0 && validBitmapEscapes(src, n, pos, rec.EscInStr, &skipEscape) {
 				return false, true
 			}
 

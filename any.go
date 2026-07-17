@@ -22,15 +22,14 @@ import (
 // decode mid-stream through decodeCompiledAny instead.
 //
 // The whole-document contract is what pays: because the value must span all
-// of src, the parser can size the [4]any array arena from the source length
-// and switch on the slab boxers (any_box.go) for large documents. Only
-// MaxDepth, ZeroCopy, and UseNumber apply from opts; the remaining
-// DecoderOptions concern typed destinations and have nothing to act on in
-// the dynamic shapes.
+// of src, the parser can size the [4]any array arena from the source length.
+// Only MaxDepth, ZeroCopy, and UseNumber apply from opts; the remaining
+// DecoderOptions concern typed destinations and have nothing to act on in the
+// dynamic shapes.
 func unmarshalAny(src []byte, opts DecoderOptions) (any, error) {
 	var arena *anyValueArena
 	if len(src) > 64 {
-		arena = &anyValueArena{sourceSize: len(src), boxScalars: len(src) >= anyBoxMinSource}
+		arena = &anyValueArena{sourceSize: len(src)}
 	}
 	p := parser{src: src, maxDepth: opts.MaxDepth, zeroCopy: opts.ZeroCopy, anyArena: arena}
 	if p.maxDepth <= 0 {
@@ -574,44 +573,24 @@ var anyPow10 = [...]float64{
 var boxedEmptyAnyValues any = []any{}
 
 // anyValueArena uses ordinary Go backing arrays to amortize storage for small
-// nested arrays, and carries the slab boxer that amortizes the interface
-// headers of the document's scalars (see any_box.go). Only array backing is
-// constructed here; interface construction stays in the boxer.
+// nested arrays. Scalar interfaces are always constructed by ordinary Go
+// conversions so the compiler and runtime own their layout and lifetime.
 type anyValueArena struct {
 	sourceSize int
 
 	arrays   [][4]any
 	arrayPos int
-
-	boxScalars bool
-	box        anyBoxer
 }
-
-// anyBoxMinSource is the source size at which the slab boxers switch on.
-// Slab boxing trades allocator work for collector work: each boxed value
-// saves a heap allocation, but its interior data word makes the collector
-// resolve the containing chunk on every mark, and a retained tree pins each
-// chunk's unused tail as live heap. Measured at default GOGC on dynamic
-// decodes, the allocator savings win on multi-hundred-kilobyte documents
-// (631 KiB and 1.7-6.2 MiB corpora all improve) and lose to the added mark
-// cost on small ones (a 137 KiB record array degrades ~8% while the same
-// build wins ~10% with the collector off). The threshold sits in the gap;
-// below it scalars keep ordinary conversions, which the tiny allocator
-// already serves well.
-const anyBoxMinSource = 512 << 10
 
 func boxedAnyBool(v bool) any {
 	return v
 }
 
-// The boxAny helpers funnel every scalar the one-pass parser produces, so the
-// arena's slab boxers plug in here. Small documents — the tiny-input path's
-// nil arena and anything under anyBoxMinSource — keep ordinary conversions.
+// The boxAny helpers funnel every scalar the one-pass parser produces through
+// ordinary conversions. Keeping the construction sites centralized makes the
+// allocation contract easy to audit without assuming interface layout.
 
 func (p *parser) boxAnyFloat64(v float64) any {
-	if a := p.anyArena; a != nil && a.boxScalars {
-		return a.box.float(v)
-	}
 	return v
 }
 
@@ -619,16 +598,10 @@ func (p *parser) boxAnyString(v string, number bool) any {
 	if number {
 		return json.Number(v)
 	}
-	if a := p.anyArena; a != nil && a.boxScalars {
-		return a.box.str(v)
-	}
 	return v
 }
 
 func (p *parser) boxAnySlice(v []any) any {
-	if a := p.anyArena; a != nil && a.boxScalars {
-		return a.box.slice(v)
-	}
 	return v
 }
 

@@ -1,23 +1,15 @@
 package simdjson
 
-// Slab-boxer corruption pass.
+// Dynamic-interface corruption pass.
 //
-// Dynamic decoding builds interface values whose data words are interior pointers
-// into shared heap slabs (any_box.go). The invariants that keep that safe —
-// slabs are heap-resident, slots are written once before handout, chunks are
-// never recycled — would, if violated, corrupt trees only when the collector
-// or another document races the violation, so this file stresses exactly
-// that: many goroutines decode concurrently, force stack growth and GC
-// between iterations, retain trees across collections, and re-verify every
-// retained tree at the end. A violation surfaces as a fatal "found bad
-// pointer in Go heap", or as a tree that no longer DeepEquals the
-// encoding/json ground truth (the safe build's boxers are ordinary
-// conversions, and the differential suites prove dynamic decoding matches
-// encoding/json, so ground truth and safe path agree).
+// Dynamic decoding constructs all scalar interfaces through ordinary Go
+// conversions. This file stresses the resulting lifetime boundary: many
+// goroutines decode concurrently, force stack growth and GC between iterations,
+// retain trees across collections, and re-verify every retained tree at the
+// end. A violation surfaces as a fatal collector error or as a tree that no
+// longer DeepEquals the encoding/json ground truth.
 //
-// As with the sibling corruption files, -race MASKS this class by perturbing
-// scheduling — and under -race the slab boxers are compiled out entirely —
-// so the intended stress invocation is without -race:
+// The intended collector stress invocation is without -race:
 //
 //	GOGC=1 GOEXPERIMENT=simd gotip test -run TestGCCorruptionAnyBox -count=5 -cpu=1,4,8 ./
 //
@@ -34,13 +26,10 @@ import (
 	"testing"
 )
 
-// anyBoxCorpusDoc builds a document that hits every slab kind: float64s in
-// and out of the plain-integer fast path, strings clean and escaped, nested
-// non-empty arrays, empty arrays, and objects, salted so goroutines cannot
-// share results by accident. The row count keeps the document above
-// anyBoxMinSource — smaller documents box scalars with ordinary conversions
-// and would not exercise the slabs at all; the test fails loudly if the two
-// ever drift apart.
+// anyBoxCorpusDoc builds a document that hits every dynamic interface kind:
+// float64s in and out of the plain-integer fast path, strings clean and
+// escaped, nested non-empty arrays, empty arrays, and objects, salted so
+// goroutines cannot share results by accident.
 const anyBoxCorpusRows = 4300
 
 func anyBoxCorpusDoc(salt int) []byte {
@@ -59,17 +48,12 @@ func anyBoxCorpusDoc(salt int) []byte {
 	return []byte(b.String())
 }
 
-// TestGCCorruptionAnyBoxSlabs decodes documents on goroutines that force
-// stack relocation and GC between iterations, retaining trees so slab chunks
-// stay live across many collections. Owned-mode sources are scribbled over
-// after decoding: a slab-boxed value that still aliased the caller's buffer
-// would surface as a mismatch, not just a leak. Every retained tree is
-// re-verified after the churn, catching a chunk that was recycled or moved
-// out from under its boxed values.
-func TestGCCorruptionAnyBoxSlabs(t *testing.T) {
-	if len(anyBoxCorpusDoc(0)) < anyBoxMinSource {
-		t.Fatalf("corpus document is smaller than anyBoxMinSource; the slab boxers are not exercised")
-	}
+// TestGCCorruptionDynamicAnyValues decodes documents on goroutines that force
+// stack relocation and GC between iterations, retaining trees across many
+// collections. Owned-mode sources are scribbled over after decoding: a value
+// that still aliased caller storage would surface as a mismatch, not just a
+// leak. Every retained tree is re-verified after the churn.
+func TestGCCorruptionDynamicAnyValues(t *testing.T) {
 	ownedDecoder, err := CompileDecoder[any](DecoderOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -155,21 +139,18 @@ func TestGCCorruptionAnyBoxSlabs(t *testing.T) {
 	}
 }
 
-// TestAnyBoxLayoutVerified pins the expectation that the slab boxers are
-// active on ordinary builds and disabled on safe builds, so a silently
-// failing layout probe cannot masquerade as a pass: if the probe ever fails
-// where it should succeed, this test fails rather than the boxers quietly
-// running in fallback mode forever.
-func TestAnyBoxLayoutVerified(t *testing.T) {
-	if hookSafeDispatch {
-		// Safe builds (-race or simdjson_safehooks) compile the boxers as
-		// ordinary conversions.
-		if anyBoxLayoutOK {
-			t.Fatal("slab boxers must be disabled in the safe build")
-		}
-		return
+// TestDynamicAnyUsesRuntimeInterfaces pins the centralized conversion contract.
+func TestDynamicAnyUsesRuntimeInterfaces(t *testing.T) {
+	var parser parser
+	if value, ok := parser.boxAnyFloat64(1.25).(float64); !ok || value != 1.25 {
+		t.Fatalf("float boxing = %v, %v", value, ok)
 	}
-	if !anyBoxLayoutOK {
-		t.Fatal("slab boxer layout probe failed on this toolchain")
+	if value, ok := parser.boxAnyString("safe", false).(string); !ok || value != "safe" {
+		t.Fatalf("string boxing = %q, %v", value, ok)
+	}
+	want := []any{"value", float64(2)}
+	value, ok := parser.boxAnySlice(want).([]any)
+	if !ok || !reflect.DeepEqual(value, want) {
+		t.Fatalf("slice boxing = %#v, %v", value, ok)
 	}
 }

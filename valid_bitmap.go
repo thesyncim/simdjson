@@ -214,7 +214,8 @@ func validBitmapPerBlock(src []byte) (valid, decided bool) {
 		}
 
 		// Escape targets inside strings must name a legal escape.
-		if bad := validBitmapEscapes(src, n, pos, escaped&inStr, &skipEscape); bad {
+		escInStr := escaped & inStr
+		if escInStr != 0 && validBitmapEscapes(src, n, pos, escInStr, &skipEscape) {
 			return false, true
 		}
 
@@ -322,7 +323,7 @@ func validBitmapStreamed(src []byte) (valid, decided bool) {
 				utf8RunEnd = block + 1
 			}
 
-			if bad := validBitmapEscapes(src, n, pos, rec.EscInStr, &skipEscape); bad {
+			if rec.EscInStr != 0 && validBitmapEscapes(src, n, pos, rec.EscInStr, &skipEscape) {
 				return false, true
 			}
 

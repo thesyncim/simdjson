@@ -251,6 +251,9 @@ func (cursor *decoderCursor) matchObjectFieldExpected(first bool, expected *type
 	src := cursor.src
 	i := cursor.i
 	n := len(src)
+	if i < n && src[i] <= ' ' {
+		i = skipSpaceIndent(src, i)
+	}
 	if i >= n || expected.keyMask == 0 {
 		return false
 	}
@@ -264,6 +267,9 @@ func (cursor *decoderCursor) matchObjectFieldExpected(first bool, expected *type
 			return false
 		}
 		i++
+		if i < n && src[i] <= ' ' {
+			i = skipSpaceIndent(src, i)
+		}
 		if i >= n || fastByteAt(base, i) != '"' {
 			return false
 		}
@@ -931,7 +937,7 @@ func newInlineDecoder(inline *typedInlineMap) *inlineDecoder {
 // ownership rules like any other decode. SetMapIndex copies both key and value
 // into the map, so reusing the source values across members is safe.
 func (d *inlineDecoder) decodeEntry(cursor *decoderCursor, inline *typedInlineMap, structPtr unsafe.Pointer, key string) error {
-	mapValue := reflect.NewAt(inline.mapType, noescape(unsafe.Add(structPtr, inline.offset))).Elem()
+	mapValue := reflect.NewAt(inline.mapType, unsafe.Add(structPtr, inline.offset)).Elem()
 	if mapValue.IsNil() {
 		mapValue.Set(reflect.MakeMap(inline.mapType))
 	}
@@ -977,7 +983,7 @@ func (cursor *decoderCursor) decodeCompiledMap(node *typedNode, dst unsafe.Point
 		}
 	}
 	if null {
-		reflect.NewAt(node.typ, noescape(dst)).Elem().SetZero()
+		reflect.NewAt(node.typ, dst).Elem().SetZero()
 		return nil
 	}
 	if err := cursor.BeginObject(node.name); err != nil {
@@ -986,7 +992,7 @@ func (cursor *decoderCursor) decodeCompiledMap(node *typedNode, dst unsafe.Point
 	// Map keys are retained by the result, so switch owned decodes to the
 	// private input copy before the first key string is sliced.
 	cursor.ownSource()
-	mapValue := reflect.NewAt(node.typ, noescape(dst)).Elem()
+	mapValue := reflect.NewAt(node.typ, dst).Elem()
 	if cursor.flags&decoderReplace != 0 && !mapValue.IsNil() {
 		// Replace decodes as if into a fresh destination, so a reused map drops
 		// keys the document does not set instead of merging into them.
@@ -1170,10 +1176,10 @@ func (cursor *decoderCursor) decodeCompiledIface(node *typedNode, dst unsafe.Poi
 		}
 	}
 	if null {
-		reflect.NewAt(node.typ, noescape(dst)).Elem().SetZero()
+		reflect.NewAt(node.typ, dst).Elem().SetZero()
 		return nil
 	}
-	value := reflect.NewAt(node.typ, noescape(dst)).Elem()
+	value := reflect.NewAt(node.typ, dst).Elem()
 	if !value.IsNil() {
 		concrete := value.Elem()
 		if concrete.Kind() == reflect.Pointer && !concrete.IsNil() {

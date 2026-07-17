@@ -1,4 +1,4 @@
-//go:build arm64 && !race && !simdjson_safehooks
+//go:build arm64 && !race
 
 package simd
 
@@ -22,7 +22,7 @@ import "unsafe"
 //     and the four state words. Reads of src touch only emit-bit
 //     positions, which the caller guarantees lie inside src.
 //
-// Race and safehooks builds exclude this file and fall back to the
+// Race builds exclude this file and fall back to the
 // portable walk (Stage2Enabled reports false there).
 
 // Stage2Enabled reports that the hand-written grammar machine backs this

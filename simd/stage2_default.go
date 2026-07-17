@@ -1,10 +1,10 @@
-//go:build !arm64 || race || simdjson_safehooks
+//go:build !arm64 || race
 
 package simd
 
 // Stage2Enabled reports whether this build provides the hand-written
 // grammar machine. Builds without it — non-arm64, -race, and
-// simdjson_safehooks — keep the portable walk.
+// race instrumentation — keep the portable walk.
 func Stage2Enabled() bool { return false }
 
 // Stage2Walk is unreachable on builds without the machine; callers must

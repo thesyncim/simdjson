@@ -61,7 +61,7 @@ func resetTyped(node *typedNode, dst unsafe.Pointer) {
 	case typedPointer:
 		*(*unsafe.Pointer)(dst) = nil
 	case typedMap, typedIface:
-		reflect.NewAt(node.typ, noescape(dst)).Elem().SetZero()
+		reflect.NewAt(node.typ, dst).Elem().SetZero()
 	case typedAny:
 		*(*any)(dst) = nil
 	}

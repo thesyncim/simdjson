@@ -9,11 +9,10 @@ package simdjson
 // goroutine observing another's data.
 //
 // The historical bug: encodeMap bound a reused (pooled, heap-resident)
-// reflect.MapIter to a map value whose internal pointer was laundered through
-// noescape and thus aliased the source struct on the goroutine STACK. A stack
-// move during the iteration loop — which a preemption or a GOMAXPROCS
-// transition can force — left the heap iterator's copy dangling, corrupting the
-// heap on the next GC. See heapBoundMapValue in encoder.go for the fix.
+// reflect.MapIter to a map value whose internal pointer had been hidden from
+// escape analysis and still aliased the goroutine stack. A stack move could
+// leave the iterator's copy dangling. Sources are now ordinarily GC-visible,
+// and releaseMapScratch unbinds the iterator before it enters the pool.
 //
 // Detecting this class reliably needs three ingredients TOGETHER, supplied by
 // the test runner, not by the test body (in-process GC/GOMAXPROCS twiddling
@@ -57,7 +56,8 @@ import (
 // small, preemptible goroutine frame with the map value freshly stack-built:
 // routing through a generic harness reshapes the frame and hides it. Under the
 // stress invocation (GOGC=1 -cpu=1,4,8) this crashed the unfixed encoder on the
-// first round; the fix in heapBoundMapValue makes it clean. Keep this shape.
+// first round; the GC-visible source and explicit iterator unbind make it
+// clean. Keep this shape.
 func TestCorruptionCanonicalMapPtr(t *testing.T) {
 	type Inner struct {
 		X string

@@ -38,10 +38,10 @@ func (v *retainingCustomReceiver) UnmarshalJSON(data []byte) error {
 }
 
 //go:noinline
-func encodeRetainingCustomReceiver() ([]byte, int, error) {
+func encodeRetainingCustomReceiver() ([]byte, int, bool, error) {
 	value := retainingCustomReceiver{Value: 41}
 	encoded, err := Marshal(&value)
-	return encoded, value.Value, err
+	return encoded, value.Value, retainedCustomReceiver == &value, err
 }
 
 //go:noinline
@@ -52,11 +52,11 @@ func decodeRetainingCustomReceiver() (int, error) {
 }
 
 //go:noinline
-func encodeRetainingCustomPointerReceiver() ([]byte, int, error) {
+func encodeRetainingCustomPointerReceiver() ([]byte, int, bool, error) {
 	value := retainingCustomReceiver{Value: 45}
 	pointer := &value
 	encoded, err := Marshal(&pointer)
-	return encoded, value.Value, err
+	return encoded, value.Value, retainedCustomReceiver == pointer, err
 }
 
 //go:noinline
@@ -86,11 +86,11 @@ func growRetentionTestStack(depth int) int {
 
 func TestCustomMethodReceiversMayBeRetained(t *testing.T) {
 	retainedCustomReceiver = nil
-	encoded, copiedBack, err := encodeRetainingCustomReceiver()
+	encoded, copiedBack, identical, err := encodeRetainingCustomReceiver()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded) != `{"value":41}` || copiedBack != 42 || retainedCustomReceiver == nil {
+	if string(encoded) != `{"value":41}` || copiedBack != 42 || !identical || retainedCustomReceiver == nil {
 		t.Fatalf("encoded = %s, retained = %p", encoded, retainedCustomReceiver)
 	}
 	encodedReceiver := retainedCustomReceiver
@@ -121,11 +121,11 @@ func TestCustomMethodReceiversMayBeRetained(t *testing.T) {
 	decodedReceiver.Value = 44
 
 	retainedCustomReceiver = nil
-	encoded, copiedBack, err = encodeRetainingCustomPointerReceiver()
+	encoded, copiedBack, identical, err = encodeRetainingCustomPointerReceiver()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded) != `{"value":45}` || copiedBack != 46 || retainedCustomReceiver == nil {
+	if string(encoded) != `{"value":45}` || copiedBack != 46 || !identical || retainedCustomReceiver == nil {
 		t.Fatalf("pointer encoded = %s, copied back = %d, retained = %p", encoded, copiedBack, retainedCustomReceiver)
 	}
 	_ = growRetentionTestStack(128)
@@ -201,6 +201,15 @@ var staticValueJSON = []byte("7")
 func (v staticValueMarshaler) MarshalJSON() ([]byte, error) {
 	if v != 7 {
 		return nil, errors.New("unexpected static value")
+	}
+	return staticValueJSON, nil
+}
+
+type staticPointerMarshaler int
+
+func (v *staticPointerMarshaler) MarshalJSON() ([]byte, error) {
+	if *v != 7 {
+		return nil, errors.New("unexpected static pointer value")
 	}
 	return staticValueJSON, nil
 }
@@ -281,6 +290,32 @@ func TestCompiledValueMarshalerScratchAllocs(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Fatal(err)
+	}
+}
+
+// TestCompiledPointerMarshalerArrayAllocs proves addressable standard encode
+// receivers use caller-owned storage rather than one detached shadow per
+// element. The output and source arrays are both preallocated outside the
+// measured operation.
+func TestCompiledPointerMarshalerArrayAllocs(t *testing.T) {
+	encoder, err := CompileEncoder[[8]staticPointerMarshaler](EncoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := [8]staticPointerMarshaler{7, 7, 7, 7, 7, 7, 7, 7}
+	buffer := make([]byte, 0, 32)
+	buffer, err = encoder.AppendJSON(buffer, &value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		buffer, err = encoder.AppendJSON(buffer[:0], &value)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("eight pointer marshalers allocated %v/op, want 0", allocs)
 	}
 }
 

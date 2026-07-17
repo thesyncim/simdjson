@@ -15,10 +15,10 @@
 # Requires the pinned gotip. Exits non-zero on the first failing round.
 set -eu
 
-gotip=${GOTIP:-/Users/thesyncim/go/bin/gotip}
+gotip=${GOTIP:-"$HOME/sdk/simdjson-gotip/bin/go"}
 rounds=20
 count=3
-pattern='TestCorruption'
+pattern='^Test.*Corruption'
 
 while getopts n:c: flag; do
 	case $flag in
@@ -32,6 +32,11 @@ shift $((OPTIND - 1))
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
+
+if [ ! -x "$gotip" ]; then
+	echo "pinned Go toolchain is not executable: $gotip (set GOTIP to override)" >&2
+	exit 1
+fi
 
 echo "stress: rounds=$rounds count=$count pattern=$pattern (GOGC=1 -cpu=1,4,8)" >&2
 
