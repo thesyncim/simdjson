@@ -412,6 +412,12 @@ func benchmarkCorpusEncode[T any](b *testing.B, src []byte) {
 		if err := equivalentJSON(want, got); err != nil {
 			b.Fatalf("%s: %v", encoder.name, err)
 		}
+		// Capacity preparation is outside the timer. In particular, simdjson
+		// requires two matching large observations before an exact hint can
+		// affect later allocations.
+		if _, err := encoder.fn(&value); err != nil {
+			b.Fatalf("%s warmup: %v", encoder.name, err)
+		}
 		b.Run(encoder.name, func(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(len(want)))

@@ -173,6 +173,14 @@ func benchmarkTyped[T any](b *testing.B, src []byte) {
 			}
 		}
 	})
+	// Marshal deliberately requires two matching large observations before it
+	// trusts a size hint. Capacity preparation, like plan compilation, belongs
+	// outside the steady-state timer.
+	for range 2 {
+		if _, err := simdjson.Marshal(&value); err != nil {
+			b.Fatal(err)
+		}
+	}
 	b.Run("encode-typed/simdjson-marshal", func(b *testing.B) {
 		b.ReportAllocs()
 		b.SetBytes(int64(len(src)))

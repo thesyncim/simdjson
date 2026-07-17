@@ -57,9 +57,9 @@ func (c Codec[T]) AppendJSON(dst []byte, src *T) ([]byte, error) {
 	return c.enc.AppendJSON(dst, src)
 }
 
-// Marshal encodes src into a new buffer presized by the codec's bounded recent
-// output-size estimate. Stable calls allocate one right-sized result without
-// allowing one exceptional value to determine every later allocation.
+// Marshal encodes src into a new buffer presized by the codec's adaptive
+// output-size estimate. Stable calls allocate one right-sized result; one
+// exceptional large value receives only a bounded allocation budget.
 func (c Codec[T]) Marshal(src *T) ([]byte, error) {
 	if c.hint == nil {
 		return nil, fmt.Errorf("simdjson: zero Codec")
@@ -68,36 +68,7 @@ func (c Codec[T]) Marshal(src *T) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	observed := uint64(len(out))
-	stored := c.hint.Load()
-	if observed == stored {
-		return out, nil
-	}
-	if observed > marshalSizeHintMax {
-		observed = marshalSizeHintMax
-	}
-	// Advance one bounded step per observation and retry failed concurrent
-	// updates. A smaller observation replaces the estimate immediately.
-	for {
-		current := stored
-		if current < marshalSizeHintMin {
-			current = marshalSizeHintMin
-		}
-		next := observed
-		if next > current {
-			growthLimit := current * marshalSizeHintGrowth
-			if growthLimit > marshalSizeHintMax {
-				growthLimit = marshalSizeHintMax
-			}
-			if next > growthLimit {
-				next = growthLimit
-			}
-		}
-		if stored == next || c.hint.CompareAndSwap(stored, next) {
-			break
-		}
-		stored = c.hint.Load()
-	}
+	updateMarshalSizeHint(c.hint, uint64(len(out)))
 	return out, nil
 }
 
