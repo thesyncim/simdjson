@@ -110,9 +110,11 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `marshaler.go` — `valueInterfaceAt`
 - `node.go` — `(Node).Bool`
 - `node.go` — `(Node).Float64`
+- `node.go` — `(Node).Uint64`
 - `node.go` — `tapeEntryOffset`
 - `node.go` — `tapeInt64`
 - `node.go` — `tapeSourceBytes`
+- `node.go` — `tapeUint64`
 - `number_digits.go` — `all16Digits`
 - `number_digits.go` — `all8Digits`
 - `number_digits.go` — `literalFalseTailAt`
@@ -142,6 +144,7 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `parser.go` — `ownedBytesString`
 - `raw.go` — `(RawValue).Float64`
 - `raw.go` — `(RawValue).Int64`
+- `raw.go` — `(RawValue).Uint64`
 - `simd/scan.go` — `slicesOverlap`
 - `simd/scan_simd.go` — `copyHTMLStringPrefix`
 - `simd/scan_simd.go` — `copyStringPrefix`
