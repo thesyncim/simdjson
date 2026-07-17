@@ -87,6 +87,7 @@ func CompileDecoder[T any](opts DecoderOptions) (Decoder[T], error) {
 		return Decoder[T]{}, err
 	}
 	prepareTypedResets(root, make(map[*typedNode]bool))
+	prepareDecoderReceivers(root)
 	structural := typedStructuralCandidate(root, make(map[*typedNode]bool))
 	rootSliceType := reflect.TypeFor[[]T]()
 	return Decoder[T]{
@@ -102,6 +103,7 @@ func CompileDecoder[T any](opts DecoderOptions) (Decoder[T], error) {
 			name:           rootSliceType.String(),
 			elem:           root,
 			emptySliceData: makeTypedEmptySliceData(rootSliceType),
+			decHasReceiver: root.decHasReceiver,
 		},
 		options: opts,
 	}, nil
@@ -185,6 +187,12 @@ func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 // dispatch, error propagation, and exact-document finalization here.
 func decodeTypedDocument(src []byte, options DecoderOptions, root *typedNode, dst unsafe.Pointer, state *decoderState) error {
 	cursor := newDecoderCursor(src, options)
+	if state == nil && root.decHasReceiver {
+		// Escaped-string arenas and detached standard-method receiver metadata
+		// may be created lazily. Their backing storage has its own lifetime, so
+		// return only the cleared state header after this document finishes.
+		defer cursor.releaseTransientState()
+	}
 	structural := state != nil && !state.structural.bad
 	if state != nil {
 		cursor.state = state
@@ -248,6 +256,9 @@ func (plan Decoder[T]) DecodePrefix(src []byte, dst *T) (int, error) {
 		return 0, fmt.Errorf("simdjson: typed Decode destination is nil")
 	}
 	cursor := newDecoderCursor(src, plan.options)
+	if plan.root.decHasReceiver {
+		defer cursor.releaseTransientState()
+	}
 	cursor.skipSpace()
 	var err error
 	switch plan.root.kind {
@@ -277,6 +288,9 @@ func (plan Decoder[T]) DecodeArray(src []byte, dst []T) ([]T, error) {
 		return dst[:0], fmt.Errorf("simdjson: zero Decoder")
 	}
 	cursor := newDecoderCursor(src, plan.options)
+	if plan.rootSlice.decHasReceiver {
+		defer cursor.releaseTransientState()
+	}
 	cursor.skipSpace()
 	if err := cursor.decodeCompiledSlice(plan.rootSlice, unsafe.Pointer(&dst)); err != nil {
 		return dst, err
@@ -468,6 +482,10 @@ type typedNode struct {
 	encSimple      bool
 	structuralFast bool
 	emptySliceData unsafe.Pointer
+	// decHasReceiver lets containers skip all batching work when their element
+	// graph has no standard JSON or text unmarshaler. The GC-scanned array type
+	// is kept only in uncommon per-decode arena metadata, not every plan node.
+	decHasReceiver bool
 	// encHasPtrMarshaler marks types that can reach a pointer-receiver
 	// marshaler through struct fields or array elements without crossing a
 	// pointer, slice, or map. Only these pay the non-addressable flag when

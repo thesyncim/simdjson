@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -214,6 +215,28 @@ func (v *staticPointerMarshaler) MarshalJSON() ([]byte, error) {
 	return staticValueJSON, nil
 }
 
+type staticPointerUnmarshaler int
+
+var retainedStaticUnmarshalers []*staticPointerUnmarshaler
+
+func (v *staticPointerUnmarshaler) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("empty static value")
+	}
+	value := 0
+	for _, digit := range data {
+		if digit < '0' || digit > '9' {
+			return errors.New("invalid static value")
+		}
+		value = value*10 + int(digit-'0')
+	}
+	*v = staticPointerUnmarshaler(value)
+	if retainedStaticUnmarshalers != nil {
+		retainedStaticUnmarshalers = append(retainedStaticUnmarshalers, v)
+	}
+	return nil
+}
+
 type pointerOnlyMarshaler struct {
 	Value int `json:"value"`
 }
@@ -316,6 +339,124 @@ func TestCompiledPointerMarshalerArrayAllocs(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("eight pointer marshalers allocated %v/op, want 0", allocs)
+	}
+}
+
+// TestCompiledPointerUnmarshalerArrayAllocs proves repeated standard decode
+// receivers share a small number of GC-scanned backing arrays while remaining
+// distinct, retainable shadows. The destination itself never becomes the
+// receiver, and no shadow storage is reused across decode operations.
+func TestCompiledPointerUnmarshalerArrayAllocs(t *testing.T) {
+	const count = 128
+	var source strings.Builder
+	source.WriteByte('[')
+	for i := 0; i < count; i++ {
+		if i != 0 {
+			source.WriteByte(',')
+		}
+		source.WriteString(strconv.Itoa(i))
+	}
+	source.WriteByte(']')
+	src := []byte(source.String())
+	decoder, err := CompileDecoder[[count]staticPointerUnmarshaler](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value [count]staticPointerUnmarshaler
+	retainedStaticUnmarshalers = make([]*staticPointerUnmarshaler, 0, count)
+	if err := decoder.Decode(src, &value); err != nil {
+		t.Fatal(err)
+	}
+	if len(retainedStaticUnmarshalers) != count {
+		t.Fatalf("retained receivers = %d, want %d", len(retainedStaticUnmarshalers), count)
+	}
+	seenReceivers := make(map[*staticPointerUnmarshaler]struct{}, count)
+	for i, receiver := range retainedStaticUnmarshalers {
+		if receiver == &value[i] || int(*receiver) != i || int(value[i]) != i {
+			t.Fatalf("receiver %d: shadow=%p value=%d destination=%p/%d",
+				i, receiver, *receiver, &value[i], value[i])
+		}
+		if _, duplicate := seenReceivers[receiver]; duplicate {
+			t.Fatalf("receiver %d reused address %p", i, receiver)
+		}
+		seenReceivers[receiver] = struct{}{}
+	}
+	firstBatchedReceiver := retainedStaticUnmarshalers[1]
+	runtime.GC()
+	*retainedStaticUnmarshalers[0] = 999
+	if value[0] != 0 {
+		t.Fatalf("retained shadow mutation changed destination to %d", value[0])
+	}
+	retainedStaticUnmarshalers = retainedStaticUnmarshalers[:0]
+	if err := decoder.Decode(src, &value); err != nil {
+		t.Fatal(err)
+	}
+
+	if !raceEnabled {
+		allocs := testing.AllocsPerRun(100, func() {
+			retainedStaticUnmarshalers = retainedStaticUnmarshalers[:0]
+			if err := decoder.Decode(src, &value); err != nil {
+				panic(err)
+			}
+		})
+		if allocs > 18 {
+			t.Fatalf("%d standard unmarshalers allocated %.1f times per run, want <=18", count, allocs)
+		}
+	}
+	if retainedStaticUnmarshalers[1] == firstBatchedReceiver {
+		t.Fatal("receiver backing was reused by a later decode")
+	}
+	*firstBatchedReceiver = 777
+	if retainedStaticUnmarshalers[1] == firstBatchedReceiver || value[1] != 1 {
+		t.Fatal("retained receiver from an earlier decode aliases later state")
+	}
+	retainedStaticUnmarshalers = nil
+}
+
+func TestCompiledPointerUnmarshalerConcurrent(t *testing.T) {
+	const count = 32
+	var source strings.Builder
+	source.WriteByte('[')
+	for i := 0; i < count; i++ {
+		if i != 0 {
+			source.WriteByte(',')
+		}
+		source.WriteString(strconv.Itoa(i))
+	}
+	source.WriteByte(']')
+	src := []byte(source.String())
+	decoder, err := CompileDecoder[[count]staticPointerUnmarshaler](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	retainedStaticUnmarshalers = nil
+	start := make(chan struct{})
+	errs := make(chan error, 64)
+	var wait sync.WaitGroup
+	for range 64 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			var value [count]staticPointerUnmarshaler
+			for range 20 {
+				if decodeErr := decoder.Decode(src, &value); decodeErr != nil {
+					errs <- decodeErr
+					return
+				}
+				if value[0] != 0 || value[count-1] != count-1 {
+					errs <- fmt.Errorf("concurrent decode endpoints = %d, %d", value[0], value[count-1])
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 }
 

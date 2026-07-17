@@ -47,6 +47,9 @@ func (cursor *decoderCursor) decodeCompiledSlice(node *typedNode, dst unsafe.Poi
 			return decodeCompiledFloat64Slice(cursor, node, dst)
 		}
 	}
+	if node.decHasReceiver {
+		return cursor.decodeCompiledSliceReceivers(node, dst, header)
+	}
 	for index, first := 0, true; ; index, first = index+1, false {
 		more, err := cursor.NextArrayElement(first)
 		if err != nil {
@@ -92,6 +95,59 @@ func (cursor *decoderCursor) decodeCompiledSlice(node *typedNode, dst unsafe.Poi
 		default:
 			elementErr = cursor.decodeCompiled(node.elem, element)
 		}
+		if elementErr != nil {
+			return prependDecodePathIndex(elementErr, index)
+		}
+	}
+}
+
+// decodeCompiledSliceReceivers is the uncommon generic slice loop for element
+// graphs containing standard unmarshal methods. Keeping it separate leaves the
+// ordinary compiled slice loop byte-for-byte free of receiver-arena branches.
+func (cursor *decoderCursor) decodeCompiledSliceReceivers(node *typedNode, dst unsafe.Pointer, header *typedSliceHeader) error {
+	for index, first := 0, true; ; index, first = index+1, false {
+		more, err := cursor.NextArrayElement(first)
+		if err != nil {
+			return err
+		}
+		if !more {
+			if index == 0 {
+				setTypedEmptySlice(node, dst)
+			}
+			return nil
+		}
+		if index == header.cap {
+			capacity := nextTypedSliceCapacity(header.cap, index+1)
+			if header.cap == 0 && node.elem.kind == typedStruct && cursor.depth <= 3 {
+				if estimate := (len(cursor.src) - cursor.i) / 128; estimate > capacity {
+					capacity = estimate
+					if capacity > 1024 {
+						capacity = 1024
+					}
+				}
+			}
+			growTypedSlice(node, dst, capacity)
+			header = (*typedSliceHeader)(dst)
+		}
+		header.len = index + 1
+		element := unsafe.Add(header.data, uintptr(index)*node.elem.size)
+		batchedReceivers := index > 0 && cursor.beginReceiverBatch()
+		var elementErr error
+		switch node.elem.kind {
+		case typedStruct:
+			elementErr = cursor.decodeCompiledStruct(node.elem, element)
+		case typedSlice:
+			elementErr = cursor.decodeCompiledSlice(node.elem, element)
+		case typedArray:
+			elementErr = cursor.decodeCompiledArray(node.elem, element)
+		case typedPointer:
+			elementErr = cursor.decodeCompiledPointer(node.elem, element)
+		case typedMap:
+			elementErr = cursor.decodeCompiledMap(node.elem, element)
+		default:
+			elementErr = cursor.decodeCompiled(node.elem, element)
+		}
+		cursor.endReceiverBatch(batchedReceivers)
 		if elementErr != nil {
 			return prependDecodePathIndex(elementErr, index)
 		}
@@ -361,6 +417,9 @@ func (cursor *decoderCursor) decodeCompiledArray(node *typedNode, dst unsafe.Poi
 		}
 		return nil
 	}
+	if node.decHasReceiver {
+		return cursor.decodeCompiledArrayReceivers(node, dst, replace)
+	}
 	for index, first := 0, true; ; index, first = index+1, false {
 		more, err := cursor.NextArrayElement(first)
 		if err != nil {
@@ -445,6 +504,39 @@ func (cursor *decoderCursor) decodeCompiledArray(node *typedNode, dst unsafe.Poi
 			if err := cursor.Skip(); err != nil {
 				return err
 			}
+		}
+	}
+}
+
+// decodeCompiledArrayReceivers is the uncommon fixed-array loop for element
+// graphs containing standard unmarshal methods. Each element after the first
+// may draw detached receivers from a typed, GC-scanned array; the ordinary
+// array loop carries no receiver-batching branch.
+func (cursor *decoderCursor) decodeCompiledArrayReceivers(node *typedNode, dst unsafe.Pointer, replace bool) error {
+	for index, first := 0, true; ; index, first = index+1, false {
+		more, err := cursor.NextArrayElement(first)
+		if err != nil {
+			return err
+		}
+		if !more {
+			if !replace {
+				zeroTypedArrayTail(node, dst, index)
+			}
+			return nil
+		}
+		if index >= node.length {
+			if err := cursor.Skip(); err != nil {
+				return err
+			}
+			continue
+		}
+
+		element := unsafe.Add(dst, uintptr(index)*node.elem.size)
+		batchedReceivers := index > 0 && cursor.beginReceiverBatch()
+		elementErr := cursor.decodeCompiled(node.elem, element)
+		cursor.endReceiverBatch(batchedReceivers)
+		if elementErr != nil {
+			return prependDecodePathIndex(elementErr, index)
 		}
 	}
 }

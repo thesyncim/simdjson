@@ -77,6 +77,7 @@ type decoderState struct {
 	strings          []byte
 	structural       decoderStructuralTape
 	structuralActive bool
+	receivers        *decoderReceiverState
 }
 
 // newDecoderCursor starts decoding src with opts.
@@ -106,6 +107,14 @@ func newDecoderCursor(src []byte, opts DecoderOptions) decoderCursor {
 		maxDepth: maxDepth,
 		flags:    flags,
 	}
+}
+
+func (c *decoderCursor) releaseTransientState() {
+	if c.state == nil {
+		return
+	}
+	releaseDecoderReceiverState(c.state)
+	c.state = nil
 }
 
 // Finish verifies that exactly one complete JSON value was consumed.

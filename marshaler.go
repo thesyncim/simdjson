@@ -23,22 +23,6 @@ func pointerInterfaceAt(typ reflect.Type, p unsafe.Pointer) any {
 	return reflect.NewAt(typ, p).Interface()
 }
 
-// copiedPointerReceiverAt creates a shallow, heap-backed *T for a call into
-// user code. Pointer-receiver methods may legally retain their receiver;
-// passing the caller's receiver directly would let the method retain storage
-// whose lifetime is owned by the current operation.
-func copiedPointerReceiverAt(typ reflect.Type, p unsafe.Pointer) (any, reflect.Value) {
-	shadow := reflect.New(typ)
-	shadow.Elem().Set(reflect.NewAt(typ, p).Elem())
-	return shadow.Interface(), shadow
-}
-
-func copiedLoadedPointerReceiverAt(typ reflect.Type, p unsafe.Pointer) (any, reflect.Value) {
-	shadow := reflect.New(typ.Elem())
-	shadow.Elem().Set(reflect.NewAt(typ.Elem(), p).Elem())
-	return shadow.Interface(), shadow
-}
-
 func copyMethodReceiverBack(typ reflect.Type, dst unsafe.Pointer, shadow reflect.Value) {
 	if !shadow.IsValid() {
 		return
@@ -73,7 +57,7 @@ func (cursor *decoderCursor) decodeViaUnmarshaler(node *typedNode, dst unsafe.Po
 		*(*unsafe.Pointer)(dst) = nil
 		return nil
 	}
-	receiver, shadow := receiverAt(node.typ, dst)
+	receiver, shadow := cursor.receiverAt(node, dst)
 	unmarshaler, ok := receiver.(json.Unmarshaler)
 	if !ok {
 		return &DecodeError{Offset: start, Type: node.typ, Reason: "invalid compiled operation"}
@@ -86,22 +70,31 @@ func (cursor *decoderCursor) decodeViaUnmarshaler(node *typedNode, dst unsafe.Po
 	return nil
 }
 
-// receiverAt boxes the un/marshaler receiver for the value at dst: pointer
-// kinds are loaded and allocated on demand, other kinds pass their address.
-func receiverAt(typ reflect.Type, dst unsafe.Pointer) (any, reflect.Value) {
+// receiverAt boxes a detached un/marshaler receiver for the value at dst.
+// Repeated container elements draw distinct receivers from a GC-scanned typed
+// array; singleton calls keep the one-object shadow. Pointer kinds are loaded
+// and allocated on demand before either path copies their pointee.
+func (cursor *decoderCursor) receiverAt(node *typedNode, dst unsafe.Pointer) (any, reflect.Value) {
+	typ := node.typ
+	var source reflect.Value
 	if typ.Kind() != reflect.Pointer {
-		return copiedPointerReceiverAt(typ, dst)
+		source = reflect.NewAt(typ, dst).Elem()
+	} else {
+		pointer := *(*unsafe.Pointer)(dst)
+		if pointer == nil {
+			value := reflect.New(typ.Elem())
+			pointer = value.UnsafePointer()
+			*(*unsafe.Pointer)(dst) = pointer
+			runtime.KeepAlive(value)
+		}
+		source = reflect.NewAt(typ.Elem(), pointer).Elem()
 	}
-	pointer := *(*unsafe.Pointer)(dst)
-	if pointer == nil {
-		value := reflect.New(typ.Elem())
-		pointer = value.UnsafePointer()
-		*(*unsafe.Pointer)(dst) = pointer
-		boxed, shadow := copiedLoadedPointerReceiverAt(typ, pointer)
-		runtime.KeepAlive(value)
-		return boxed, shadow
+	if shadow, ok := cursor.nextReceiverShadow(node, source); ok {
+		return shadow.Interface(), shadow
 	}
-	return copiedLoadedPointerReceiverAt(typ, pointer)
+	shadow := reflect.New(source.Type())
+	shadow.Elem().Set(source)
+	return shadow.Interface(), shadow
 }
 
 // decodeViaTextUnmarshaler decodes a JSON string through UnmarshalText.
@@ -127,7 +120,7 @@ func (cursor *decoderCursor) decodeViaTextUnmarshaler(node *typedNode, dst unsaf
 		return err
 	}
 
-	receiver, shadow := receiverAt(node.typ, dst)
+	receiver, shadow := cursor.receiverAt(node, dst)
 	unmarshaler, ok := receiver.(encoding.TextUnmarshaler)
 	if !ok {
 		return &DecodeError{Offset: start, Type: node.typ, Reason: "invalid compiled operation"}

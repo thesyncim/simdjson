@@ -58,6 +58,7 @@ type inlineDecoder struct {
 	keyValue     reflect.Value
 	elementValue reflect.Value
 	elementPtr   unsafe.Pointer
+	entries      int
 }
 
 // newInlineDecoder builds the reusable state for a catch-all map. It is called
@@ -82,6 +83,8 @@ func (d *inlineDecoder) decodeEntry(cursor *decoderCursor, inline *typedInlineMa
 		mapValue.Set(reflect.MakeMap(inline.mapType))
 	}
 	d.elementValue.SetZero()
+	batchedReceivers := d.entries > 0 && inline.elem.decHasReceiver && cursor.beginReceiverBatch()
+	d.entries++
 	var err error
 	switch inline.elem.kind {
 	case typedStruct:
@@ -97,6 +100,7 @@ func (d *inlineDecoder) decodeEntry(cursor *decoderCursor, inline *typedInlineMa
 	default:
 		err = cursor.decodeCompiled(inline.elem, d.elementPtr)
 	}
+	cursor.endReceiverBatch(batchedReceivers)
 	if err != nil {
 		return err
 	}
@@ -162,6 +166,7 @@ func (cursor *decoderCursor) decodeCompiledMap(node *typedNode, dst unsafe.Point
 			return nil
 		}
 		elementValue.SetZero()
+		batchedReceivers := !first && node.decHasReceiver && cursor.beginReceiverBatch()
 		var entryErr error
 		switch node.elem.kind {
 		case typedStruct:
@@ -177,6 +182,7 @@ func (cursor *decoderCursor) decodeCompiledMap(node *typedNode, dst unsafe.Point
 		default:
 			entryErr = cursor.decodeCompiled(node.elem, elementPtr)
 		}
+		cursor.endReceiverBatch(batchedReceivers)
 		if entryErr != nil {
 			return prependDecodePathField(entryErr, key)
 		}
@@ -297,6 +303,7 @@ func dynamicDecodeNode(typ reflect.Type) (*typedNode, error) {
 	node, err := compiler.compile(typ, typ.String())
 	if err == nil {
 		prepareTypedResets(node, make(map[*typedNode]bool))
+		prepareDecoderReceivers(node)
 	}
 	entry, _ := dynamicDecodeNodes.LoadOrStore(typ, &dynamicDecodeEntry{node: node, err: err})
 	cached := entry.(*dynamicDecodeEntry)

@@ -33,6 +33,14 @@ type decoderStructuralTape struct {
 
 var decoderStatePool sync.Pool
 
+func takeDecoderState() *decoderState {
+	state, _ := decoderStatePool.Get().(*decoderState)
+	if state == nil {
+		state = new(decoderState)
+	}
+	return state
+}
+
 // decoderStructuralWorthwhile applies the document-side routing contract for
 // the forward structural producer. The caller separately checks that its
 // compiled shape has a structural executor.
@@ -42,10 +50,7 @@ func decoderStructuralWorthwhile(src []byte) bool {
 }
 
 func acquireDecoderState(src []byte) *decoderState {
-	state, _ := decoderStatePool.Get().(*decoderState)
-	if state == nil {
-		state = new(decoderState)
-	}
+	state := takeDecoderState()
 	state.strings = nil
 	state.structuralActive = true
 	state.structural.build(src)
@@ -56,6 +61,7 @@ func releaseDecoderState(state *decoderState) {
 	// Escaped output strings own their arena backing independently. Dropping
 	// the slice prevents a later decode from mutating that retained output.
 	state.strings = nil
+	state.resetReceiverArenas()
 	state.structuralActive = false
 	state.structural.resetForPool()
 	decoderStatePool.Put(state)
