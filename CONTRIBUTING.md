@@ -22,6 +22,17 @@ Parser or codec behavior changes need differential coverage against
 and terminal-state coverage. Ownership changes need forced GC, stack growth,
 and retained-result coverage.
 
+The design records under `docs/design` describe the maintained invariants:
+
+- [`ownership.md`](docs/design/ownership.md) for public and internal lifetimes;
+- [`typed-plan.md`](docs/design/typed-plan.md) for compiled operations and the
+  specialization budget;
+- [`structural-decoder.md`](docs/design/structural-decoder.md) for route choice,
+  index tradeoffs, and threshold history;
+- [`pooling.md`](docs/design/pooling.md) for retained-resource limits; and
+- [`hooks.md`](docs/design/hooks.md) for field matching, trusted output, and
+  receiver lifetime.
+
 ## Unsafe code
 
 `unsafe` is permitted only where ordinary Go cannot express the measured hot

@@ -29,14 +29,10 @@ const _ = uint(simdkernels.Stage2MaxDepth-defaultMaxDepth) + uint(defaultMaxDept
 
 // validBitmapStreamChunkAsm is the number of blocks per batched kernel
 // call once the whitespace sample has committed and the stage-2 machine
-// is consuming the masks. The machine reloads and stores its state words
-// per call, so unlike the Go walk it wants wide runs: at 4 blocks the
-// call and state traffic cost about a third of a nanosecond per position
-// on FHIR-shaped documents (1.35 vs 1.07 ns/pos at 16 blocks), while 16
-// blocks holds every gate corpus at or under 1.1. Inside the sampling
-// window the engine keeps validBitmapStreamChunk's 4-block cadence so
-// the bailout decision — and therefore the decided verdict — is
-// bit-identical to the Go engines'. Must be a multiple of
+// is consuming the masks. The machine amortizes state reloads over wider runs.
+// Inside the sampling window the engine keeps validBitmapStreamChunk's
+// four-block cadence so the bailout decision — and therefore the decided
+// verdict — is bit-identical to the Go engines. Must be a multiple of
 // validBitmapStreamChunk, divide validBitmapSampleBlocks' window
 // alignment, and not exceed simdkernels.Stage1ChunkBlocks.
 const validBitmapStreamChunkAsm = 16

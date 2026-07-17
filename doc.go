@@ -52,9 +52,10 @@
 // value path as [DecodeError].
 //
 // Concrete types encountered inside interface values are compiled on first
-// use and cached for the process lifetime. This suits the finite type sets used
-// by ordinary programs. Programs that synthesize an unbounded number of
-// reflect types should not feed them through interface-valued encode paths.
+// use and cached for the process lifetime; encode entries are distinct for the
+// HTML-escaping modes. This suits the finite type sets used by ordinary
+// programs. Programs that synthesize an unbounded number of reflect types
+// should not feed them through interface-valued codec paths.
 //
 // # Custom marshalers
 //
@@ -101,10 +102,10 @@
 //
 // # Toolchain
 //
-// The module currently requires a Go 1.27 development toolchain for generic
-// methods. Building with GOEXPERIMENT=simd on arm64 or amd64 enables vector
-// kernels for string scanning, UTF-8 validation, number parsing, and number
-// and time formatting through Go's experimental simd/archsimd package.
+// The module currently requires the pinned Go 1.27 development toolchain.
+// Building with GOEXPERIMENT=simd on arm64 or amd64 enables vector kernels for
+// string scanning, UTF-8 validation, number parsing, and number and time
+// formatting through Go's experimental simd/archsimd package.
 // Architecture code, portable fallbacks, and runtime reporting live in the
 // public github.com/thesyncim/simdjson/simd subpackage.
 package simdjson

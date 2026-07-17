@@ -10,11 +10,9 @@ package simdjson
 //		use(it.Current())
 //	}
 //
-// The by-value shape keeps the iterator's state in registers, where the
-// pointer receiver pins it to the stack, and iterates measurably faster:
-// about 3.3x on a kind-only loop over an array of small objects
-// (BenchmarkIterShape). Prefer it on hot paths; the two shapes visit the
-// same elements.
+// The by-value shape lets the iterator state remain in registers. Prefer it on
+// hot paths; use Next when its conventional pointer-receiver loop is clearer.
+// The two shapes visit the same elements.
 type ArrayIter struct {
 	src       *byte
 	entry     *IndexEntry
@@ -128,10 +126,9 @@ func (it *ArrayIter) NextRaw() (RawValue, bool) {
 // FlatArrayIter iterates an array whose direct elements each occupy one index
 // entry. Its fixed entry stride is faster than the general subtree cursor.
 //
-// It supports the same two loop shapes as [ArrayIter]; the by-value
-// Valid/Current/Advance form is about 6.4x faster than Next here
-// (BenchmarkIterShape), the fixed stride leaving nothing to hide the Next
-// family's per-element stack round trip behind.
+// It supports the same two loop shapes as [ArrayIter]. The by-value
+// Valid/Current/Advance form avoids the Next family's per-element stack round
+// trip.
 type FlatArrayIter struct {
 	src       *byte
 	entry     *IndexEntry
@@ -243,9 +240,8 @@ func (it *FlatArrayIter) NextRaw() (RawValue, bool) {
 
 // ObjectIter iterates ordered object key/value pairs without allocating.
 //
-// It supports the same two loop shapes as [ArrayIter]; the by-value
-// Valid/Current/Advance form is about 1.3x faster than Next on a
-// record-shaped object (BenchmarkIterShape).
+// It supports the same two loop shapes as [ArrayIter]. Prefer the by-value
+// Valid/Current/Advance form on hot paths.
 type ObjectIter struct {
 	src       *byte
 	entry     *IndexEntry
@@ -347,9 +343,8 @@ func (it *ObjectIter) NextRaw() (key, value RawValue, ok bool) {
 // FlatObjectIter iterates an object whose direct values each occupy one index
 // entry.
 //
-// It supports the same two loop shapes as [ArrayIter]; the by-value
-// Valid/Current/Advance form is about 2.9x faster than Next on a flat
-// scalar object (BenchmarkIterShape).
+// It supports the same two loop shapes as [ArrayIter]. Prefer the by-value
+// Valid/Current/Advance form on hot paths.
 type FlatObjectIter struct {
 	src       *byte
 	entry     *IndexEntry

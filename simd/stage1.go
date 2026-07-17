@@ -6,13 +6,8 @@ package simd
 // 64-byte block is classified into one-bit-per-byte masks from which the
 // caller derives string extents and structural positions.
 //
-// The production consumer is the bitmap validation engine in the root
-// package (valid_bitmap.go), which reads the masks without materializing
-// positions. A position-driven parser was also built on these kernels and
-// measured about twice as slow as the recursive-descent scanner — the cost
-// was position extraction and cursor dispatch, not the masks — so tape
-// building stays recursive; the economics flip only with a consumer near
-// one nanosecond per emitted position.
+// The production consumers read masks directly or build forward structural
+// positions. Persistent index construction uses its own fused writer.
 
 // Stage1Enabled reports whether this build provides the stage-1 kernel.
 func Stage1Enabled() bool { return true }

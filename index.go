@@ -281,9 +281,7 @@ func (b *tapeBuilder) stringFast(start int, flags uint8) tapeParseStatus {
 
 // fastWalkMaxDepth bounds the container nesting the iterative walk handles
 // inline. Its open-scope stack lives in one fixed on-stack frame so the walk
-// stays allocation-free; a cap keeps that frame small (a deeper frame measured
-// as a net loss, the zeroing and register pressure outweighing the saved
-// recursion). Real documents nest far shallower than this; anything deeper
+// stays allocation-free; the cap keeps that frame small. Anything deeper
 // diverts to the diagnostic parser, which is bounded only by maxDepth.
 const fastWalkMaxDepth = 64
 

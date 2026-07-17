@@ -11,7 +11,7 @@ import (
 )
 
 // The dispatch thresholds start at max int, which disables the probe and
-// vector stages until initStringScanner installs the measured values for a
+// vector stages until initStringScanner installs backend-specific values for a
 // detected backend; without one the dispatchers run only their word loops.
 var (
 	scanStringSpecialBackend   = "scalar"

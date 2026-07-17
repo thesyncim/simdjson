@@ -11,24 +11,21 @@ import (
 // whitespace disappears into the block masks, string interiors are skipped
 // wholesale by the in-string mask, and the grammar machine touches only
 // structural characters, string openers, and the first byte of each scalar.
-// That inverts the position economics that sank the position-driven parser:
-// on indentation-heavy documents most bytes never reach the walk at all.
+// On indentation-heavy documents most bytes never reach the walk at all.
 //
-// Dense compact documents emit a position every few bytes, where the
-// recursive scanner is still faster, so a density sample of the leading
-// blocks decides which engine runs (see validBitmapSampleCommit). The
-// engine only reports validity; Validate re-runs the scalar validator for
-// exact error offsets.
+// Dense compact documents emit a position every few bytes, so a density sample
+// of the leading blocks decides which engine runs (see
+// validBitmapSampleCommit). The engine only reports validity; Validate re-runs
+// the scalar validator for exact error offsets.
 //
 // On arm64 the classification runs through the batched stage-1 kernel
 // (simd.Stage1BlocksGP): a chunk of blocks is classified per call, so the
 // vector constants load once per chunk instead of once per block, and the
 // escape chain and quote prefix-XOR resolve inside the kernel. The grammar
 // machine then consumes precomputed per-block records. Amd64 has no batched
-// kernel — native movemask makes the per-block setup cheap enough that the
-// batching win does not pay for the record round-trip — so there the
-// per-block path below classifies one block at a time. Both paths share the
-// grammar walk (validBitmapWalk) and produce identical verdicts.
+// kernel, so the per-block path below classifies one block at a time. Both
+// paths share the grammar walk (validBitmapWalk) and produce identical
+// verdicts. docs/design/structural-decoder.md records the routing rationale.
 
 // stage1ValidatorEnabled gates the bitmap engine to builds with the
 // stage-1 kernels.
@@ -44,30 +41,19 @@ const (
 	validBitmapMinBytes = 1 << 16
 
 	// The density dispatch samples the first 2 KiB; the commit rule itself
-	// lives in validBitmapSampleCommit. The whitespace leg requires at
-	// least 25% outside whitespace and a ws:emit ratio above 3.5
-	// (2ws >= 7emits). The ratio was retuned from 4.5 after the ADDP mask
-	// kernels cut the per-block cost by about thirty percent; citm-shaped
-	// documents at a ratio near 3.8 now win with the engine.
+	// lives in validBitmapSampleCommit. The whitespace leg requires at least
+	// 25% outside whitespace and a ws:emit ratio above 3.5 (2ws >= 7emits).
 	validBitmapSampleBlocks = 32
 	validBitmapSampleMinWs  = 512
 
-	// validBitmapSampleMinInStr is the string leg's floor: 9/16 (56.25%)
-	// of the sampled bytes inside strings. Measured sample shares:
-	// twitter-shaped documents sit near 66% and win with the engine by
-	// about 10%, while compact source-code-in-strings documents sit near
-	// 50% and lose; the floor splits the two with better than 10% margin
-	// on each side.
+	// validBitmapSampleMinInStr is the string leg's floor: 9/16 of the
+	// sampled bytes inside strings.
 	validBitmapSampleMinInStr = validBitmapSampleBlocks * 64 * 9 / 16
 
 	// validBitmapStreamChunk is the number of blocks classified per batched
-	// kernel call. Smaller chunks interleave kernel and grammar work more
-	// tightly, which matters on emit-dense documents: at 8 blocks the phase
-	// separation between a pure-SIMD kernel window and a pure-GP grammar
-	// window cost 2% on the nested benchmark document, while 4 blocks won 3%
-	// there and kept the whitespace-heavy win. Must divide
-	// validBitmapSampleBlocks so the sampling bailout stays chunk-aligned,
-	// and cannot exceed simdkernels.Stage1ChunkBlocks.
+	// kernel call. It must divide validBitmapSampleBlocks so the sampling
+	// bailout stays chunk-aligned, and cannot exceed
+	// simdkernels.Stage1ChunkBlocks.
 	validBitmapStreamChunk = 4
 
 	// After the density sample commits, the Go superinstruction walker uses
@@ -76,8 +62,7 @@ const (
 	validBitmapStreamChunkGo = 32
 
 	// Adjacent non-ASCII runs absorb short ASCII gaps to amortize SIMD UTF-8
-	// setup without rereading large sparse spans. Two blocks is the measured
-	// crossover on arm64 for the multilingual Twitter corpus.
+	// setup without rereading large sparse spans.
 	validUTF8CoalesceBlocks = 2
 )
 
@@ -111,33 +96,16 @@ type vbState struct {
 
 // validBitmapSampleCommit decides engine commitment from the byte classes
 // of the 2 KiB sample: whitespace outside strings, grammar emits, in-string
-// bytes, and escape targets inside strings. Three signals separate the
-// document shapes:
+// bytes, and escape targets inside strings. Three signals select document
+// shapes that can skip enough scalar work:
 //
-//   - Spacey-structural (the whitespace leg): the engine wins when skipped
-//     whitespace pays for the mask trees and the grammar walk stays sparse.
-//     A skipped whitespace byte saves about a nanosecond while an emitted
-//     position costs several, hence the floor and the ws:emit ratio.
+//   - Spacey-structural: skipped whitespace must dominate emitted positions.
 //   - String-heavy (the in-string leg): string interiors die inside the
-//     masks, so the engine also wins when strings dominate even with
-//     little whitespace. But string bytes are worth far less than
-//     whitespace bytes: the recursive scanner skips string interiors with
-//     a vector scanner at tens of GB/s, while it walks whitespace nearly
-//     byte by byte. The engine's edge on string-heavy documents is
-//     therefore thin, and the grammar walk must stay very sparse: the
-//     bytes the engine skips wholesale (ws+inStr) must outnumber emitted
-//     positions six to one. Prose-payload documents sample near 10:1 and
-//     win by several percent; compact record shapes with short keys and
-//     values sample near 3:1 and lose double digits.
+//     masks, but skipped whitespace and string bytes together must still
+//     outnumber emitted positions six to one.
 //   - Escape-dense (the guard on the in-string leg): every escape target
-//     costs a per-bit scalar check in validBitmapEscapes, so documents
-//     whose strings are full of escapes lose despite their string share.
-//     Escape-dense corpora run near one escape per six string bytes; the
-//     1/16 ceiling refuses them while normal prose (one per hundred or
-//     less) commits with margin.
-//
-// Each threshold sits with better than 10% slack from the corpora it
-// separates, so small shifts in the signals do not flip the routing.
+//     costs a scalar check, so the string-heavy leg rejects more than one
+//     escape target per sixteen string bytes.
 func validBitmapSampleCommit(ws, emit, inStr, esc int) bool {
 	if ws >= validBitmapSampleMinWs && ws*2 >= emit*7 {
 		return true
@@ -227,7 +195,7 @@ func validBitmapPerBlock(src []byte) (valid, decided bool) {
 		// A multi-byte sequence cannot cross a pure-ASCII block (every lead
 		// and continuation byte has the high bit set), so a maximal run
 		// validates as an independent slice. Nearby runs coalesce through the
-		// measured ASCII-gap threshold above; validating that gap is harmless
+		// configured ASCII-gap threshold above; validating that gap is harmless
 		// and amortizes per-run kernel setup on alternating layouts.
 		if m.NonASCII {
 			if utf8RunStart >= 0 && block-utf8RunEnd > validUTF8CoalesceBlocks {
@@ -511,17 +479,16 @@ func validBitmapWalkTrusted(src []byte, base unsafe.Pointer, n, pos int, emits, 
 	// back only on the suspension return; the early returns all report
 	// done, after which g is never read again.
 	//
-	// The labeled blocks below are the superinstruction policy from the
-	// stage-2 consumer study, expressed portably: after '{' or ',' inside
+	// The labeled blocks below express the superinstruction policy portably:
+	// after '{' or ',' inside
 	// an object only a key quote can follow; after a key only ':'; after
 	// ':' a string or scalar value dominates; and after a completed object
 	// value the follower set is exactly ',' or '}'. Each block peeks the
 	// next emit bit under an exact-byte guard, consumes it inline on a
 	// hit, and bails to the generic switch on any miss without consuming,
-	// so fusion can never change a verdict — it only skips the dispatch
-	// and state checks the guards make redundant. Fusions stay gated to
-	// object context: the study's array-specific variant regressed the
-	// object and FHIR shapes and is fenced off.
+	// so fusion can never change a verdict; it only skips dispatch and state
+	// checks made redundant by the guards. Fusions stay gated to object
+	// context.
 	state := g.state
 	depth := g.depth
 	numberMode := g.numberMode

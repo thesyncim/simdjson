@@ -189,9 +189,8 @@ func scanNumberFastTagged(base unsafe.Pointer, n, i int) (end int, integer, ok b
 	if fastByteAt(base, i) == '0' {
 		i++
 	} else if isOneNine(fastByteAt(base, i)) {
-		// Unlike the fraction below, the integer part stays byte-at-a-time:
-		// integer runs of eight or more digits are rare enough that a SWAR
-		// probe measured as a net loss on record-shaped documents.
+		// Unlike the fraction below, the integer part stays byte-at-a-time;
+		// the common short run avoids a speculative fixed-width load.
 		for i++; i < n && isDigit(fastByteAt(base, i)); i++ {
 		}
 	} else {

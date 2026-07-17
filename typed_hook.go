@@ -57,13 +57,13 @@ type UnmarshalerSimd interface {
 // own compact JSON through the TrustedAppender's zero-cost helpers and return the
 // advanced TrustedAppender. It is the simdjson-native counterpart of json.Marshaler.
 //
-// The by-value builder shape keeps the output buffer in registers across the
-// whole body, which is measurably faster than a pointer-held writer. Bodies
-// thread the TrustedAppender through and return it (w = w.Int(...), or chained). The
-// output is trusted to be valid compact JSON for the value and is spliced into
-// the surrounding document verbatim: there is no re-validation, compaction, or
-// escape pass, which is the whole point of the hook. Emitting malformed JSON
-// corrupts the surrounding document, so a generator must emit correct syntax.
+// The by-value builder shape lets the output buffer remain in registers across
+// the whole body. Bodies thread the TrustedAppender through and return it
+// (w = w.Int(...), or chained). The output is trusted to be valid compact JSON
+// for the value and is spliced into the surrounding document verbatim: there
+// is no re-validation, compaction, or escape pass, which is the whole point of
+// the hook. Emitting malformed JSON corrupts the surrounding document, so a
+// generator must emit correct syntax.
 // Tests and debug builds can enable the simdjson_validate_hooks build tag to
 // validate exactly the span emitted by every invocation; normal builds compile
 // that validation away.
