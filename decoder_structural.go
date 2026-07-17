@@ -15,6 +15,9 @@ const (
 	structuralFieldEnd     uint8 = 2
 	structuralArrayValue   uint8 = 1
 	structuralArrayEnd     uint8 = 2
+
+	decoderStructuralTapeRetentionBytes     = 2 << 20
+	decoderStructuralTapeRetentionPositions = decoderStructuralTapeRetentionBytes / 4
 )
 
 // decoderStructuralTape is the typed decoder's On-Demand-style cursor. Stage
@@ -61,10 +64,23 @@ func releaseDecoderState(state *decoderState) {
 	// the slice prevents a later decode from mutating that retained output.
 	state.strings = nil
 	state.structuralActive = false
-	state.structural.index = 0
-	state.structural.bad = false
-	state.structural.positions = state.structural.positions[:0]
+	state.structural.resetForPool()
 	decoderStatePool.Put(state)
+}
+
+// resetForPool keeps ordinary structural tapes reusable while preventing one
+// exceptional document from setting the global pool's permanent high-water
+// memory. uint32 has a fixed four-byte width, so the byte budget is exact.
+func (t *decoderStructuralTape) resetForPool() {
+	t.index = 0
+	t.bad = false
+	t.nonASCII = false
+	t.escaped = false
+	if cap(t.positions) > decoderStructuralTapeRetentionPositions {
+		t.positions = nil
+		return
+	}
+	t.positions = t.positions[:0]
 }
 
 func (t *decoderStructuralTape) build(src []byte) {
