@@ -34,3 +34,9 @@ func Stage1CursorBlocks(p *byte, nblocks int, base uint32, st *Stage1IndexStream
 func Stage1ValidBlocks(p *byte, nblocks int, base uint32, st *Stage1IndexStream, out []uint32, meta *Stage1ValidMeta) int {
 	panic("simd: stage1 validation kernel disabled")
 }
+
+// Stage1ValidBlocksCoarse is unreachable without the batched validation
+// producer.
+func Stage1ValidBlocksCoarse(p *byte, nblocks int, base uint32, st *Stage1IndexStream, out []uint32, meta *Stage1ValidMeta) int {
+	panic("simd: stage1 validation kernel disabled")
+}

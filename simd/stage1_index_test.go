@@ -198,6 +198,60 @@ func TestStage1IndexBlocksMetaMatchesGeneric(t *testing.T) {
 	}
 }
 
+func TestStage1ValidBlocksCoarseMatchesExact(t *testing.T) {
+	rng := rand.New(rand.NewSource(0x434f41525345))
+	alphabet := []byte("{}[],:\"\\ truefalsenull0123456789\n\t\rabcdefghijklmnopqrstuvwxyz")
+	for trial := 0; trial < 200; trial++ {
+		blocks := 1 + rng.Intn(67)
+		src := make([]byte, blocks*64)
+		if _, err := rng.Read(src); err != nil {
+			t.Fatal(err)
+		}
+		for i := range src {
+			if rng.Intn(4) != 0 {
+				src[i] = alphabet[rng.Intn(len(alphabet))]
+			}
+		}
+
+		var exact, coarse Stage1IndexStream
+		for block, chunk := 0, 0; block < blocks; chunk++ {
+			count := 1 + rng.Intn(Stage1ChunkBlocks)
+			if count > blocks-block {
+				count = blocks - block
+			}
+			base := uint32(block * 64)
+			exactOut := make([]uint32, count*64+64)
+			coarseOut := make([]uint32, count*64+64)
+			var exactMeta, coarseMeta Stage1ValidMeta
+			exactN := Stage1ValidBlocks(&src[block*64], count, base, &exact, exactOut, &exactMeta)
+			coarseN := Stage1ValidBlocksCoarse(&src[block*64], count, base, &coarse, coarseOut, &coarseMeta)
+			if coarseN != exactN || !reflect.DeepEqual(coarseOut[:coarseN], exactOut[:exactN]) {
+				t.Fatalf("trial %d chunk %d index mismatch\ngot  %v\nwant %v",
+					trial, chunk, coarseOut[:coarseN], exactOut[:exactN])
+			}
+			if coarse != exact {
+				t.Fatalf("trial %d chunk %d state mismatch: coarse=%+v exact=%+v",
+					trial, chunk, coarse, exact)
+			}
+			for i := 0; i < count; i++ {
+				if coarseMeta.EscInStr[i] != exactMeta.EscInStr[i] {
+					t.Fatalf("trial %d chunk %d block %d escape mismatch: coarse=%016x exact=%016x",
+						trial, chunk, i, coarseMeta.EscInStr[i], exactMeta.EscInStr[i])
+				}
+			}
+			wantNonASCII := uint32(0)
+			if exactMeta.NonASCII != 0 {
+				wantNonASCII = ^uint32(0) >> (Stage1ChunkBlocks - count)
+			}
+			if coarseMeta.NonASCII != wantNonASCII {
+				t.Fatalf("trial %d chunk %d coarse non-ASCII mismatch: got %032b want %032b (exact %032b)",
+					trial, chunk, coarseMeta.NonASCII, wantNonASCII, exactMeta.NonASCII)
+			}
+			block += count
+		}
+	}
+}
+
 func TestStage1CursorBlocksOmitsOnlyColons(t *testing.T) {
 	rng := rand.New(rand.NewSource(0xc01051))
 	alphabet := []byte("{}[],:\"\\ truefalsenull0123456789\n\t\rabcdefghijklmnopqrstuvwxyz")

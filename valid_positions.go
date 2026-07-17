@@ -12,36 +12,50 @@ import (
 // consumes them immediately and compacts scalar starts in place, so storage is
 // fixed per chunk and the path allocates nothing.
 func validPositionsStreamed(src []byte) (valid, decided bool) {
-	if commit, invalid, numberMode := validPositionsSample(src); invalid {
+	if commit, invalid, numberMode, coarseNonASCII := validPositionsSample(src); invalid {
 		return false, true
 	} else if !commit {
 		return false, false
 	} else {
-		return validPositionsCommitted(src, numberMode), true
+		return validPositionsCommitted(src, numberMode, coarseNonASCII), true
 	}
 }
 
-func validPositionsSample(src []byte) (commit, invalid bool, numberMode uint8) {
+func validPositionsSample(src []byte) (commit, invalid bool, numberMode uint8, coarseNonASCII bool) {
 	base := unsafe.Pointer(unsafe.SliceData(src))
 	var stream simdkernels.Stage1Stream
 	var recs [simdkernels.Stage1ChunkBlocks]simdkernels.Stage1Rec
 	simdkernels.Stage1BlocksGP((*byte)(base), validBitmapSampleBlocks, &stream, &recs)
 
 	ws, emit, inStr, esc := 0, 0, 0, 0
+	hasNonASCII := false
 	for i := 0; i < validBitmapSampleBlocks; i++ {
 		rec := &recs[i]
 		if rec.Bad {
-			return false, true, 0
+			return false, true, 0, false
 		}
 		ws += bits.OnesCount64(rec.WsOut)
 		emit += bits.OnesCount64(rec.Emit)
 		inStr += bits.OnesCount64(rec.InStr)
 		esc += bits.OnesCount64(rec.EscInStr)
+		hasNonASCII = hasNonASCII || rec.NonASCII
 	}
-	return validBitmapSampleCommit(ws, emit, inStr, esc), false, validBitmapNumberMode(inStr)
+	coarseNonASCII = true
+	if hasNonASCII {
+		const highBits = uint64(0x8080808080808080)
+		highBytes := 0
+		for i := 0; i < validBitmapSampleBlocks*64; i += 8 {
+			highBytes += bits.OnesCount64(loadUint64LE(unsafe.Add(base, i)) & highBits)
+			if highBytes > 64 {
+				coarseNonASCII = false
+				break
+			}
+		}
+	}
+	return validBitmapSampleCommit(ws, emit, inStr, esc), false, validBitmapNumberMode(inStr), coarseNonASCII
 }
 
-func validPositionsCommitted(src []byte, numberMode uint8) bool {
+func validPositionsCommitted(src []byte, numberMode uint8, coarseNonASCII bool) bool {
 	n := len(src)
 	base := unsafe.Pointer(unsafe.SliceData(src))
 	fullBlocks := n / 64
@@ -75,9 +89,19 @@ func validPositionsCommitted(src []byte, numberMode uint8) bool {
 
 	for block := 0; block < fullBlocks; block += simdkernels.Stage1ChunkBlocks {
 		count := min(simdkernels.Stage1ChunkBlocks, fullBlocks-block)
-		written := simdkernels.Stage1ValidBlocks(
-			(*byte)(unsafe.Add(base, block*64)), count, uint32(block*64), &stream, positions[:], &meta,
-		)
+		written := 0
+		if coarseNonASCII {
+			written = simdkernels.Stage1ValidBlocksCoarse(
+				(*byte)(unsafe.Add(base, block*64)), count, uint32(block*64), &stream, positions[:], &meta,
+			)
+			if meta.NonASCII != 0 {
+				meta.NonASCII = sparseNonASCIIMask(unsafe.Add(base, block*64), count)
+			}
+		} else {
+			written = simdkernels.Stage1ValidBlocks(
+				(*byte)(unsafe.Add(base, block*64)), count, uint32(block*64), &stream, positions[:], &meta,
+			)
+		}
 		for i := 0; i < count; i++ {
 			current := block + i
 			if meta.NonASCII&(1<<i) != 0 {
@@ -105,9 +129,16 @@ func validPositionsCommitted(src []byte, numberMode uint8) bool {
 			tail[i] = ' '
 		}
 		copy(tail[:], src[fullBlocks*64:])
-		written := simdkernels.Stage1ValidBlocks(
-			&tail[0], 1, uint32(fullBlocks*64), &stream, positions[:], &meta,
-		)
+		written := 0
+		if coarseNonASCII {
+			written = simdkernels.Stage1ValidBlocksCoarse(
+				&tail[0], 1, uint32(fullBlocks*64), &stream, positions[:], &meta,
+			)
+		} else {
+			written = simdkernels.Stage1ValidBlocks(
+				&tail[0], 1, uint32(fullBlocks*64), &stream, positions[:], &meta,
+			)
+		}
 		if meta.NonASCII&1 != 0 {
 			if utf8RunStart >= 0 && fullBlocks-utf8RunEnd > validUTF8CoalesceBlocks {
 				if !validUTF8Fast(src[utf8RunStart*64 : utf8RunEnd*64]) {
@@ -134,6 +165,26 @@ func validPositionsCommitted(src []byte, numberMode uint8) bool {
 		return false
 	}
 	return true
+}
+
+func sparseNonASCIIMask(base unsafe.Pointer, nblocks int) uint32 {
+	const highBits = uint64(0x8080808080808080)
+	var mask uint32
+	for block := 0; block < nblocks; block++ {
+		p := unsafe.Add(base, block*64)
+		hi := loadUint64LE(p) |
+			loadUint64LE(unsafe.Add(p, 8)) |
+			loadUint64LE(unsafe.Add(p, 16)) |
+			loadUint64LE(unsafe.Add(p, 24)) |
+			loadUint64LE(unsafe.Add(p, 32)) |
+			loadUint64LE(unsafe.Add(p, 40)) |
+			loadUint64LE(unsafe.Add(p, 48)) |
+			loadUint64LE(unsafe.Add(p, 56))
+		if hi&highBits != 0 {
+			mask |= 1 << block
+		}
+	}
+	return mask
 }
 
 func validScalarTokenAtMode(src []byte, base unsafe.Pointer, n, j int, numberMode uint8) bool {
