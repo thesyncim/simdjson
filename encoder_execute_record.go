@@ -41,6 +41,7 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 		e.dst = append(e.dst, name...)
 		var err error
 		switch encField.encOp {
+		// BEGIN GENERATED TYPED ENCODER FIELD DISPATCH
 		case typedOpBool:
 			if *(*bool)(fieldSrc) {
 				e.dst = append(e.dst, "true"...)
@@ -85,6 +86,7 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 			err = e.encodeQuoted(encField.node, fieldSrc)
 		case typedOpMarshaler:
 			err = e.encodeMarshaler(encField.node, fieldSrc)
+		// END GENERATED TYPED ENCODER FIELD DISPATCH
 		default:
 			err = e.encode(encField.node, fieldSrc)
 		}

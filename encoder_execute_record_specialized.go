@@ -223,6 +223,7 @@ func appendSimpleFieldName(dst []byte, field *typedEncField, packed []byte) []by
 
 func (e *encodeState) encodeStructFieldValue(field *typedEncField, src unsafe.Pointer) error {
 	switch field.encOp {
+	// BEGIN GENERATED TYPED ENCODER VALUE DISPATCH
 	case typedOpBool:
 		if *(*bool)(src) {
 			e.dst = append(e.dst, "true"...)
@@ -267,6 +268,7 @@ func (e *encodeState) encodeStructFieldValue(field *typedEncField, src unsafe.Po
 		return e.encodeQuoted(field.node, src)
 	case typedOpMarshaler:
 		return e.encodeMarshaler(field.node, src)
+	// END GENERATED TYPED ENCODER VALUE DISPATCH
 	default:
 		return e.encode(field.node, src)
 	}

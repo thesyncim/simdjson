@@ -1,5 +1,7 @@
 package simdjson
 
+//go:generate go run typed_ops_gen.go
+
 import (
 	"encoding"
 	"encoding/binary"
@@ -404,6 +406,7 @@ const (
 type typedOp uint8
 
 const (
+	// BEGIN GENERATED TYPED OP ENUM
 	typedOpInvalid typedOp = iota
 	typedOpBool
 	typedOpString
@@ -429,6 +432,7 @@ const (
 	typedOpUnmarshaler
 	typedOpMarshaler
 	typedOpIface
+	// END GENERATED TYPED OP ENUM
 )
 
 // encoderBackingSlot is intentionally distinct from the marshaler/key scratch
@@ -872,8 +876,9 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 				break
 			}
 			switch field.op {
-			case typedOpBool, typedOpString, typedOpInt64, typedOpFloat64,
-				typedOpStruct, typedOpSlice, typedOpArray:
+			// BEGIN GENERATED TYPED STRUCTURAL FIELD ELIGIBILITY
+			case typedOpBool, typedOpString, typedOpInt64, typedOpFloat64, typedOpStruct, typedOpSlice, typedOpArray:
+			// END GENERATED TYPED STRUCTURAL FIELD ELIGIBILITY
 			default:
 				node.structuralFast = false
 			}

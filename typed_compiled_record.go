@@ -107,6 +107,7 @@ func (cursor *decoderCursor) decodeCompiledStruct(node *typedNode, dst unsafe.Po
 		fieldDst := unsafe.Add(fieldBase, field.offset)
 		var fieldErr error
 		switch field.op {
+		// BEGIN GENERATED TYPED CURSOR FIELD DISPATCH
 		case typedOpBool:
 			fieldErr = cursor.Bool((*bool)(fieldDst))
 		case typedOpString:
@@ -160,6 +161,7 @@ func (cursor *decoderCursor) decodeCompiledStruct(node *typedNode, dst unsafe.Po
 			}
 		case typedOpIface:
 			fieldErr = cursor.decodeCompiledIface(fieldNode, fieldDst)
+		// END GENERATED TYPED CURSOR FIELD DISPATCH
 		default:
 			fieldErr = &DecodeError{Offset: cursor.i, Type: fieldNode.typ, Reason: "invalid compiled operation"}
 		}
@@ -782,6 +784,7 @@ func (cursor *decoderCursor) decodeCompiledStructStructuralSlow(node *typedNode,
 		fieldDst := unsafe.Add(fieldBase, field.offset)
 		var fieldErr error
 		switch field.op {
+		// BEGIN GENERATED TYPED STRUCTURAL FIELD DISPATCH
 		case typedOpBool:
 			fieldErr = cursor.Bool((*bool)(fieldDst))
 		case typedOpString:
@@ -835,6 +838,7 @@ func (cursor *decoderCursor) decodeCompiledStructStructuralSlow(node *typedNode,
 			}
 		case typedOpIface:
 			fieldErr = cursor.decodeCompiledIface(fieldNode, fieldDst)
+		// END GENERATED TYPED STRUCTURAL FIELD DISPATCH
 		default:
 			fieldErr = &DecodeError{Offset: cursor.i, Type: fieldNode.typ, Reason: "invalid compiled operation"}
 		}
