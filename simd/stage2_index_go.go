@@ -19,8 +19,9 @@ func Stage2IndexPositionsFused(base *byte, n int, positions []uint32, slab *[Sta
 	key := st.KeyRow8
 	count := st.Count
 	entryOff := st.EntryOff
-	stringEntry := st.StringEntry
-	inString := st.InString
+	// Keep resumable quote state in one register; the entry index matters only
+	// while the high-word resume flag is set.
+	stringState := uint64(st.StringEntry) | uint64(st.InString)<<32
 	inObj := prev & 8
 	pi := 0
 	var j, cls, members, entryIndex, scope, parent, next, isKey uint64
@@ -37,13 +38,13 @@ dispatch:
 	j = uint64(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
 	pi++
 	c = *(*byte)(unsafe.Add(basep, uintptr(j)))
-	if inString != 0 {
-		if c != '"' || uint64(stringEntry)<<4 >= entryOff {
+	if stringState>>32 != 0 {
+		if c != '"' || uint64(uint32(stringState))<<4 >= entryOff {
 			bad |= 1
 			goto done
 		}
-		*(*uint32)(unsafe.Add(entryp, uintptr(stringEntry)*16+4)) = uint32(j + 1)
-		inString = 0
+		*(*uint32)(unsafe.Add(entryp, uintptr(uint32(stringState))*16+4)) = uint32(j + 1)
+		stringState = 0
 		if prev>>4&15 == stage2RowQk {
 			goto fusedColon
 		}
@@ -206,11 +207,11 @@ writeString:
 	*(*uint64)(p) = j
 	*(*uint64)(unsafe.Add(p, 8)) = 1 | uint64(info)<<32
 	entryOff += 16
-	stringEntry = uint32(entryIndex)
+	stringState = uint64(uint32(entryIndex))
 	prev = 96 | isKey<<4 | inObj
 	key = 0
 	if pi == len(positions) {
-		inString = 1
+		stringState |= 1 << 32
 		goto done
 	}
 	j = uint64(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
@@ -221,7 +222,6 @@ writeString:
 	}
 	pi++
 	*(*uint32)(unsafe.Add(p, 4)) = uint32(j + 1)
-	inString = 0
 	if isKey != 0 {
 		goto fusedColon
 	}
@@ -501,6 +501,6 @@ done:
 	st.KeyRow8 = key
 	st.Count = count
 	st.EntryOff = entryOff
-	st.StringEntry = stringEntry
-	st.InString = inString
+	st.StringEntry = uint32(stringState)
+	st.InString = uint32(stringState >> 32)
 }
