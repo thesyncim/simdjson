@@ -250,6 +250,43 @@ func BenchmarkHookDecodeSmall(b *testing.B) {
 	})
 }
 
+var fieldSetLookupSink int
+
+func BenchmarkFieldSetLookup(b *testing.B) {
+	set := MakeFieldSet("id", "active", "name", "note", "score")
+	for _, test := range []struct {
+		name string
+		key  string
+	}{
+		{name: "exact", key: "score"},
+		{name: "ascii-folded", key: "SCORE"},
+		{name: "unknown", key: "missing"},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				fieldSetLookupSink, _ = set.Lookup(test.key, false)
+			}
+		})
+	}
+}
+
+func BenchmarkHookDecodeUnknownField(b *testing.B) {
+	src := []byte(`{"unknown":0,"id":42,"active":true,"name":"small","note":"n","score":3.5}`)
+	decoder, err := CompileDecoder[hkbHookRecord](DecoderOptions{ZeroCopy: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	var dst hkbHookRecord
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := decoder.Decode(src, &dst); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkHookEncodeSmall interleaves hook vs interpreter encode of a small
 // struct.
 func BenchmarkHookEncodeSmall(b *testing.B) {

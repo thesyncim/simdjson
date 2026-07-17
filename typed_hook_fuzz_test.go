@@ -26,6 +26,8 @@ func FuzzHookMatchesReflection(f *testing.F) {
 	f.Add([]byte(`null`), true)
 	f.Add([]byte(`{"ADDRESS":{"STREET":"x"},"ID":9}`), false)
 	f.Add([]byte(`{"id":1,"id":2,"id":3}`), true)
+	f.Add([]byte(`{"ſcore":2.5}`), false)
+	f.Add([]byte(`{"nic\u212Aname":"kelvin-fold"}`), false)
 
 	build := func(cs bool) (Decoder[hookPerson], Decoder[hookPersonPlain]) {
 		opts := DecoderOptions{CaseSensitive: cs}
