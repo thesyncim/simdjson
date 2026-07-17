@@ -41,10 +41,11 @@ can retain its receiver, escape analysis keeps that receiver alive. A
 non-addressable map or interface value is copied into typed addressable storage
 before dispatch.
 
-Decode methods receive a heap-backed receiver shadow that is copied back before
-return. A native decode hook receives a heap-backed cursor handle that is
-invalidated on success, error, or panic. Retaining the handle therefore traps
-instead of observing a reused parser frame.
+Standard decode methods receive a heap-backed receiver shadow that is copied
+back before return. Native decode hooks use the real addressable receiver and
+transfer `DecodeCursor` by value. A retained cursor copy owns ordinary Go state
+and cannot alias a decoder stack frame; only the returned copy advances the
+enclosing decode.
 
 The lifetime contract is enforced by the ownership, GC, corruption, hook
 retention, reader lifecycle, route differential, race, and checkptr suites.

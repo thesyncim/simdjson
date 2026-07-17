@@ -40,12 +40,14 @@ Encode hooks receive ordinary GC-visible Go values. Addressable receiver
 identity is preserved; non-addressable values use a typed copy when required
 by `encoding/json` compatibility.
 
-Decode hooks receive a heap-backed `DecodeCursor` handle that owns its parser
-state copy. The handle is invalidated on every exit path, including panic, and
-the advanced state is copied back only through the controlled dispatch point.
-Retaining the handle is a usage error and cannot expose a reused stack frame.
+Decode hooks receive `DecodeCursor` by value and return the advanced value. The
+cursor copy contains ordinary Go slice and pointer fields, never a pointer into
+the decoder's stack frame. A retained copy is memory-safe and owns the input it
+references, but it is disconnected from the enclosing decode; only the value
+returned by the method advances that operation.
 
-Native decode hooks allocate for their safe receiver and cursor ownership and
-are not a general speed path. New complexity in that route requires a real code
-generator, end-to-end evidence, and the same retention and panic-path tests as
-the compiled decoder.
+Addressable decode receivers use ordinary Go pointer identity. Reused roots,
+fields, and slice elements need no receiver shadow. A fresh stack-local root may
+escape once because arbitrary user code can retain its receiver; hiding that
+escape would be unsafe. The performance contract is zero allocations for reused
+destinations and no allocation proportional to hook or element count.

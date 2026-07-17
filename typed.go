@@ -145,9 +145,9 @@ func typedStructuralCandidate(node *typedNode, visiting map[*typedNode]bool) boo
 // encoding/json; DecoderOptions.Replace resets state absent from the document.
 // Slice capacities already reachable through dst are retained where possible.
 //
-// Decode keeps ordinary compiled destinations stack eligible. Pointer-receiver
-// custom methods use a heap-backed receiver copied back before Decode returns,
-// so retaining that receiver cannot retain an internal stack address.
+// Decode keeps ordinary compiled destinations stack eligible. Native hooks
+// receive and return cursor state by value and use ordinary addressable
+// receivers; standard unmarshal methods retain their detached receiver rule.
 func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 	if plan.root == nil {
 		return fmt.Errorf("simdjson: zero Decoder")

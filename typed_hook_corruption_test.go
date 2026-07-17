@@ -9,10 +9,10 @@ import (
 	"testing"
 )
 
-// This file is the corruption gate for the method-hook tier. Decode receivers
-// and DecodeCursor state are heap-backed; addressable encode receivers use
-// ordinary GC-visible pointers. The collector must see every reference while
-// goroutine stacks move and calls run concurrently.
+// This file is the corruption gate for the method-hook tier. DecodeCursor state
+// crosses the hook by value; decode and encode receivers use ordinary
+// GC-visible pointers. The collector must see every reference while goroutine
+// stacks move and calls run concurrently.
 // These tests drive that lifetime contract under aggressive GC:
 //
 //	GOGC=1 GOEXPERIMENT=simd gotip test -run TestHookCorruption -count=5 -cpu=1,4,8 ./
@@ -35,30 +35,30 @@ type hookCorruptRecord struct {
 
 var hookCorruptFields = MakeFieldSet("id", "name", "addr", "kids", "score")
 
-func (r *hookCorruptRecord) UnmarshalSimdJSON(c *DecodeCursor) error {
+func (r *hookCorruptRecord) UnmarshalSimdJSON(c DecodeCursor) (DecodeCursor, error) {
 	if null, err := c.Null(); err != nil {
-		return err
+		return c, err
 	} else if null {
-		return nil
+		return c, nil
 	}
 	if err := c.BeginObject("hookCorruptRecord"); err != nil {
-		return err
+		return c, err
 	}
 	first := true
 	cs := c.CaseSensitive()
 	for {
 		key, ok, err := c.NextField(first)
 		if err != nil {
-			return err
+			return c, err
 		}
 		if !ok {
-			return nil
+			return c, nil
 		}
 		first = false
 		idx, known := hookCorruptFields.Lookup(key, cs)
 		if !known {
 			if err := c.Skip(); err != nil {
-				return err
+				return c, err
 			}
 			continue
 		}
@@ -68,14 +68,16 @@ func (r *hookCorruptRecord) UnmarshalSimdJSON(c *DecodeCursor) error {
 		case 1:
 			err = c.String(&r.Name)
 		case 2:
-			err = r.Addr.UnmarshalSimdJSON(c)
+			var next DecodeCursor
+			next, err = r.Addr.UnmarshalSimdJSON(c)
+			c = next
 		case 3:
-			err = r.decodeKids(c)
+			err = r.decodeKids(&c)
 		case 4:
 			err = c.Float64(&r.Score)
 		}
 		if err != nil {
-			return err
+			return c, err
 		}
 	}
 }
@@ -106,7 +108,9 @@ func (r *hookCorruptRecord) decodeKids(c *DecodeCursor) error {
 		}
 		first = false
 		var a hookAddress
-		if err := a.UnmarshalSimdJSON(c); err != nil {
+		next, err := a.UnmarshalSimdJSON(*c)
+		*c = next
+		if err != nil {
 			return err
 		}
 		r.Kids = append(r.Kids, a)
@@ -279,8 +283,8 @@ type gcReceiverPayload struct {
 
 const gcReceiverTag = 0x5144_4a53_4d49_53
 
-// gcReceiverProbe proves the heap-backed receiver is a GC-visible root for the
-// whole call. The body allocates a payload reachable
+// gcReceiverProbe proves the ordinary addressable receiver is a GC-visible root
+// for the whole call. The body allocates a payload reachable
 // only through the receiver, drops every other reference, forces several GCs
 // with intervening allocation, and re-reads the payload through the receiver.
 // If dispatch failed to keep the receiver visible to the collector, the
@@ -299,9 +303,9 @@ func newGCReceiverPayload() *gcReceiverPayload {
 	return p
 }
 
-func (p *gcReceiverProbe) UnmarshalSimdJSON(c *DecodeCursor) error {
+func (p *gcReceiverProbe) UnmarshalSimdJSON(c DecodeCursor) (DecodeCursor, error) {
 	if err := c.Skip(); err != nil {
-		return err
+		return c, err
 	}
 	// Reachable only through the receiver from here on.
 	p.payload = newGCReceiverPayload()
@@ -324,7 +328,7 @@ func (p *gcReceiverProbe) UnmarshalSimdJSON(c *DecodeCursor) error {
 		}
 	}
 	p.ok = good
-	return nil
+	return c, nil
 }
 
 // TestHookGCReceiverVisibility proves the receiver is scanned and kept alive

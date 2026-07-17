@@ -33,40 +33,44 @@ type hookAddressPlain struct {
 
 var hookAddressFields = MakeFieldSet("street", "city", "zip")
 
-func (a *hookAddress) UnmarshalSimdJSON(c *DecodeCursor) error {
+func (a *hookAddress) UnmarshalSimdJSON(c DecodeCursor) (DecodeCursor, error) {
 	// A top-level null is a no-op on a struct, matching encoding/json.
 	if null, err := c.Null(); err != nil {
-		return err
+		return c, err
 	} else if null {
-		return nil
+		return c, nil
 	}
 	if err := c.BeginObject("hookAddress"); err != nil {
-		return err
+		return c, err
 	}
 	// Expected-order fast path: chain packed matches, drop to the general
 	// loop at the first miss so any other order still decodes correctly.
 	if c.Field(true, hookAddressFields.Field(0)) {
 		if err := c.String(&a.Street); err != nil {
-			return err
+			return c, err
 		}
 		if c.Field(false, hookAddressFields.Field(1)) {
 			if err := c.String(&a.City); err != nil {
-				return err
+				return c, err
 			}
 			if c.Field(false, hookAddressFields.Field(2)) {
 				if err := c.Int(&a.Zip); err != nil {
-					return err
+					return c, err
 				}
 				if c.ExpectObjectClose() {
-					return nil
+					return c, nil
 				}
-				return a.unmarshalRest(c, false)
+				err := a.unmarshalRest(&c, false)
+				return c, err
 			}
-			return a.unmarshalRest(c, false)
+			err := a.unmarshalRest(&c, false)
+			return c, err
 		}
-		return a.unmarshalRest(c, false)
+		err := a.unmarshalRest(&c, false)
+		return c, err
 	}
-	return a.unmarshalRest(c, true)
+	err := a.unmarshalRest(&c, true)
+	return c, err
 }
 
 // unmarshalRest is the arbitrary-order fallback: a NextField loop keyed by the
@@ -137,18 +141,19 @@ type hookPersonPlain struct {
 
 var hookPersonFields = MakeFieldSet("id", "name", "active", "score", "tags", "address", "aliases", "nickname")
 
-func (p *hookPerson) UnmarshalSimdJSON(c *DecodeCursor) error {
+func (p *hookPerson) UnmarshalSimdJSON(c DecodeCursor) (DecodeCursor, error) {
 	if null, err := c.Null(); err != nil {
-		return err
+		return c, err
 	} else if null {
-		return nil
+		return c, nil
 	}
 	if err := c.BeginObject("hookPerson"); err != nil {
-		return err
+		return c, err
 	}
 	// This body always takes the general loop, exercising the FieldSet lookup
 	// and nested-hook dispatch on every member.
-	return p.unmarshalAll(c, true)
+	err := p.unmarshalAll(&c, true)
+	return c, err
 }
 
 func (p *hookPerson) unmarshalAll(c *DecodeCursor, first bool) error {
@@ -181,7 +186,9 @@ func (p *hookPerson) unmarshalAll(c *DecodeCursor, first bool) error {
 		case 4:
 			err = p.decodeTags(c)
 		case 5:
-			err = p.Address.UnmarshalSimdJSON(c)
+			var next DecodeCursor
+			next, err = p.Address.UnmarshalSimdJSON(*c)
+			*c = next
 		case 6:
 			err = p.decodeAliases(c)
 		case 7:
@@ -254,7 +261,9 @@ func (p *hookPerson) decodeAliases(c *DecodeCursor) error {
 		}
 		first = false
 		var a hookAddress
-		if err := a.UnmarshalSimdJSON(c); err != nil {
+		next, err := a.UnmarshalSimdJSON(*c)
+		*c = next
+		if err != nil {
 			return err
 		}
 		p.Aliases = append(p.Aliases, a)

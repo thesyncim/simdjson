@@ -29,22 +29,24 @@ type fieldMatchingPlain struct {
 
 var fieldMatchingFields = MakeFieldSet("Name", "NAME", "Kelvin", "ſcore", "Σ", "ς", "plain")
 
-func (v *fieldMatchingHook) UnmarshalSimdJSON(c *DecodeCursor) error {
+func (v *fieldMatchingHook) UnmarshalSimdJSON(c DecodeCursor) (DecodeCursor, error) {
 	if null, err := c.Null(); err != nil {
-		return err
+		return c, err
 	} else if null {
-		return nil
+		return c, nil
 	}
 	if err := c.BeginObject("fieldMatchingHook"); err != nil {
-		return err
+		return c, err
 	}
 	if c.Field(true, fieldMatchingFields.Field(0)) {
 		if err := c.Int(&v.Name); err != nil {
-			return err
+			return c, err
 		}
-		return v.unmarshalFields(c, false)
+		err := v.unmarshalFields(&c, false)
+		return c, err
 	}
-	return v.unmarshalFields(c, true)
+	err := v.unmarshalFields(&c, true)
+	return c, err
 }
 
 func (v *fieldMatchingHook) unmarshalFields(c *DecodeCursor, first bool) error {

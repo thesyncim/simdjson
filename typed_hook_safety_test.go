@@ -25,12 +25,13 @@ func (receiver *safeArrayHook) MarshalSimdJSON(appender TrustedAppender) Trusted
 	return appender.Int(int64(index))
 }
 
-func (receiver *safeHookReceiver) UnmarshalSimdJSON(cursor *DecodeCursor) error {
+func (receiver *safeHookReceiver) UnmarshalSimdJSON(cursor DecodeCursor) (DecodeCursor, error) {
 	retainedDecodeReceiver = receiver
 	stackSink := forceStackMovement(48, receiver.Value)
 	runtime.GC()
 	runtime.KeepAlive(stackSink)
-	return cursor.Int(&receiver.Value)
+	err := cursor.Int(&receiver.Value)
+	return cursor, err
 }
 
 // TestEncodeHookArrayUsesStableSourcePointers covers the allocation-free batch
@@ -74,10 +75,9 @@ func (receiver *safeHookReceiver) MarshalSimdJSON(appender TrustedAppender) Trus
 	return appender.Int(int64(receiver.Value))
 }
 
-// TestHookReceiverLifetimes pins the one-mode safety contract. Decode receives
-// a detached heap shadow because destinations can include reusable map scratch.
-// Encode receives the ordinary addressable *T: retaining it safely retains and
-// aliases the caller's source, exactly like a direct Go method call.
+// TestHookReceiverLifetimes pins the ordinary receiver contract. Decode and
+// encode both receive the addressable caller-owned *T, so retaining either
+// receiver keeps and aliases the caller's value like a direct Go method call.
 func TestHookReceiverLifetimes(t *testing.T) {
 	retainedDecodeReceiver = nil
 	retainedEncodeReceiver = nil
@@ -99,8 +99,8 @@ func TestHookReceiverLifetimes(t *testing.T) {
 	if decoded.Value != 7 {
 		t.Fatalf("decoded value = %d, want 7", decoded.Value)
 	}
-	if retainedDecodeReceiver == nil || retainedDecodeReceiver == &decoded {
-		t.Fatal("decode hook did not receive a detached heap-backed receiver")
+	if retainedDecodeReceiver != &decoded {
+		t.Fatal("decode hook did not receive the caller-owned addressable receiver")
 	}
 
 	encoder, err := CompileEncoder[safeHookReceiver](EncoderOptions{})
@@ -124,7 +124,7 @@ func TestHookReceiverLifetimes(t *testing.T) {
 	retainedDecodeReceiver.Value = 70
 	retainedEncodeReceiver.Value = 110
 	runtime.KeepAlive(stackSink)
-	if decoded.Value != 7 || encoded.Value != 110 {
+	if decoded.Value != 70 || encoded.Value != 110 {
 		t.Fatalf("receiver ownership differs: decoded=%d encoded=%d", decoded.Value, encoded.Value)
 	}
 }

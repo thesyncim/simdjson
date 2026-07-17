@@ -1,64 +1,59 @@
 package simdjson
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
-var retainedPanicCursor *DecodeCursor
+var retainedPanicCursor DecodeCursor
 
-// retentionViolator deliberately breaks the no-retention contract: it stashes
-// the *DecodeCursor it was handed and, after UnmarshalSimdJSON returns, a
-// later call dereferences it. The default dispatch nils the
-// DecodeCursor's inner pointer once the body returns, so the stashed handle
-// traps with a nil-pointer panic instead of aliasing a reused or freed frame.
-// This test proves the always-on retention trap fires.
-type retentionViolator struct {
-	stashed *DecodeCursor
+// retentionProbe keeps the input cursor value before advancing the copy it
+// returns. The saved value must remain memory-safe and independent after the
+// enclosing decode completes.
+type retentionProbe struct {
+	stashed DecodeCursor
 }
 
-func (r *retentionViolator) UnmarshalSimdJSON(c *DecodeCursor) error {
-	r.stashed = c // contract violation: retaining the DecodeCursor past the call.
-	return c.Skip()
+func (r *retentionProbe) UnmarshalSimdJSON(c DecodeCursor) (DecodeCursor, error) {
+	r.stashed = c
+	err := c.Skip()
+	return c, err
 }
 
-// TestHookRetentionTrapPanics decodes with a body that retains the
-// DecodeCursor, then uses the retained handle and requires a panic. Without
-// the trap this would be silent undefined behaviour; with it, the violation
-// is immediate and attributable.
-func TestHookRetentionTrapPanics(t *testing.T) {
-	dec, err := CompileDecoder[retentionViolator](DecoderOptions{})
+func TestHookRetainedCursorValueIsIndependent(t *testing.T) {
+	dec, err := CompileDecoder[retentionProbe](DecoderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var v retentionViolator
-	if err := dec.Decode([]byte(`{"x":1}`), &v); err != nil {
-		t.Fatalf("decode itself should succeed: %v", err)
+	input := []byte(`{"x":1}`)
+	var value retentionProbe
+	if err := dec.Decode(input, &value); err != nil {
+		t.Fatal(err)
 	}
-	if v.stashed == nil {
-		t.Fatal("expected the body to have stashed the DecodeCursor")
+	input = nil
+	runtime.GC()
+
+	// The saved copy still owns the source slice and starts where the hook
+	// received it. Advancing it cannot alter the cursor returned to Decode.
+	if err := value.stashed.Skip(); err != nil {
+		t.Fatalf("retained value was not independently usable: %v", err)
 	}
-	defer func() {
-		if recover() == nil {
-			t.Fatal("using a retained DecodeCursor after the call should panic")
-		}
-	}()
-	// The dispatch nil'd the inner pointer after the body returned; touching it
-	// now must panic rather than read a reused frame.
-	_ = v.stashed.Skip()
+	if value.stashed.d.i != len(value.stashed.d.src) {
+		t.Fatalf("retained value stopped at %d of %d", value.stashed.d.i, len(value.stashed.d.src))
+	}
 }
 
-type panicRetentionViolator struct{}
+type panicRetentionProbe struct{}
 
-func (*panicRetentionViolator) UnmarshalSimdJSON(c *DecodeCursor) error {
+func (*panicRetentionProbe) UnmarshalSimdJSON(c DecodeCursor) (DecodeCursor, error) {
 	retainedPanicCursor = c
 	panic("hook panic")
 }
 
-// TestHookRetentionTrapAfterPanic proves invalidation is unconditional: a
-// panicking hook cannot leave a retained cursor connected to parser state or
-// the caller's input after recovery.
-func TestHookRetentionTrapAfterPanic(t *testing.T) {
-	retainedPanicCursor = nil
-	t.Cleanup(func() { retainedPanicCursor = nil })
-	dec, err := CompileDecoder[panicRetentionViolator](DecoderOptions{})
+func TestHookRetainedCursorValueAfterPanic(t *testing.T) {
+	retainedPanicCursor = DecodeCursor{}
+	t.Cleanup(func() { retainedPanicCursor = DecodeCursor{} })
+	dec, err := CompileDecoder[panicRetentionProbe](DecoderOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,16 +63,13 @@ func TestHookRetentionTrapAfterPanic(t *testing.T) {
 				t.Fatal("panicking hook did not propagate its panic")
 			}
 		}()
-		var value panicRetentionViolator
+		var value panicRetentionProbe
 		_ = dec.Decode([]byte(`null`), &value)
 	}()
-	if retainedPanicCursor == nil {
-		t.Fatal("panicking hook did not retain the cursor")
+	if len(retainedPanicCursor.d.src) == 0 {
+		t.Fatal("panicking hook did not retain its cursor value")
 	}
-	defer func() {
-		if recover() == nil {
-			t.Fatal("cursor retained by a panicking hook remained usable")
-		}
-	}()
-	_ = retainedPanicCursor.Skip()
+	if err := retainedPanicCursor.Skip(); err != nil {
+		t.Fatalf("retained cursor value after panic was unsafe: %v", err)
+	}
 }

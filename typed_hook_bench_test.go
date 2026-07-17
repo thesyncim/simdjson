@@ -36,45 +36,46 @@ type hkbHookRecord struct {
 
 var hkbHookFields = MakeFieldSet("id", "active", "name", "note", "score")
 
-func (r *hkbHookRecord) UnmarshalSimdJSON(c *DecodeCursor) error {
+func (r *hkbHookRecord) UnmarshalSimdJSON(c DecodeCursor) (DecodeCursor, error) {
 	if null, err := c.Null(); err != nil {
-		return err
+		return c, err
 	} else if null {
-		return nil
+		return c, nil
 	}
 	if err := c.BeginObject("hkbHookRecord"); err != nil {
-		return err
+		return c, err
 	}
 	// Expected-order fast path with a general fallback.
 	if c.Field(true, hkbHookFields.Field(0)) {
 		if err := c.Int64(&r.ID); err != nil {
-			return err
+			return c, err
 		}
 		if c.Field(false, hkbHookFields.Field(1)) {
 			if err := c.Bool(&r.Active); err != nil {
-				return err
+				return c, err
 			}
 			if c.Field(false, hkbHookFields.Field(2)) {
 				if err := c.String(&r.Name); err != nil {
-					return err
+					return c, err
 				}
 				if c.Field(false, hkbHookFields.Field(3)) {
 					if err := c.String(&r.Note); err != nil {
-						return err
+						return c, err
 					}
 					if c.Field(false, hkbHookFields.Field(4)) {
 						if err := c.Float64(&r.Score); err != nil {
-							return err
+							return c, err
 						}
 						if c.ExpectObjectClose() {
-							return nil
+							return c, nil
 						}
 					}
 				}
 			}
 		}
 	}
-	return r.unmarshalRest(c)
+	err := r.unmarshalRest(&c)
+	return c, err
 }
 
 func (r *hkbHookRecord) unmarshalRest(c *DecodeCursor) error {

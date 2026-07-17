@@ -5,29 +5,23 @@ package simdjson
 // kernels. A type opts in by implementing [UnmarshalerSimd] or [MarshalerSimd]
 // with signatures that avoid raw-value reparsing, output re-validation and
 // compaction, and intermediate buffers. The compiled plan detects the
-// interfaces at compile time. Decode dispatch owns detached receiver and cursor
-// state; encode dispatch follows ordinary Go receiver ownership.
+// interfaces at compile time. Cursor state crosses decode hooks by value;
+// receiver dispatch follows ordinary Go ownership in both directions.
 //
 // # Lifetime contract
 //
-// The [DecodeCursor] passed to UnmarshalSimdJSON and the [TrustedAppender] passed to
-// MarshalSimdJSON borrow state that lives on the enclosing decode or encode
-// call. Neither should be retained past the method's return. Decode hooks
-// always receive a heap-backed cursor copy that is invalidated on return, so a
-// retained DecodeCursor deterministically panics instead of aliasing a reused
-// frame. Encode hooks receive an ordinary TrustedAppender value; retaining it keeps a
-// caller-owned buffer alive and can race with later buffer reuse, so it remains
-// a usage error rather than an unsafe runtime-layout contract.
+// [DecodeCursor] and [TrustedAppender] are passed and returned by value. A hook
+// owns its input value during the call and returns the advanced value. Retaining
+// a copy keeps referenced input or output storage alive, but a stale copy is
+// disconnected from the enclosing operation and cannot advance it.
 //
 // # Safety
 //
-// Decode hook receivers are shallow-copied to heap-backed shadows before user
-// code is called and copied back on return. Encode hooks use normal Go receiver
-// ownership: addressable values expose their GC-visible *T, while
-// non-addressable value receivers get a runtime-owned value copy. Interface
-// values are constructed only by reflection and the Go runtime. There is no
-// unsafe itab rebinding, layout probe, safety build tag, or alternate dispatch
-// mode.
+// Decode and encode hooks use normal Go receiver ownership: addressable values
+// expose their GC-visible *T, while non-addressable value receivers get a
+// runtime-owned value copy. Cursor state contains ordinary Go pointers and is
+// transferred by value; no pointer into a decoder stack frame is exposed.
+// Interface values are constructed only by reflection and the Go runtime.
 
 import (
 	"reflect"
@@ -40,17 +34,16 @@ import (
 // UnmarshalerSimd is an opt-in custom decode hook. Use it for a type that needs
 // custom semantics or for generated decoding code; ordinary structs should use
 // the compiled Decoder. The method reads through the decoder's kernels instead
-// of reparsing raw bytes. Its heap-backed receiver and cursor shadows may
-// allocate when the hook runs.
+// of reparsing raw bytes. Dispatch creates no receiver or cursor heap shadow;
+// a fresh stack-local receiver may still undergo the ordinary Go escape needed
+// when arbitrary user code can retain *T.
 //
 // The method must consume exactly one JSON value and leave the cursor
 // positioned immediately after it, exactly as the compiled decoder would.
-// Returning an error aborts the enclosing decode.
-//
-// The DecodeCursor must not be retained past the call; see the lifetime
-// contract in this file's package comment.
+// Returning an error aborts the enclosing decode. The returned cursor must be
+// the input cursor after consuming exactly one value, including on error.
 type UnmarshalerSimd interface {
-	UnmarshalSimdJSON(c *DecodeCursor) error
+	UnmarshalSimdJSON(c DecodeCursor) (DecodeCursor, error)
 }
 
 // MarshalerSimd is the opt-in encode hook. A type implements it to append its
@@ -86,11 +79,11 @@ var (
 // the machinery the compiled path uses, so a hook pays no interpretation
 // overhead.
 //
-// A DecodeCursor is only ever obtained as the argument to UnmarshalSimdJSON
-// and must not be retained past that call.
+// A DecodeCursor is obtained as the argument to UnmarshalSimdJSON and returned
+// after consuming one value. It owns a copy of the parser state; copying it is
+// safe, but only the returned value advances the enclosing decode.
 type DecodeCursor struct {
-	d     *decoderCursor
-	state decoderCursor
+	d decoderCursor
 }
 
 // TrustedAppender is the encoder handle passed to MarshalSimdJSON. It is a
@@ -244,7 +237,7 @@ func (c *DecodeCursor) NextElement(first bool) (bool, error) { return c.d.NextAr
 // reports whether it did. It lets a body stay on the packed path for a compact
 // document and fall back explicitly when a delimiter is missing.
 func (c *DecodeCursor) Expect(ch byte) bool {
-	d := c.d
+	d := &c.d
 	if i := d.i; i < len(d.src) && d.src[i] == ch {
 		d.i = i + 1
 		return true
@@ -256,7 +249,7 @@ func (c *DecodeCursor) Expect(ch byte) bool {
 // and reports whether it did. A body uses it to close an object opened with
 // BeginObject after matching every member in order.
 func (c *DecodeCursor) ExpectObjectClose() bool {
-	d := c.d
+	d := &c.d
 	if i := d.i; i < len(d.src) && d.src[i] == '}' {
 		d.i = i + 1
 		d.depth--
@@ -279,7 +272,7 @@ func (c *DecodeCursor) Null() (bool, error) { return c.d.TryNull() }
 // valid only under the input's lifetime and, in zero-copy mode, only while the
 // input is unmodified.
 func (c *DecodeCursor) Raw() (RawValue, error) {
-	d := c.d
+	d := &c.d
 	start := d.i
 	if err := d.Skip(); err != nil {
 		return RawValue{}, err
@@ -590,18 +583,16 @@ func simpleFoldClass(r rune) []rune {
 
 // --- plan dispatch ---------------------------------------------------------
 
-// decodeViaSimdHook decodes through a heap-backed receiver shadow. The hook
-// cannot retain a pointer into the caller's stack, and the advanced shadow is
-// copied back before the call returns.
+// decodeViaSimdHook uses the ordinary addressable destination receiver. The
+// runtime-built interface keeps the destination storage visible to the GC;
+// dispatchDecodeHook transfers cursor state by value.
 func (cursor *decoderCursor) decodeViaSimdHook(node *typedNode, dst unsafe.Pointer) error {
-	boxed, shadow := copiedPointerReceiverAt(node.typ, dst)
+	boxed := pointerInterfaceAt(node.typ, dst)
 	hook, ok := boxed.(UnmarshalerSimd)
 	if !ok {
 		return &DecodeError{Offset: cursor.i, Type: node.typ, Reason: "invalid compiled operation"}
 	}
-	err := dispatchDecodeHook(hook, cursor)
-	copyMethodReceiverBack(node.typ, dst, shadow)
-	return err
+	return dispatchDecodeHook(hook, cursor)
 }
 
 // encodeViaSimdHook uses ordinary Go receiver ownership. Addressable values

@@ -14,39 +14,40 @@ type hookAllocRecord struct {
 
 var hookAllocFields = MakeFieldSet("id", "active", "name", "score")
 
-func (r *hookAllocRecord) UnmarshalSimdJSON(c *DecodeCursor) error {
+func (r *hookAllocRecord) UnmarshalSimdJSON(c DecodeCursor) (DecodeCursor, error) {
 	if null, err := c.Null(); err != nil {
-		return err
+		return c, err
 	} else if null {
-		return nil
+		return c, nil
 	}
 	if err := c.BeginObject("hookAllocRecord"); err != nil {
-		return err
+		return c, err
 	}
 	if c.Field(true, hookAllocFields.Field(0)) {
 		if err := c.Int64(&r.ID); err != nil {
-			return err
+			return c, err
 		}
 		if c.Field(false, hookAllocFields.Field(1)) {
 			if err := c.Bool(&r.Active); err != nil {
-				return err
+				return c, err
 			}
 			if c.Field(false, hookAllocFields.Field(2)) {
 				if err := c.String(&r.Name); err != nil {
-					return err
+					return c, err
 				}
 				if c.Field(false, hookAllocFields.Field(3)) {
 					if err := c.Float64(&r.Score); err != nil {
-						return err
+						return c, err
 					}
 					if c.ExpectObjectClose() {
-						return nil
+						return c, nil
 					}
 				}
 			}
 		}
 	}
-	return r.unmarshalRest(c)
+	err := r.unmarshalRest(&c)
+	return c, err
 }
 
 func (r *hookAllocRecord) unmarshalRest(c *DecodeCursor) error {
@@ -92,10 +93,9 @@ func (r *hookAllocRecord) MarshalSimdJSON(w TrustedAppender) TrustedAppender {
 	return w.RawByteUnchecked('}')
 }
 
-// TestHookDecodeAllocationBound guards the always-safe hook dispatch against
-// accidental per-field boxing. The receiver shadow and DecodeCursor each live
-// on the heap by contract, so a fixed two-allocation delta is expected; it must
-// not scale with the fields decoded by the body.
+// TestHookDecodeAllocationBound guards the by-value hook dispatch against
+// receiver boxing or cursor-state escapes. Reused zero-copy decode must remain
+// allocation-free, just like the compiled interpreter.
 func TestHookDecodeAllocationBound(t *testing.T) {
 	hookDec, err := CompileDecoder[hookAllocRecord](DecoderOptions{ZeroCopy: true})
 	if err != nil {
@@ -125,8 +125,44 @@ func TestHookDecodeAllocationBound(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if delta := hookAllocs - plainAllocs; delta < 0 || delta > 2 {
-		t.Fatalf("hook decode allocated %v/op vs reflection %v/op: fixed safety delta exceeds 2", hookAllocs, plainAllocs)
+	if hookAllocs != 0 || hookAllocs != plainAllocs {
+		t.Fatalf("hook decode allocated %v/op vs interpreter %v/op, want both 0", hookAllocs, plainAllocs)
+	}
+}
+
+var hookAllocSink hookAllocRecord
+
+//go:noinline
+func decodeLocalHookRecord(dec Decoder[hookAllocRecord], src []byte) error {
+	var dst hookAllocRecord
+	if err := dec.Decode(src, &dst); err != nil {
+		return err
+	}
+	hookAllocSink = dst
+	return nil
+}
+
+// TestHookDecodeLocalDestinationAllocationBound covers the stack-eligible
+// entry shape, not only a destination reused by the caller. Passing its address
+// through a hook must not force heap shadows per field or cursor. One ordinary
+// Go escape is allowed because an arbitrary pointer-receiver method may retain
+// *T; hiding that possibility from escape analysis would be unsafe.
+func TestHookDecodeLocalDestinationAllocationBound(t *testing.T) {
+	dec, err := CompileDecoder[hookAllocRecord](DecoderOptions{ZeroCopy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := []byte(`{"id":42,"active":true,"name":"short","score":3.5}`)
+	if err := decodeLocalHookRecord(dec, src); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(500, func() {
+		if err := decodeLocalHookRecord(dec, src); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 1 {
+		t.Fatalf("local hook decode allocated %v/op, want <=1 receiver-lifetime escape", allocs)
 	}
 }
 

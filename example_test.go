@@ -270,17 +270,17 @@ type examplePoint struct {
 	X, Y int64
 }
 
-func (p *examplePoint) UnmarshalSimdJSON(c *simdjson.DecodeCursor) error {
+func (p *examplePoint) UnmarshalSimdJSON(c simdjson.DecodeCursor) (simdjson.DecodeCursor, error) {
 	if err := c.BeginObject("examplePoint"); err != nil {
-		return err
+		return c, err
 	}
 	for first := true; ; first = false {
 		key, ok, err := c.NextField(first)
 		if err != nil {
-			return err
+			return c, err
 		}
 		if !ok {
-			return nil
+			return c, nil
 		}
 		switch key {
 		case "x":
@@ -291,7 +291,7 @@ func (p *examplePoint) UnmarshalSimdJSON(c *simdjson.DecodeCursor) error {
 			err = c.Skip()
 		}
 		if err != nil {
-			return err
+			return c, err
 		}
 	}
 }

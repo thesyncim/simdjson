@@ -344,7 +344,7 @@ malformed `json.Number`) return an `EncodeError` with a typed path.
 <summary><b>Custom marshal/unmarshal hooks</b></summary>
 
 A type can decode from the package cursor or append through the package writer
-by implementing `UnmarshalSimdJSON(*DecodeCursor) error` or
+by implementing `UnmarshalSimdJSON(DecodeCursor) (DecodeCursor, error)` or
 `MarshalSimdJSON(TrustedAppender) TrustedAppender`. The hooks avoid reparsing
 raw custom marshaler output and are useful for generated or carefully
 hand-written hot types.
@@ -358,16 +358,14 @@ func (e Event) MarshalSimdJSON(w simdjson.TrustedAppender) simdjson.TrustedAppen
 ```
 
 Safety is not a build option. Every build constructs hook interfaces through
-the Go runtime. Decode hooks receive a heap-backed receiver shadow and one
-heap object that owns its cursor copy; the cursor is invalidated on return.
-That is a fixed two-allocation cost per decode hook call, independent of the
-number of fields. Encode hooks use ordinary Go
-ownership: addressable values expose their real GC-visible receiver, while
-non-addressable value receivers get an ordinary value copy. This preserves
-pointer identity and retention safety without a per-hook receiver allocation.
-If an addressable source was otherwise stack-local, allowing a hook to retain
-one of its receivers may make that source escape once for the whole operation;
-an array does not allocate once per element.
+the Go runtime. DecodeCursor and TrustedAppender are both transferred by value:
+the hook returns the advanced state, so no pointer into a codec stack frame is
+exposed and no cursor box is allocated. Addressable decode and encode values
+expose their real GC-visible receiver. Reused destinations, struct fields, and
+slice elements therefore add no receiver allocation; a fresh stack-local root
+may escape once because an arbitrary pointer-receiver method is legally allowed
+to retain `*T`. That is one ordinary receiver-lifetime escape, not one
+allocation per hook or element.
 There is no itab rebinding, layout probe, unsafe fast mode, or alternate
 dispatch build.
 Hooks must still consume or emit exactly one valid JSON value, and callers must
@@ -646,9 +644,10 @@ Unsafe code is restricted to measured internal paths: complete guarded blocks
 around vector loads and stores, clamped public scanners with a documented
 `simd.Unchecked` precondition surface, size-proven float and integer stores,
 and typed offsets taken from public `reflect` metadata. Source-backed APIs
-require immutable input. Standard and native decode hooks use GC-safe
-heap-backed shadows. Standard and native encode hooks expose real addressable
-receivers through ordinary runtime-built interfaces, so the GC
+require immutable input. Standard decode hooks use GC-safe heap-backed shadows;
+native decode hooks transfer cursor state by value and expose real addressable
+receivers through ordinary runtime-built interfaces. Native and standard encode
+hooks use the same ordinary receiver ownership, so the GC
 tracks retained pointers exactly as it does for a direct Go method call;
 non-addressable value receivers get a value copy. Pooled map storage is cleared
 through typed reflection so pointer-bearing elements retain the GC's write
