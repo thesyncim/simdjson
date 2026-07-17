@@ -85,6 +85,9 @@ handleKnown:
 		goto fusedArrayValue
 	case stage2ccQ:
 		isKey = key
+		if isKey != 0 {
+			goto writeKey
+		}
 		goto writeString
 	default:
 		goto writeScalar
@@ -159,6 +162,35 @@ closeContainer:
 		goto fusedArrayComma
 	}
 	goto dispatch
+
+writeKey:
+	// A complete key contributes closer, colon, and value as three consecutive
+	// positions. Load the first pair together and finish the key in two stores.
+	if len(positions)-pi < 3 {
+		isKey = 8
+		goto writeString
+	}
+	if entryOff>>4 >= uint64(entCap) {
+		bad |= Stage2IndexFull
+		goto done
+	}
+	next = *(*uint64)(unsafe.Add(posp, uintptr(pi)*4))
+	parent = next & uint64(^uint32(0))
+	scope = next >> 32
+	if *(*byte)(unsafe.Add(basep, uintptr(parent))) != '"' || *(*byte)(unsafe.Add(basep, uintptr(scope))) != ':' {
+		bad |= 1
+		goto done
+	}
+	p = unsafe.Add(entryp, uintptr(entryOff))
+	*(*uint64)(p) = j | (parent+1)<<32
+	*(*uint64)(unsafe.Add(p, 8)) = 1 | uint64(Stage2IndexInfoString|Stage2IndexKeyFlag)<<32
+	entryOff += 16
+	j = uint64(*(*uint32)(unsafe.Add(posp, uintptr(pi+2)*4)))
+	c = *(*byte)(unsafe.Add(basep, uintptr(j)))
+	pi += 3
+	prev = 64 | inObj
+	key = 0
+	goto fusedValueKnown
 
 writeString:
 	if entryOff>>4 >= uint64(entCap) {
@@ -345,8 +377,7 @@ fusedKey:
 		goto handleKnown
 	}
 	pi++
-	isKey = 8
-	goto writeString
+	goto writeKey
 
 fusedColon:
 	if pi == len(positions) {
@@ -371,6 +402,7 @@ fusedValue:
 	j = uint64(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
 	c = *(*byte)(unsafe.Add(basep, uintptr(j)))
 	pi++
+fusedValueKnown:
 	switch c {
 	case '"':
 		isKey = 0
@@ -462,7 +494,6 @@ fusedArrayComma:
 	}
 	cls = uint64(stage2Class[c])
 	goto handleKnown
-
 done:
 	st.Bad = bad
 	st.Depth = depth
