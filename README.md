@@ -540,35 +540,37 @@ and runtime dispatch.
 
 <!-- benchpublish:main-summary:start -->
 The current publication is measured from clean library revision
-`47bd858b21563f5c2ad009074779f6543f2bc910` on an Apple M4 Max, one CPU, with
-six 300 ms samples per row and pinned Go revision
-`03845e30f7b73d1703bd8c21017297f6eecb76d6`. Each contract runs in a fresh
-process so allocator-heavy dynamic decode cannot perturb later groups. Lower
-time is better; speedups are geometric means across the seven exact 6.33 MiB
-Go `encoding/json` corpus payloads.
+`ed273875f67d8f06b03286bedfee43f778d6a8df`. Measurements use an Apple M4 Max and one CPU. Each row reports the median of
+six approximately 300 ms samples; the pinned Go revision is `03845e30f7b73d1703bd8c21017297f6eecb76d6`. Each contract runs in a fresh process so
+allocator-heavy dynamic decode cannot perturb later groups. Lower time is
+better; speedups are geometric means across the seven exact 6.33 MiB Go
+`encoding/json` corpus payloads.
 
 | Operation | Contract | vs stdlib | vs fastest rival | vs native Sonic | SIMD vs pure Go |
 |---|---|---:|---:|---:|---:|
-| Validate | Strict JSON + UTF-8 | **3.14x** | **2.86x** | **1.37x** | **1.800x** |
-| Typed decode | Owned strings | **4.09x** | **1.80x** | **1.69x** | **1.129x** |
-| Dynamic decode | Owned `any` tree | **3.59x** | **1.85x** | **1.12x** | **1.056x** |
-| Encode | Owned output | **2.47x** | **1.40x** | **2.53x** | **1.283x** |
-| Encode | Reused output buffer | **4.75x** | **2.69x** | — | **1.518x** |
-| Parse + full walk | Complete semantic traversal | **6.03x** | — | — | **1.232x** |
+| Validate | Strict JSON + UTF-8 | **3.17x** | **2.83x** | **1.36x** | **1.803x** |
+| Typed owned decode | Owned strings | **4.11x** | **1.79x** | **1.66x** | **1.092x** |
+| Dynamic owned decode | Owned `any` tree | **3.60x** | **1.86x** | **1.12x** | **1.063x** |
+| Owned encode | Owned output | **1.92x** | **1.10x** | **1.96x** | **1.257x** |
+| Compiled encode reuse | Reused output buffer | **4.77x** | **2.73x** | — | **1.496x** |
+| Parse + complete walk | Complete semantic traversal | **6.33x** | — | — | **1.222x** |
+
+![Geometric-mean performance comparison](benchmarks/charts/headline.svg)
+
+Every plotted value is baseline time divided by simdjson time: `1x` is equal
+performance, and larger values mean simdjson is faster. SIMD uplift stays in
+the table above and has a dedicated chart in the detailed results.
 
 The fastest-rival column chooses the best compatible result per payload from
 go-json, Segment, jsoniter, and fastjson, all built with the pinned Go tip.
-Owned encode is slightly behind the fastest rival on CITM and Synthea, so the
-geometric-mean lead is not presented as a universal win. Native Sonic v1.15.2
-uses Go 1.26.4 in an isolated module because it falls back on Go tip; its
-syntax-only `Valid` is not contract-equivalent to strict UTF-8 validation and
-is excluded from fastest-rival selection.
+Native Sonic uses its stable supported toolchain in an isolated module; its
+syntax-only `Valid` result is context rather than a strict-validation peer.
 
-The same corpus puts `encoding/json/v2` behind by 3.29x on typed decode, 1.97x
-on dynamic decode, and 2.31x on owned encode. Reusable structural-index
+The same corpus puts `encoding/json/v2` behind by 3.29x on typed decode, 1.99x
+on dynamic decode, and 1.75x on owned encode. Reusable structural-index
 construction is part of the regular benchmark gate and remains zero-allocation.
 
-[Current per-corpus results, allocations, hook cost, SIMD uplift, and exact commands](benchmarks/README.md).
+[Current per-corpus results, allocations, hook cost, SIMD uplift, charts, and exact commands](benchmarks/README.md).
 The [cross-language benchmark](benchmarks/crosslang/README.md) publishes only
 the enforced parse-plus-semantic-digest contract as a direct comparison.
 <!-- benchpublish:main-summary:end -->

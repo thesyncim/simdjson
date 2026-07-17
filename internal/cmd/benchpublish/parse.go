@@ -155,14 +155,11 @@ func parseCrosslangFile(path string, metadata *Metadata) ([]CrosslangResult, err
 		switch {
 		case strings.HasPrefix(line, "benchmark-implementation="):
 			implementation = strings.TrimPrefix(line, "benchmark-implementation=")
-		case strings.HasPrefix(line, "clang version "):
+		case strings.Contains(line, "clang version "):
 			metadata.CXXVersion = line
-		case strings.Contains(line, "implementation=") && strings.HasPrefix(line, "simdjson"):
-			for _, field := range strings.Fields(line) {
-				if strings.HasPrefix(field, "implementation=") {
-					metadata.CXXImpl = strings.TrimPrefix(field, "implementation=")
-				}
-			}
+		case strings.HasPrefix(line, "C++ simdjson ") && strings.Contains(line, "implementation:"):
+			_, metadata.CXXImpl, _ = strings.Cut(line, "implementation:")
+			metadata.CXXImpl = strings.TrimSpace(metadata.CXXImpl)
 		case strings.Contains(line, "contract=parse+semantic-digest"):
 			if implementation == "" {
 				return nil, fmt.Errorf("cross-language result appeared before implementation marker")

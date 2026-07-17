@@ -112,8 +112,8 @@ func checkFiles(files map[string][]byte) error {
 
 func renderMainSummary(p Publication) string {
 	var out strings.Builder
-	fmt.Fprintf(&out, "The current publication is measured from clean library revision\n`%s` on an %s, one CPU, with %d %s samples per row and pinned\nGo revision `%s`. Each contract runs in a fresh process so allocator-heavy\ndynamic decode cannot perturb later groups. Lower time is better; speedups are\ngeometric means across the seven exact 6.33 MiB Go `encoding/json` corpus\npayloads.\n\n",
-		p.Metadata.Commit, p.Metadata.Machine, p.Metadata.Samples, p.Metadata.BenchTime, p.Metadata.GoCommit)
+	fmt.Fprintf(&out, "The current publication is measured from clean library revision\n`%s`. Measurements use an %s and one CPU. Each row reports the median of\n%s; the pinned Go revision is `%s`. Each contract runs in a fresh process so\nallocator-heavy dynamic decode cannot perturb later groups. Lower time is\nbetter; speedups are geometric means across the seven exact 6.33 MiB Go\n`encoding/json` corpus payloads.\n\n",
+		p.Metadata.Commit, p.Metadata.Machine, sampleContract(p.Metadata), p.Metadata.GoCommit)
 	out.WriteString("| Operation | Contract | vs stdlib | vs fastest rival | vs native Sonic | SIMD vs pure Go |\n")
 	out.WriteString("|---|---|---:|---:|---:|---:|\n")
 	for _, spec := range headlineOperations {
@@ -121,10 +121,15 @@ func renderMainSummary(p Publication) string {
 		rival := operationGeomean(p, spec, "rival")
 		sonic := operationGeomean(p, spec, "sonic")
 		simd := operationGeomean(p, spec, "simd")
+		label := spec.Label
+		if label == "Strict validation" {
+			label = "Validate"
+		}
 		fmt.Fprintf(&out, "| %s | %s | **%.2fx** | %s | %s | **%.3fx** |\n",
-			strings.TrimPrefix(spec.Label, "Strict "), spec.Contract, stdlib, formatRatioCell(rival, 2), formatRatioCell(sonic, 2), simd)
+			label, spec.Contract, stdlib, formatRatioCell(rival, 2), formatRatioCell(sonic, 2), simd)
 	}
 	out.WriteString("\n![Geometric-mean performance comparison](benchmarks/charts/headline.svg)\n\n")
+	out.WriteString("Every plotted value is baseline time divided by simdjson time: `1x` is equal\nperformance, and larger values mean simdjson is faster. SIMD uplift stays in\nthe table above and has a dedicated chart in the detailed results.\n\n")
 	out.WriteString("The fastest-rival column chooses the best compatible result per payload from\ngo-json, Segment, jsoniter, and fastjson, all built with the pinned Go tip.\nNative Sonic uses its stable supported toolchain in an isolated module; its\nsyntax-only `Valid` result is context rather than a strict-validation peer.\n\n")
 	fmt.Fprintf(&out, "The same corpus puts `encoding/json/v2` behind by %.2fx on typed decode, %.2fx\non dynamic decode, and %.2fx on owned encode. Reusable structural-index\nconstruction is part of the regular benchmark gate and remains zero-allocation.\n\n",
 		variantGeomean(p, "jsonv2", "BenchmarkStdlibCorpusJSONV2", "typed-reused", "jsonv2", headlineOperations[1]),
@@ -137,8 +142,8 @@ func renderMainSummary(p Publication) string {
 
 func renderGoPublication(p Publication) string {
 	var out strings.Builder
-	fmt.Fprintf(&out, "Every table in this document is generated from one clean publication record:\n\n| Component | Revision |\n|---|---|\n| simdjson | `%s` (`dirty=false`) |\n| Go | `%s`, commit `%s` |\n| Machine | %s, `%s/%s`, one CPU |\n| Samples | %d samples per row, %s each, median reported |\n\n",
-		p.Metadata.Commit, escapePipes(p.Metadata.GoVersion), p.Metadata.GoCommit, p.Metadata.Machine, p.Metadata.OS, p.Metadata.Arch, p.Metadata.Samples, p.Metadata.BenchTime)
+	fmt.Fprintf(&out, "Every table in this document is generated from one clean publication record:\n\n| Component | Revision |\n|---|---|\n| simdjson | `%s` (`dirty=false`) |\n| Go | `%s`, commit `%s` |\n| Machine | %s, `%s/%s`, one CPU |\n| Samples | %s, median reported |\n\n",
+		p.Metadata.Commit, escapePipes(p.Metadata.GoVersion), p.Metadata.GoCommit, p.Metadata.Machine, p.Metadata.OS, p.Metadata.Arch, sampleContract(p.Metadata))
 	out.WriteString("Each `valid`, `dynamic-owned`, `dom`, `typed-reused`, and `encode`\ncontract runs in a fresh process. Compilation, plan creation, fixture decode,\ncapacity preparation, and correctness checks happen before the timer.\n\n")
 	out.WriteString("## Headline geomeans\n\n")
 	out.WriteString("| Operation | vs `encoding/json` | vs fastest compatible rival | SIMD vs pure Go |\n|---|---:|---:|---:|\n")
@@ -147,6 +152,7 @@ func renderGoPublication(p Publication) string {
 			operationGeomean(p, spec, "stdlib"), formatRatioCell(operationGeomean(p, spec, "rival"), 3), operationGeomean(p, spec, "simd"))
 	}
 	out.WriteString("\n![Headline geometric-mean speedups](charts/headline.svg)\n\n")
+	out.WriteString("Read each bar as baseline time divided by simdjson time. The `1x` line is\nequal performance; longer bars are faster.\n\n")
 	out.WriteString("The rival is the fastest compatible per-payload result from go-json, Segment,\njsoniter, or fastjson. Aggregate leads do not imply a win on every payload.\n\n")
 	out.WriteString("## Per-corpus results\n\n### Strict validation\n\n")
 	renderComparisonTable(&out, p, headlineOperations[0])
@@ -181,6 +187,7 @@ func renderGoPublication(p Publication) string {
 		fmt.Fprintf(&out, "| %s | %s | **%s** | **%.2fx** |\n", corpusLabels[corpus], formatDuration(stdlib.NsPerOp), formatDuration(ours.NsPerOp), stdlib.NsPerOp/ours.NsPerOp)
 	}
 	out.WriteString("\n![Per-corpus speedup over encoding/json](charts/corpus-speedups.svg)\n\n")
+	out.WriteString("Each cell is `encoding/json` time divided by simdjson time for that exact\noperation and payload. `1x` is equal performance; larger values are faster.\n\n")
 	out.WriteString("### Reusable structural index\n\n`BuildIndex` validates the input and builds a caller-owned navigable tape.\nCorrectly sized storage is reused; every row allocates zero bytes and objects.\n\n| Corpus | Time | Throughput |\n|---|---:|---:|\n")
 	for _, corpus := range corpusOrder {
 		metric := p.mustMetric("index-simd", benchmarkName("BenchmarkStdlibCorpusNativeParse", corpus, "", "simdjson-index-reused"))
@@ -196,12 +203,13 @@ func renderGoPublication(p Publication) string {
 		wins, uplift := simdControl(p, control)
 		fmt.Fprintf(&out, "| %s | %d/7 | **%.3fx** |\n", control.Label, wins, uplift)
 	}
-	out.WriteString("\n![SIMD uplift by path](charts/simd-uplift.svg)\n\n## Additional Go context\n\n")
+	out.WriteString("\n![SIMD uplift by path](charts/simd-uplift.svg)\n\n")
+	out.WriteString("Each bar is portable-Go time divided by SIMD time. `1x` is equal\nperformance; values above `1x` are a SIMD win.\n\n## Additional Go context\n\n")
 	fmt.Fprintf(&out, "`encoding/json/v2` is built from the pinned Go tip. Its time divided by\nsimdjson time is %.3fx for typed owned decode, %.3fx for dynamic owned decode,\nand %.3fx for owned encode.\n\n",
 		variantGeomean(p, "jsonv2", "BenchmarkStdlibCorpusJSONV2", "typed-reused", "jsonv2", headlineOperations[1]),
 		variantGeomean(p, "jsonv2", "BenchmarkStdlibCorpusJSONV2", "dynamic-owned", "jsonv2", headlineOperations[2]),
 		variantGeomean(p, "jsonv2", "BenchmarkStdlibCorpusJSONV2", "encode", "jsonv2", headlineOperations[3]))
-	fmt.Fprintf(&out, "Sonic is measured with `%s` because its native path does not support the\npinned Go tip. Sonic time divided by simdjson time is %.3fx for typed owned\ndecode, %.3fx for dynamic owned decode, and %.3fx for owned encode. Its\nsyntax-only validation result (%.3fx) is context, not a strict-UTF-8 peer.\n",
+	fmt.Fprintf(&out, "Sonic is measured with `%s` because its native path does not support\nthe pinned Go tip. Sonic time divided by simdjson time is %.3fx for typed\nowned decode, %.3fx for dynamic owned decode, and %.3fx for owned encode. Its\nsyntax-only validation result (%.3fx) is context, not a strict-UTF-8 peer.\n",
 		p.Metadata.LegacyVersion,
 		operationGeomean(p, headlineOperations[1], "sonic"), operationGeomean(p, headlineOperations[2], "sonic"), operationGeomean(p, headlineOperations[3], "sonic"), operationGeomean(p, headlineOperations[0], "sonic"))
 	return out.String()
@@ -228,7 +236,7 @@ func renderCrossLanguage(p Publication) string {
 	var out strings.Builder
 	fmt.Fprintf(&out, "| Component | Revision |\n|---|---|\n| Go simdjson | `%s` (`dirty=false`) |\n| Go compiler | `%s`, `GOEXPERIMENT=%s` |\n| C++ simdjson | %s, commit `%s`, %s implementation |\n| C++ compiler | %s |\n| Machine | %s, single thread |\n\n",
 		p.Metadata.Commit, escapePipes(p.Metadata.GoVersion), p.Metadata.GoExperiment, p.Metadata.CXXLibrary, p.Metadata.CXXCommit, p.Metadata.CXXImpl, escapePipes(p.Metadata.CXXVersion), p.Metadata.Machine)
-	out.WriteString("Six approximately 300 ms samples are taken per operation; the median is\nreported.\n\n| Corpus | Digest | C++ | Go | Go / C++ |\n|---|---|---:|---:|---:|\n")
+	fmt.Fprintf(&out, "%s are taken per operation; the median is reported.\n\n| Corpus | Digest | C++ | Go | Go speedup |\n|---|---|---:|---:|---:|\n", strings.ToUpper(sampleContract(p.Metadata)[:1])+sampleContract(p.Metadata)[1:])
 	for _, corpus := range corpusOrder {
 		cpp, _ := p.crosslang("cpp", corpus)
 		goResult, _ := p.crosslang("go", corpus)
@@ -238,15 +246,16 @@ func renderCrossLanguage(p Publication) string {
 		} else {
 			goCell = bold(goCell)
 		}
-		fmt.Fprintf(&out, "| %s | `%s` | %s | %s | %.3fx |\n", corpusLabels[corpus], cpp.Digest, cppCell, goCell, goResult.NsPerOp/cpp.NsPerOp)
+		fmt.Fprintf(&out, "| %s | `%s` | %s | %s | **%.3fx** |\n", corpusLabels[corpus], cpp.Digest, cppCell, goCell, cpp.NsPerOp/goResult.NsPerOp)
 	}
-	out.WriteString("\n![C++ and Go semantic traversal comparison](chart.svg)\n\nThe identical digest for the two string fixtures is expected: they decode to\nthe same semantic value even though one source uses escapes and the other uses\nliteral Unicode.\n")
+	out.WriteString("\n![Go speedup over C++ semantic traversal](chart.svg)\n\n")
+	out.WriteString("`Go speedup` is C++ time divided by Go time. `1x` is equal performance;\nvalues above `1x` mean Go is faster. The raw medians remain in the adjacent\ncolumns. The identical digest for the two string fixtures is expected: they\ndecode to the same semantic value even though one source uses escapes and the\nother uses literal Unicode.\n")
 	return out.String()
 }
 
 func renderLegacyControl(p Publication) string {
 	var out strings.Builder
-	fmt.Fprintf(&out, "%s, one CPU, `%s`, %d %s samples per row, median reported:\n\n| Corpus | Typed owned | Dynamic owned | Owned encode | Syntax-only `Valid` |\n|---|---:|---:|---:|---:|\n", p.Metadata.Machine, p.Metadata.LegacyVersion, p.Metadata.Samples, p.Metadata.BenchTime)
+	fmt.Fprintf(&out, "%s, one CPU, `%s`, %s per row, median reported:\n\n| Corpus | Typed owned | Dynamic owned | Owned encode | Syntax-only `Valid` |\n|---|---:|---:|---:|---:|\n", p.Metadata.Machine, p.Metadata.LegacyVersion, sampleContract(p.Metadata))
 	for _, corpus := range corpusOrder {
 		fmt.Fprintf(&out, "| %s | %s | %s | %s | %s |\n", corpusLabels[corpus],
 			formatDuration(legacyMetric(p, corpus, "typed-reused").NsPerOp),
@@ -414,6 +423,27 @@ func formatRatioCell(value float64, precision int) string {
 		return "—"
 	}
 	return fmt.Sprintf("**%.*fx**", precision, value)
+}
+
+func sampleContract(metadata Metadata) string {
+	return fmt.Sprintf("%s approximately %s samples", countWord(metadata.Samples), formatBenchTime(metadata.BenchTime))
+}
+
+func countWord(count int) string {
+	words := [...]string{"zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"}
+	if count >= 0 && count < len(words) {
+		return words[count]
+	}
+	return strconv.Itoa(count)
+}
+
+func formatBenchTime(value string) string {
+	for i, r := range value {
+		if r < '0' || r > '9' {
+			return value[:i] + " " + value[i:]
+		}
+	}
+	return value
 }
 
 func bold(value string) string { return "**" + value + "**" }

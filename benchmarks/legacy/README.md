@@ -12,22 +12,22 @@ models. `scripts/check-stdlib-corpus.sh` verifies those copies.
 ## Current corpus control
 
 <!-- benchpublish:legacy-control:start -->
-Apple M4 Max, one CPU, Go 1.26.4, six 300 ms samples per row, median reported:
+Apple M4 Max, one CPU, `go1.26.4 darwin/arm64`, six approximately 300 ms samples per row, median reported:
 
 | Corpus | Typed owned | Dynamic owned | Owned encode | Syntax-only `Valid` |
 |---|---:|---:|---:|---:|
-| Canada geometry | 438.6 us | 852.3 us | 799.7 us | 191.1 us |
-| CITM catalog | 1.436 ms | 3.230 ms | 961.1 us | 786.8 us |
-| Go source | 3.380 ms | 7.040 ms | 3.977 ms | 1.551 ms |
-| Escaped strings | 32.4 us | 34.0 us | 20.5 us | 3.4 us |
-| Unicode strings | 12.0 us | 13.7 us | 20.5 us | 1.7 us |
-| Synthea FHIR | 2.842 ms | 5.652 ms | 8.213 ms | 859.9 us |
-| Twitter status | 754.5 us | 1.235 ms | 584.5 us | 235.9 us |
+| Canada geometry | 439.1 us | 818.9 us | 832.7 us | 189.3 us |
+| CITM catalog | 1.438 ms | 3.109 ms | 971.5 us | 787.3 us |
+| Go source | 3.426 ms | 6.964 ms | 4.025 ms | 1.530 ms |
+| Escaped strings | 31.9 us | 33.8 us | 20.6 us | 3.3 us |
+| Unicode strings | 11.9 us | 13.7 us | 20.6 us | 1.7 us |
+| Synthea FHIR | 2.853 ms | 5.622 ms | 8.096 ms | 860.1 us |
+| Twitter status | 758.5 us | 1.218 ms | 585.4 us | 234.1 us |
 
-Sonic's `Valid` accepts invalid UTF-8, so that column is not equivalent to
-simdjson's strict validation contract. It is reported only as implementation
-context. Compiler and standard-library revisions also differ; main benchmark
-tables keep these rows out of same-toolchain fastest-rival selection.
+Sonic's `Valid` accepts invalid UTF-8, so that column is implementation
+context rather than a strict-validation comparison. Compiler and standard-
+library revisions also differ; the main tables exclude these rows from
+same-toolchain fastest-rival selection.
 <!-- benchpublish:legacy-control:end -->
 
 ## Reproduce

@@ -34,28 +34,31 @@ and pins C++ simdjson 4.6.4 at git commit
 <!-- benchpublish:cross-language:start -->
 | Component | Revision |
 |---|---|
-| Go simdjson | `8080e2117f36ca5d58c86383afe710be4d7993cf` (`dirty=false`) |
-| Go compiler | `go1.27-devel_03845e30`, `GOEXPERIMENT=simd` |
-| C++ simdjson | 4.6.4, arm64 implementation, clang 21 |
+| Go simdjson | `ed273875f67d8f06b03286bedfee43f778d6a8df` (`dirty=false`) |
+| Go compiler | `go1.27-devel_03845e30 Fri Jul 10 12:31:49 2026 -0700 darwin/arm64`, `GOEXPERIMENT=simd` |
+| C++ simdjson | simdjson 4.6.4, commit `1bcf71bd85059ab6574ea1159de9298dcc1212c5`, arm64 implementation |
+| C++ compiler | Apple clang version 21.0.0 (clang-2100.1.1.101) |
 | Machine | Apple M4 Max, single thread |
 
-Six approximately 300 ms samples are taken per operation; the median is
-reported.
+Six approximately 300 ms samples are taken per operation; the median is reported.
 
-| Corpus | Digest | C++ | Go |
-|---|---|---:|---:|
-| Canada geometry | `99bfa84117bedba4` | **367.872 us** | 418.329 us |
-| CITM catalog | `aa5480c889a90335` | **1.008286 ms** | 1.088386 ms |
-| Go source | `143678d948841678` | **3.348530 ms** | 3.503826 ms |
-| Escaped strings | `ceb1fff950644c35` | 70.515 us | **40.086 us** |
-| Unicode strings | `ceb1fff950644c35` | 22.777 us | **22.769 us** |
-| Synthea FHIR | `3d3241a500faabe1` | **1.847042 ms** | 2.066710 ms |
-| Twitter status | `7fd8ebd3db991240` | **682.615 us** | 752.033 us |
+| Corpus | Digest | C++ | Go | Go speedup |
+|---|---|---:|---:|---:|
+| Canada geometry | `99bfa84117bedba4` | 358.803 us | **341.102 us** | **1.052x** |
+| CITM catalog | `aa5480c889a90335` | 1.000670 ms | **892.307 us** | **1.121x** |
+| Go source | `143678d948841678` | 3.281954 ms | **2.749569 ms** | **1.194x** |
+| Escaped strings | `ceb1fff950644c35` | 69.538 us | **39.530 us** | **1.759x** |
+| Unicode strings | `ceb1fff950644c35` | 22.636 us | **22.096 us** | **1.024x** |
+| Synthea FHIR | `3d3241a500faabe1` | 1.838083 ms | **1.603395 ms** | **1.146x** |
+| Twitter status | `7fd8ebd3db991240` | 680.820 us | **624.488 us** | **1.090x** |
 
-The identical digest for the two string fixtures is expected: they decode to
-the same semantic value even though one source uses escapes and the other uses
-literal Unicode. That is also why the two rows have very different parsing
-costs.
+![Go speedup over C++ semantic traversal](chart.svg)
+
+`Go speedup` is C++ time divided by Go time. `1x` is equal performance;
+values above `1x` mean Go is faster. The raw medians remain in the adjacent
+columns. The identical digest for the two string fixtures is expected: they
+decode to the same semantic value even though one source uses escapes and the
+other uses literal Unicode.
 <!-- benchpublish:cross-language:end -->
 
 ## Reproduce
