@@ -237,6 +237,55 @@ func TestEncoderScratchDropsOversizedDynamicMap(t *testing.T) {
 	pool.Put(returned)
 }
 
+// FuzzEncoderScratchRetentionSequence interleaves tiny maps with at most one
+// over-budget map and checks the scratch budgets after every operation. The
+// 0xff operation makes huge-then-small behavior part of the seed corpus
+// without making every mutation allocate an adversarial map.
+func FuzzEncoderScratchRetentionSequence(f *testing.F) {
+	f.Add([]byte{1, 2, 0xff, 1, 0, 3})
+	f.Add([]byte{0xff, 0, 1})
+	f.Add([]byte{})
+
+	enc, err := CompileEncoder[map[int]uint64](EncoderOptions{})
+	if err != nil {
+		f.Fatal(err)
+	}
+	scratch, pool := dedicatedEncoderScratch(&enc)
+
+	f.Fuzz(func(t *testing.T, operations []byte) {
+		if len(operations) > 64 {
+			t.Skip()
+		}
+		hugeUsed := false
+		for step, operation := range operations {
+			size := int(operation & 31)
+			if operation == 0xff && !hugeUsed {
+				size = oversizedEncoderMapLen(unsafe.Sizeof(uint64(0)))
+				hugeUsed = true
+			}
+			value := make(map[int]uint64, size)
+			for i := 0; i < size; i++ {
+				value[i] = uint64(i + step)
+			}
+			out, err := enc.AppendJSON(nil, &value)
+			if err != nil || !Valid(out) {
+				t.Fatalf("step %d size %d = %q, %v", step, size, out, err)
+			}
+			returned := pool.Get().(*encoderScratch)
+			if returned != scratch {
+				t.Fatalf("step %d dedicated pool returned a different scratch object", step)
+			}
+			assertEncoderScratchBudgets(t, returned)
+			pool.Put(returned)
+		}
+		tiny := map[int]uint64{1: 1}
+		out, err := enc.AppendJSON(nil, &tiny)
+		if err != nil || string(out) != `{"1":1}` {
+			t.Fatalf("tiny recovery = %q, %v", out, err)
+		}
+	})
+}
+
 func benchmarkEncodeTinyMap[V any](b *testing.B, tiny map[int]V, huge map[int]V) {
 	b.Helper()
 	enc, err := CompileEncoder[map[int]V](EncoderOptions{})

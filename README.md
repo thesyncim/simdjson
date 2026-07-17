@@ -620,8 +620,11 @@ The test suite covers all 318 JSONTestSuite parsing cases, the seven pinned
 Go tip payloads with exact concrete models, typed and dynamic differentials
 against `encoding/json`, 500,000 randomized float spellings, 700,000
 randomized or boundary timestamps, randomized scalar/SIMD differentials
-across lengths and alignments, and fuzzers for validation, transforms, typed
-decode, encode, numbers, and the SIMD kernels.
+across lengths and alignments, and 33 automatically discovered fuzz targets
+covering validation, transforms, typed decode, encode, Reader lifecycle,
+resource spikes, hooks, numbers, and the SIMD kernels. Pull-request CI shards
+every target; scheduled CI runs longer pure-Go and SIMD campaigns and uploads
+crash corpora.
 
 Correctness fixes that touch a hot path require before-and-after benchmarks.
 A regression is optimized back before merge; correctness is never traded away
@@ -642,7 +645,10 @@ TIP_GO="$HOME/sdk/simdjson-gotip/bin/go"
 
 "$TIP_GO" test ./...
 GOEXPERIMENT=simd "$TIP_GO" test ./...
+GOEXPERIMENT=simd GOFLAGS=-tags=simdjson_validate_hooks "$TIP_GO" test ./...
 "$TIP_GO" vet ./...
+"$TIP_GO" test -race \
+  -skip 'Alloc|ZeroCost|StaysOnStack|TestParseFloat64' ./...
 GOEXPERIMENT=simd "$TIP_GO" test -race \
   -skip 'Alloc|ZeroCost|StaysOnStack|TestParseFloat64' ./...
 GOEXPERIMENT=simd "$TIP_GO" test -gcflags='all=-d=checkptr=2' \
@@ -650,9 +656,10 @@ GOEXPERIMENT=simd "$TIP_GO" test -gcflags='all=-d=checkptr=2' \
 GOGC=1 GOEXPERIMENT=simd "$TIP_GO" test \
   -run '^Test(EncoderScratchPoolPoisoning|DynamicMapScratchIsPlanIndependent|EncodeHookArrayUsesStableSourcePointers|HookReceiverLifetimes|HookRetentionTrapAfterPanic)$' \
   -count=10 -cpu=1,4,8 .
-GOEXPERIMENT=simd "$TIP_GO" test -run='^$' \
-  -fuzz='^FuzzEncoderScratchOperationSequence$' -fuzztime=30s .
+GOEXPERIMENT=simd GOFLAGS=-tags=simdjson_validate_hooks \
+  ./scripts/fuzz-smoke.sh "$TIP_GO" 5s
 ./scripts/check-stdlib-corpus.sh "$TIP_GO"
+GOTIP="$TIP_GO" ./scripts/bench-gate.sh -b HEAD~1
 ```
 
 The full vet suite, including `unsafeptr`, runs without exceptions.

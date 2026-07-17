@@ -3,7 +3,8 @@
 # interleaved benchmark rounds, the zero-regression gate used before every
 # performance-sensitive commit.
 #
-#   scripts/bench-gate.sh [-b ref] [-n rounds] [-t benchtime] [pattern]
+#   scripts/bench-gate.sh [-b ref] [-d directory] [-n rounds]
+#                         [-t benchtime] [-r max-regression-percent] [pattern]
 #
 # The default baseline is HEAD, rounds default to 8, benchtime to 250ms, and
 # the pattern defaults to the corpus decode/validate/encode rows. Requires
@@ -14,15 +15,19 @@ set -eu
 gotip=${GOTIP:-"$HOME/sdk/simdjson-gotip/bin/go"}
 benchstat=${BENCHSTAT:-"$HOME/go/bin/benchstat"}
 baseline=HEAD
+benchdir=tests/stdlib
 rounds=8
 benchtime=250ms
+regression_limit=${BENCH_REGRESSION_LIMIT:-2}
 pattern='BenchmarkHighLevelCorpus/.*/(valid|index|decode-typed|decode-any|encode-typed)/simdjson'
 
-while getopts b:n:t: flag; do
+while getopts b:d:n:t:r: flag; do
 	case $flag in
 	b) baseline=$OPTARG ;;
+	d) benchdir=$OPTARG ;;
 	n) rounds=$OPTARG ;;
 	t) benchtime=$OPTARG ;;
+	r) regression_limit=$OPTARG ;;
 	*) exit 2 ;;
 	esac
 done
@@ -45,12 +50,13 @@ if [ ! -x "$benchstat" ]; then
 fi
 
 echo "baseline: $(git -C "$root" rev-parse --short "$baseline_commit")  rounds: $rounds  benchtime: $benchtime" >&2
+echo "benchdir: $benchdir  max significant sec/op regression: $regression_limit%" >&2
 
 git -C "$root" worktree add --force --detach "$work/baseline" "$baseline_commit" >/dev/null 2>&1 ||
 	git -C "$work/baseline" checkout --force "$baseline_commit" >/dev/null 2>&1
 
-(cd "$root/tests/stdlib" && GOEXPERIMENT=simd "$gotip" test -c -o "$work/new.test" .)
-(cd "$work/baseline/tests/stdlib" && GOEXPERIMENT=simd "$gotip" test -c -o "$work/old.test" .)
+(cd "$root/$benchdir" && GOEXPERIMENT=simd "$gotip" test -c -o "$work/new.test" .)
+(cd "$work/baseline/$benchdir" && GOEXPERIMENT=simd "$gotip" test -c -o "$work/old.test" .)
 
 : >"$work/old.txt"
 : >"$work/new.txt"
@@ -62,3 +68,5 @@ while [ "$round" -lt "$rounds" ]; do
 done
 
 "$benchstat" "$work/old.txt" "$work/new.txt"
+BENCHSTAT="$benchstat" "$root/scripts/check-benchstat.sh" \
+	"$work/old.txt" "$work/new.txt" "$regression_limit"

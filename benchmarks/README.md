@@ -240,5 +240,9 @@ GOTIP="$HOME/sdk/simdjson-gotip/bin/go" ./scripts/bench-gate.sh -b HEAD~1
 ```
 
 Its default pattern covers validation, reusable structural indexing, typed and
-dynamic decode, and encode. The nested module pins every comparison dependency
-in `go.mod` and `go.sum`.
+dynamic decode, and encode. It exits non-zero for any statistically significant
+`sec/op` regression above 2% and for any significant `B/op` or `allocs/op`
+increase; `-r` changes the time threshold and `-d .` selects root-package
+resource and hook contracts. Pull requests run these checks on the dedicated
+`simdjson-performance` runner rather than a noisy shared host. The nested
+module pins every comparison dependency in `go.mod` and `go.sum`.

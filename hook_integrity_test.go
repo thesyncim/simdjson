@@ -1,6 +1,8 @@
 package simdjson
 
 import (
+	"bytes"
+	"math"
 	"strings"
 	"testing"
 )
@@ -59,4 +61,119 @@ func TestHookIntegrityValidationMode(t *testing.T) {
 	if Valid(got) {
 		t.Fatalf("unchecked malformed hook unexpectedly produced valid JSON: %s", got)
 	}
+}
+
+type hookIntegrityRaw []byte
+
+func (raw hookIntegrityRaw) MarshalSimdJSON(w TrustedAppender) TrustedAppender {
+	return w.RawBytesUnchecked(raw)
+}
+
+func FuzzHookIntegritySpan(f *testing.F) {
+	f.Add([]byte("null"))
+	f.Add([]byte(`{"valid":[1,2,3]}`))
+	f.Add([]byte(`{"unterminated"`))
+	f.Add([]byte{})
+
+	type document struct {
+		Hook hookIntegrityRaw `json:"hook"`
+	}
+	enc, err := CompileEncoder[document](EncoderOptions{})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		if len(raw) > 1<<12 {
+			t.Skip()
+		}
+		value := document{Hook: raw}
+		got, err := enc.AppendJSON(nil, &value)
+		if validateSimdHookOutput {
+			if valid := Valid(raw); valid != (err == nil) {
+				t.Fatalf("checked hook acceptance for %q = %v, want valid=%v", raw, err, valid)
+			}
+			if err == nil && !Valid(got) {
+				t.Fatalf("checked hook produced invalid document: %q", got)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("unchecked hook returned error for %q: %v", raw, err)
+		}
+		want := append([]byte(`{"hook":`), raw...)
+		want = append(want, '}')
+		if !bytes.Equal(got, want) {
+			t.Fatalf("unchecked hook = %q, want %q", got, want)
+		}
+	})
+}
+
+type hookRecoveryValue struct {
+	Mode byte
+	N    int64
+}
+
+func (v hookRecoveryValue) MarshalSimdJSON(w TrustedAppender) TrustedAppender {
+	switch v.Mode % 3 {
+	case 0:
+		return w.Int(v.N)
+	case 1:
+		return w.Float64(math.NaN())
+	default:
+		panic("hook recovery fuzz panic")
+	}
+}
+
+func FuzzHookPlanRecoverySequence(f *testing.F) {
+	f.Add([]byte{0, 1, 2, 0})
+	f.Add([]byte{2, 2, 1, 0, 1, 0})
+
+	type document struct {
+		Values map[string]int    `json:"values"`
+		Hook   hookRecoveryValue `json:"hook"`
+	}
+	enc, err := CompileEncoder[document](EncoderOptions{})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Fuzz(func(t *testing.T, operations []byte) {
+		if len(operations) > 64 {
+			t.Skip()
+		}
+		buffer := make([]byte, 0, 128)
+		value := document{Values: map[string]int{"stable": 1}}
+		encode := func() (out []byte, err error, panicked bool) {
+			defer func() {
+				if recover() != nil {
+					panicked = true
+				}
+			}()
+			out, err = enc.AppendJSON(buffer[:0], &value)
+			return out, err, false
+		}
+		for step, operation := range operations {
+			value.Hook = hookRecoveryValue{Mode: operation, N: int64(step)}
+			out, err, panicked := encode()
+			switch operation % 3 {
+			case 0:
+				if panicked || err != nil || !Valid(out) {
+					t.Fatalf("step %d success = %q, %v, panic=%v", step, out, err, panicked)
+				}
+				buffer = out
+			case 1:
+				if panicked || err == nil {
+					t.Fatalf("step %d unsupported value = %v, panic=%v", step, err, panicked)
+				}
+			default:
+				if !panicked {
+					t.Fatalf("step %d hook panic was not propagated", step)
+				}
+			}
+		}
+		value.Hook = hookRecoveryValue{N: 99}
+		out, err, panicked := encode()
+		if panicked || err != nil || !bytes.Contains(out, []byte(`"hook":99`)) || !Valid(out) {
+			t.Fatalf("final recovery = %q, %v, panic=%v", out, err, panicked)
+		}
+	})
 }

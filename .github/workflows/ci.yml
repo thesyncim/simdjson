@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '23 3 * * 1'
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -14,9 +19,11 @@ jobs:
           - runner: ubuntu-latest
             cross_arch: arm64
             primary: true
+            fuzz_shard: 0
           - runner: ubuntu-24.04-arm
             cross_arch: amd64
             primary: false
+            fuzz_shard: 1
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
@@ -24,10 +31,10 @@ jobs:
       # bootstrap from trying to auto-download an unreleased toolchain.
       GOTOOLCHAIN: local
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Go bootstrap
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: 1.26.4
           cache: false
@@ -43,13 +50,56 @@ jobs:
         env:
           GOEXPERIMENT: simd
 
+      - name: Tests, shuffled
+        if: ${{ matrix.primary }}
+        run: $RUNNER_TEMP/gotip/bin/go test -shuffle=on ./...
+
       - name: Go stdlib high-level corpus
         run: ./scripts/check-stdlib-corpus.sh "$RUNNER_TEMP/gotip/bin/go"
 
       - name: Vet
         run: $RUNNER_TEMP/gotip/bin/go vet ./...
 
-      - name: Race
+      - name: Install pinned analysis tools
+        if: ${{ matrix.primary }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          GOBIN="$RUNNER_TEMP/bin" $RUNNER_TEMP/gotip/bin/go install honnef.co/go/tools/cmd/staticcheck@v0.8.0-rc.1
+          GOBIN="$RUNNER_TEMP/bin" $RUNNER_TEMP/gotip/bin/go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+      - name: Static analysis
+        if: ${{ matrix.primary }}
+        # SA4006 and SA4008 currently misread the goto state machines and a
+        # conventional incrementing block loop under the pinned Go-tip export
+        # format. Keep every other correctness check enabled on production code.
+        run: >-
+          PATH="$RUNNER_TEMP/gotip/bin:$PATH"
+          "$RUNNER_TEMP/bin/staticcheck"
+          -tests=false '-checks=SA*,-SA4006,-SA4008' ./...
+
+      - name: Vulnerability scan
+        if: ${{ matrix.primary }}
+        run: >-
+          PATH="$RUNNER_TEMP/gotip/bin:$PATH"
+          "$RUNNER_TEMP/bin/govulncheck" ./...
+
+      - name: Generated files are clean
+        if: ${{ matrix.primary }}
+        run: |
+          $RUNNER_TEMP/gotip/bin/go generate ./...
+          git diff --exit-code
+
+      - name: Module files are tidy
+        if: ${{ matrix.primary }}
+        run: |
+          $RUNNER_TEMP/gotip/bin/go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Race, pure Go
+        if: ${{ matrix.primary }}
+        run: $RUNNER_TEMP/gotip/bin/go test -race -skip 'Alloc|ZeroCost|StaysOnStack|TestParseFloat64' ./...
+
+      - name: Race, SIMD
         run: $RUNNER_TEMP/gotip/bin/go test -race -skip 'Alloc|ZeroCost|StaysOnStack|TestParseFloat64' ./...
         env:
           GOEXPERIMENT: simd
@@ -78,14 +128,32 @@ jobs:
           GOARCH: ${{ matrix.cross_arch }}
           GOEXPERIMENT: simd
 
-      - name: Fuzz smoke
+      - name: Cross-compile 32-bit and big-endian targets
         if: ${{ matrix.primary }}
         run: |
-          $RUNNER_TEMP/gotip/bin/go test -run='^$' -fuzz='^FuzzTypedDecoderMatchesStdlib$' -fuzztime=60s .
-          $RUNNER_TEMP/gotip/bin/go test -run='^$' -fuzz='^FuzzEncoderMatchesStdlib$' -fuzztime=60s .
-          $RUNNER_TEMP/gotip/bin/go test -run='^$' -fuzz='^FuzzEncoderScratchOperationSequence$' -fuzztime=30s .
+          GOARCH=386 $RUNNER_TEMP/gotip/bin/go build ./...
+          GOARCH=s390x $RUNNER_TEMP/gotip/bin/go build ./...
+
+      - name: Fuzz smoke, all targets
+        run: ./scripts/fuzz-smoke.sh "$RUNNER_TEMP/gotip/bin/go" 5s "${{ matrix.fuzz_shard }}" 2
         env:
           GOEXPERIMENT: simd
+          GOFLAGS: -tags=simdjson_validate_hooks
+          FUZZ_PARALLEL: 4
+
+      - name: Scheduled fuzz, pure Go
+        if: ${{ github.event_name == 'schedule' }}
+        run: ./scripts/fuzz-smoke.sh "$RUNNER_TEMP/gotip/bin/go" 30s "${{ matrix.fuzz_shard }}" 2
+        env:
+          FUZZ_PARALLEL: 4
+
+      - name: Upload fuzz crash corpus
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-crash-${{ matrix.runner }}-${{ matrix.fuzz_shard }}
+          path: '**/testdata/fuzz/**'
+          if-no-files-found: ignore
 
       - name: Comparison module builds
         if: ${{ matrix.primary }}

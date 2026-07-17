@@ -195,3 +195,55 @@ func TestFieldSetBoundedFoldExpansionFallback(t *testing.T) {
 		t.Fatalf("Lookup(missing, false) = (%d, %v), want (-1, false)", got, ok)
 	}
 }
+
+func FuzzFieldSetLookupParity(f *testing.F) {
+	f.Add([]byte("Name\x00NAME\x00Kelvin\x00ſcore\x00Σ\x00ς"), []byte("name"), false)
+	f.Add([]byte("Kelvin\x00score\x00plain"), []byte("ſcore"), false)
+	f.Add([]byte("exact\x00EXACT"), []byte("exact"), true)
+
+	f.Fuzz(func(t *testing.T, encodedNames, encodedKey []byte, caseSensitive bool) {
+		if len(encodedNames) > 128 || len(encodedKey) > 32 {
+			t.Skip()
+		}
+		parts := strings.Split(string(encodedNames), "\x00")
+		if len(parts) > 8 {
+			parts = parts[:8]
+		}
+		names := make([]string, 0, len(parts))
+		for _, name := range parts {
+			duplicate := false
+			for _, existing := range names {
+				if existing == name {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				names = append(names, name)
+			}
+		}
+
+		set := MakeFieldSet(names...)
+		key := string(encodedKey)
+		want := -1
+		for i, name := range names {
+			if name == key {
+				want = i
+				break
+			}
+		}
+		if want < 0 && !caseSensitive {
+			for i, name := range names {
+				if strings.EqualFold(name, key) {
+					want = i
+					break
+				}
+			}
+		}
+		got, ok := set.Lookup(key, caseSensitive)
+		if got != want || ok != (want >= 0) {
+			t.Fatalf("names=%q Lookup(%q, %v) = (%d, %v), want (%d, %v)",
+				names, key, caseSensitive, got, ok, want, want >= 0)
+		}
+	})
+}

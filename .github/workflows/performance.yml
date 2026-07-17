@@ -1,0 +1,71 @@
+name: performance
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Git ref to compare against
+        required: false
+        default: origin/main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark-contracts:
+    # This label is intentionally dedicated: shared hosted runners are too
+    # noisy to make a statistically significant regression gate authoritative.
+    runs-on: [self-hosted, linux, arm64, simdjson-performance]
+    timeout-minutes: 45
+    env:
+      GOTOOLCHAIN: local
+      BASELINE: ${{ github.event.pull_request.base.sha || inputs.baseline }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Go bootstrap
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.26.4
+          cache: false
+
+      - name: Build pinned Go tip
+        run: ./scripts/bootstrap-gotip.sh "$RUNNER_TEMP/gotip"
+
+      - name: Install pinned benchstat
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          GOBIN="$RUNNER_TEMP/bin" "$RUNNER_TEMP/gotip/bin/go" install golang.org/x/perf/cmd/benchstat@v0.0.0-20260610192853-712aea8b4705
+
+      - name: High-level corpus gate
+        run: >-
+          ./scripts/bench-gate.sh
+          -b "${BASELINE:-origin/main}" -n 12 -t 500ms -r 2
+        env:
+          GOTIP: ${{ runner.temp }}/gotip/bin/go
+          BENCHSTAT: ${{ runner.temp }}/bin/benchstat
+
+      - name: Resource-after-spike gate
+        run: >-
+          ./scripts/bench-gate.sh -d .
+          -b "${BASELINE:-origin/main}" -n 12 -t 500ms -r 2
+          '^Benchmark(EncodeTinyAfterHuge|StructuralTapeTinyAfterHuge|CodecMarshalSmall|MarshalSmall)$'
+        env:
+          GOTIP: ${{ runner.temp }}/gotip/bin/go
+          BENCHSTAT: ${{ runner.temp }}/bin/benchstat
+
+      - name: Hook and field-dispatch gate
+        run: >-
+          ./scripts/bench-gate.sh -d .
+          -b "${BASELINE:-origin/main}" -n 12 -t 500ms -r 2
+          '^Benchmark(FieldSetLookup|HookEncodeSmall|HookDecodeSmall|HookDecodeUnknownField)$'
+        env:
+          GOTIP: ${{ runner.temp }}/gotip/bin/go
+          BENCHSTAT: ${{ runner.temp }}/bin/benchstat
