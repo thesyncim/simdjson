@@ -11,11 +11,11 @@ type CodecOptions struct {
 	Encoder EncoderOptions
 }
 
-// Codec bundles a compiled encoder and decoder for one type so the
-// allocation-free paths are the obvious ones: Append reuses caller buffers,
-// Marshal presizes from a per-codec bounded recent-size estimate instead of
-// the global per-type cache, and EncodeTo and DecodeFrom plug directly into the
-// streaming Writer and Reader. Compile it once and use it concurrently.
+// Codec bundles a compiled Encoder and Decoder for one type. Use it when a
+// protocol or stream needs both directions under one options value. AppendJSON
+// reuses caller buffers, Marshal uses a per-codec bounded size estimate, and
+// EncodeTo and DecodeFrom connect directly to Writer and Reader. A Codec is
+// immutable after compilation and may be used concurrently.
 type Codec[T any] struct {
 	enc  Encoder[T]
 	dec  Decoder[T]

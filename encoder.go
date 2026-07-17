@@ -32,10 +32,12 @@ type EncoderOptions struct {
 	UnsortedInlineFields bool
 }
 
-// Encoder is an immutable encoder for one concrete Go type. Compile it once
-// and reuse it concurrently; AppendJSON keeps all mutable state local to the
-// call. Output matches encoding/json byte for byte: compact, with U+2028 and
-// U+2029 escaped and invalid UTF-8 replaced by the replacement character.
+// Encoder is an immutable compiled encoder for one concrete Go type. Use
+// Marshal for occasional calls; use an Encoder when encoding the type
+// repeatedly, when options are required, or when output storage should be
+// reused. An Encoder may be used concurrently because AppendJSON keeps mutable
+// state local to the call. Output matches encoding/json byte for byte: compact,
+// with U+2028 and U+2029 escaped and invalid UTF-8 replaced.
 type Encoder[T any] struct {
 	root       *typedNode
 	escapeHTML bool

@@ -8,8 +8,9 @@ import (
 	simdkernels "github.com/thesyncim/simdjson/simd"
 )
 
-// Writer streams JSON to an io.Writer through one reused buffer, so encoding
-// allocates nothing once the buffer has grown to its working size.
+// Writer streams JSON to an io.Writer through one reused buffer. Use EncodeTo
+// for compiled Go values and the token methods for documents assembled a field
+// at a time. For a single in-memory value, Encoder.AppendJSON is simpler.
 //
 // Two levels are available and may be mixed between top-level values.
 // EncodeTo appends one complete value through a compiled [Encoder]. The token

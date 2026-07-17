@@ -90,15 +90,23 @@ type IndexOptions struct {
 	MaxDepth int
 }
 
-// Index is a validated, zero-copy structural index over its source JSON.
+// Index is an immutable, zero-copy navigation index over validated JSON.
+// Building an Index scans the complete document and writes one compact entry
+// per structural value. It is intended for repeated or out-of-order access to
+// one document; use GetRaw for a single pointer lookup and Parse when the
+// document should own its backing storage.
+//
+// An Index aliases both its source and entry storage. Neither may be modified
+// or reused while the Index or any Node obtained from it is in use. Concurrent
+// reads are safe when both remain immutable.
 type Index struct {
 	src     []byte
 	entries []IndexEntry
 }
 
-// BuildIndex validates src and builds a navigable index in caller-owned storage.
-// The returned Index aliases both src and storage. It performs no heap
-// allocations for valid input when storage is sufficient.
+// BuildIndex validates src and builds a navigable index in caller-owned
+// storage. The returned Index aliases both src and storage. It performs no
+// heap allocations for valid input when storage is sufficient.
 func BuildIndex(src []byte, storage []IndexEntry) (Index, error) {
 	return BuildIndexOptions(src, storage, IndexOptions{})
 }

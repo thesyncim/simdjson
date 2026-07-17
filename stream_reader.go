@@ -20,6 +20,9 @@ import (
 // the buffer has grown to the largest value seen (bounded by
 // SetMaxValueBytes). All reads and decoding happen on the caller's goroutine;
 // Reader does not start background workers and is not safe for concurrent use.
+// Use DecodeNext for typed streams and Cursor for a forward dynamic pass. Use
+// Parse or BuildIndex instead when a value must support retained, out-of-order
+// navigation.
 type Reader struct {
 	in    io.Reader
 	buf   []byte

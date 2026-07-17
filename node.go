@@ -7,9 +7,10 @@ import (
 	"unsafe"
 )
 
-// Node is a lightweight handle into an Index. Like the Index, it aliases
-// the source document and the entry storage, and is valid only while both
-// stay alive and unmodified.
+// Node is a lightweight value handle obtained from an Index. Node accessors
+// read directly from the indexed source and do not allocate unless they must
+// unescape or materialize data. Like Index, a Node is valid only while the
+// source document and entry storage remain alive and unmodified.
 type Node struct {
 	src   *byte
 	entry *IndexEntry

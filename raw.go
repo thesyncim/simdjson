@@ -5,7 +5,11 @@ import (
 	"unsafe"
 )
 
-// RawValue is an exact JSON value slice aliasing the source passed to GetRaw.
+// RawValue is a borrowed exact JSON value. Selectors and iterators return it
+// when callers need source bytes or scalar access without building a tree.
+// Its bytes alias the input and remain valid only while that input is alive and
+// unmodified. Use AppendJSON or Bytes followed by a copy when ownership is
+// required.
 type RawValue struct {
 	src []byte
 }

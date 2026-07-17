@@ -27,7 +27,7 @@ Performance changes must preserve the correctness and lifetime gates. Safety
 fixes are measured immediately so avoidable cost can be recovered with typed,
 runtime-managed ownership rather than hidden pointers or runtime-layout tricks.
 
-[Install](#install) | [Quick start](#quick-start) | [Usage](#usage) | [Performance](#performance) | [Contracts](#compatibility-and-contracts) | [SIMD package](#simd-package) | [Reproduce](#reproduce-benchmarks)
+[Install](#install) | [Quick start](#quick-start) | [Choose an API](#choose-an-api) | [Usage](#usage) | [Performance](#performance) | [Contracts](#compatibility-and-contracts) | [SIMD package](#simd-package) | [Reproduce](#reproduce-benchmarks)
 
 ## Install
 
@@ -76,6 +76,35 @@ out, err := simdjson.Marshal(&event)
 Both functions behave like `encoding/json` — same tags, same merge semantics,
 same output bytes — and cache one compiled plan per type for the life of the
 process. Everything below is opt-in.
+
+## Choose an API
+
+Choose by the lifetime and access pattern of the data, not by the name of an
+individual benchmark.
+
+| Need | API | Why |
+| --- | --- | --- |
+| Decode a known Go type occasionally | `Unmarshal` | Default compatible behavior with a cached plan. |
+| Decode one Go type repeatedly | `Decoder` | Compile options once and reuse destinations safely. |
+| Encode occasionally or repeatedly | `Marshal` or `Encoder` | `Encoder.AppendJSON` reuses caller-owned output. |
+| Keep both directions together | `Codec` | One options value and one reusable encoder/decoder pair. |
+| Read one JSON Pointer target | `GetRaw` or `ScanFirstRaw` | No persistent tree; the method name states last- versus first-duplicate behavior. |
+| Traverse one document repeatedly or out of order | `Index` and `Node` | Validate and build caller-owned navigation storage once, then reuse it without allocating. |
+| Retain an ordered, lazy dynamic document | `Parse` and `Value` | The result owns its storage by default and materializes only what is requested. |
+| Produce ordinary dynamic Go values | `Unmarshal` into `any` | Builds the familiar `map[string]any` and `[]any` representation. |
+| Decode a typed stream | `Reader` with `DecodeNext` | Frames and decodes each value in one forward pass. |
+| Inspect a dynamic stream once | `Reader.Cursor` | Forward-only access without constructing an index per value. |
+
+An `Index` makes later navigation fast, but constructing it still scans the
+whole document and writes structural entries. That cost is worthwhile when the
+same document is revisited or accessed randomly. A one-shot typed decode can
+scan and decode in one pass, and a streaming cursor can discard each value as
+soon as it is consumed.
+
+`Index`, `Node`, `RawValue`, zero-copy `Value`, and cursor strings borrow their
+input. Keep the source alive and unmodified for as long as those values are in
+use. Default `Parse` and default typed decoding own the string storage they
+expose.
 
 ## Usage
 

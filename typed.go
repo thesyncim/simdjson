@@ -59,9 +59,11 @@ type DecoderOptions struct {
 	InlineFields bool
 }
 
-// Decoder is an immutable decoder for one concrete Go type. Compile it
-// once and reuse it concurrently; Decode keeps all mutable parser state local
-// to the call.
+// Decoder is an immutable compiled decoder for one concrete Go type. Use
+// Unmarshal for occasional default-option calls; use a Decoder when decoding
+// the type repeatedly, when options are required, or when a caller-owned
+// destination should be reused. A Decoder may be used concurrently because
+// Decode keeps mutable parser state local to the call.
 type Decoder[T any] struct {
 	root       *typedNode
 	rootSlice  *typedNode

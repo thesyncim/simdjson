@@ -2,6 +2,26 @@
 // compiled typed decoding, validation, caller-backed structural indexes,
 // JSON Pointer selectors, dynamic decoding, and transforms.
 //
+// # Choosing an API
+//
+// For JSON with a known Go type, use [Unmarshal] for occasional calls and
+// compile a [Decoder] for repeated calls. Use [Marshal] and [Encoder] under the
+// same rule in the other direction. A [Codec] keeps both compiled plans
+// together.
+//
+// For dynamic JSON, choose by access pattern. [GetRaw] reads one RFC 6901
+// target. [BuildIndex] performs a full validation and builds caller-owned
+// navigation storage; use its [Index] and [Node] handles when one document will
+// be traversed repeatedly or out of order. [Parse] returns an owning [Value]
+// handle when the parsed document must outlive the input or when ordered,
+// lazy navigation is more convenient than managing index storage. Unmarshaling
+// into any produces the usual map and slice tree when interoperability matters
+// more than preserving order or avoiding materialization.
+//
+// For a stream, use [DecodeNext] when the destination type is known and
+// [ValueCursor] for one forward dynamic pass. Both avoid building a persistent
+// index for each streamed value.
+//
 // # Decoding into structs
 //
 // [Unmarshal] behaves like encoding/json.Unmarshal and caches one compiled
@@ -13,12 +33,10 @@
 // Hot paths should compile the decoder once with [CompileDecoder] and reuse
 // it; the returned [Decoder] is immutable and safe for concurrent use.
 // [DecoderOptions] selects string ownership (ZeroCopy), unknown-field
-// handling, case sensitivity, and merge-versus-replace semantics for
-// existing destination state (the default merges like encoding/json). When decoding fails against the Go type,
-// the returned [DecodeError] reports the byte offset and the path of the
-// offending value (for example "items[3].scores[1]"); the path is
-// constructed only when an error unwinds, so successful decodes pay nothing
-// for it.
+// handling, case sensitivity, and merge-versus-replace semantics for existing
+// destination state. The default merges like encoding/json. When decoding
+// fails against the Go type, the returned [DecodeError] reports the byte
+// offset and the path of the offending value, such as "items[3].scores[1]".
 //
 // # Encoding structs
 //
@@ -32,6 +50,11 @@
 // encoding does not allocate. Unrepresentable values (NaN, infinities,
 // malformed json.Number) return an [EncodeError] carrying the same style of
 // value path as [DecodeError].
+//
+// Concrete types encountered inside interface values are compiled on first
+// use and cached for the process lifetime. This suits the finite type sets used
+// by ordinary programs. Programs that synthesize an unbounded number of
+// reflect types should not feed them through interface-valued encode paths.
 //
 // # Custom marshalers
 //

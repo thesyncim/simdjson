@@ -144,6 +144,58 @@ func ExampleBuildIndex() {
 	// Output: 7
 }
 
+func ExampleParse() {
+	root, err := simdjson.Parse([]byte(`{"user":{"name":"ada"},"active":true}`))
+	if err != nil {
+		panic(err)
+	}
+	user, _ := root.Get("user")
+	name, _ := user.Get("name")
+	text, _ := name.Text()
+
+	fmt.Println(text)
+	// Output: ada
+}
+
+func ExampleReader_Cursor() {
+	r := simdjson.NewReader(bytes.NewBufferString("{\"id\":1}\n{\"id\":2}\n"))
+	for r.Next() {
+		cursor := r.Cursor()
+		if err := cursor.BeginObject(); err != nil {
+			panic(err)
+		}
+		for {
+			key, ok, err := cursor.NextField()
+			if err != nil {
+				panic(err)
+			}
+			if !ok {
+				break
+			}
+			if key != "id" {
+				if err := cursor.Skip(); err != nil {
+					panic(err)
+				}
+				continue
+			}
+			id, err := cursor.Int64()
+			if err != nil {
+				panic(err)
+			}
+			fmt.Println(id)
+		}
+		if err := cursor.Finish(); err != nil {
+			panic(err)
+		}
+	}
+	if err := r.Err(); err != nil {
+		panic(err)
+	}
+	// Output:
+	// 1
+	// 2
+}
+
 func ExampleDecoderOptions() {
 	decoder, err := simdjson.CompileDecoder[exampleEvent](simdjson.DecoderOptions{Replace: true})
 	if err != nil {

@@ -37,12 +37,11 @@ import (
 	"unsafe"
 )
 
-// UnmarshalerSimd is the opt-in decode hook. A type implements it to decode
-// itself directly from the cursor, consuming exactly one complete JSON value.
-// It is the simdjson-native counterpart of json.Unmarshaler, but it reads
-// through the decoder's own kernels instead of receiving raw bytes, so there
-// is no re-parse. The always-safe receiver and cursor shadows may allocate when
-// the hook runs.
+// UnmarshalerSimd is an opt-in custom decode hook. Use it for a type that needs
+// custom semantics or for generated decoding code; ordinary structs should use
+// the compiled Decoder. The method reads through the decoder's kernels instead
+// of reparsing raw bytes. Its heap-backed receiver and cursor shadows may
+// allocate when the hook runs.
 //
 // The method must consume exactly one JSON value and leave the cursor
 // positioned immediately after it, exactly as the compiled decoder would.
@@ -94,17 +93,15 @@ type DecodeCursor struct {
 	state decoderCursor
 }
 
-// TrustedAppender is the public face of the encoder inside a MarshalSimdJSON body: a
-// by-value builder over the output buffer whose helpers are thin, inlinable
-// wrappers over the package's append kernels. Bodies thread it through and
-// return it, which keeps the buffer in registers for the whole method.
+// TrustedAppender is the encoder handle passed to MarshalSimdJSON. It is a
+// by-value builder over the output buffer; methods must thread it through and
+// return the advanced value.
 //
 // Errors are sticky. The first helper that meets an unencodable value (a NaN
 // or an infinity) poisons the builder and every later helper is a no-op; the
 // enclosing encode reports the failure after the body returns, so a generated
 // body stays straight-line with no per-helper error check. The poison is a
-// plain bool rather than an error field so the builder stays register-sized —
-// the shape the prototype's register-allocation study settled on.
+// plain bool rather than an error field, keeping the value small.
 type TrustedAppender struct {
 	dst        []byte
 	escapeHTML bool

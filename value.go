@@ -54,9 +54,15 @@ type valueRoot struct {
 	entries []IndexEntry
 }
 
-// Value is an immutable handle into a parsed JSON document. Parse builds only
-// the structural index and reads each value straight from it as the caller
-// navigates, so a document read in part never pays to materialize the whole.
+// Value is an immutable, owning handle into a document returned by Parse. Use
+// Value when member order matters, navigation is lazy, or results must remain
+// usable without managing the source and index storage separately. For a
+// caller-backed, zero-copy index use Index and Node instead.
+//
+// Parse builds only the structural index and reads each value straight from it
+// as the caller navigates, so a document read in part is not materialized in
+// full. Array and Object materialize slices on request; iterator-style access
+// through the underlying indexed handles avoids those slices.
 //
 // A Value keeps its document alive through root: the lightweight node cursor
 // aliases the owned source and index, and root is what holds that storage
