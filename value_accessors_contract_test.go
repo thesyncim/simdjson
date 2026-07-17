@@ -51,16 +51,22 @@ func TestAccessorWrongKinds(t *testing.T) {
 		if kind != Number {
 			n, ok := node.Int64()
 			check(field+" Node.Int64", ok, n == 0)
+			u, ok := node.Uint64()
+			check(field+" Node.Uint64", ok, u == 0)
 			f, ok := node.Float64()
 			check(field+" Node.Float64", ok, f == 0)
 			nb, ok := node.NumberBytes()
 			check(field+" Node.NumberBytes", ok, nb == nil)
 			rn, ok := raw.Int64()
 			check(field+" RawValue.Int64", ok, rn == 0)
+			ru, ok := raw.Uint64()
+			check(field+" RawValue.Uint64", ok, ru == 0)
 			rf, ok := raw.Float64()
 			check(field+" RawValue.Float64", ok, rf == 0)
 			vn, ok := val.Int64()
 			check(field+" Value.Int64", ok, vn == 0)
+			vu, ok := val.Uint64()
+			check(field+" Value.Uint64", ok, vu == 0)
 			vf, ok := val.Float64()
 			check(field+" Value.Float64", ok, vf == 0)
 		}
@@ -144,6 +150,8 @@ func TestNumberAccessorConsistency(t *testing.T) {
 
 		wantInt, intErr := strconv.ParseInt(spelling, 10, 64)
 		wantIntOK := intErr == nil
+		wantUint, uintErr := strconv.ParseUint(spelling, 10, 64)
+		wantUintOK := uintErr == nil
 		wantFloat, floatErr := strconv.ParseFloat(spelling, 64)
 		wantFloatOK := floatErr == nil
 
@@ -188,6 +196,16 @@ func TestNumberAccessorConsistency(t *testing.T) {
 			f, ok := got()
 			if ok != wantFloatOK || (ok && f != wantFloat) {
 				t.Errorf("%s: %s = %g, %v; strconv = %g, %v", spelling, name, f, ok, wantFloat, wantFloatOK)
+			}
+		}
+		for name, got := range map[string]func() (uint64, bool){
+			"Node.Uint64":     node.Uint64,
+			"RawValue.Uint64": raw.Uint64,
+			"Value.Uint64":    val.Uint64,
+		} {
+			u, ok := got()
+			if ok != wantUintOK || (ok && u != wantUint) {
+				t.Errorf("%s: %s = %d, %v; strconv = %d, %v", spelling, name, u, ok, wantUint, wantUintOK)
 			}
 		}
 	}

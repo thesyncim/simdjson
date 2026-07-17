@@ -68,6 +68,13 @@ func (v Node) NumberText() (string, bool) {
 	return ownedBytesString(b), true
 }
 
+// IsInteger reports whether v is a number with an integer spelling: an
+// optional minus sign followed by digits, with no fraction or exponent.
+// It does not imply that the value fits in a particular integer type.
+func (v Node) IsInteger() bool {
+	return v.Kind() == Number && v.entry.flags()&tapeFlagInt != 0
+}
+
 // Int64 parses an integer value.
 func (v Node) Int64() (int64, bool) {
 	if v.Kind() != Number {
@@ -81,6 +88,41 @@ func (v Node) Int64() (int64, bool) {
 	s := ownedBytesString(tapeSourceBytes(v.src, e.start, e.end))
 	n, err := strconv.ParseInt(s, 10, 64)
 	return n, err == nil
+}
+
+// Uint64 parses an unsigned integer value. Fractional, exponent, negative,
+// and out-of-range spellings report false.
+func (v Node) Uint64() (uint64, bool) {
+	if v.Kind() != Number {
+		return 0, false
+	}
+	e := v.entry
+	if e.flags()&tapeFlagInt == 0 || *(*byte)(unsafe.Add(unsafe.Pointer(v.src), uintptr(e.start))) == '-' {
+		return 0, false
+	}
+	return tapeUint64(unsafe.Pointer(v.src), int(e.start), int(e.end))
+}
+
+// tapeUint64 parses a validated, non-negative integer in [start, end).
+func tapeUint64(base unsafe.Pointer, start, end int) (uint64, bool) {
+	if value, ok := parseTapeDigitsUint64(base, start, end); ok {
+		return value, true
+	}
+	// parseTapeDigitsUint64 deliberately stops at nineteen digits because
+	// that is enough for signed reads. Uint64 has one additional valid digit;
+	// accumulate that rare width with an explicit overflow guard.
+	if end-start != 20 {
+		return 0, false
+	}
+	value := uint64(0)
+	for i := start; i < end; i++ {
+		digit := uint64(fastByteAt(base, i) - '0')
+		if value > (^uint64(0)-digit)/10 {
+			return 0, false
+		}
+		value = value*10 + digit
+	}
+	return value, true
 }
 
 // tapeInt64 parses a number the tape classified as a plain integer: an

@@ -56,26 +56,33 @@ func parseFloat64(src []byte) (float64, error) {
 }
 
 // tapeFloat64 rounds the JSON number in [start, end) to the nearest float64
-// through the in-house kernels, following the same ladder as
-// decoderCursor.floatSlow: the exact-multiply envelope first, then
-// Eisel-Lemire, and strconv only for the truncated or tie-ambiguous spellings
-// both of those defer on. A lazy read therefore yields the identical bits the
-// streaming decode of the same bytes would.
+// through the same shape-specialized scanner and conversion ladder as the
+// typed decoder: the exact-multiply envelope first, then Eisel-Lemire, and
+// strconv only for truncated or tie-ambiguous spellings both defer on. A lazy
+// read therefore yields the identical bits the streaming decode would, while
+// common geographic coordinates avoid a second digit-by-digit scan.
 //
 // ok is false exactly when strconv.ParseFloat would report an error — an
 // out-of-range magnitude that overflows to an infinity — so the lazy readers
 // keep reporting those as failures. The exact and Eisel-Lemire paths never
 // produce an out-of-range value, so they always succeed.
 //
-// The digits were validated before this is reached, so scanJSONNumber succeeds
-// and stops exactly at end; its status is asserted by construction, not
-// branched on. base+start..base+end must lie within one live document.
+// The digits were validated before this is reached. The parsed-end check is a
+// defensive assertion of that index invariant; base+start..base+end must lie
+// within one live document.
 func tapeFloat64(base unsafe.Pointer, start, end int) (float64, bool) {
-	_, number, _ := scanJSONNumber(base, end, start)
-	if value, exact := number.exactFloat64(); exact {
+	parsedEnd, value, exact, number, haveNumber, _ := scanTypedFloat64Number(base, end, start)
+	if parsedEnd != end {
+		return 0, false
+	}
+	if exact {
 		return value, true
 	}
-	if !number.truncated {
+	if !haveNumber {
+		_, number, _ = scanJSONNumber(base, end, start)
+		haveNumber = !number.truncated
+	}
+	if haveNumber {
 		if value, ok := eiselLemire64(number.mantissa, number.exponent, number.negative); ok {
 			return value, true
 		}

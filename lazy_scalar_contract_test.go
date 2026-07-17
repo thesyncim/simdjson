@@ -6,8 +6,8 @@ import (
 	"testing"
 )
 
-// TestLazyScalarKernelParity pins the lazy scalar readers — Node.Float64,
-// Node.Int64, RawValue.Float64, and RawValue.Int64 — against strconv on the
+// TestLazyScalarKernelParity pins the lazy scalar readers — Node and RawValue
+// Float64, Int64, and Uint64 — against strconv on the
 // boundary spellings where the in-house number kernels and strconv can disagree:
 // int64 limits, signed zero, subnormals, the 19/20-digit mantissa edge, the
 // exact-conversion envelope, and out-of-range magnitudes. Every reader must
@@ -79,6 +79,8 @@ func TestLazyScalarKernelParity(t *testing.T) {
 		wantFOK := wantFErr == nil
 		wantI, wantIErr := strconv.ParseInt(s, 10, 64)
 		wantIOK := wantIErr == nil
+		wantU, wantUErr := strconv.ParseUint(s, 10, 64)
+		wantUOK := wantUErr == nil
 
 		v, err := Parse([]byte(s))
 		if err != nil {
@@ -107,6 +109,14 @@ func TestLazyScalarKernelParity(t *testing.T) {
 		}
 		if gotI, gotOK := raw.Int64(); gotOK != wantIOK || (wantIOK && gotI != wantI) {
 			t.Fatalf("RawValue.Int64(%q) = (%v, %v), want (%v, %v)", s, gotI, gotOK, wantI, wantIOK)
+		}
+
+		// Node.Uint64 and RawValue.Uint64 versus strconv.ParseUint.
+		if gotU, gotOK := node.Uint64(); gotOK != wantUOK || (wantUOK && gotU != wantU) {
+			t.Fatalf("Node.Uint64(%q) = (%v, %v), want (%v, %v)", s, gotU, gotOK, wantU, wantUOK)
+		}
+		if gotU, gotOK := raw.Uint64(); gotOK != wantUOK || (wantUOK && gotU != wantU) {
+			t.Fatalf("RawValue.Uint64(%q) = (%v, %v), want (%v, %v)", s, gotU, gotOK, wantU, wantUOK)
 		}
 	}
 }

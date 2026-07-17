@@ -117,6 +117,17 @@ func (v Value) Int64() (int64, bool) {
 	return v.node.Int64()
 }
 
+// Uint64 parses an unsigned integer number value as uint64.
+func (v Value) Uint64() (uint64, bool) {
+	return v.node.Uint64()
+}
+
+// IsInteger reports whether v is a number with an integer spelling. It does
+// not imply that the value fits in a particular integer type.
+func (v Value) IsInteger() bool {
+	return v.node.IsInteger()
+}
+
 // Array returns v as an array. The element Values are materialized on demand
 // and share v's root.
 func (v Value) Array() ([]Value, bool) {

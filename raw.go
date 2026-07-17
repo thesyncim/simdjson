@@ -130,6 +130,19 @@ func (r RawValue) Int64() (int64, bool) {
 	return int64(value), true
 }
 
+// Uint64 parses r as a uint64 JSON number.
+func (r RawValue) Uint64() (uint64, bool) {
+	if len(r.src) == 0 {
+		return 0, false
+	}
+	base := unsafe.Pointer(unsafe.SliceData(r.src))
+	end, integer, ok := scanNumberFastTagged(base, len(r.src), 0)
+	if !ok || end != len(r.src) || !integer || fastByteAt(base, 0) == '-' {
+		return 0, false
+	}
+	return tapeUint64(base, 0, end)
+}
+
 // Float64 parses r as a float64 JSON number.
 func (r RawValue) Float64() (float64, bool) {
 	if len(r.src) == 0 {

@@ -9,8 +9,6 @@ import (
 	"runtime"
 	"runtime/debug"
 	"slices"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/thesyncim/simdjson"
@@ -18,132 +16,135 @@ import (
 
 var digestSink uint64
 
-func hashByte(hash *uint64, value byte) {
-	*hash ^= uint64(value)
-	*hash *= 1099511628211
+func hashByte(hash uint64, value byte) uint64 {
+	return (hash ^ uint64(value)) * 1099511628211
 }
 
-func hashUint64(hash *uint64, value uint64) {
+func hashUint64(hash uint64, value uint64) uint64 {
 	for shift := 0; shift < 64; shift += 8 {
-		hashByte(hash, byte(value>>shift))
+		hash = hashByte(hash, byte(value>>shift))
 	}
+	return hash
 }
 
-func hashBytes(hash *uint64, value []byte) {
-	hashUint64(hash, uint64(len(value)))
+func hashBytes(hash uint64, value []byte) uint64 {
+	hash = hashUint64(hash, uint64(len(value)))
 	for _, b := range value {
-		hashByte(hash, b)
+		hash = hashByte(hash, b)
 	}
+	return hash
 }
 
-func hashString(hash *uint64, value string) {
-	hashUint64(hash, uint64(len(value)))
+func hashString(hash uint64, value string) uint64 {
+	hash = hashUint64(hash, uint64(len(value)))
 	for i := range len(value) {
-		hashByte(hash, value[i])
+		hash = hashByte(hash, value[i])
 	}
+	return hash
 }
 
-func digestNode(node simdjson.Node, hash *uint64, textScratch *[]byte) bool {
+func decodedText(node simdjson.Node, scratch *[]byte) ([]byte, bool) {
+	if text, ok := node.StringBytes(); ok {
+		return text, true
+	}
+	text, ok := node.AppendText((*scratch)[:0])
+	*scratch = text
+	return text, ok
+}
+
+func digestNode(node simdjson.Node, hash uint64, textScratch *[]byte) (uint64, bool) {
 	switch node.Kind() {
 	case simdjson.Array:
-		hashByte(hash, '[')
+		hash = hashByte(hash, '[')
 		iter, ok := node.ArrayIter()
 		if !ok {
-			return false
+			return hash, false
 		}
 		for {
 			child, ok := iter.Next()
 			if !ok {
 				break
 			}
-			if !digestNode(child, hash, textScratch) {
-				return false
+			hash, ok = digestNode(child, hash, textScratch)
+			if !ok {
+				return hash, false
 			}
 		}
-		hashByte(hash, ']')
-		return true
+		return hashByte(hash, ']'), true
 	case simdjson.Object:
-		hashByte(hash, '{')
+		hash = hashByte(hash, '{')
 		iter, ok := node.ObjectIter()
 		if !ok {
-			return false
+			return hash, false
 		}
 		for {
 			key, value, ok := iter.Next()
 			if !ok {
 				break
 			}
-			hashByte(hash, 'k')
-			text, ok := key.AppendText((*textScratch)[:0])
+			hash = hashByte(hash, 'k')
+			text, ok := decodedText(key, textScratch)
 			if !ok {
-				return false
+				return hash, false
 			}
-			hashBytes(hash, text)
-			*textScratch = text
-			if !digestNode(value, hash, textScratch) {
-				return false
+			hash = hashBytes(hash, text)
+			hash, ok = digestNode(value, hash, textScratch)
+			if !ok {
+				return hash, false
 			}
 		}
-		hashByte(hash, '}')
-		return true
+		return hashByte(hash, '}'), true
 	case simdjson.String:
-		hashByte(hash, 's')
-		text, ok := node.AppendText((*textScratch)[:0])
+		hash = hashByte(hash, 's')
+		text, ok := decodedText(node, textScratch)
 		if !ok {
-			return false
+			return hash, false
 		}
-		hashBytes(hash, text)
-		*textScratch = text
-		return true
+		return hashBytes(hash, text), true
 	case simdjson.Number:
+		if !node.IsInteger() {
+			value, ok := node.Float64()
+			if !ok {
+				return hash, false
+			}
+			hash = hashByte(hash, 'd')
+			return hashUint64(hash, math.Float64bits(value)), true
+		}
+		if value, ok := node.Int64(); ok {
+			hash = hashByte(hash, 'i')
+			return hashUint64(hash, uint64(value)), true
+		}
+		if value, ok := node.Uint64(); ok {
+			hash = hashByte(hash, 'u')
+			return hashUint64(hash, value), true
+		}
 		text, ok := node.NumberText()
 		if !ok {
-			return false
+			return hash, false
 		}
-		if strings.ContainsAny(text, ".eE") {
-			value, err := strconv.ParseFloat(text, 64)
-			if err != nil {
-				return false
-			}
-			hashByte(hash, 'd')
-			hashUint64(hash, math.Float64bits(value))
-			return true
-		}
-		if value, err := strconv.ParseInt(text, 10, 64); err == nil {
-			hashByte(hash, 'i')
-			hashUint64(hash, uint64(value))
-			return true
-		}
-		if value, err := strconv.ParseUint(text, 10, 64); err == nil {
-			hashByte(hash, 'u')
-			hashUint64(hash, value)
-			return true
-		}
-		hashByte(hash, 'g')
-		hashString(hash, text)
-		return true
+		hash = hashByte(hash, 'g')
+		return hashString(hash, text), true
 	case simdjson.Bool:
 		value, ok := node.Bool()
 		if !ok {
-			return false
+			return hash, false
 		}
 		if value {
-			hashByte(hash, 't')
+			hash = hashByte(hash, 't')
 		} else {
-			hashByte(hash, 'f')
+			hash = hashByte(hash, 'f')
 		}
-		return true
+		return hash, true
 	case simdjson.Null:
-		hashByte(hash, 'n')
-		return true
+		return hashByte(hash, 'n'), true
 	default:
-		return false
+		return hash, false
 	}
 }
 
 func semanticDigest(root simdjson.Node, textScratch *[]byte) uint64 {
-	hash := uint64(14695981039346656037)
-	if !digestNode(root, &hash, textScratch) {
+	hash, ok := digestNode(root, uint64(14695981039346656037), textScratch)
+	if !ok {
 		panic("semantic digest failed")
 	}
 	return hash
