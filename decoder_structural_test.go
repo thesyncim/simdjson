@@ -152,12 +152,9 @@ func TestStructuralRecordIntegerFastPathAndFallback(t *testing.T) {
 
 func TestStructuralDecodeMatchesRawCursor(t *testing.T) {
 	compact := benchRecordsJSON(256)
-	src, err := Indent(compact, "", "  ")
+	indented, err := Indent(compact, "", "  ")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if !decoderStructuralWorthwhile(src) {
-		t.Fatal("test document did not select the structural decoder")
 	}
 	decoder, err := CompileDecoder[benchDocument](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
 	if err != nil {
@@ -167,19 +164,32 @@ func TestStructuralDecodeMatchesRawCursor(t *testing.T) {
 		t.Fatal("fully compiled document was not marked structural")
 	}
 
-	var structural, raw benchDocument
-	if err := decoder.Decode(src, &structural); err != nil {
-		t.Fatalf("structural decode: %v", err)
-	}
-	consumed, err := decoder.DecodePrefix(src, &raw)
-	if err != nil {
-		t.Fatalf("raw cursor decode: %v", err)
-	}
-	if consumed != len(src) {
-		t.Fatalf("raw cursor consumed %d of %d bytes", consumed, len(src))
-	}
-	if !reflect.DeepEqual(structural, raw) {
-		t.Fatal("structural and raw cursor decodes differ")
+	for _, test := range []struct {
+		name string
+		src  []byte
+	}{
+		{name: "compact", src: compact},
+		{name: "indented", src: indented},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if len(test.src) < decoderStructuralMinBytes || !decoderStructuralWorthwhile(test.src) {
+				t.Fatal("test document did not select the structural decoder")
+			}
+			var structural, raw benchDocument
+			if err := decoder.Decode(test.src, &structural); err != nil {
+				t.Fatalf("structural decode: %v", err)
+			}
+			consumed, err := decoder.DecodePrefix(test.src, &raw)
+			if err != nil {
+				t.Fatalf("raw cursor decode: %v", err)
+			}
+			if consumed != len(test.src) {
+				t.Fatalf("raw cursor consumed %d of %d bytes", consumed, len(test.src))
+			}
+			if !reflect.DeepEqual(structural, raw) {
+				t.Fatal("structural and raw cursor decodes differ")
+			}
+		})
 	}
 }
 

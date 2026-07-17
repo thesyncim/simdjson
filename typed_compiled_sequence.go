@@ -119,6 +119,9 @@ func (cursor *decoderCursor) decodeCompiledSliceStructural(node *typedNode, dst 
 			return err
 		}
 	}
+	if !cursor.structuralFirstValueGapOK() {
+		return cursor.err(cursor.i, "unexpected colon after array opener")
+	}
 	header := (*typedSliceHeader)(dst)
 	header.len = 0
 	switch elem := node.elem; elem.kind {
@@ -454,9 +457,6 @@ func (cursor *decoderCursor) decodeCompiledArrayStructural(node *typedNode, dst 
 	if i := cursor.i; i < len(cursor.src) && cursor.src[i] == '[' && cursor.depth < cursor.maxDepth {
 		cursor.depth++
 		cursor.i = i + 1
-		if replace {
-			resetTyped(node, dst)
-		}
 	} else {
 		null := false
 		if !cursor.notNullFast() {
@@ -478,6 +478,12 @@ func (cursor *decoderCursor) decodeCompiledArrayStructural(node *typedNode, dst 
 		if err := cursor.BeginArray(node.name); err != nil {
 			return err
 		}
+	}
+	if replace {
+		resetTyped(node, dst)
+	}
+	if !cursor.structuralFirstValueGapOK() {
+		return cursor.err(cursor.i, "unexpected colon after array opener")
 	}
 	var err error
 	if node.elem.kind == typedFloat {

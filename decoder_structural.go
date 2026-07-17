@@ -1,7 +1,6 @@
 package simdjson
 
 import (
-	"bytes"
 	"strings"
 	"sync"
 	"unsafe"
@@ -18,6 +17,7 @@ const (
 
 	decoderStructuralTapeRetentionBytes     = 2 << 20
 	decoderStructuralTapeRetentionPositions = decoderStructuralTapeRetentionBytes / 4
+	decoderStructuralMinBytes               = 4096
 )
 
 // decoderStructuralTape is the typed decoder's On-Demand-style cursor. Stage
@@ -33,19 +33,12 @@ type decoderStructuralTape struct {
 
 var decoderStatePool sync.Pool
 
-// decoderStructuralWorthwhile keeps stage-1 setup away from small and compact
-// inputs. A raw line feed cannot occur in a valid JSON string, so finding one
-// near the front is a cheap signal that the token cursor can replace enough
-// raw delimiter and string-boundary work to repay stage 1.
+// decoderStructuralWorthwhile applies the document-side routing contract for
+// the forward structural producer. The caller separately checks that its
+// compiled shape has a structural executor.
 func decoderStructuralWorthwhile(src []byte) bool {
-	if !simdkernels.Stage1StreamEnabled() || uint64(len(src)) > uint64(^uint32(0)) {
-		return false
-	}
-	sample := src
-	if len(sample) > 2048 {
-		sample = sample[:2048]
-	}
-	return bytes.IndexByte(sample, '\n') >= 0
+	return len(src) >= decoderStructuralMinBytes && simdkernels.Stage1StreamEnabled() &&
+		uint64(len(src)) <= uint64(^uint32(0))
 }
 
 func acquireDecoderState(src []byte) *decoderState {
@@ -215,6 +208,27 @@ func structuralColonGap(base unsafe.Pointer, n, closePosition, valuePosition int
 func structuralPackedColonTail(base unsafe.Pointer, closePosition, valuePosition int) bool {
 	gap := valuePosition - closePosition
 	return gap == 2 || gap == 3 && fastByteAt(base, closePosition+2) <= ' '
+}
+
+// structuralFirstValueGapOK verifies the one gap where the colon-elided stream
+// has no preceding value to protect it. The next tape entry normally follows
+// the opener directly or after whitespace; a colon is the only structural byte
+// Stage 1 can hide there. Structural container decoders establish this once so
+// all of their specialized executors share the same grammar invariant.
+func (c *decoderCursor) structuralFirstValueGapOK() bool {
+	tape := &c.state.structural
+	index := tape.index + 1
+	if uint(index) >= uint(len(tape.positions)) {
+		return true
+	}
+	base := unsafe.Pointer(unsafe.SliceData(c.src))
+	end := int(tape.positions[index])
+	for start := c.i; start < end; start++ {
+		if fastByteAt(base, start) == ':' {
+			return false
+		}
+	}
+	return true
 }
 
 // syncStructuralValue restores the forward-cursor invariant after a value was

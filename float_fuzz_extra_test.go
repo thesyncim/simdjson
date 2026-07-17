@@ -150,6 +150,10 @@ func FuzzFloatDecodeAllPaths(f *testing.F) {
 	f.Add(false, "22250738585072014", "", false, -324, true)
 	f.Add(false, "1", "234567890123456789012345", true, -300, true)
 	f.Add(false, "0", "1", true, 0, false)
+	f.Add(false, "73", "1234567890123", true, 0, false)
+	f.Add(true, "73", "12345678901234", true, 0, false)
+	f.Add(false, "173", "123456789012345", true, 0, false)
+	f.Add(false, "10", "00000000", true, -300, true)
 	f.Add(false, "", "3", true, -400, true)
 	f.Add(false, "17976931348623157", "", false, 292, true)
 	f.Fuzz(func(t *testing.T, neg bool, intPart, fracPart string, hasFrac bool, exp int, hasExp bool) {

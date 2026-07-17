@@ -173,25 +173,52 @@ func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 			return nil
 		}
 	}
-	if plan.structural && len(src) >= 4096 && decoderStructuralWorthwhile(src) {
+	if plan.structural && decoderStructuralWorthwhile(src) {
 		return plan.decodeStructural(src, dst)
 	}
-	cursor := newDecoderCursor(src, plan.options)
+	return decodeTypedDocument(src, plan.options, plan.root, unsafe.Pointer(dst), nil)
+}
+
+// decodeTypedDocument is the single whole-document cursor contract. A nil
+// state selects the raw cursor; an eligible structural state selects the
+// forward executor unless stage 1 declined the input. Both engines share root
+// dispatch, error propagation, and exact-document finalization here.
+func decodeTypedDocument(src []byte, options DecoderOptions, root *typedNode, dst unsafe.Pointer, state *decoderState) error {
+	cursor := newDecoderCursor(src, options)
+	structural := state != nil && !state.structural.bad
+	if state != nil {
+		cursor.state = state
+		if !structural {
+			state.structuralActive = false
+		}
+	}
 	cursor.skipSpace()
 	var err error
-	switch plan.root.kind {
+	switch root.kind {
 	case typedStruct:
-		err = cursor.decodeCompiledStruct(plan.root, unsafe.Pointer(dst))
+		if structural {
+			err = cursor.decodeCompiledStructStructural(root, dst)
+		} else {
+			err = cursor.decodeCompiledStruct(root, dst)
+		}
 	case typedSlice:
-		err = cursor.decodeCompiledSlice(plan.root, unsafe.Pointer(dst))
+		if structural {
+			err = cursor.decodeCompiledSliceStructural(root, dst)
+		} else {
+			err = cursor.decodeCompiledSlice(root, dst)
+		}
 	case typedArray:
-		err = cursor.decodeCompiledArray(plan.root, unsafe.Pointer(dst))
+		if structural {
+			err = cursor.decodeCompiledArrayStructural(root, dst)
+		} else {
+			err = cursor.decodeCompiledArray(root, dst)
+		}
 	case typedPointer:
-		err = cursor.decodeCompiledPointer(plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledPointer(root, dst)
 	case typedMap:
-		err = cursor.decodeCompiledMap(plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiledMap(root, dst)
 	default:
-		err = cursor.decodeCompiled(plan.root, unsafe.Pointer(dst))
+		err = cursor.decodeCompiled(root, dst)
 	}
 	if err != nil {
 		return err
@@ -203,49 +230,7 @@ func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 func (plan Decoder[T]) decodeStructural(src []byte, dst *T) error {
 	state := acquireDecoderState(src)
 	defer releaseDecoderState(state)
-	cursor := newDecoderCursor(src, plan.options)
-	cursor.state = state
-	structural := !state.structural.bad
-	if !structural {
-		state.structuralActive = false
-	}
-	cursor.skipSpace()
-	var err error
-	if structural {
-		switch plan.root.kind {
-		case typedStruct:
-			err = cursor.decodeCompiledStructStructural(plan.root, unsafe.Pointer(dst))
-		case typedSlice:
-			err = cursor.decodeCompiledSliceStructural(plan.root, unsafe.Pointer(dst))
-		case typedArray:
-			err = cursor.decodeCompiledArrayStructural(plan.root, unsafe.Pointer(dst))
-		case typedPointer:
-			err = cursor.decodeCompiledPointer(plan.root, unsafe.Pointer(dst))
-		case typedMap:
-			err = cursor.decodeCompiledMap(plan.root, unsafe.Pointer(dst))
-		default:
-			err = cursor.decodeCompiled(plan.root, unsafe.Pointer(dst))
-		}
-	} else {
-		switch plan.root.kind {
-		case typedStruct:
-			err = cursor.decodeCompiledStruct(plan.root, unsafe.Pointer(dst))
-		case typedSlice:
-			err = cursor.decodeCompiledSlice(plan.root, unsafe.Pointer(dst))
-		case typedArray:
-			err = cursor.decodeCompiledArray(plan.root, unsafe.Pointer(dst))
-		case typedPointer:
-			err = cursor.decodeCompiledPointer(plan.root, unsafe.Pointer(dst))
-		case typedMap:
-			err = cursor.decodeCompiledMap(plan.root, unsafe.Pointer(dst))
-		default:
-			err = cursor.decodeCompiled(plan.root, unsafe.Pointer(dst))
-		}
-	}
-	if err != nil {
-		return err
-	}
-	return cursor.Finish()
+	return decodeTypedDocument(src, plan.options, plan.root, unsafe.Pointer(dst), state)
 }
 
 // DecodePrefix decodes one JSON value from the front of src into dst and

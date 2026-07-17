@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 	"os"
@@ -16,29 +17,88 @@ import (
 
 var digestSink uint64
 
+const (
+	fnvPrime  = uint64(1099511628211)
+	fnvPrime5 = uint64(0x0caee32a7d4f6a63)
+	fnvPrime6 = uint64(0xdc966432edf1c639)
+	fnvPrime7 = uint64(0xc5527b8a51d3d2db)
+	fnvPrime8 = uint64(0x1efac7090aef4a21)
+)
+
 func hashByte(hash uint64, value byte) uint64 {
-	return (hash ^ uint64(value)) * 1099511628211
+	return (hash ^ uint64(value)) * fnvPrime
 }
 
 func hashUint64(hash uint64, value uint64) uint64 {
-	for shift := 0; shift < 64; shift += 8 {
-		hash = hashByte(hash, byte(value>>shift))
-	}
+	hash = (hash ^ uint64(byte(value))) * fnvPrime
+	hash = (hash ^ uint64(byte(value>>8))) * fnvPrime
+	hash = (hash ^ uint64(byte(value>>16))) * fnvPrime
+	hash = (hash ^ uint64(byte(value>>24))) * fnvPrime
+	hash = (hash ^ uint64(byte(value>>32))) * fnvPrime
+	hash = (hash ^ uint64(byte(value>>40))) * fnvPrime
+	hash = (hash ^ uint64(byte(value>>48))) * fnvPrime
+	hash = (hash ^ uint64(byte(value>>56))) * fnvPrime
 	return hash
 }
 
 func hashBytes(hash uint64, value []byte) uint64 {
-	hash = hashUint64(hash, uint64(len(value)))
-	for _, b := range value {
-		hash = hashByte(hash, b)
+	length := uint64(len(value))
+	switch {
+	case length < 1<<8:
+		hash = (hash ^ length) * fnvPrime8
+	case length < 1<<16:
+		hash = (hash ^ uint64(byte(length))) * fnvPrime
+		hash = (hash ^ uint64(byte(length>>8))) * fnvPrime7
+	case length < 1<<24:
+		hash = (hash ^ uint64(byte(length))) * fnvPrime
+		hash = (hash ^ uint64(byte(length>>8))) * fnvPrime
+		hash = (hash ^ uint64(byte(length>>16))) * fnvPrime6
+	default:
+		hash = (hash ^ uint64(byte(length))) * fnvPrime
+		hash = (hash ^ uint64(byte(length>>8))) * fnvPrime
+		hash = (hash ^ uint64(byte(length>>16))) * fnvPrime
+		hash = (hash ^ uint64(byte(length>>24))) * fnvPrime5
+	}
+	i := 0
+	for i+8 <= len(value) {
+		word := binary.LittleEndian.Uint64(value[i:])
+		hash = (hash ^ uint64(byte(word))) * fnvPrime
+		hash = (hash ^ uint64(byte(word>>8))) * fnvPrime
+		hash = (hash ^ uint64(byte(word>>16))) * fnvPrime
+		hash = (hash ^ uint64(byte(word>>24))) * fnvPrime
+		hash = (hash ^ uint64(byte(word>>32))) * fnvPrime
+		hash = (hash ^ uint64(byte(word>>40))) * fnvPrime
+		hash = (hash ^ uint64(byte(word>>48))) * fnvPrime
+		hash = (hash ^ uint64(byte(word>>56))) * fnvPrime
+		i += 8
+	}
+	for i < len(value) {
+		hash = (hash ^ uint64(value[i])) * fnvPrime
+		i++
 	}
 	return hash
 }
 
 func hashString(hash uint64, value string) uint64 {
-	hash = hashUint64(hash, uint64(len(value)))
+	length := uint64(len(value))
+	switch {
+	case length < 1<<8:
+		hash = (hash ^ length) * fnvPrime8
+	case length < 1<<16:
+		hash = (hash ^ uint64(byte(length))) * fnvPrime
+		hash = (hash ^ uint64(byte(length>>8))) * fnvPrime7
+	case length < 1<<24:
+		hash = (hash ^ uint64(byte(length))) * fnvPrime
+		hash = (hash ^ uint64(byte(length>>8))) * fnvPrime
+		hash = (hash ^ uint64(byte(length>>16))) * fnvPrime6
+	default:
+		hash = (hash ^ uint64(byte(length))) * fnvPrime
+		hash = (hash ^ uint64(byte(length>>8))) * fnvPrime
+		hash = (hash ^ uint64(byte(length>>16))) * fnvPrime
+		hash = (hash ^ uint64(byte(length>>24))) * fnvPrime5
+	}
 	for i := range len(value) {
-		hash = hashByte(hash, value[i])
+		hash = (hash ^ uint64(value[i])) * fnvPrime
 	}
 	return hash
 }

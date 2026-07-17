@@ -165,6 +165,49 @@ func TestTypedDecodeForcedRouteParity(t *testing.T) {
 	compareDecodeRoutes(t, invalid, routes[:4], true)
 }
 
+// FuzzTypedStructuralRouteParity pads arbitrary inputs past the automatic
+// structural threshold and compares that default route with the raw cursor.
+// Trailing JSON whitespace does not change the document, so mutations still
+// target the parser while every short seed exercises the large-input router.
+func FuzzTypedStructuralRouteParity(f *testing.F) {
+	for _, src := range [][]byte{
+		[]byte(`{"id":7,"active":true,"name":"alpha","note":"plain","scores":[1.5,-2,3e4]}`),
+		[]byte(` { "scores" : [0,1,2], "note":"line\ntext", "name":"beta", "active":false, "id":-9 } `),
+		[]byte(`{"id":1,"id":2,"active":true,"name":"first","note":"x","scores":[1,2,3]}`),
+		[]byte(`{"id":1,"active":true,"name":"x","note":"y","scores":[1,2`),
+		[]byte(`{:}`),
+		[]byte(`{:"id":1,"active":true,"name":"x","note":"y","scores":[1,2,3]}`),
+		[]byte(`{"id":1,"active":true,"name":"x","note":"y","scores"::[1,2,3]}`),
+		[]byte(`{"id":1,"active":true,"name":"x","note":"y","scores":[:1,2,3]}`),
+	} {
+		f.Add(src)
+	}
+	decoder, err := CompileDecoder[routeRecord](DecoderOptions{})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Fuzz(func(t *testing.T, src []byte) {
+		if len(src) > 1<<13 {
+			return
+		}
+		padded := make([]byte, max(len(src), decoderStructuralMinBytes))
+		copy(padded, src)
+		for i := len(src); i < len(padded); i++ {
+			padded[i] = ' '
+		}
+
+		var raw, structural routeRecord
+		rawErr := decodeCursorRoute(decoder, padded, &raw)
+		structuralErr := decoder.Decode(padded, &structural)
+		if (rawErr == nil) != (structuralErr == nil) {
+			t.Fatalf("acceptance differs: raw=%v structural=%v\nsrc=%.160q", rawErr, structuralErr, src)
+		}
+		if rawErr == nil && !reflect.DeepEqual(raw, structural) {
+			t.Fatalf("value differs: raw=%+v structural=%+v\nsrc=%.160q", raw, structural, src)
+		}
+	})
+}
+
 func TestTypedDecodeOwnedAndZeroCopyLifetime(t *testing.T) {
 	owned, err := CompileDecoder[routeRecord](DecoderOptions{})
 	if err != nil {

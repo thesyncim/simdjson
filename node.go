@@ -72,7 +72,11 @@ func (v Node) NumberText() (string, bool) {
 // optional minus sign followed by digits, with no fraction or exponent.
 // It does not imply that the value fits in a particular integer type.
 func (v Node) IsInteger() bool {
-	return v.Kind() == Number && v.entry.flags()&tapeFlagInt != 0
+	// tapeFlagInt is exclusive to Number entries; strings use only the
+	// escaped/key bits and every other kind has zero flags. Testing the flag
+	// therefore preserves the kind check while avoiding a second packed-kind
+	// decode after callers have already dispatched on Kind.
+	return v.valid() && v.entry.flags()&tapeFlagInt != 0
 }
 
 // Int64 parses an integer value.

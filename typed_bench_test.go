@@ -177,6 +177,19 @@ func BenchmarkDecodeLargeReused(b *testing.B) {
 	}
 }
 
+func BenchmarkUnmarshalLargeReused(b *testing.B) {
+	src := benchRecordsJSON(1024)
+	dst := benchDocument{Items: make([]benchRecord, 0, 1024)}
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := Unmarshal(src, &dst); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkDecodeLargeIndented(b *testing.B) {
 	compact := benchRecordsJSON(1024)
 	src, err := Indent(compact, "", "  ")

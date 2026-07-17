@@ -200,6 +200,9 @@ func (cursor *decoderCursor) decodeCompiledStructStructural(node *typedNode, dst
 			return err
 		}
 	}
+	if !cursor.structuralFirstValueGapOK() {
+		return cursor.err(cursor.i, "unexpected colon after object opener")
+	}
 	if cursor.flags&decoderReplace != 0 && (node.inlineMap != nil || (node.allSet == 0 && len(node.fields) > 0)) {
 		resetTyped(node, dst)
 	}

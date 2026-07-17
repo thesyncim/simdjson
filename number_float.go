@@ -71,6 +71,9 @@ func parseFloat64(src []byte) (float64, error) {
 // defensive assertion of that index invariant; base+start..base+end must lie
 // within one live document.
 func tapeFloat64(base unsafe.Pointer, start, end int) (float64, bool) {
+	if value, ok := tapeFixedDecimalFloat64(base, start, end); ok {
+		return value, true
+	}
 	parsedEnd, value, exact, number, haveNumber, _ := scanTypedFloat64Number(base, end, start)
 	if parsedEnd != end {
 		return 0, false
@@ -90,6 +93,100 @@ func tapeFloat64(base unsafe.Pointer, start, end int) (float64, bool) {
 	text := unsafe.String((*byte)(unsafe.Add(base, start)), end-start)
 	value, err := strconv.ParseFloat(text, 64)
 	return value, err == nil
+}
+
+// tapeFixedDecimalFloat64 consumes the long fixed-point shapes common in
+// indexed geographic data. The index has already validated every byte and
+// supplied the exact end, so this lazy accessor does not need the delimiter
+// probes and digit predicates required by the streaming scanner. Restricting
+// the shortcut to 13-15 fractional digits keeps the mantissa within 18 digits
+// for the two- and three-digit integer parts it accepts.
+func tapeFixedDecimalFloat64(base unsafe.Pointer, start, end int) (float64, bool) {
+	i := start
+	negative := fastByteAt(base, i) == '-'
+	if negative {
+		i++
+	}
+	width := end - i
+	if width < 16 || width > 19 {
+		return 0, false
+	}
+
+	integerDigits := 0
+	switch {
+	case fastByteAt(base, i+2) == '.':
+		integerDigits = 2
+	case fastByteAt(base, i+3) == '.':
+		integerDigits = 3
+	default:
+		return 0, false
+	}
+	fractionStart := i + integerDigits + 1
+	fractionDigits := end - fractionStart
+	if fractionDigits < 13 || fractionDigits > 15 || integerDigits+fractionDigits > 18 {
+		return 0, false
+	}
+	fractionWord := loadUint64LE(unsafe.Add(base, fractionStart))
+	if byteEqMask(fractionWord, 'e')|byteEqMask(fractionWord, 'E') != 0 {
+		return 0, false
+	}
+
+	mantissa := uint64(fastByteAt(base, i) - '0')
+	if integerDigits == 2 {
+		mantissa = mantissa*10 + uint64(fastByteAt(base, i+1)-'0')
+	} else {
+		mantissa = (mantissa*10+uint64(fastByteAt(base, i+1)-'0'))*10 +
+			uint64(fastByteAt(base, i+2)-'0')
+	}
+	mantissa = mantissa*1e8 + parse8DigitsWord(fractionWord)
+	tailStart := fractionStart + 8
+	remaining := fractionDigits - 8
+	b0 := fastByteAt(base, tailStart)
+	b1 := fastByteAt(base, tailStart+1)
+	b2 := fastByteAt(base, tailStart+2)
+	b3 := fastByteAt(base, tailStart+3)
+	b4 := fastByteAt(base, tailStart+4)
+	if b0|0x20 == 'e' || b1|0x20 == 'e' || b2|0x20 == 'e' || b3|0x20 == 'e' || b4|0x20 == 'e' {
+		return 0, false
+	}
+	tail := (((uint64(b0-'0')*10+uint64(b1-'0'))*10+uint64(b2-'0'))*10+uint64(b3-'0'))*10 + uint64(b4-'0')
+	if remaining >= 6 {
+		b5 := fastByteAt(base, tailStart+5)
+		if b5|0x20 == 'e' {
+			return 0, false
+		}
+		tail = tail*10 + uint64(b5-'0')
+		if remaining == 7 {
+			b6 := fastByteAt(base, tailStart+6)
+			if b6|0x20 == 'e' {
+				return 0, false
+			}
+			tail = tail*10 + uint64(b6-'0')
+		}
+	}
+	mantissa = mantissa*pow10Uint64[remaining] + tail
+
+	if mantissa >= uint64(1)<<52 {
+		switch fractionDigits {
+		case 13:
+			return scaleJSONFloat64Fixed(
+				mantissa, 0xe12e13424bb40e14, 0xd79a5a0df94f9046, 978, negative,
+			), true
+		case 14:
+			return scaleJSONFloat64Fixed(
+				mantissa, 0xb424dc35095cd810, 0xac7b7b3e610c736b, 975, negative,
+			), true
+		case 15:
+			return scaleJSONFloat64Fixed(
+				mantissa, 0x901d7cf73ab0acda, 0xf062c8feb409f5ef, 972, negative,
+			), true
+		}
+	}
+	value := float64(mantissa) / anyPow10[fractionDigits]
+	if negative {
+		value = -value
+	}
+	return value, true
 }
 
 func scanJSONNumber(base unsafe.Pointer, n, start int) (int, jsonNumber, bool) {

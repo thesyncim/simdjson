@@ -57,6 +57,7 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `decoder_structural.go` — `(*decoderCursor).matchObjectFieldStructural`
 - `decoder_structural.go` — `(*decoderCursor).nextArrayElementExact`
 - `decoder_structural.go` — `(*decoderCursor).nextObjectFieldStructural`
+- `decoder_structural.go` — `(*decoderCursor).structuralFirstValueGapOK`
 - `decoder_structural.go` — `(*decoderStructuralTape).build`
 - `decoder_structural.go` — `structuralColonGap`
 - `decoder_structural.go` — `structuralPackedColonTail`
@@ -139,6 +140,7 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `number_float.go` — `scanTypedSimpleFloat64Number`
 - `number_float.go` — `scanTypedThreeDigitFloat64`
 - `number_float.go` — `scanTypedTwoDigitFloat64`
+- `number_float.go` — `tapeFixedDecimalFloat64`
 - `number_float.go` — `tapeFloat64`
 - `parser.go` — `(*parser).string`
 - `parser.go` — `ownedBytesString`
@@ -185,6 +187,7 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `typed.go` — `(Decoder[T]).DecodePrefix`
 - `typed.go` — `(Decoder[T]).decodeStructural`
 - `typed.go` — `copyTypedSlice`
+- `typed.go` — `decodeTypedDocument`
 - `typed.go` — `fieldNameHash`
 - `typed.go` — `growTypedSlice`
 - `typed.go` — `makeTypedEmptySliceData`
