@@ -63,18 +63,20 @@ type decoderCursor struct {
 	// loops: while set, elements skip the short-form probe that uniformly
 	// long values (geographic coordinates) always fail.
 	floatLong bool
-	// strings is the escaped-string arena, allocated on the first escaped
-	// string. Keeping the bookkeeping behind one pointer holds the cursor
-	// to a cache line.
-	strings *stringArenaState
+	// state carries uncommon per-decode storage behind one pointer, keeping
+	// the cursor to a cache line. It is allocated lazily for escaped strings;
+	// the structural decoder supplies a stack-local state instead.
+	state *decoderState
 }
 
-// stringArenaState carries the escaped-string arena between parser round
-// trips: buf's length is the retained prefix, and appends past its capacity
-// relocate the block, which is safe because strings already handed out keep
-// aliasing the old one.
-type stringArenaState struct {
-	buf []byte
+// decoderState carries uncommon state between parser round trips. strings'
+// length is the retained arena prefix; appends past its capacity relocate the
+// block, which is safe because strings already handed out keep aliasing the
+// old one.
+type decoderState struct {
+	strings          []byte
+	structural       decoderStructuralTape
+	structuralActive bool
 }
 
 // newDecoderCursor starts decoding src with opts.
@@ -350,7 +352,7 @@ func (c *decoderCursor) NextArrayElement(first bool) (bool, error) {
 
 //go:noinline
 func (c *decoderCursor) nextArrayElementSlow(first bool) (bool, error) {
-	c.i = skipSpaceIndent(c.src, c.i)
+	c.skipSpace()
 	if c.i >= len(c.src) {
 		return false, c.err(c.i, "unterminated array")
 	}
@@ -407,7 +409,7 @@ func (c *decoderCursor) Bool[T boolValue](dst *T) error {
 				return nil
 			}
 		case 'f':
-			if literalFalseAt(c.src, i) {
+			if literalFalseTailAt(c.src, i) {
 				*dst = false
 				c.i = i + 5
 				return nil
@@ -442,7 +444,7 @@ func (c *decoderCursor) boolSlow[T boolValue](dst *T) error {
 		c.i = i + 4
 		return nil
 	case 'f':
-		if !literalFalseAt(c.src, i) {
+		if !literalFalseTailAt(c.src, i) {
 			return c.err(i, "invalid literal")
 		}
 		*dst = false
@@ -466,6 +468,53 @@ func (c *decoderCursor) String[T stringValue](dst *T) error {
 		}
 	}
 	return c.stringSlow(dst)
+}
+
+func (c *decoderCursor) stringStructural(dst *string) error {
+	i := c.i
+	if i >= len(c.src) || c.src[i] != '"' {
+		return c.stringStructuralSlow(dst)
+	}
+	tape := &c.state.structural
+	index := tape.index
+	positions := tape.positions
+	if uint(index+1) >= uint(len(positions)) || int(positions[index]) != i {
+		return c.stringStructuralSlow(dst)
+	}
+	entry := positions[index+1]
+	end := int(entry)
+	if end >= len(c.src) || c.src[end] != '"' {
+		return c.stringStructuralSlow(dst)
+	}
+	tape.index = index + 1
+	start := i + 1
+	if !tape.nonASCII && !tape.escaped &&
+		c.flags&(decoderZeroCopy|decoderSourceOwned) != 0 {
+		*dst = unsafe.String(unsafe.SliceData(c.src[start:end]), end-start)
+		c.i = end + 1
+		return nil
+	}
+	return c.stringStructuralExactSlow(dst, start, end)
+}
+
+//go:noinline
+func (c *decoderCursor) stringStructuralExactSlow(dst *string, start, end int) error {
+	if !c.state.structural.escaped &&
+		(!c.state.structural.nonASCII || validUTF8Fast(c.src[start:end])) {
+		c.ownSource()
+		*dst = unsafe.String(unsafe.SliceData(c.src[start:end]), end-start)
+		c.i = end + 1
+		return nil
+	}
+	return c.String(dst)
+}
+
+//go:noinline
+func (c *decoderCursor) stringStructuralSlow(dst *string) error {
+	if i := c.i; i < len(c.src) && c.src[i] == '"' {
+		c.structuralStringEnd(i)
+	}
+	return c.String(dst)
 }
 
 //go:noinline
@@ -725,7 +774,8 @@ func (c *decoderCursor) Uint[T unsignedInteger](dst *T) error {
 func (c *decoderCursor) Float[T floatValue](dst *T) error {
 	i := c.i
 	if i < len(c.src) && (c.src[i] == '-' || isDigit(c.src[i])) {
-		if value, end, ok := shortTypedFloatAt(c.src, i); ok {
+		base := unsafe.Pointer(unsafe.SliceData(c.src))
+		if value, end, ok := shortTypedFloatAt(base, len(c.src), i); ok {
 			*dst = T(value)
 			c.i = end
 			return nil
@@ -814,46 +864,49 @@ func (c *decoderCursor) floatSlow[T floatValue](dst *T) error {
 	return nil
 }
 
-func shortTypedFloatAt(src []byte, start int) (value float64, end int, ok bool) {
+func shortTypedFloatAt(base unsafe.Pointer, n, start int) (value float64, end int, ok bool) {
+	if uint(start) >= uint(n) {
+		return 0, start, false
+	}
 	negative := false
 	i := start
-	if src[i] == '-' {
+	if fastByteAt(base, i) == '-' {
 		negative = true
 		i++
 	}
-	if i >= len(src) || !isDigit(src[i]) {
+	if i >= n || !isDigit(fastByteAt(base, i)) {
 		return 0, start, false
 	}
-	value = float64(src[i] - '0')
+	value = float64(fastByteAt(base, i) - '0')
 	i++
-	if typedNumberEnd(src, i) {
+	if typedNumberEnd(base, n, i) {
 		if negative {
 			value = -value
 		}
 		return value, i, true
 	}
-	if i >= len(src) {
+	if i >= n {
 		return 0, start, false
 	}
-	switch src[i] {
+	switch fastByteAt(base, i) {
 	case '.':
 		i++
-		if i >= len(src) || !isDigit(src[i]) {
+		if i >= n || !isDigit(fastByteAt(base, i)) {
 			return 0, start, false
 		}
-		value += float64(src[i]-'0') / 10
+		value += float64(fastByteAt(base, i)-'0') / 10
 		i++
 	case 'e', 'E':
 		i++
 		exponentNegative := false
-		if i < len(src) && (src[i] == '+' || src[i] == '-') {
-			exponentNegative = src[i] == '-'
+		if i < n && (fastByteAt(base, i) == '+' || fastByteAt(base, i) == '-') {
+			exponentNegative = fastByteAt(base, i) == '-'
 			i++
 		}
-		if i >= len(src) || !isDigit(src[i]) {
+		if i >= n || !isDigit(fastByteAt(base, i)) {
 			return 0, start, false
 		}
-		exponent := int(src[i] - '0')
+		exponent := int(fastByteAt(base, i) - '0')
 		if exponentNegative {
 			value /= anyPow10[exponent]
 		} else {
@@ -863,7 +916,7 @@ func shortTypedFloatAt(src []byte, start int) (value float64, end int, ok bool) 
 	default:
 		return 0, start, false
 	}
-	if !typedNumberEnd(src, i) {
+	if !typedNumberEnd(base, n, i) {
 		return 0, start, false
 	}
 	if negative {
@@ -872,11 +925,14 @@ func shortTypedFloatAt(src []byte, start int) (value float64, end int, ok bool) 
 	return value, i, true
 }
 
-func typedNumberEnd(src []byte, i int) bool {
-	if i == len(src) {
+func typedNumberEnd(base unsafe.Pointer, n, i int) bool {
+	if i == n {
 		return true
 	}
-	switch src[i] {
+	if uint(i) >= uint(n) {
+		return false
+	}
+	switch fastByteAt(base, i) {
 	case ',', ']', '}', ' ', '\n', '\r', '\t':
 		return true
 	default:
@@ -909,6 +965,13 @@ func (c *decoderCursor) ownSource() {
 }
 
 func (c *decoderCursor) skipSpace() {
+	if c.state != nil && c.state.structuralActive {
+		if uint(c.i) >= uint(len(c.src)) || !isJSONWhitespace(c.src[c.i]) {
+			return
+		}
+		c.i = c.state.structural.position(c.i, len(c.src))
+		return
+	}
 	c.i = skipSpace(c.src, c.i)
 }
 
@@ -950,21 +1013,24 @@ const (
 )
 
 func (c *decoderCursor) ensureStringArena() {
-	if c.strings != nil {
+	if c.state != nil && c.state.strings != nil {
 		return
+	}
+	if c.state == nil {
+		c.state = new(decoderState)
 	}
 	capacity := stringArenaSeed
 	if capacity > len(c.src) {
 		capacity = len(c.src) + 1
 	}
-	c.strings = &stringArenaState{buf: make([]byte, 0, capacity)}
+	c.state.strings = make([]byte, 0, capacity)
 }
 
 func (c *decoderCursor) stringArena() []byte {
-	if c.strings == nil {
+	if c.state == nil {
 		return nil
 	}
-	return c.strings.buf
+	return c.state.strings
 }
 
 // adoptStringArena records the arena state after a parser round trip,
@@ -972,14 +1038,14 @@ func (c *decoderCursor) stringArena() []byte {
 // arena grew a private block; adopting it lets the rest of the decode reuse
 // that storage.
 func (c *decoderCursor) adoptStringArena(arena []byte) {
-	if c.strings == nil {
+	if c.state == nil {
 		if cap(arena) == 0 {
 			return
 		}
-		c.strings = &stringArenaState{buf: arena}
+		c.state = &decoderState{strings: arena}
 		return
 	}
-	c.strings.buf = arena
+	c.state.strings = arena
 }
 
 func (c *decoderCursor) genericExpected[T any](jsonType string) error {

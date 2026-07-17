@@ -2,13 +2,12 @@
 
 [![ci](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml/badge.svg)](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml)
 
-Strict, high-performance JSON for Go. `Unmarshal` and `Marshal` are drop-in
-replacements for their `encoding/json` counterparts; compiled per-type codecs,
-structural indexes, and vector kernels built on Go's experimental
-`simd/archsimd` package supply the speed. The root module has no third-party
-dependencies, generated codecs, C, `go:linkname`, or runtime map-layout
-assumptions. A small existing arm64 stage-2 walker is implemented in assembly;
-all other accelerated kernels are Go-native SIMD or portable Go.
+Strict, high-performance JSON for Go, written entirely in Go. `Unmarshal` and
+`Marshal` are drop-in replacements for their `encoding/json` counterparts;
+compiled per-type codecs, structural indexes, and vector kernels built on Go's
+experimental `simd/archsimd` package supply the speed. The root module has no
+third-party dependencies, generated codecs, assembly, C, `go:linkname`, or
+runtime map-layout assumptions.
 
 > [!IMPORTANT]
 > **Go tip is required.** simdjson does not currently build with a stable Go
@@ -634,9 +633,9 @@ TIP_GO="$HOME/sdk/simdjson-gotip/bin/go"
 GOEXPERIMENT=simd "$TIP_GO" test ./...
 "$TIP_GO" vet ./...
 GOEXPERIMENT=simd "$TIP_GO" test -race \
-  -skip 'Alloc|TestParseFloat64' ./...
+  -skip 'Alloc|ZeroCost|StaysOnStack|TestParseFloat64' ./...
 GOEXPERIMENT=simd "$TIP_GO" test -gcflags='all=-d=checkptr=2' \
-  -skip 'Alloc|TestParseFloat64' ./...
+  -skip 'Alloc|ZeroCost|StaysOnStack|TestParseFloat64' ./...
 GOGC=1 GOEXPERIMENT=simd "$TIP_GO" test \
   -run '^Test(EncoderScratchPoolPoisoning|DynamicMapScratchIsPlanIndependent|EncodeHookArrayUsesStableSourcePointers|HookReceiverLifetimes|HookRetentionTrapAfterPanic)$' \
   -count=10 -cpu=1,4,8 .

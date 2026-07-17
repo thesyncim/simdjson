@@ -1,17 +1,9 @@
 package simd
 
 // Stage-2 index machine: the entry-writing sibling of the validation
-// machine. It consumes the same stage-1 emit masks through the same
-// pair-table grammar, and additionally writes one production tape entry
-// per value or key token, patching container entries in place when their
-// closers arrive — end offset, subtree span (next link), and direct
-// member count. String and scalar entries are written with their start
-// position and a placeholder body; the caller finishes their ends,
-// kinds, and flags with the same byte scanners the fallback builder
-// uses, so acceptance and every finished field are identical by
-// construction. (When the stage-1 record grows a closing-quote mask,
-// string ends can come from the masks instead of a byte scan; the
-// finishing pass is the seam for that swap.)
+// machine. It consumes exact structural positions through the pair-table
+// grammar and writes one production tape entry per value or key token.
+// Strings and scalar bodies finish inline; containers are patched at close.
 //
 // The machine only ever shortcuts the accepting path: any grammar
 // violation, nesting past Stage2IndexMaxDepth, or entry-buffer
@@ -41,11 +33,6 @@ const Stage2IndexMaxDepth = 64
 // store-to-load forwarding chains in the token loop.
 const Stage2IndexSlabLen = 128
 
-// Stage2IndexScalarSlots is the scratch capacity required when the index
-// machine consumes a full stage-1 chunk. Scalar records are uint32 absolute
-// entry indexes; the emit-bit bound makes every assembly store unconditional.
-const Stage2IndexScalarSlots = Stage1ChunkBlocks * 64
-
 // Abort flags folded into Stage2IndexState.Bad alongside the grammar
 // bits: entry storage exhausted, and nesting past the machine's cap.
 const (
@@ -53,9 +40,8 @@ const (
 	Stage2IndexDeep uint64 = 1 << 61
 )
 
-// Stage2IndexState carries the index machine's registers between chunk
-// calls. Field order is the assembly's load/store order. The zero value
-// is NOT the document-start state; call Stage2IndexReset first.
+// Stage2IndexState carries the index machine's registers between chunk calls.
+// The zero value is NOT the document-start state; call Stage2IndexReset first.
 type Stage2IndexState struct {
 	// Bad is the sticky violation accumulator plus the abort flags;
 	// nonzero means the caller must fall back to the portable builder.
@@ -72,6 +58,13 @@ type Stage2IndexState struct {
 	// EntryOff is the entry cursor as a byte offset into the caller's
 	// entry storage; divide by 16 for the entry count.
 	EntryOff uint64
+	// StringEntry and InString carry an exact quote pair across packed
+	// position chunks so string ends can be patched directly.
+	StringEntry uint32
+	InString    uint32
+	// ObjectStringFast enables the complete object string-value
+	// superinstruction for documents whose stage-1 sample is string dominant.
+	ObjectStringFast uint64
 }
 
 // Stage2IndexReset puts st in the document-start state. The caller's
@@ -86,7 +79,7 @@ func Stage2IndexReset(st *Stage2IndexState) {
 // exactly as Stage2Finish does for the validation machine.
 func Stage2IndexFinish(st *Stage2IndexState) bool {
 	bad := st.Bad | uint64(stage2EOFBad[st.PrevRowIO>>4&15])
-	if st.Depth != 0 {
+	if st.Depth != 0 || st.InString != 0 {
 		bad |= 1
 	}
 	return bad == 0
@@ -102,15 +95,9 @@ const (
 	Stage2IndexInfoObject uint32 = 6 << 26 // Object kind; count patched at close
 	Stage2IndexInfoArray  uint32 = 5 << 26 // Array kind; count patched at close
 	Stage2IndexInfoString uint32 = 4 << 26 // String kind; end and escaped flag finished by the caller
+	Stage2IndexInfoNumber uint32 = 3 << 26 // Number kind
+	Stage2IndexInfoBool   uint32 = 2 << 26 // Boolean kind
+	Stage2IndexInfoNull   uint32 = 1 << 26 // Null kind
 	Stage2IndexKeyFlag    uint32 = 1 << 30 // key flag within a string's info word
+	Stage2IndexIntFlag    uint32 = 1 << 31 // plain-integer flag within a number's info word
 )
-
-// stage2IdxClsOff is the index machine's dispatch displacement table.
-// Its handlers carry entry writes and close patches, so they occupy
-// 256-byte slots (class*256) instead of the validation machine's 128.
-var stage2IdxClsOff = func() (t [256]uint64) {
-	for i := range t {
-		t[i] = stage2ClsOff[i] * 2
-	}
-	return
-}()

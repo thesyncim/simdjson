@@ -18,9 +18,8 @@ package benchmarks
 //   ConsumerSwitchEntries     production-shaped switch FSM plus entry writes
 //
 // Further pair-machine refinements — Reg (register bit-stack kinds),
-// Branchy (branched container block), Golf (Branchy minus codegen slop),
-// the hand-written arm64 Asm machine (consumer_asm_arm64.s) and its
-// Dense/Uniform mask-shape probes — are documented at their definitions.
+// Branchy (branched container block), and Golf (Branchy minus codegen slop)
+// are documented at their definitions.
 //
 // The pair machine is built around dependency-chain economics rather than
 // instruction minimality:
@@ -891,16 +890,6 @@ func consumerCheck(t *testing.T, src []byte, label string) {
 	if got, n := consumerPairEntriesGolf(src, emit, kinds, entries); got != want || n != npos {
 		t.Fatalf("%s: pair golf = %v (n=%d), oracle = %v (npos=%d)\n%.200q", label, got, n, want, npos, src)
 	}
-	if consumerAsmEnabled {
-		clear(kinds)
-		if got, n := consumerPairEntriesAsm(src, emit, kinds, entries); got != want || n != npos {
-			t.Fatalf("%s: pair asm = %v (n=%d), oracle = %v (npos=%d)\n%.200q", label, got, n, want, npos, src)
-		}
-		clear(kinds)
-		if got, n := consumerPairEntriesAsmSuper(src, emit, kinds, entries); got != want || n != npos {
-			t.Fatalf("%s: pair asm super = %v (n=%d), oracle = %v (npos=%d)\n%.200q", label, got, n, want, npos, src)
-		}
-	}
 	clear(kinds)
 	if got, n := consumerDFAEntries(src, emit, kinds, entries); got != want || n != npos {
 		t.Fatalf("%s: DFA = %v (n=%d), oracle = %v (npos=%d)\n%.200q", label, got, n, want, npos, src)
@@ -939,28 +928,6 @@ func TestConsumerCorpora(t *testing.T) {
 			}
 		}
 
-		// The hand-written machines must produce byte-identical entries.
-		if consumerAsmEnabled {
-			for _, variant := range []struct {
-				name string
-				fn   func([]byte, []uint64, []byte, []uint64) (bool, int)
-			}{
-				{"asm", consumerPairEntriesAsm},
-				{"asm super", consumerPairEntriesAsmSuper},
-			} {
-				entries2 := make([]uint64, len(entries))
-				clear(kinds)
-				ok, n := variant.fn(c.src, c.emit, kinds, entries2)
-				if !ok || n != len(c.positions) {
-					t.Fatalf("%s: %s ok=%v n=%d want %d", c.label, variant.name, ok, n, len(c.positions))
-				}
-				for i := range 2 * n {
-					if entries2[i] != entries[i] {
-						t.Fatalf("%s: %s entry word %d = %#x, want %#x", c.label, variant.name, i, entries2[i], entries[i])
-					}
-				}
-			}
-		}
 	}
 }
 
@@ -1226,46 +1193,6 @@ func BenchmarkConsumerPairEntriesGolf(b *testing.B) {
 	}
 }
 
-func BenchmarkConsumerPairEntriesAsm(b *testing.B) {
-	if !consumerAsmEnabled {
-		b.Skip("arm64 only")
-	}
-	for _, c := range loadGapCorpora(b) {
-		b.Run(c.label, func(b *testing.B) {
-			kinds := make([]byte, consumerKindsLen)
-			entries := make([]uint64, 2*(len(c.positions)+flattenSlack))
-			b.SetBytes(int64(len(c.src)))
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				ok, n := consumerPairEntriesAsm(c.src, c.emit, kinds, entries)
-				boolSink = ok
-				intSink = n
-			}
-			reportPerPosition(b, len(c.positions))
-		})
-	}
-}
-
-func BenchmarkConsumerPairEntriesAsmSuper(b *testing.B) {
-	if !consumerAsmEnabled {
-		b.Skip("arm64 only")
-	}
-	for _, c := range loadGapCorpora(b) {
-		b.Run(c.label, func(b *testing.B) {
-			kinds := make([]byte, consumerKindsLen)
-			entries := make([]uint64, 2*(len(c.positions)+flattenSlack))
-			b.SetBytes(int64(len(c.src)))
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				ok, n := consumerPairEntriesAsmSuper(c.src, c.emit, kinds, entries)
-				boolSink = ok
-				intSink = n
-			}
-			reportPerPosition(b, len(c.positions))
-		})
-	}
-}
-
 // BenchmarkConsumerPairEntriesFlat composes flatten and the branchless
 // body: what a position-materializing engine would pay end to end from
 // precomputed masks.
@@ -1357,50 +1284,4 @@ func consumerUniformRemap(c gapCorpus) (src2 []byte) {
 		src2[p] = '5'
 	}
 	return
-}
-
-func BenchmarkConsumerAsmDense(b *testing.B) {
-	if !consumerAsmEnabled {
-		b.Skip("arm64 only")
-	}
-	for _, c := range loadGapCorpora(b) {
-		b.Run(c.label, func(b *testing.B) {
-			src2, emit2 := consumerDenseRemap(c)
-			kinds := make([]byte, consumerKindsLen)
-			entries := make([]uint64, 2*(len(c.positions)+flattenSlack))
-			ok, n := consumerPairEntriesAsm(src2, emit2, kinds, entries)
-			if !ok || n != len(c.positions) {
-				b.Fatalf("dense remap must stay grammatical: ok=%v n=%d want %d", ok, n, len(c.positions))
-			}
-			b.SetBytes(int64(len(src2)))
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				ok, n := consumerPairEntriesAsm(src2, emit2, kinds, entries)
-				boolSink = ok
-				intSink = n
-			}
-			reportPerPosition(b, len(c.positions))
-		})
-	}
-}
-
-func BenchmarkConsumerAsmUniform(b *testing.B) {
-	if !consumerAsmEnabled {
-		b.Skip("arm64 only")
-	}
-	for _, c := range loadGapCorpora(b) {
-		b.Run(c.label, func(b *testing.B) {
-			src2 := consumerUniformRemap(c)
-			kinds := make([]byte, consumerKindsLen)
-			entries := make([]uint64, 2*(len(c.positions)+flattenSlack))
-			b.SetBytes(int64(len(src2)))
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				ok, n := consumerPairEntriesAsm(src2, c.emit, kinds, entries)
-				boolSink = ok
-				intSink = n
-			}
-			reportPerPosition(b, len(c.positions))
-		})
-	}
 }

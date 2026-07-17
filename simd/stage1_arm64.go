@@ -59,7 +59,7 @@ func Stage1Block(p *[64]byte, m *Stage1Masks) {
 	c3 := loTable.LookupOrZero(v3.And(lowNibble)).And(hiTable.LookupOrZero(v3.ShiftAllRight(4)))
 
 	// Class values are one-hot: whitespace classes are 1 and 2, structural
-	// classes 4 through 32, everything else 0. One unsigned compare per
+	// classes 8 through 64, everything else 0. One unsigned compare per
 	// vector therefore tests each group — "any class" is c > 0 and
 	// "structural" is c > stage1WhitespaceBits — and whitespace falls out
 	// of the two masks with one scalar op, saving a weighted AND per

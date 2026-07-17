@@ -197,6 +197,52 @@ func BenchmarkDecodeLargeIndented(b *testing.B) {
 	}
 }
 
+func BenchmarkDecodeLargeIndentedReused(b *testing.B) {
+	compact := benchRecordsJSON(1024)
+	src, err := Indent(compact, "", "  ")
+	if err != nil {
+		b.Fatal(err)
+	}
+	decoder, err := CompileDecoder[benchDocument](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	dst := benchDocument{Items: make([]benchRecord, 0, 1024)}
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := decoder.Decode(src, &dst); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDecodeLargeIndentedRawReused(b *testing.B) {
+	compact := benchRecordsJSON(1024)
+	src, err := Indent(compact, "", "  ")
+	if err != nil {
+		b.Fatal(err)
+	}
+	decoder, err := CompileDecoder[benchDocument](DecoderOptions{ZeroCopy: true, CaseSensitive: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	dst := benchDocument{Items: make([]benchRecord, 0, 1024)}
+	b.SetBytes(int64(len(src)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		consumed, err := decoder.DecodePrefix(src, &dst)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if consumed != len(src) {
+			b.Fatalf("consumed %d of %d bytes", consumed, len(src))
+		}
+	}
+}
+
 func BenchmarkDecodeLargeOwned(b *testing.B) {
 	src := benchRecordsJSON(1024)
 	decoder, err := CompileDecoder[benchDocument](DecoderOptions{CaseSensitive: true})

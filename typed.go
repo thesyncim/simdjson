@@ -63,9 +63,10 @@ type DecoderOptions struct {
 // once and reuse it concurrently; Decode keeps all mutable parser state local
 // to the call.
 type Decoder[T any] struct {
-	root      *typedNode
-	rootSlice *typedNode
-	options   DecoderOptions
+	root       *typedNode
+	rootSlice  *typedNode
+	options    DecoderOptions
+	structural bool
 }
 
 // CompileDecoder builds a decoder for T. Scalar and field dispatch use the
@@ -82,20 +83,58 @@ func CompileDecoder[T any](opts DecoderOptions) (Decoder[T], error) {
 		return Decoder[T]{}, err
 	}
 	prepareTypedResets(root, make(map[*typedNode]bool))
+	structural := typedStructuralCandidate(root, make(map[*typedNode]bool))
+	rootSliceType := reflect.TypeFor[[]T]()
 	return Decoder[T]{
-		root: root,
+		root:       root,
+		structural: structural,
 		rootSlice: &typedNode{
-			kind:     typedSlice,
-			encKind:  typedSlice,
-			baseKind: typedSlice,
-			op:       typedOpSlice,
-			encOp:    typedOpSlice,
-			typ:      reflect.TypeFor[[]T](),
-			name:     reflect.TypeFor[[]T]().String(),
-			elem:     root,
+			kind:           typedSlice,
+			encKind:        typedSlice,
+			baseKind:       typedSlice,
+			op:             typedOpSlice,
+			encOp:          typedOpSlice,
+			typ:            rootSliceType,
+			name:           rootSliceType.String(),
+			elem:           root,
+			emptySliceData: makeTypedEmptySliceData(rootSliceType),
 		},
 		options: opts,
 	}, nil
+}
+
+func typedStructuralCandidate(node *typedNode, visiting map[*typedNode]bool) bool {
+	if node == nil || visiting[node] {
+		return false
+	}
+	switch node.kind {
+	case typedStruct:
+		if !node.structuralFast {
+			return false
+		}
+		visiting[node] = true
+		for i := range node.fields {
+			field := &node.fields[i]
+			switch field.op {
+			case typedOpStruct, typedOpSlice, typedOpArray:
+				if !typedStructuralCandidate(field.node, visiting) {
+					delete(visiting, node)
+					return false
+				}
+			}
+		}
+		delete(visiting, node)
+		return true
+	case typedSlice, typedArray:
+		visiting[node] = true
+		eligible := typedStructuralCandidate(node.elem, visiting)
+		delete(visiting, node)
+		return eligible
+	case typedBool, typedString, typedInt, typedUint, typedFloat:
+		return true
+	default:
+		return false
+	}
 }
 
 // Decode decodes one JSON value into dst. By default it merges like
@@ -130,6 +169,9 @@ func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 			return nil
 		}
 	}
+	if plan.structural && len(src) >= 4096 && decoderStructuralWorthwhile(src) {
+		return plan.decodeStructural(src, dst)
+	}
 	cursor := newDecoderCursor(src, plan.options)
 	cursor.skipSpace()
 	var err error
@@ -146,6 +188,55 @@ func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 		err = cursor.decodeCompiledMap(plan.root, unsafe.Pointer(dst))
 	default:
 		err = cursor.decodeCompiled(plan.root, unsafe.Pointer(dst))
+	}
+	if err != nil {
+		return err
+	}
+	return cursor.Finish()
+}
+
+//go:noinline
+func (plan Decoder[T]) decodeStructural(src []byte, dst *T) error {
+	state := acquireDecoderState(src)
+	defer releaseDecoderState(state)
+	cursor := newDecoderCursor(src, plan.options)
+	cursor.state = state
+	structural := !state.structural.bad
+	if !structural {
+		state.structuralActive = false
+	}
+	cursor.skipSpace()
+	var err error
+	if structural {
+		switch plan.root.kind {
+		case typedStruct:
+			err = cursor.decodeCompiledStructStructural(plan.root, unsafe.Pointer(dst))
+		case typedSlice:
+			err = cursor.decodeCompiledSliceStructural(plan.root, unsafe.Pointer(dst))
+		case typedArray:
+			err = cursor.decodeCompiledArrayStructural(plan.root, unsafe.Pointer(dst))
+		case typedPointer:
+			err = cursor.decodeCompiledPointer(plan.root, unsafe.Pointer(dst))
+		case typedMap:
+			err = cursor.decodeCompiledMap(plan.root, unsafe.Pointer(dst))
+		default:
+			err = cursor.decodeCompiled(plan.root, unsafe.Pointer(dst))
+		}
+	} else {
+		switch plan.root.kind {
+		case typedStruct:
+			err = cursor.decodeCompiledStruct(plan.root, unsafe.Pointer(dst))
+		case typedSlice:
+			err = cursor.decodeCompiledSlice(plan.root, unsafe.Pointer(dst))
+		case typedArray:
+			err = cursor.decodeCompiledArray(plan.root, unsafe.Pointer(dst))
+		case typedPointer:
+			err = cursor.decodeCompiledPointer(plan.root, unsafe.Pointer(dst))
+		case typedMap:
+			err = cursor.decodeCompiledMap(plan.root, unsafe.Pointer(dst))
+		default:
+			err = cursor.decodeCompiled(plan.root, unsafe.Pointer(dst))
+		}
 	}
 	if err != nil {
 		return err
@@ -362,6 +453,7 @@ type typedNode struct {
 	mapKeyTextDecode bool
 	mapKeyTextEncode bool
 	fields           []typedField
+	decShape         typedDecShape
 	fieldTable       []int16
 	fieldTableMask   uint32
 	encFields        []typedEncField
@@ -377,12 +469,14 @@ type typedNode struct {
 	// encFusedExtra counts the static struct levels fused into this
 	// node's pair program, so depth checks preserve the exact limit the
 	// unfused recursion enforced.
-	encFusedExtra uint8
-	fieldHops     [][]typedFieldHop
-	hopResets     []uintptr
-	reset         []typedResetOp
-	ready         bool
-	encSimple     bool
+	encFusedExtra  uint8
+	fieldHops      [][]typedFieldHop
+	hopResets      []uintptr
+	reset          []typedResetOp
+	ready          bool
+	encSimple      bool
+	structuralFast bool
+	emptySliceData unsafe.Pointer
 	// encHasPtrMarshaler marks types that can reach a pointer-receiver
 	// marshaler through struct fields or array elements without crossing a
 	// pointer, slice, or map. Only these pay the non-addressable flag when
@@ -614,6 +708,7 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 		}
 		node.kind = typedSlice
 		node.op = typedOpSlice
+		node.emptySliceData = makeTypedEmptySliceData(typ)
 		elem, err := c.compile(typ.Elem(), path+"[]")
 		if err != nil {
 			return err
@@ -763,6 +858,23 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 			}
 			node.fields = append(node.fields, compiledField)
 		}
+		node.structuralFast = node.inlineMap == nil
+		for i := range node.fields {
+			field := &node.fields[i]
+			if field.hop >= 0 || field.keyMask == 0 || field.keyLen > 7 {
+				node.structuralFast = false
+				break
+			}
+			switch field.op {
+			case typedOpBool, typedOpString, typedOpInt64, typedOpFloat64,
+				typedOpStruct, typedOpSlice, typedOpArray:
+			default:
+				node.structuralFast = false
+			}
+		}
+		if node.structuralFast {
+			node.decShape = compileTypedDecShape(node.fields)
+		}
 		if node.encSimple {
 			fuseSimpleStructFields(node)
 			for i := 0; i+1 < len(node.encFields); i += 2 {
@@ -843,6 +955,13 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 		return c.unsupported(typ, path, "kind "+typ.Kind().String()+" would require interface or reflective value dispatch")
 	}
 	return nil
+}
+
+func makeTypedEmptySliceData(typ reflect.Type) unsafe.Pointer {
+	backing := reflect.MakeSlice(typ, 1, 1)
+	data := backing.UnsafePointer()
+	runtime.KeepAlive(backing)
+	return data
 }
 
 // typedMapKeyKind classifies how map keys convert to and from JSON member

@@ -71,7 +71,7 @@ func Stage1BlocksGP(p *byte, nblocks int, st *Stage1Stream, out *[Stage1ChunkBlo
 		c3 := loTable.LookupOrZero(v3.And(lowNibble)).And(hiTable.LookupOrZero(v3.Shift(nibShift)))
 
 		// Class values are one-hot: whitespace classes are 1 and 2,
-		// structural classes 4 through 32, everything else 0. One
+		// structural classes 8 through 64, everything else 0. One
 		// unsigned compare per vector therefore tests each group — "any
 		// class" is c > 0 and "structural" is c > stage1WhitespaceBits —
 		// and whitespace falls out of the two masks with one scalar op,
@@ -126,6 +126,7 @@ func Stage1BlocksGP(p *byte, nblocks int, st *Stage1Stream, out *[Stage1ChunkBlo
 
 		rec := &recs[i]
 		rec.Emit = (structural|starts)&outside | openers
+		rec.Scalar = cand & outside
 		rec.EscInStr = escaped & inStr
 		rec.Bad = control&(inStr|outside&^ws) != 0
 		rec.WsOut = ws & outside

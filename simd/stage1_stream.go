@@ -21,15 +21,13 @@ const Stage1ChunkBlocks = 32
 // Stage1Rec is the per-block output of the batched kernel. Bit i of each
 // mask describes byte i of the block.
 //
-// The record is deliberately 40 bytes. Growing it to 48 measured about one
-// percent slower end to end on emit-dense documents (the validator consumes
-// records from small stack arrays right after the kernel writes them), and
-// carrying the density signals as kernel-side popcounts instead measured
-// several percent worse (two popcounts per block dwarf the one store they
-// save). Bad therefore carries only the verdict — no consumer needs the
-// violation positions — which frees its mask slot for InStr.
+// Scalar keeps the complete scalar-byte runs that produced Emit's scalar
+// starts. The Go grammar consumer uses those runs to recover exact token ends
+// with one trailing-zero operation, avoiding delimiter reloads and bytewise
+// scans for the overwhelmingly common short integers and literals.
 type Stage1Rec struct {
 	Emit     uint64 // structural bytes outside strings, opening quotes, scalar starts
+	Scalar   uint64 // every byte in scalar runs outside strings
 	EscInStr uint64 // escape-target bytes inside strings (byte after a backslash)
 	WsOut    uint64 // whitespace outside strings (density sampling)
 	InStr    uint64 // in-string bytes, opening quote included, closing quote excluded (density sampling)
@@ -42,6 +40,39 @@ type Stage1Rec struct {
 type Stage1Stream struct {
 	Carry   Stage1Carry
 	Follows uint64 // bit 0: last byte of the previous block was a scalar candidate
+}
+
+// Stage1IndexStream carries the state for the packed structural-index
+// producer. The zero value is the document-start state.
+type Stage1IndexStream struct {
+	Carry      Stage1Carry
+	Follows    uint64
+	PreviousIn uint64
+	Bad        bool
+	NonASCII   bool
+	Escaped    bool
+}
+
+// Stage1ValidMeta carries the per-block checks that cannot be reduced to a
+// document-wide sticky bit. Stage1ValidBlocks overwrites entries for the
+// blocks in its current call.
+type Stage1ValidMeta struct {
+	EscInStr [Stage1ChunkBlocks]uint64
+	NonASCII uint32
+}
+
+// Stage1IndexMeta carries the per-block facts needed by a direct index
+// consumer. Counts cover the current call and let the first 2 KiB double as
+// the density sample instead of classifying it twice.
+type Stage1IndexMeta struct {
+	EscInStr   [Stage1ChunkBlocks]uint64
+	InStr      [Stage1ChunkBlocks]uint64
+	NonASCII   uint32
+	Sample     bool
+	WsCount    uint32
+	EmitCount  uint32
+	InStrCount uint32
+	EscCount   uint32
 }
 
 // Stage1RecFromMasks derives one record from a block's classification
@@ -58,6 +89,7 @@ func Stage1RecFromMasks(m *Stage1Masks, st *Stage1Stream, r *Stage1Rec) {
 	starts := cand &^ (cand<<1 | st.Follows)
 	st.Follows = cand >> 63
 	r.Emit = m.Structural&outside | openers | starts&outside
+	r.Scalar = cand & outside
 	r.EscInStr = escaped & inStr
 	r.Bad = m.Control&inStr|m.Control&outside&^m.Whitespace != 0
 	r.WsOut = m.Whitespace & outside

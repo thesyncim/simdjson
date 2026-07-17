@@ -51,12 +51,51 @@ func buildIndexReference(src []byte, storage []IndexEntry) (Index, error) {
 	return Index{src: src, entries: b.entries}, nil
 }
 
+func TestIndexPositionsFallbackNumberMode(t *testing.T) {
+	sample := func(long int) ([]byte, []uint32) {
+		var src []byte
+		var positions []uint32
+		for i := 0; i < 16; i++ {
+			positions = append(positions, uint32(len(src)))
+			if i < long {
+				src = append(src, "12345678"...)
+			} else {
+				src = append(src, '1')
+			}
+			src = append(src, ',')
+		}
+		return src, positions
+	}
+	src, positions := sample(8)
+	meta := simdkernels.Stage1IndexMeta{EmitCount: 512, InStrCount: 512}
+	if got := indexPositionsFallbackNumberMode(src, positions, &meta); got != tapeNumberSWAR {
+		t.Fatalf("half long heads selected mode %d", got)
+	}
+
+	short, shortPositions := sample(0)
+	if got := indexPositionsFallbackNumberMode(short, shortPositions, &meta); got != tapeNumberScalar {
+		t.Fatalf("short heads selected mode %d", got)
+	}
+
+	meta.EmitCount = 511
+	if got := indexPositionsFallbackNumberMode(src, positions, &meta); got != tapeNumberScalar {
+		t.Fatalf("sparse sample selected mode %d", got)
+	}
+}
+
 // indexOracleBufs hold reusable generous storage so the mutation battery
 // does not allocate per mutant. Generous capacity matters: an engine
 // starved of storage aborts Full, which would mask a wrong-accept.
 type indexOracleBufs struct {
 	mach []IndexEntry
 	ref  []IndexEntry
+}
+
+func stage2IndexSkipIfUnavailable(tb testing.TB) {
+	tb.Helper()
+	if !stage2IndexPositionEnabled {
+		tb.Skip("Go SIMD index machine not available on this build")
+	}
 }
 
 func (b *indexOracleBufs) grow(src []byte) {
@@ -100,7 +139,7 @@ func indexBitmapOracle(t *testing.T, src []byte, bufs *indexOracleBufs, mustAcce
 // counts and next links for nested and empty containers, key and escaped
 // flags, integer tagging, literal bodies, and the scalar terminator rule.
 func TestIndexBitmapCases(t *testing.T) {
-	stage2SkipIfUnavailable(t)
+	stage2IndexSkipIfUnavailable(t)
 	var bufs indexOracleBufs
 	accepted := []string{
 		`{}`, `[]`, `5`, `"a"`, `true`, `false`, `null`, `-0.5e+7`,
@@ -140,7 +179,7 @@ func TestIndexBitmapCases(t *testing.T) {
 // (the fallback diverts to the diagnostic parser, as it always has), and
 // kind-mismatched closers.
 func TestIndexBitmapDepthCases(t *testing.T) {
-	stage2SkipIfUnavailable(t)
+	stage2IndexSkipIfUnavailable(t)
 	var bufs indexOracleBufs
 	nest := func(depth int) string {
 		var b strings.Builder
@@ -183,7 +222,7 @@ func TestIndexBitmapDepthCases(t *testing.T) {
 // TestIndexBitmapTestSuite runs the whole JSONTestSuite corpus, plain
 // and indentation-wrapped, through the differential.
 func TestIndexBitmapTestSuite(t *testing.T) {
-	stage2SkipIfUnavailable(t)
+	stage2IndexSkipIfUnavailable(t)
 	entries, err := os.ReadDir(jsonTestSuiteDir)
 	if err != nil {
 		t.Skip("JSONTestSuite corpus not present")
@@ -221,7 +260,7 @@ func TestIndexBitmapMutations(t *testing.T) {
 	if testing.Short() {
 		t.Skip("mutation differential is not short")
 	}
-	stage2SkipIfUnavailable(t)
+	stage2IndexSkipIfUnavailable(t)
 	doc := buildBitmapTestDocument(t)
 	var bufs indexOracleBufs
 	indexBitmapOracle(t, doc, &bufs, true, "base document")
@@ -229,26 +268,36 @@ func TestIndexBitmapMutations(t *testing.T) {
 	rng := rand.New(rand.NewPCG(41, 43))
 	for mutants := 0; mutants < 20_000; mutants++ {
 		mutated := append([]byte(nil), doc...)
+		label := ""
 		switch rng.IntN(4) {
 		case 0:
-			mutated[rng.IntN(len(mutated))] = byte(rng.IntN(256))
+			pos := rng.IntN(len(mutated))
+			from, to := mutated[pos], byte(rng.IntN(256))
+			mutated[pos] = to
+			label = fmt.Sprintf("mutant %d replace %d %#02x -> %#02x", mutants, pos, from, to)
 		case 1:
 			hostile := []byte(`"\{}[]:,0x eEtfn.+-` + "\x00\x1f\x80\xe2\xff")
-			mutated[rng.IntN(len(mutated))] = hostile[rng.IntN(len(hostile))]
+			pos := rng.IntN(len(mutated))
+			from, to := mutated[pos], hostile[rng.IntN(len(hostile))]
+			mutated[pos] = to
+			label = fmt.Sprintf("mutant %d hostile %d %#02x -> %#02x", mutants, pos, from, to)
 		case 2:
 			pos := rng.IntN(len(mutated))
+			label = fmt.Sprintf("mutant %d delete %d %#02x", mutants, pos, mutated[pos])
 			mutated = append(mutated[:pos], mutated[pos+1:]...)
 		case 3:
-			mutated = mutated[:rng.IntN(len(mutated))]
+			pos := rng.IntN(len(mutated))
+			mutated = mutated[:pos]
+			label = fmt.Sprintf("mutant %d truncate %d", mutants, pos)
 		}
-		indexBitmapOracle(t, mutated, &bufs, false, "mutant")
+		indexBitmapOracle(t, mutated, &bufs, false, label)
 	}
 }
 
 // TestIndexBitmapTruncations cuts a mid-size document at every engine
 // chunk boundary and a small prefix at every byte.
 func TestIndexBitmapTruncations(t *testing.T) {
-	stage2SkipIfUnavailable(t)
+	stage2IndexSkipIfUnavailable(t)
 	doc := buildBitmapTestDocument(t)
 	var bufs indexOracleBufs
 	for cut := 0; cut <= len(doc); cut += validBitmapStreamChunkAsm * 64 {
@@ -263,12 +312,38 @@ func TestIndexBitmapTruncations(t *testing.T) {
 // TestIndexBitmapChunkResume carries machine state, the scope slab, and
 // the entry cursor across randomized split points: any chunking of the
 // same masks must produce the identical tape.
-func TestIndexBitmapChunkResume(t *testing.T) {
-	stage2SkipIfUnavailable(t)
+// TestIndexPositionChunkResume carries grammar, quote, scope, and entry state
+// across arbitrary position-stream splits. Splits deliberately land between
+// opening and closing quotes as well as between ordinary grammar tokens.
+func TestIndexPositionChunkResume(t *testing.T) {
+	stage2IndexSkipIfUnavailable(t)
 	doc := buildBitmapTestDocument(t)
-	emit := stage2EmitMasks(doc)
 	n := len(doc)
 	base := unsafe.Pointer(unsafe.SliceData(doc))
+	fullBlocks := n / 64
+	positions := make([]uint32, n+128)
+	written := 0
+	var stream simdkernels.Stage1IndexStream
+	for block := 0; block < fullBlocks; block += simdkernels.Stage1ChunkBlocks {
+		count := min(simdkernels.Stage1ChunkBlocks, fullBlocks-block)
+		written += simdkernels.Stage1IndexBlocks(
+			(*byte)(unsafe.Add(base, block*64)), count, uint32(block*64), &stream, positions[written:],
+		)
+	}
+	if fullBlocks*64 != n {
+		var tail [64]byte
+		for i := range tail {
+			tail[i] = ' '
+		}
+		copy(tail[:], doc[fullBlocks*64:])
+		written += simdkernels.Stage1IndexBlocks(
+			&tail[0], 1, uint32(fullBlocks*64), &stream, positions[written:],
+		)
+	}
+	if stream.Bad || stream.Carry.InString != 0 {
+		t.Fatal("stage 1 rejected the resume document")
+	}
+	positions = positions[:written]
 
 	var refBuf indexOracleBufs
 	refBuf.grow(doc)
@@ -276,78 +351,39 @@ func TestIndexBitmapChunkResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// Whole-document per-block records, so each random split can hand the
-	// finishing pass exactly the chunk view the engine would.
-	allRecs := make([]simdkernels.Stage1Rec, len(emit))
-	{
-		var st simdkernels.Stage1Stream
-		var recs [simdkernels.Stage1ChunkBlocks]simdkernels.Stage1Rec
-		fullBlocks := n / 64
-		for chunk := 0; chunk < fullBlocks; chunk += simdkernels.Stage1ChunkBlocks {
-			cnt := min(fullBlocks-chunk, simdkernels.Stage1ChunkBlocks)
-			simdkernels.Stage1BlocksGP((*byte)(unsafe.Add(base, chunk*64)), cnt, &st, &recs)
-			copy(allRecs[chunk:], recs[:cnt])
-		}
-		if fullBlocks < len(emit) {
-			var tail [64]byte
-			for i := range tail {
-				tail[i] = ' '
-			}
-			copy(tail[:], doc[fullBlocks*64:])
-			simdkernels.Stage1BlocksGP(&tail[0], 1, &st, &recs)
-			allRecs[fullBlocks] = recs[0]
-		}
+	for i := range ref.entries {
+		ref.entries[i].info &^= uint32(tapeFlagEscaped) << infoFlagsShift
 	}
 
 	run := func(splits []int, storage []IndexEntry) ([]IndexEntry, bool) {
 		full := storage[:cap(storage)]
 		entBase := (*byte)(unsafe.Pointer(unsafe.SliceData(full)))
-		var g simdkernels.Stage2IndexState
-		simdkernels.Stage2IndexReset(&g)
+		var grammar simdkernels.Stage2IndexState
+		simdkernels.Stage2IndexReset(&grammar)
 		var slab [simdkernels.Stage2IndexSlabLen]uint64
-		var recs [simdkernels.Stage1ChunkBlocks]simdkernels.Stage1Rec
-		var scalars [simdkernels.Stage2IndexScalarSlots]uint32
 		start := 0
 		for _, end := range splits {
-			prevOff := g.EntryOff
-			nscalars := simdkernels.Stage2IndexWalk((*byte)(unsafe.Pointer(unsafe.SliceData(doc))), start*64, emit[start:end], &slab, entBase, cap(storage), scalars[:], &g)
-			if g.Bad != 0 {
-				return nil, false
-			}
-			copy(recs[:], allRecs[start:end])
-			if !indexBitmapFinish(doc, base, n, full, prevOff, g.EntryOff, scalars[:nscalars], &recs, start*64, end-start) {
+			simdkernels.Stage2IndexPositionsFused(
+				unsafe.SliceData(doc), n, positions[start:end], &slab, entBase, cap(storage), &grammar,
+			)
+			if grammar.Bad != 0 {
 				return nil, false
 			}
 			start = end
 		}
-		if g.PrevRowIO>>4&7 == 6 && g.EntryOff >= 16 {
-			e := &full[g.EntryOff/16-1]
-			k := n - 1
-			for k > int(e.start) {
-				if c := fastByteAt(base, k); c != ' ' && c != '\t' && c != '\n' && c != '\r' {
-					break
-				}
-				k--
-			}
-			if k <= int(e.start) || fastByteAt(base, k) != '"' {
-				return nil, false
-			}
-			e.end = uint32(k + 1)
-		}
-		if !simdkernels.Stage2IndexFinish(&g) {
+		if !simdkernels.Stage2IndexFinish(&grammar) {
 			return nil, false
 		}
-		return full[:g.EntryOff/16], true
+		return full[:grammar.EntryOff/16], true
 	}
 
 	storage := make([]IndexEntry, 0, len(ref.entries)+8)
 	rng := rand.New(rand.NewPCG(47, 53))
 	for round := 0; round < 30; round++ {
 		var splits []int
-		for w := 0; w < len(emit); {
-			w += 1 + rng.IntN(11)
-			splits = append(splits, min(w, len(emit)))
+		for p := 0; p < len(positions); {
+			p = min(p+1+rng.IntN(257), len(positions))
+			splits = append(splits, p)
 		}
 		entries, ok := run(splits, storage)
 		if !ok {
@@ -369,7 +405,7 @@ func TestIndexBitmapChunkResume(t *testing.T) {
 // before any out-of-bounds write, and the public path maps it to
 // ErrIndexFull through the fallback.
 func TestIndexBitmapStorageBounds(t *testing.T) {
-	stage2SkipIfUnavailable(t)
+	stage2IndexSkipIfUnavailable(t)
 	doc := buildBitmapTestDocument(t)
 	need, err := RequiredIndexEntries(doc)
 	if err != nil {
@@ -403,7 +439,7 @@ func TestIndexBitmapStorageBounds(t *testing.T) {
 // TestIndexBitmapPublicWiring proves the public entry point takes the
 // engine on a large committed document and produces the identical index.
 func TestIndexBitmapPublicWiring(t *testing.T) {
-	stage2SkipIfUnavailable(t)
+	stage2IndexSkipIfUnavailable(t)
 	doc := buildBitmapTestDocument(t)
 	need, err := RequiredIndexEntries(doc)
 	if err != nil {
@@ -441,7 +477,7 @@ func TestIndexBitmapPublicWiring(t *testing.T) {
 //
 //	GOGC=1 GOEXPERIMENT=simd gotip test -run TestGCCorruptionStage2Index -count=5 -cpu=1,4,8 ./
 func TestGCCorruptionStage2Index(t *testing.T) {
-	stage2SkipIfUnavailable(t)
+	stage2IndexSkipIfUnavailable(t)
 	doc := buildBitmapTestDocument(t)
 	need, err := RequiredIndexEntries(doc)
 	if err != nil {
@@ -520,7 +556,7 @@ func TestGCCorruptionStage2Index(t *testing.T) {
 // benchmarkIndexEngines interleaves the portable builder and the engine
 // on one committed document.
 func benchmarkIndexEngines(b *testing.B, doc []byte) {
-	stage2SkipIfUnavailable(b)
+	stage2IndexSkipIfUnavailable(b)
 	need, err := RequiredIndexEntries(doc)
 	if err != nil {
 		b.Fatal(err)

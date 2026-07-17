@@ -2,11 +2,39 @@ package simdjson
 
 import (
 	"bytes"
+	"math/rand"
 	"strings"
 	"testing"
+	"unsafe"
 
 	simdkernels "github.com/thesyncim/simdjson/simd"
 )
+
+func TestSparseNonASCIIMask(t *testing.T) {
+	rng := rand.New(rand.NewSource(0x55544638))
+	for trial := 0; trial < 500; trial++ {
+		blocks := 1 + rng.Intn(simdkernels.Stage1ChunkBlocks)
+		src := make([]byte, blocks*64)
+		if _, err := rng.Read(src); err != nil {
+			t.Fatal(err)
+		}
+		var want uint32
+		for block := 0; block < blocks; block++ {
+			if rng.Intn(3) == 0 {
+				src[block*64+rng.Intn(64)] |= 0x80
+			}
+			for _, c := range src[block*64 : (block+1)*64] {
+				if c >= 0x80 {
+					want |= 1 << block
+					break
+				}
+			}
+		}
+		if got := sparseNonASCIIMask(unsafe.Pointer(unsafe.SliceData(src)), blocks); got != want {
+			t.Fatalf("trial %d mask mismatch: got %032b want %032b", trial, got, want)
+		}
+	}
+}
 
 func TestBitmapUTF8RunReject(t *testing.T) {
 	// A >64KiB whitespace-heavy document with multi-byte UTF-8 in its values.

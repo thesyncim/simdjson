@@ -20,6 +20,9 @@ import (
 // machine itself and the batched stage-1 kernel that feeds it.
 var stage2MachineEnabled = simdkernels.Stage2Enabled() && simdkernels.Stage1StreamEnabled()
 
+// stage2IndexPositionEnabled gates the Go-native forward index writer.
+var stage2IndexPositionEnabled = simdkernels.Stage1StreamEnabled()
+
 // The machine's depth limit must equal the walk's; both reject the open
 // that would exceed it.
 const _ = uint(simdkernels.Stage2MaxDepth-defaultMaxDepth) + uint(defaultMaxDepth-simdkernels.Stage2MaxDepth)
@@ -103,7 +106,7 @@ func validBitmapStreamedAsm(src []byte) (valid, decided bool) {
 			// are still cache-warm; see validBitmapPerBlock for the
 			// coalescing rationale.
 			if rec.NonASCII {
-				if utf8RunStart >= 0 && block-utf8RunEnd > 8 {
+				if utf8RunStart >= 0 && block-utf8RunEnd > validUTF8CoalesceBlocks {
 					if !validUTF8Fast(src[utf8RunStart*64 : utf8RunEnd*64]) {
 						return false, true
 					}
@@ -113,9 +116,10 @@ func validBitmapStreamedAsm(src []byte) (valid, decided bool) {
 				}
 				utf8RunEnd = block + 1
 			}
-
-			if rec.EscInStr != 0 && validBitmapEscapes(src, n, pos, rec.EscInStr, &skipEscape) {
-				return false, true
+			if esc := rec.EscInStr; esc != 0 {
+				if validBitmapEscapes(src, n, pos, esc, &skipEscape) {
+					return false, true
+				}
 			}
 
 			emits[i] = rec.Emit
@@ -159,20 +163,8 @@ func validBitmapWalkAsm(src []byte, base unsafe.Pointer, n, pos int, emits []uin
 	// guard. They cannot arise from the space-padded tail block, so the
 	// scan only ever runs on the document's final chunk and fails closed
 	// on masks that violate the framing contract.
-	if pos+len(emits)*64 > n {
-		for i := len(emits) - 1; i >= 0; i-- {
-			wordBase := pos + i*64
-			if wordBase >= n {
-				if emits[i] != 0 {
-					return false, true
-				}
-				continue
-			}
-			if rel := uint(n - wordBase); rel < 64 && emits[i]>>rel != 0 {
-				return false, true
-			}
-			break
-		}
+	if !validBitmapEmitsInBounds(n, pos, emits) {
+		return false, true
 	}
 
 	ns := simdkernels.Stage2Walk((*byte)(unsafe.Add(base, pos)), emits, kinds, scalars, st)
@@ -209,7 +201,7 @@ func validScalarTokenAt(src []byte, base unsafe.Pointer, n, j int) bool {
 		}
 		end = j + 4
 	case c == 'f':
-		if !literalFalseAt(src, j) {
+		if !literalFalseTailAt(src, j) {
 			return false
 		}
 		end = j + 5

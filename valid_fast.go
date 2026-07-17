@@ -205,7 +205,55 @@ func scanNumberFastTagged(base unsafe.Pointer, n, i int) (end int, integer, ok b
 			return i, false, false
 		}
 		if i+8 <= n && isDigit(fastByteAt(base, i+7)) {
-			i = scanDigitsFast(base, n, i)
+			i = scanDigitsLong(base, n, i)
+		} else {
+			for i++; i < n && isDigit(fastByteAt(base, i)); i++ {
+			}
+		}
+	}
+	if i < n && (fastByteAt(base, i) == 'e' || fastByteAt(base, i) == 'E') {
+		integer = false
+		i++
+		if i < n && (fastByteAt(base, i) == '+' || fastByteAt(base, i) == '-') {
+			i++
+		}
+		if i >= n || !isDigit(fastByteAt(base, i)) {
+			return i, false, false
+		}
+		for i++; i < n && isDigit(fastByteAt(base, i)); i++ {
+		}
+	}
+	return i, integer, true
+}
+
+func scanNumberFastTaggedSWAR(base unsafe.Pointer, n, i int) (end int, integer, ok bool) {
+	if fastByteAt(base, i) == '-' {
+		i++
+		if i >= n {
+			return i, false, false
+		}
+	}
+	if fastByteAt(base, i) == '0' {
+		i++
+	} else if isOneNine(fastByteAt(base, i)) {
+		i++
+		if i+8 <= n && nonDigitMask8(loadUint64LE(unsafe.Add(base, i))) == 0 {
+			i += 8
+		}
+		for ; i < n && isDigit(fastByteAt(base, i)); i++ {
+		}
+	} else {
+		return i, false, false
+	}
+	integer = true
+	if i < n && fastByteAt(base, i) == '.' {
+		integer = false
+		i++
+		if i >= n || !isDigit(fastByteAt(base, i)) {
+			return i, false, false
+		}
+		if i+8 <= n && isDigit(fastByteAt(base, i+7)) {
+			i = scanDigitsLong(base, n, i)
 		} else {
 			for i++; i < n && isDigit(fastByteAt(base, i)); i++ {
 			}
