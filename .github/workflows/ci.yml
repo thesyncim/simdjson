@@ -89,6 +89,10 @@ jobs:
           $RUNNER_TEMP/gotip/bin/go generate ./...
           git diff --exit-code
 
+      - name: Unsafe inventory is complete
+        if: ${{ matrix.primary }}
+        run: $RUNNER_TEMP/gotip/bin/go run ./internal/cmd/unsafeinventory -check UNSAFE.md
+
       - name: Module files are tidy
         if: ${{ matrix.primary }}
         run: |

@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /benchmarks
+    schedule:
+      interval: weekly
+  - package-ecosystem: gomod
+    directory: /benchmarks/legacy
+    schedule:
+      interval: weekly

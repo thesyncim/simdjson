@@ -11,8 +11,8 @@ runtime map-layout assumptions.
 
 > [!IMPORTANT]
 > **Go tip is required.** simdjson does not currently build with a stable Go
-> release. Any current Go tip toolchain can be used; the exact Go commit shown
-> in the benchmark section is only a reproducibility pin. Set
+> release. The revision pinned by `scripts/bootstrap-gotip.sh` is supported;
+> newer Go tip revisions are best effort until the pin advances. Set
 > `GOEXPERIMENT=simd` to enable the Go-native SIMD kernels. The same Go tip
 > compiler builds portable fallbacks when the experiment is omitted.
 
@@ -31,7 +31,13 @@ runtime-managed ownership rather than hidden pointers or runtime-layout tricks.
 
 ## Install
 
-Install any current Go tip toolchain. `gotip` is the simplest option:
+Build the supported Go tip toolchain from a checkout of this repository:
+
+```sh
+./scripts/bootstrap-gotip.sh "$HOME/sdk/simdjson-gotip"
+```
+
+The moving `gotip` toolchain is convenient for trying a newer revision:
 
 ```sh
 go install golang.org/dl/gotip@latest
@@ -41,18 +47,18 @@ gotip download
 Then, from your module:
 
 ```sh
-gotip get github.com/thesyncim/simdjson@latest
+"$HOME/sdk/simdjson-gotip/bin/go" get github.com/thesyncim/simdjson@latest
 ```
 
 Enable the SIMD kernels when building or testing:
 
 ```sh
-GOEXPERIMENT=simd gotip build ./...
+GOEXPERIMENT=simd "$HOME/sdk/simdjson-gotip/bin/go" build ./...
 ```
 
 Without `GOEXPERIMENT=simd`, simdjson keeps the same API and behavior while
-using its portable Go implementations. To build the exact pinned compiler used
-for published benchmarks, run `./scripts/bootstrap-gotip.sh "$HOME/sdk/simdjson-gotip"`.
+using its portable Go implementations. The exact support and compiler-update
+policy is documented in [`docs/toolchain.md`](docs/toolchain.md).
 
 ## Quick start
 
