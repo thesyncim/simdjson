@@ -1,13 +1,8 @@
 package benchmarks
 
-// Production stage-2 machine study: the resumable grammar machine
-// (simd/stage2_arm64.s) measured over real corpus masks, whole-document
-// and chunked the way the Valid engine feeds it. The demonstration
-// consumer (consumer_asm_arm64.s) ran 0.63-0.92 ns/pos with 16-byte entry
-// writes and no suspend/resume; the production machine drops the entry
-// writes, records scalar-start positions instead, and reloads/stores its
-// four state words per chunk call. The chunked benchmarks price that
-// suspend/resume traffic at the engine's granularity.
+// Production stage-2 study: the resumable Go grammar machines measured over
+// real corpus masks and packed positions, whole-document and chunked the way
+// the Valid engine feeds them.
 
 import (
 	"testing"
@@ -113,14 +108,27 @@ func stage2RunChunkedGo(src []byte, emit []uint64, chunkWords int, collect *[]ui
 	return simdkernels.Stage2Finish(&st)
 }
 
+func stage2RunPositionsGo(src []byte) bool {
+	positions, stream := stage1ValidPositions(src)
+	if stream.Bad || stream.Carry.InString != 0 {
+		return false
+	}
+	var st simdkernels.Stage2State
+	simdkernels.Stage2Reset(&st)
+	kinds := new([simdkernels.Stage2KindsLen]byte)
+	scalars := make([]uint32, len(positions))
+	simdkernels.Stage2PositionsGo(unsafe.SliceData(src), positions, kinds, scalars, &st)
+	return simdkernels.Stage2Finish(&st)
+}
+
 // TestStage2MachineCorpora checks the production machine on every corpus:
 // acceptance whole and chunked at the engine's granularities, scalar
 // records equal to the classified positions, and — because Bad judges
 // exactly the grammar the oracle walk judges — verdict agreement with
 // consumerOracleWalk on mutated corpus prefixes.
 func TestStage2MachineCorpora(t *testing.T) {
-	if !simdkernels.Stage2Enabled() {
-		t.Skip("stage-2 machine not available on this build")
+	if !simdkernels.Stage1StreamEnabled() {
+		t.Skip("packed-position producer not available on this build")
 	}
 	for _, c := range loadGapCorpora(t) {
 		wantScalars := stage2CorpusScalars(c)
@@ -173,10 +181,17 @@ func TestStage2MachineCorpora(t *testing.T) {
 			}
 		}
 		for _, chunkWords := range []int{4, 8, 16, len(c.emit)} {
-			for _, machine := range []struct {
+			machines := []struct {
 				name string
 				run  func([]byte, []uint64, int, *[]uint32) bool
-			}{{"asm", stage2RunChunked}, {"go", stage2RunChunkedGo}} {
+			}{{"go", stage2RunChunkedGo}}
+			if simdkernels.Stage2Enabled() {
+				machines = append(machines, struct {
+					name string
+					run  func([]byte, []uint64, int, *[]uint32) bool
+				}{"native", stage2RunChunked})
+			}
+			for _, machine := range machines {
 				var got []uint32
 				if !machine.run(c.src, c.emit, chunkWords, &got) {
 					t.Fatalf("%s: %s machine rejected the corpus at chunk %d", c.label, machine.name, chunkWords)
@@ -200,11 +215,16 @@ func TestStage2MachineCorpora(t *testing.T) {
 			mutated[p] = hostile[i%len(hostile)]
 			emit := stage1EmitMasks(mutated)
 			want := consumerOracleWalk(mutated, emit)
-			if got := stage2RunChunked(mutated, emit, 4, nil); got != want {
-				t.Fatalf("%s: mutant at %d (%q): machine = %v, oracle = %v", c.label, p, mutated[p], got, want)
+			if simdkernels.Stage2Enabled() {
+				if got := stage2RunChunked(mutated, emit, 4, nil); got != want {
+					t.Fatalf("%s: mutant at %d (%q): native machine = %v, oracle = %v", c.label, p, mutated[p], got, want)
+				}
 			}
 			if got := stage2RunChunkedGo(mutated, emit, 4, nil); got != want {
 				t.Fatalf("%s: mutant at %d (%q): Go machine = %v, oracle = %v", c.label, p, mutated[p], got, want)
+			}
+			if got := stage2RunPositionsGo(mutated); got != want {
+				t.Fatalf("%s: mutant at %d (%q): position machine = %v, oracle = %v", c.label, p, mutated[p], got, want)
 			}
 		}
 	}

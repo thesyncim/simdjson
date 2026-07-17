@@ -447,7 +447,7 @@ handleKnown:
 		inObj = 0
 		prev = 16
 		key = 0
-		goto dispatch
+		goto fusedArrayValue
 	case stage2ccC:
 		bad |= (inObj ^ 8) >> 3
 		depth--
@@ -459,6 +459,9 @@ handleKnown:
 		key = 0
 		if inObj != 0 {
 			goto fusedComma
+		}
+		if depth > 0 {
+			goto fusedArrayComma
 		}
 		goto dispatch
 	case stage2ccB:
@@ -472,6 +475,9 @@ handleKnown:
 		key = 0
 		if inObj != 0 {
 			goto fusedComma
+		}
+		if depth > 0 {
+			goto fusedArrayComma
 		}
 		goto dispatch
 	case stage2ccL:
@@ -487,6 +493,9 @@ handleKnown:
 		if inObj != 0 {
 			goto fusedKey
 		}
+		if depth > 0 {
+			goto fusedArrayValue
+		}
 		goto dispatch
 	case stage2ccQ:
 		isKey := key
@@ -498,6 +507,9 @@ handleKnown:
 		if inObj != 0 {
 			goto fusedComma
 		}
+		if depth > 0 {
+			goto fusedArrayComma
+		}
 		goto dispatch
 	default:
 		*(*uint32)(unsafe.Add(scalarp, uintptr(nscalars)*4)) = uint32(j)
@@ -506,6 +518,9 @@ handleKnown:
 		key = 0
 		if inObj != 0 {
 			goto fusedComma
+		}
+		if depth > 0 {
+			goto fusedArrayComma
 		}
 		goto dispatch
 	}
@@ -537,7 +552,32 @@ fusedColon:
 	pi++
 	prev = 64 | inObj
 	key = 0
-	goto dispatch
+	goto fusedValue
+
+fusedValue:
+	if pi == len(positions) {
+		goto done
+	}
+	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
+	switch c := *(*byte)(unsafe.Add(basep, j)); c {
+	case '"':
+		pi++
+		prev = 96 | inObj
+		key = 0
+		goto fusedComma
+	default:
+		cls = uint64(stage2Class[c])
+		if cls != stage2ccS {
+			pi++
+			goto handleKnown
+		}
+		pi++
+		*(*uint32)(unsafe.Add(scalarp, uintptr(nscalars)*4)) = uint32(j)
+		nscalars++
+		prev = 112 | inObj
+		key = 0
+		goto fusedComma
+	}
 
 fusedComma:
 	if pi == len(positions) {
@@ -562,10 +602,92 @@ fusedComma:
 		if inObj != 0 {
 			goto fusedComma
 		}
+		if depth > 0 {
+			goto fusedArrayComma
+		}
 		goto dispatch
 	default:
 		pi++
 		cls = uint64(stage2Class[*(*byte)(unsafe.Add(basep, j))])
+		goto handleKnown
+	}
+
+fusedArrayComma:
+	if pi == len(positions) {
+		goto done
+	}
+	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
+	switch *(*byte)(unsafe.Add(basep, j)) {
+	case ',':
+		pi++
+		prev = 80
+		key = 0
+		goto fusedArrayValue
+	case ']':
+		pi++
+		depth--
+		if depth < 0 {
+			bad |= 1
+		}
+		inObj = uint64(*(*byte)(unsafe.Add(kindp, uintptr(uint64(depth)&(Stage2KindsLen-1))))) & 8
+		prev = 48 | inObj
+		key = 0
+		if inObj != 0 {
+			goto fusedComma
+		}
+		if depth > 0 {
+			goto fusedArrayComma
+		}
+		goto dispatch
+	default:
+		pi++
+		cls = uint64(stage2Class[*(*byte)(unsafe.Add(basep, j))])
+		goto handleKnown
+	}
+
+fusedArrayValue:
+	if pi == len(positions) {
+		goto done
+	}
+	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
+	switch c := *(*byte)(unsafe.Add(basep, j)); uint64(stage2Class[c]) {
+	case stage2ccQ:
+		pi++
+		prev = 96
+		key = 0
+		goto fusedArrayComma
+	case stage2ccS:
+		pi++
+		*(*uint32)(unsafe.Add(scalarp, uintptr(nscalars)*4)) = uint32(j)
+		nscalars++
+		prev = 112
+		key = 0
+		goto fusedArrayComma
+	case stage2ccA:
+		pi++
+		depth++
+		if depth > Stage2MaxDepth {
+			bad |= 1
+		}
+		*(*byte)(unsafe.Add(kindp, uintptr(uint64(depth)&(Stage2KindsLen-1)))) = 0
+		inObj = 0
+		prev = 16
+		key = 0
+		goto fusedArrayValue
+	case stage2ccO:
+		pi++
+		depth++
+		if depth > Stage2MaxDepth {
+			bad |= 1
+		}
+		*(*byte)(unsafe.Add(kindp, uintptr(uint64(depth)&(Stage2KindsLen-1)))) = 8
+		inObj = 8
+		prev = 8
+		key = 8
+		goto fusedKey
+	default:
+		pi++
+		cls = uint64(stage2Class[c])
 		goto handleKnown
 	}
 
