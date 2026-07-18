@@ -402,27 +402,28 @@ func Stage2PositionsGo(base *byte, positions []uint32, kinds *[Stage2KindsLen]by
 // kernel free of panic edges and stack-frame spills.
 func Stage2PositionsTrusted(base *byte, positions []uint32, kinds *[Stage2KindsLen]byte, scalars []uint32, st *Stage2State) int {
 	basep := unsafe.Pointer(base)
-	posp := unsafe.Pointer(unsafe.SliceData(positions))
+	pos := unsafe.Pointer(unsafe.SliceData(positions))
+	posEnd := unsafe.Add(pos, uintptr(len(positions))*4)
 	ptp := unsafe.Pointer(&stage2PairBad[0])
 	kindp := unsafe.Pointer(&kinds[0])
-	scalarp := unsafe.Pointer(unsafe.SliceData(scalars))
+	scalar := unsafe.Pointer(unsafe.SliceData(scalars))
 
 	bad := st.Bad
 	depth := st.Depth
 	prev := st.PrevRowIO
 	key := st.KeyRow8
 	inObj := prev & 8
-	pi := 0
 	nscalars := 0
 	var j int
 	var cls uint64
+	var c byte
 
 dispatch:
-	if pi == len(positions) {
+	if pos == posEnd {
 		goto done
 	}
-	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
-	pi++
+	j = int(*(*uint32)(pos))
+	pos = unsafe.Add(pos, 4)
 	cls = uint64(stage2Class[*(*byte)(unsafe.Add(basep, j))])
 
 handleKnown:
@@ -512,7 +513,8 @@ handleKnown:
 		}
 		goto dispatch
 	default:
-		*(*uint32)(unsafe.Add(scalarp, uintptr(nscalars)*4)) = uint32(j)
+		*(*uint32)(scalar) = uint32(j)
+		scalar = unsafe.Add(scalar, 4)
 		nscalars++
 		prev = 112 | inObj
 		key = 0
@@ -526,47 +528,47 @@ handleKnown:
 	}
 
 fusedKey:
-	if pi == len(positions) {
+	if pos == posEnd {
 		goto done
 	}
-	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
+	j = int(*(*uint32)(pos))
 	if *(*byte)(unsafe.Add(basep, j)) != '"' {
-		pi++
+		pos = unsafe.Add(pos, 4)
 		cls = uint64(stage2Class[*(*byte)(unsafe.Add(basep, j))])
 		goto handleKnown
 	}
-	pi++
+	pos = unsafe.Add(pos, 4)
 	prev = 224 | inObj
 	goto fusedColon
 
 fusedColon:
-	if pi == len(positions) {
+	if pos == posEnd {
 		goto done
 	}
-	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
+	j = int(*(*uint32)(pos))
 	if *(*byte)(unsafe.Add(basep, j)) != ':' {
-		pi++
+		pos = unsafe.Add(pos, 4)
 		cls = uint64(stage2Class[*(*byte)(unsafe.Add(basep, j))])
 		goto handleKnown
 	}
-	pi++
+	pos = unsafe.Add(pos, 4)
 	prev = 64 | inObj
 	key = 0
 	goto fusedValue
 
 fusedValue:
-	if pi == len(positions) {
+	if pos == posEnd {
 		goto done
 	}
-	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
+	j = int(*(*uint32)(pos))
 	switch c := *(*byte)(unsafe.Add(basep, j)); c {
 	case '"':
-		pi++
+		pos = unsafe.Add(pos, 4)
 		prev = 96 | inObj
 		key = 0
 		goto fusedComma
 	case '{':
-		pi++
+		pos = unsafe.Add(pos, 4)
 		depth++
 		if depth > Stage2MaxDepth {
 			bad |= 1
@@ -577,7 +579,7 @@ fusedValue:
 		key = 8
 		goto fusedKey
 	case '[':
-		pi++
+		pos = unsafe.Add(pos, 4)
 		depth++
 		if depth > Stage2MaxDepth {
 			bad |= 1
@@ -589,12 +591,12 @@ fusedValue:
 		goto fusedArrayValue
 	default:
 		cls = uint64(stage2Class[c])
+		pos = unsafe.Add(pos, 4)
 		if cls != stage2ccS {
-			pi++
 			goto handleKnown
 		}
-		pi++
-		*(*uint32)(unsafe.Add(scalarp, uintptr(nscalars)*4)) = uint32(j)
+		*(*uint32)(scalar) = uint32(j)
+		scalar = unsafe.Add(scalar, 4)
 		nscalars++
 		prev = 112 | inObj
 		key = 0
@@ -602,18 +604,18 @@ fusedValue:
 	}
 
 fusedComma:
-	if pi == len(positions) {
+	if pos == posEnd {
 		goto done
 	}
-	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
+	j = int(*(*uint32)(pos))
 	switch *(*byte)(unsafe.Add(basep, j)) {
 	case ',':
-		pi++
+		pos = unsafe.Add(pos, 4)
 		prev = 80 | inObj
 		key = inObj
 		goto fusedKey
 	case '}':
-		pi++
+		pos = unsafe.Add(pos, 4)
 		depth--
 		if depth < 0 {
 			bad |= 1
@@ -629,24 +631,24 @@ fusedComma:
 		}
 		goto dispatch
 	default:
-		pi++
+		pos = unsafe.Add(pos, 4)
 		cls = uint64(stage2Class[*(*byte)(unsafe.Add(basep, j))])
 		goto handleKnown
 	}
 
 fusedArrayComma:
-	if pi == len(positions) {
+	if pos == posEnd {
 		goto done
 	}
-	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
+	j = int(*(*uint32)(pos))
 	switch *(*byte)(unsafe.Add(basep, j)) {
 	case ',':
-		pi++
+		pos = unsafe.Add(pos, 4)
 		prev = 80
 		key = 0
 		goto fusedArrayValue
 	case ']':
-		pi++
+		pos = unsafe.Add(pos, 4)
 		depth--
 		if depth < 0 {
 			bad |= 1
@@ -662,31 +664,31 @@ fusedArrayComma:
 		}
 		goto dispatch
 	default:
-		pi++
+		pos = unsafe.Add(pos, 4)
 		cls = uint64(stage2Class[*(*byte)(unsafe.Add(basep, j))])
 		goto handleKnown
 	}
 
 fusedArrayValue:
-	if pi == len(positions) {
+	if pos == posEnd {
 		goto done
 	}
-	j = int(*(*uint32)(unsafe.Add(posp, uintptr(pi)*4)))
-	switch c := *(*byte)(unsafe.Add(basep, j)); uint64(stage2Class[c]) {
+	j = int(*(*uint32)(pos))
+	c = *(*byte)(unsafe.Add(basep, j))
+	pos = unsafe.Add(pos, 4)
+	switch uint64(stage2Class[c]) {
 	case stage2ccQ:
-		pi++
 		prev = 96
 		key = 0
 		goto fusedArrayComma
 	case stage2ccS:
-		pi++
-		*(*uint32)(unsafe.Add(scalarp, uintptr(nscalars)*4)) = uint32(j)
+		*(*uint32)(scalar) = uint32(j)
+		scalar = unsafe.Add(scalar, 4)
 		nscalars++
 		prev = 112
 		key = 0
 		goto fusedArrayComma
 	case stage2ccA:
-		pi++
 		depth++
 		if depth > Stage2MaxDepth {
 			bad |= 1
@@ -697,7 +699,6 @@ fusedArrayValue:
 		key = 0
 		goto fusedArrayValue
 	case stage2ccO:
-		pi++
 		depth++
 		if depth > Stage2MaxDepth {
 			bad |= 1
@@ -708,7 +709,6 @@ fusedArrayValue:
 		key = 8
 		goto fusedKey
 	default:
-		pi++
 		cls = uint64(stage2Class[c])
 		goto handleKnown
 	}
