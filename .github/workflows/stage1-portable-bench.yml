@@ -1,4 +1,4 @@
-name: stage1 portable kernel bench
+name: backend comparison
 
 on:
   pull_request:
@@ -9,23 +9,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: stage1-portable-${{ github.event.pull_request.number || github.ref }}
+  group: backend-comparison-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Upload source snapshot
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: portable-source
-          path: |
-            .
-            !.git
-          include-hidden-files: true
       - name: Build pinned Go tip
         shell: bash
         run: ./scripts/bootstrap-gotip.sh "$RUNNER_TEMP/simdjson-gotip"
@@ -34,44 +26,67 @@ jobs:
         run: |
           "$RUNNER_TEMP/simdjson-gotip/bin/go" version
           uname -a
-          lscpu | sed -n '1,20p'
-      - name: Portable correctness
+          lscpu | sed -n '1,30p'
+      - name: Pure-Go correctness
         shell: bash
+        env:
+          GOEXPERIMENT: nosimd
         run: |
           set -o pipefail
-          "$RUNNER_TEMP/simdjson-gotip/bin/go" test ./simd -count=1 -v \
-            2>&1 | tee "$RUNNER_TEMP/simd-tests-${RUNNER_ARCH}.txt"
-      - name: Portable kernel benchmarks
+          "$RUNNER_TEMP/simdjson-gotip/bin/go" test ./... -count=1 \
+            2>&1 | tee "$RUNNER_TEMP/purego-tests.txt"
+      - name: SIMD correctness
         shell: bash
+        env:
+          GOEXPERIMENT: simd
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/simdjson-gotip/bin/go" test ./... -count=1 \
+            2>&1 | tee "$RUNNER_TEMP/simd-tests.txt"
+      - name: Pure-Go kernels
+        shell: bash
+        env:
+          GOEXPERIMENT: nosimd
         run: |
           set -o pipefail
           "$RUNNER_TEMP/simdjson-gotip/bin/go" test ./simd \
-            -run '^$' \
-            -bench '^Benchmark(Stage1(BlockPortable|EscapedPortable|PrefixXORPortable|RecPortable)|Parse16Digits)$' \
-            -benchtime=750ms -count=8 -cpu=1 \
-            2>&1 | tee "$RUNNER_TEMP/portable-kernels-${RUNNER_ARCH}.txt"
-      - name: SIMD digit selection benchmark
+            -run '^$' -bench '^(BenchmarkStage1|BenchmarkParse16Digits|BenchmarkScan)' \
+            -benchmem -benchtime=1s -count=8 -cpu=1 \
+            2>&1 | tee "$RUNNER_TEMP/purego-kernels.txt"
+      - name: SIMD kernels
         shell: bash
         env:
           GOEXPERIMENT: simd
         run: |
           set -o pipefail
           "$RUNNER_TEMP/simdjson-gotip/bin/go" test ./simd \
-            -run '^$' -bench '^BenchmarkParse16Digits$' \
-            -benchtime=750ms -count=8 -cpu=1 \
-            2>&1 | tee "$RUNNER_TEMP/simd-digits-${RUNNER_ARCH}.txt"
-      - name: Portable end-to-end benchmarks
+            -run '^$' -bench '^(BenchmarkStage1|BenchmarkParse16Digits|BenchmarkScan)' \
+            -benchmem -benchtime=1s -count=8 -cpu=1 \
+            2>&1 | tee "$RUNNER_TEMP/simd-kernels.txt"
+      - name: Pure-Go end-to-end
         shell: bash
+        env:
+          GOEXPERIMENT: nosimd
         run: |
           set -o pipefail
           "$RUNNER_TEMP/simdjson-gotip/bin/go" test . \
-            -run '^$' -bench '^BenchmarkPortableBackend(Valid|BuildIndex)$' \
-            -benchtime=1s -count=8 -cpu=1 \
-            2>&1 | tee "$RUNNER_TEMP/portable-end-to-end-${RUNNER_ARCH}.txt"
-      - name: Upload output
+            -run '^$' -bench '^(BenchmarkPortableBackend|BenchmarkValidate|BenchmarkBuildIndex)' \
+            -benchmem -benchtime=1s -count=8 -cpu=1 \
+            2>&1 | tee "$RUNNER_TEMP/purego-end-to-end.txt"
+      - name: SIMD end-to-end
+        shell: bash
+        env:
+          GOEXPERIMENT: simd
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/simdjson-gotip/bin/go" test . \
+            -run '^$' -bench '^(BenchmarkPortableBackend|BenchmarkValidate|BenchmarkBuildIndex)' \
+            -benchmem -benchtime=1s -count=8 -cpu=1 \
+            2>&1 | tee "$RUNNER_TEMP/simd-end-to-end.txt"
+      - name: Upload comparison
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: portable-debug-ubuntu
+          name: backend-comparison-${{ runner.os }}-${{ runner.arch }}
           path: ${{ runner.temp }}/*.txt
-          if-no-files-found: warn
+          if-no-files-found: error
