@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: stage1-portable-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   benchmark:
     strategy:
@@ -17,7 +21,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Go bootstrap
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.26.4
+          cache: false
       - name: Build pinned Go tip
         shell: bash
         run: ./scripts/bootstrap-gotip.sh "$RUNNER_TEMP/simdjson-gotip"
@@ -30,11 +39,30 @@ jobs:
           if command -v lscpu >/dev/null 2>&1; then lscpu | sed -n '1,20p'; fi
       - name: Candidate correctness
         shell: bash
-        run: "$RUNNER_TEMP/simdjson-gotip/bin/go" test ./simd -run '^TestStage1PortableCandidates$' -count=1
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/simdjson-gotip/bin/go" test ./simd \
+            -run '^TestStage1PortableCandidates$' -count=1 -v \
+            2>&1 | tee "$RUNNER_TEMP/correctness-${RUNNER_OS}-${RUNNER_ARCH}.txt"
+      - name: Pure Go package tests
+        shell: bash
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/simdjson-gotip/bin/go" test ./simd -count=1 \
+            2>&1 | tee "$RUNNER_TEMP/simd-tests-${RUNNER_OS}-${RUNNER_ARCH}.txt"
       - name: Portable kernel benchmarks
         shell: bash
         run: |
+          set -o pipefail
           "$RUNNER_TEMP/simdjson-gotip/bin/go" test ./simd \
             -run '^$' \
-            -bench '^BenchmarkStage1(Escaped|Rec)Portable$' \
-            -benchtime=1s -count=12 -cpu=1
+            -bench '^Benchmark(Stage1(BlockPortable|EscapedPortable|PrefixXORPortable|RecPortable)|Parse16Digits)$' \
+            -benchtime=1s -count=8 -cpu=1 \
+            2>&1 | tee "$RUNNER_TEMP/bench-${RUNNER_OS}-${RUNNER_ARCH}.txt"
+      - name: Upload output
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: portable-debug-${{ matrix.os }}
+          path: ${{ runner.temp }}/*.txt
+          if-no-files-found: warn
