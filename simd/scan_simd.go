@@ -17,14 +17,15 @@ var (
 	scanStringSpecialBackend   = "scalar"
 	scanStringSelectedMinBytes = int(^uint(0) >> 1)
 	scanStringProbeMinBytes    = int(^uint(0) >> 1)
+	scanStringProbeBytes       = 16
 	scanStringVectorBytes      int
+	scanEncodedHTMLMinBytes    = 16
 	scanCPUFeatures            CPUFeatures
 )
 
-// scanEncodedHTMLMinBytes gates the HTML scanners straight into the vector
-// kernels at one full block. They have no SWAR probe stage: each word mask
-// must test three extra characters, roughly doubling its cost.
-const scanEncodedHTMLMinBytes = 16
+// scanEncodedHTMLMinBytes gates the HTML scanners into the selected backend.
+// It stays low on ARM64, where NEON wins immediately, and is raised on amd64
+// to amortize the init-selected assembly tail trampoline.
 
 // A \uXXXX escape is six bytes, so escape structure repeats every
 // lcm(6, 16) = 48 bytes. The three phase-shifted rows of each table below
@@ -92,6 +93,12 @@ func scanStringSpecial(src []byte, i int) int {
 			return i + bits.TrailingZeros64(m)/8
 		}
 		i += 8
+		for i-start < scanStringProbeBytes && i+8 <= len(src) {
+			if m := stringSpecialMask(binary.LittleEndian.Uint64(src[i:])); m != 0 {
+				return i + bits.TrailingZeros64(m)/8
+			}
+			i += 8
+		}
 	}
 	if len(src)-i >= scanStringSelectedMinBytes {
 		return scanStringSpecialRuntime(src, i)
@@ -145,6 +152,12 @@ func scanStringSyntax(src []byte, i int) int {
 			return i + bits.TrailingZeros64(m)/8
 		}
 		i += 8
+		for i-start < scanStringProbeBytes && i+8 <= len(src) {
+			if m := stringSyntaxMask(binary.LittleEndian.Uint64(src[i:])); m != 0 {
+				return i + bits.TrailingZeros64(m)/8
+			}
+			i += 8
+		}
 	}
 	if len(src)-i >= scanStringSelectedMinBytes {
 		return scanStringSyntaxRuntime(src, i)

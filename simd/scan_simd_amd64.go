@@ -20,10 +20,13 @@ func initStringScanner() {
 	// AVX2 is the demonstrated production width, including on AVX-512
 	// capable CPUs. Capability checks happen only here.
 	scanCPUFeatures = detectX86CPUFeatures()
+	scanEncodedHTMLMinBytes = int(^uint(0) >> 1)
 	if useAVX2Scanner(scanCPUFeatures) {
 		selectAVX2Scanner()
-		scanStringSelectedMinBytes = 32
+		scanStringSelectedMinBytes = 512
 		scanStringProbeMinBytes = 40
+		scanStringProbeBytes = 128
+		scanEncodedHTMLMinBytes = 512
 		scanStringSpecialBackend = "amd64-avx2"
 		scanStringVectorBytes = 32
 	}
