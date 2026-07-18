@@ -2,6 +2,82 @@ package simd
 
 import "testing"
 
+var stage1PortableBlockSink Stage1Masks
+
+func stage1BlockBytewise(block *[64]byte) Stage1Masks {
+	var masks Stage1Masks
+	for i, c := range block {
+		bit := uint64(1) << i
+		switch c {
+		case ' ', '\t', '\n', '\r':
+			masks.Whitespace |= bit
+		case '{', '}', '[', ']', ':', ',':
+			masks.Structural |= bit
+		case '"':
+			masks.Quote |= bit
+		case '\\':
+			masks.Backslash |= bit
+		}
+		if c < 0x20 {
+			masks.Control |= bit
+		}
+		if c >= 0x80 {
+			masks.NonASCII = true
+		}
+	}
+	return masks
+}
+
+func TestStage1BlockPortableExhaustive(t *testing.T) {
+	var block [64]byte
+	for i := range block {
+		block[i] = 'a'
+	}
+	for value := 0; value < 256; value++ {
+		for lane := range block {
+			block[lane] = byte(value)
+			var got Stage1Masks
+			stage1BlockPortable(&block, &got)
+			if want := stage1BlockBytewise(&block); got != want {
+				t.Fatalf("byte %#02x lane %d: got %+v, want %+v", value, lane, got, want)
+			}
+			block[lane] = 'a'
+		}
+	}
+
+	state := uint64(0x9e3779b97f4a7c15)
+	for round := 0; round < 100000; round++ {
+		for i := range block {
+			state ^= state << 13
+			state ^= state >> 7
+			state ^= state << 17
+			block[i] = byte(state)
+		}
+		var got Stage1Masks
+		stage1BlockPortable(&block, &got)
+		if want := stage1BlockBytewise(&block); got != want {
+			t.Fatalf("random round %d: got %+v, want %+v", round, got, want)
+		}
+	}
+}
+
+func BenchmarkStage1BlockPortable(b *testing.B) {
+	var block [64]byte
+	copy(block[:], `    {"key":"value with words","n":12345,"ok":true},`)
+	b.Run("bytewise", func(b *testing.B) {
+		b.SetBytes(64)
+		for i := 0; i < b.N; i++ {
+			stage1PortableBlockSink = stage1BlockBytewise(&block)
+		}
+	})
+	b.Run("swar", func(b *testing.B) {
+		b.SetBytes(64)
+		for i := 0; i < b.N; i++ {
+			stage1BlockPortable(&block, &stage1PortableBlockSink)
+		}
+	})
+}
+
 func stage1RefEscaped(backslash uint64, escaped bool) (uint64, bool) {
 	var out uint64
 	for bit := uint64(1); bit != 0; bit <<= 1 {
@@ -86,7 +162,7 @@ type stage1PortableWalker struct {
 }
 
 func (w *stage1PortableWalker) block(block *[64]byte) (Stage1Masks, Stage1Rec) {
-	var masks Stage1Masks
+	masks := stage1BlockBytewise(block)
 	var rec Stage1Rec
 	for i, c := range block {
 		bit := uint64(1) << i
@@ -95,26 +171,9 @@ func (w *stage1PortableWalker) block(block *[64]byte) (Stage1Masks, Stage1Rec) {
 		rawQuote := c == '"'
 		control := c < 0x20
 
-		if whitespace {
-			masks.Whitespace |= bit
-		}
-		if structural {
-			masks.Structural |= bit
-		}
-		if rawQuote {
-			masks.Quote |= bit
-		}
-		if c == '\\' {
-			masks.Backslash |= bit
-		}
-		if control {
-			masks.Control |= bit
-		}
 		if c >= 0x80 {
-			masks.NonASCII = true
 			rec.NonASCII = true
 		}
-
 		escaped := w.escaped
 		w.escaped = false
 		if c == '\\' && !escaped {
@@ -166,8 +225,13 @@ func TestStage1RecFromMasksMatchesWalker(t *testing.T) {
 			block[i] = alphabet[state%uint64(len(alphabet))]
 		}
 		masks, want := walker.block(&block)
+		var classified Stage1Masks
+		stage1BlockPortable(&block, &classified)
+		if classified != masks {
+			t.Fatalf("round %d: classifier %+v, want %+v", round, classified, masks)
+		}
 		var got Stage1Rec
-		Stage1RecFromMasks(&masks, &stream, &got)
+		Stage1RecFromMasks(&classified, &stream, &got)
 		if got != want {
 			t.Fatalf("round %d: got %+v, want %+v; block=%q", round, got, want, block)
 		}
