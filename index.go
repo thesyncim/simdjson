@@ -261,6 +261,18 @@ func (b *tapeBuilder) stringFast(start int, flags uint8) tapeParseStatus {
 			scanStart += 8
 		}
 	}
+	if indexScalarStrings && len(b.src) <= indexScalarStringMaxBytes {
+		if j := scanStringSpecialScalar(b.src, scanStart); j < len(b.src) && b.src[j] == '"' {
+			if len(b.entries) == cap(b.entries) {
+				return tapeParseFull
+			}
+			entry := len(b.entries)
+			b.entries = b.entries[:entry+1]
+			b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(j + 1), next: 1, info: packInfo(0, String, flags)}
+			b.i = j + 1
+			return tapeParseOK
+		}
+	}
 	end, escaped, ok := scanJSONStringFastFrom(b.src, b.base, scanStart)
 	if !ok {
 		return tapeParseInvalid

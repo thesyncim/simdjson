@@ -17,6 +17,13 @@ func (UncheckedScans) IndexStringSpecial(src []byte, start int) int {
 	return scanStringSpecial(src, start)
 }
 
+// IndexStringSpecialScalar scans with the portable word-at-a-time kernel.
+// It is useful to callers whose own routing has already established that
+// vector setup cannot be amortized.
+func (UncheckedScans) IndexStringSpecialScalar(src []byte, start int) int {
+	return scanStringSpecialScalar(src, start)
+}
+
 // IndexStringSpecialLong is the unchecked form of the package function.
 func (UncheckedScans) IndexStringSpecialLong(src []byte, start int) int {
 	return scanStringSpecialLong(src, start)
