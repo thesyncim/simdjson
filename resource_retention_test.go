@@ -308,13 +308,14 @@ func TestDynamicEncodeBoxRetentionBound(t *testing.T) {
 	}
 }
 
-// FuzzEncoderScratchRetentionSequence interleaves tiny maps with at most one
-// over-budget map and checks the scratch budgets after every operation. The
-// 0xff operation makes huge-then-small behavior part of the seed corpus
-// without making every mutation allocate an adversarial map.
+// FuzzEncoderScratchRetentionSequence interleaves bounded maps and checks the
+// scratch budgets after every operation. Over-budget maps stay in the
+// deterministic retention tests above: constructing one from an ordinary
+// mutated byte can prevent a fuzz worker from returning before a short smoke
+// deadline, which tests harness scheduling rather than a new input property.
 func FuzzEncoderScratchRetentionSequence(f *testing.F) {
-	f.Add([]byte{1, 2, 0xff, 1, 0, 3})
-	f.Add([]byte{0xff, 0, 1})
+	f.Add([]byte{1, 2, 31, 1, 0, 3})
+	f.Add([]byte{31, 0, 1})
 	f.Add([]byte{})
 
 	enc, err := CompileEncoder[map[int]uint64](EncoderOptions{})
@@ -327,13 +328,8 @@ func FuzzEncoderScratchRetentionSequence(f *testing.F) {
 		if len(operations) > 64 {
 			t.Skip()
 		}
-		hugeUsed := false
 		for step, operation := range operations {
 			size := int(operation & 31)
-			if operation == 0xff && !hugeUsed {
-				size = oversizedEncoderMapLen(unsafe.Sizeof(uint64(0)))
-				hugeUsed = true
-			}
 			value := make(map[int]uint64, size)
 			for i := 0; i < size; i++ {
 				value[i] = uint64(i + step)
