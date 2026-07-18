@@ -8,34 +8,23 @@ import (
 var stage1PortableBenchRecSink Stage1Rec
 var stage1PortableBenchMaskSink uint64
 
-const stage1CandidateEvenBits = uint64(0x5555555555555555)
-
-func stage1EscapedFastCandidate(backslash uint64, carry *Stage1Carry) uint64 {
-	carryEsc := carry.Escaped
+func stage1EscapedBaseline(backslash uint64, carry *Stage1Carry) uint64 {
 	if backslash == 0 {
+		escaped := carry.Escaped
 		carry.Escaped = 0
-		return carryEsc
+		return escaped
 	}
-
-	// A carried escape consumes a backslash in lane zero; it must be removed
-	// before both the isolated-run test and the shifted target mask.
-	backslash &^= carryEsc
-	followsEscape := backslash<<1 | carryEsc
-	if backslash&followsEscape == 0 {
-		carry.Escaped = backslash >> 63
-		return followsEscape
-	}
-
-	oddSequenceStarts := backslash & ^(stage1CandidateEvenBits | followsEscape)
-	sum, overflow := bits.Add64(oddSequenceStarts, backslash, 0)
+	backslash &^= carry.Escaped
+	followsEscape := backslash<<1 | carry.Escaped
+	const evenBits = uint64(0x5555555555555555)
+	oddSequenceStarts := backslash & ^evenBits & ^followsEscape
+	sequencesStartingOnEven, overflow := bits.Add64(oddSequenceStarts, backslash, 0)
 	carry.Escaped = overflow
-	return (stage1CandidateEvenBits ^ sum<<1) & followsEscape
+	invert := sequencesStartingOnEven << 1
+	return (evenBits ^ invert) & followsEscape
 }
 
-func stage1PrefixXORFastCandidate(quotes uint64, carry *Stage1Carry) uint64 {
-	if quotes == 0 {
-		return carry.InString
-	}
+func stage1PrefixXORBaseline(quotes uint64, carry *Stage1Carry) uint64 {
 	m := quotes
 	m ^= m << 1
 	m ^= m << 2
@@ -48,37 +37,20 @@ func stage1PrefixXORFastCandidate(quotes uint64, carry *Stage1Carry) uint64 {
 	return m
 }
 
-func stage1RecAlgebraCandidate(m *Stage1Masks, st *Stage1Stream, r *Stage1Rec) {
-	escaped := Stage1Escaped(m.Backslash, &st.Carry)
+func stage1RecBaseline(m *Stage1Masks, st *Stage1Stream, r *Stage1Rec) {
+	escaped := stage1EscapedBaseline(m.Backslash, &st.Carry)
 	quotes := m.Quote &^ escaped
-	inStr := Stage1PrefixXOR(quotes, &st.Carry)
-	outside := ^(inStr | quotes)
+	inStr := stage1PrefixXORBaseline(quotes, &st.Carry)
+	closers := quotes &^ inStr
 	openers := quotes & inStr
+	outside := ^(inStr | closers)
 	cand := ^(m.Whitespace | m.Structural | m.Quote | inStr)
 	starts := cand &^ (cand<<1 | st.Follows)
 	st.Follows = cand >> 63
-	r.Emit = (m.Structural|starts)&outside | openers
-	r.Scalar = cand
+	r.Emit = m.Structural&outside | openers | starts&outside
+	r.Scalar = cand & outside
 	r.EscInStr = escaped & inStr
-	r.Bad = m.Control&(inStr|outside&^m.Whitespace) != 0
-	r.WsOut = m.Whitespace & outside
-	r.InStr = inStr
-	r.NonASCII = m.NonASCII
-}
-
-func stage1RecFastCandidate(m *Stage1Masks, st *Stage1Stream, r *Stage1Rec) {
-	escaped := stage1EscapedFastCandidate(m.Backslash, &st.Carry)
-	quotes := m.Quote &^ escaped
-	inStr := stage1PrefixXORFastCandidate(quotes, &st.Carry)
-	outside := ^(inStr | quotes)
-	openers := quotes & inStr
-	cand := ^(m.Whitespace | m.Structural | m.Quote | inStr)
-	starts := cand &^ (cand<<1 | st.Follows)
-	st.Follows = cand >> 63
-	r.Emit = (m.Structural|starts)&outside | openers
-	r.Scalar = cand
-	r.EscInStr = escaped & inStr
-	r.Bad = m.Control&(inStr|outside&^m.Whitespace) != 0
+	r.Bad = m.Control&inStr|m.Control&outside&^m.Whitespace != 0
 	r.WsOut = m.Whitespace & outside
 	r.InStr = inStr
 	r.NonASCII = m.NonASCII
@@ -115,9 +87,9 @@ func stage1PortableMasks(doc []byte) [32]Stage1Masks {
 
 func TestStage1PortableCandidates(t *testing.T) {
 	state := uint64(0x243f6a8885a308d3)
-	var escapedCurrent, escapedFast Stage1Carry
-	var prefixCurrent, prefixFast Stage1Carry
-	var streamCurrent, streamAlgebra, streamFast Stage1Stream
+	var escapedBaseline, escapedFinal Stage1Carry
+	var prefixBaseline, prefixFinal Stage1Carry
+	var streamBaseline, streamFinal Stage1Stream
 	for round := 0; round < 1_000_000; round++ {
 		state ^= state << 13
 		state ^= state >> 7
@@ -126,17 +98,22 @@ func TestStage1PortableCandidates(t *testing.T) {
 		if round&7 != 0 {
 			backslash &= state >> 17 & state >> 41
 		}
-		gotEscaped := Stage1Escaped(backslash, &escapedCurrent)
-		wantEscaped := stage1EscapedFastCandidate(backslash, &escapedFast)
-		if gotEscaped != wantEscaped || escapedCurrent != escapedFast {
-			t.Fatalf("escaped round %d: current=(%#x,%+v) fast=(%#x,%+v)", round, gotEscaped, escapedCurrent, wantEscaped, escapedFast)
+		baselineEscaped := stage1EscapedBaseline(backslash, &escapedBaseline)
+		finalEscaped := Stage1Escaped(backslash, &escapedFinal)
+		if baselineEscaped != finalEscaped || escapedBaseline != escapedFinal {
+			t.Fatalf("escaped round %d: baseline=(%#x,%+v) final=(%#x,%+v)",
+				round, baselineEscaped, escapedBaseline, finalEscaped, escapedFinal)
 		}
 
 		quotes := bits.RotateLeft64(state, 23) & (state >> 13)
-		gotPrefix := Stage1PrefixXOR(quotes, &prefixCurrent)
-		wantPrefix := stage1PrefixXORFastCandidate(quotes, &prefixFast)
-		if gotPrefix != wantPrefix || prefixCurrent != prefixFast {
-			t.Fatalf("prefix round %d: current=(%#x,%+v) fast=(%#x,%+v)", round, gotPrefix, prefixCurrent, wantPrefix, prefixFast)
+		if round%5 == 0 {
+			quotes = 0
+		}
+		baselinePrefix := stage1PrefixXORBaseline(quotes, &prefixBaseline)
+		finalPrefix := Stage1PrefixXOR(quotes, &prefixFinal)
+		if baselinePrefix != finalPrefix || prefixBaseline != prefixFinal {
+			t.Fatalf("prefix round %d: baseline=(%#x,%+v) final=(%#x,%+v)",
+				round, baselinePrefix, prefixBaseline, finalPrefix, prefixFinal)
 		}
 
 		m := Stage1Masks{
@@ -147,12 +124,12 @@ func TestStage1PortableCandidates(t *testing.T) {
 			Control:    bits.RotateLeft64(state, 37) & (state >> 3),
 			NonASCII:   state>>63 != 0,
 		}
-		var current, algebra, fast Stage1Rec
-		Stage1RecFromMasks(&m, &streamCurrent, &current)
-		stage1RecAlgebraCandidate(&m, &streamAlgebra, &algebra)
-		stage1RecFastCandidate(&m, &streamFast, &fast)
-		if current != algebra || current != fast || streamCurrent != streamAlgebra || streamCurrent != streamFast {
-			t.Fatalf("record round %d diverged\ncurrent=%+v state=%+v\nalgebra=%+v state=%+v\nfast=%+v state=%+v", round, current, streamCurrent, algebra, streamAlgebra, fast, streamFast)
+		var baselineRec, finalRec Stage1Rec
+		stage1RecBaseline(&m, &streamBaseline, &baselineRec)
+		Stage1RecFromMasks(&m, &streamFinal, &finalRec)
+		if baselineRec != finalRec || streamBaseline != streamFinal {
+			t.Fatalf("record round %d diverged\nbaseline=%+v state=%+v\nfinal=%+v state=%+v",
+				round, baselineRec, streamBaseline, finalRec, streamFinal)
 		}
 	}
 }
@@ -167,21 +144,21 @@ func BenchmarkStage1EscapedPortable(b *testing.B) {
 		{"runs", 0x00ff00ff00ff00ff},
 	}
 	for _, workload := range workloads {
-		b.Run(workload.name+"/current", func(b *testing.B) {
+		b.Run(workload.name+"/baseline", func(b *testing.B) {
+			var carry Stage1Carry
+			var sink uint64
+			b.SetBytes(64)
+			for i := 0; i < b.N; i++ {
+				sink ^= stage1EscapedBaseline(workload.mask, &carry)
+			}
+			stage1PortableBenchMaskSink = sink ^ carry.Escaped
+		})
+		b.Run(workload.name+"/final", func(b *testing.B) {
 			var carry Stage1Carry
 			var sink uint64
 			b.SetBytes(64)
 			for i := 0; i < b.N; i++ {
 				sink ^= Stage1Escaped(workload.mask, &carry)
-			}
-			stage1PortableBenchMaskSink = sink ^ carry.Escaped
-		})
-		b.Run(workload.name+"/fast", func(b *testing.B) {
-			var carry Stage1Carry
-			var sink uint64
-			b.SetBytes(64)
-			for i := 0; i < b.N; i++ {
-				sink ^= stage1EscapedFastCandidate(workload.mask, &carry)
 			}
 			stage1PortableBenchMaskSink = sink ^ carry.Escaped
 		})
@@ -198,21 +175,21 @@ func BenchmarkStage1PrefixXORPortable(b *testing.B) {
 		{"dense", 0x1111111111111111},
 	}
 	for _, workload := range workloads {
-		b.Run(workload.name+"/current", func(b *testing.B) {
+		b.Run(workload.name+"/baseline", func(b *testing.B) {
+			var carry Stage1Carry
+			var sink uint64
+			b.SetBytes(64)
+			for i := 0; i < b.N; i++ {
+				sink ^= stage1PrefixXORBaseline(workload.mask, &carry)
+			}
+			stage1PortableBenchMaskSink = sink ^ carry.InString
+		})
+		b.Run(workload.name+"/final", func(b *testing.B) {
 			var carry Stage1Carry
 			var sink uint64
 			b.SetBytes(64)
 			for i := 0; i < b.N; i++ {
 				sink ^= Stage1PrefixXOR(workload.mask, &carry)
-			}
-			stage1PortableBenchMaskSink = sink ^ carry.InString
-		})
-		b.Run(workload.name+"/fast", func(b *testing.B) {
-			var carry Stage1Carry
-			var sink uint64
-			b.SetBytes(64)
-			for i := 0; i < b.N; i++ {
-				sink ^= stage1PrefixXORFastCandidate(workload.mask, &carry)
 			}
 			stage1PortableBenchMaskSink = sink ^ carry.InString
 		})
@@ -232,35 +209,24 @@ func BenchmarkStage1RecPortable(b *testing.B) {
 	}
 	for _, workload := range workloads {
 		masks := stage1PortableMasks(workload.doc)
-		b.Run(workload.name+"/current", func(b *testing.B) {
+		b.Run(workload.name+"/baseline", func(b *testing.B) {
+			st := Stage1Stream{Carry: Stage1Carry{InString: workload.inString}}
+			var rec Stage1Rec
+			b.SetBytes(32 * 64)
+			for n := 0; n < b.N; n++ {
+				for i := range masks {
+					stage1RecBaseline(&masks[i], &st, &rec)
+				}
+			}
+			stage1PortableBenchRecSink = rec
+		})
+		b.Run(workload.name+"/final", func(b *testing.B) {
 			st := Stage1Stream{Carry: Stage1Carry{InString: workload.inString}}
 			var rec Stage1Rec
 			b.SetBytes(32 * 64)
 			for n := 0; n < b.N; n++ {
 				for i := range masks {
 					Stage1RecFromMasks(&masks[i], &st, &rec)
-				}
-			}
-			stage1PortableBenchRecSink = rec
-		})
-		b.Run(workload.name+"/algebra", func(b *testing.B) {
-			st := Stage1Stream{Carry: Stage1Carry{InString: workload.inString}}
-			var rec Stage1Rec
-			b.SetBytes(32 * 64)
-			for n := 0; n < b.N; n++ {
-				for i := range masks {
-					stage1RecAlgebraCandidate(&masks[i], &st, &rec)
-				}
-			}
-			stage1PortableBenchRecSink = rec
-		})
-		b.Run(workload.name+"/fast", func(b *testing.B) {
-			st := Stage1Stream{Carry: Stage1Carry{InString: workload.inString}}
-			var rec Stage1Rec
-			b.SetBytes(32 * 64)
-			for n := 0; n < b.N; n++ {
-				for i := range masks {
-					stage1RecFastCandidate(&masks[i], &st, &rec)
 				}
 			}
 			stage1PortableBenchRecSink = rec
