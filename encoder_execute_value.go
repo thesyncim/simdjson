@@ -362,6 +362,9 @@ func (e *encodeState) releaseMapScratch(entries []mapEncodeEntry, keyArena []byt
 		return
 	}
 	scratch := e.scratch
+	// A nested call may return its operation-local backing while the outer call
+	// still owns the original pooled slice. Keep the first returned backing and
+	// let the outer release leave that occupied slot unchanged.
 	if scratch == nil || scratch.mapEntries != nil {
 		return
 	}
