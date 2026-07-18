@@ -28,7 +28,7 @@ func storeDateTimeParts(dst *[20]byte, year, month, day, hour, minute, second ui
 }
 
 func parseBackend() string {
-	return "amd64-swar"
+	return "scalar"
 }
 
 func parseVectorBytes() int {
