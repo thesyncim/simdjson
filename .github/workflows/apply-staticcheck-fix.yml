@@ -1,0 +1,51 @@
+name: apply staticcheck fix
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-staticcheck-fix-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  apply:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+      - name: Apply exact fixes and remove temporary workflows
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          test_path = Path("simd/stage1_portable_test.go")
+          text = test_path.read_text()
+          old = "\t\tquotes := state & state>>3 & state>>11"
+          new = "\t\tquotes := state & (state >> 3) & (state >> 11)"
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one quote-mask expression, found {text.count(old)}")
+          test_path.write_text(text.replace(old, new))
+
+          bitmap_path = Path("valid_bitmap.go")
+          text = bitmap_path.read_text()
+          old = "\t//lint:ignore SA4008 see docs/toolchain.md; block changes in the loop post statement\n"
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one stale lint directive, found {text.count(old)}")
+          bitmap_path.write_text(text.replace(old, ""))
+
+          Path(".github/workflows/staticcheck-debug.yml").unlink(missing_ok=True)
+          Path(".github/workflows/apply-staticcheck-fix.yml").unlink(missing_ok=True)
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add simd/stage1_portable_test.go valid_bitmap.go .github/workflows
+          git diff --cached --check
+          git commit -m "test: fix staticcheck diagnostics"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
