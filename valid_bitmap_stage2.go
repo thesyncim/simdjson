@@ -186,9 +186,9 @@ func validScalarTokenAt(src []byte, base unsafe.Pointer, n, j int) bool {
 	var end int
 	switch c := fastByteAt(base, j); {
 	case c == '-' || '0' <= c && c <= '9':
-		var msg string
-		end, msg = scanNumber(src, j)
-		if msg != "" {
+		var ok bool
+		end, ok = scanNumberFast(base, n, j)
+		if !ok {
 			return false
 		}
 	case c == 't':
@@ -209,10 +209,5 @@ func validScalarTokenAt(src []byte, base unsafe.Pointer, n, j int) bool {
 	default:
 		return false
 	}
-	if end < n {
-		if c := fastByteAt(base, end); !isJSONSpaceOrStructural(c) {
-			return false
-		}
-	}
-	return true
+	return end == n || isJSONSpaceOrStructural(fastByteAt(base, end))
 }
