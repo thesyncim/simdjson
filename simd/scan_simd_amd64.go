@@ -288,11 +288,16 @@ func scanStringSpecialAVX2(src []byte, i int) int {
 	slash := archsimd.BroadcastUint8x32('\\')
 	ctrlOrNonASCII := archsimd.BroadcastInt8x32(0x20)
 	base := unsafe.Pointer(unsafe.SliceData(src))
+
 	for i+64 <= n {
 		v0 := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(base, i)))
 		v1 := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(base, i+32)))
-		b0 := v0.Equal(quote).Or(v0.Equal(slash)).Or(v0.BitsToInt8().Less(ctrlOrNonASCII)).ToBits()
-		b1 := v1.Equal(quote).Or(v1.Equal(slash)).Or(v1.BitsToInt8().Less(ctrlOrNonASCII)).ToBits()
+		b0 := v0.Equal(quote).
+			Or(v0.Equal(slash)).
+			Or(v0.BitsToInt8().Less(ctrlOrNonASCII)).ToBits()
+		b1 := v1.Equal(quote).
+			Or(v1.Equal(slash)).
+			Or(v1.BitsToInt8().Less(ctrlOrNonASCII)).ToBits()
 		if b0|b1 != 0 {
 			if b0 != 0 {
 				return i + bits.TrailingZeros32(b0)
@@ -303,7 +308,9 @@ func scanStringSpecialAVX2(src []byte, i int) int {
 	}
 	if i+32 <= n {
 		v := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(base, i)))
-		b := v.Equal(quote).Or(v.Equal(slash)).Or(v.BitsToInt8().Less(ctrlOrNonASCII)).ToBits()
+		b := v.Equal(quote).
+			Or(v.Equal(slash)).
+			Or(v.BitsToInt8().Less(ctrlOrNonASCII)).ToBits()
 		if b != 0 {
 			return i + bits.TrailingZeros32(b)
 		}
@@ -318,11 +325,16 @@ func scanStringSpecialAVX512(src []byte, i int) int {
 	slash := archsimd.BroadcastUint8x64('\\')
 	ctrlOrNonASCII := archsimd.BroadcastInt8x64(0x20)
 	base := unsafe.Pointer(unsafe.SliceData(src))
+
 	for i+128 <= n {
 		v0 := archsimd.LoadUint8x64Array((*[64]uint8)(unsafe.Add(base, i)))
 		v1 := archsimd.LoadUint8x64Array((*[64]uint8)(unsafe.Add(base, i+64)))
-		b0 := v0.Equal(quote).ToBits() | v0.Equal(slash).ToBits() | v0.BitsToInt8().Less(ctrlOrNonASCII).ToBits()
-		b1 := v1.Equal(quote).ToBits() | v1.Equal(slash).ToBits() | v1.BitsToInt8().Less(ctrlOrNonASCII).ToBits()
+		b0 := v0.Equal(quote).ToBits() |
+			v0.Equal(slash).ToBits() |
+			v0.BitsToInt8().Less(ctrlOrNonASCII).ToBits()
+		b1 := v1.Equal(quote).ToBits() |
+			v1.Equal(slash).ToBits() |
+			v1.BitsToInt8().Less(ctrlOrNonASCII).ToBits()
 		if b0|b1 != 0 {
 			if b0 != 0 {
 				return i + bits.TrailingZeros64(b0)
@@ -333,7 +345,9 @@ func scanStringSpecialAVX512(src []byte, i int) int {
 	}
 	if i+64 <= n {
 		v := archsimd.LoadUint8x64Array((*[64]uint8)(unsafe.Add(base, i)))
-		b := v.Equal(quote).ToBits() | v.Equal(slash).ToBits() | v.BitsToInt8().Less(ctrlOrNonASCII).ToBits()
+		b := v.Equal(quote).ToBits() |
+			v.Equal(slash).ToBits() |
+			v.BitsToInt8().Less(ctrlOrNonASCII).ToBits()
 		if b != 0 {
 			return i + bits.TrailingZeros64(b)
 		}
@@ -348,6 +362,7 @@ func scanStringSyntaxAVX2(src []byte, i int) int {
 	slash := archsimd.BroadcastUint8x32('\\')
 	ctrl := archsimd.BroadcastUint8x32(0x20)
 	base := unsafe.Pointer(unsafe.SliceData(src))
+
 	for i+64 <= n {
 		v0 := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(base, i)))
 		v1 := archsimd.LoadUint8x32Array((*[32]uint8)(unsafe.Add(base, i+32)))
@@ -378,6 +393,7 @@ func scanStringSyntaxAVX512(src []byte, i int) int {
 	slash := archsimd.BroadcastUint8x64('\\')
 	ctrl := archsimd.BroadcastUint8x64(0x20)
 	base := unsafe.Pointer(unsafe.SliceData(src))
+
 	for i+128 <= n {
 		v0 := archsimd.LoadUint8x64Array((*[64]uint8)(unsafe.Add(base, i)))
 		v1 := archsimd.LoadUint8x64Array((*[64]uint8)(unsafe.Add(base, i+64)))
