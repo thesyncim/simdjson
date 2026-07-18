@@ -1,0 +1,132 @@
+name: apply asm dispatch
+
+on:
+  push:
+    branches: [perf/zero-runtime-dispatch]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: perf/zero-runtime-dispatch
+          fetch-depth: 0
+      - name: Install assembly tail dispatch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("simd/scan_simd_amd64.go")
+          source = path.read_text()
+          start = source.index("// Scanner implementations are selected once during package initialization.")
+          end = source.index("func validUTF8NoLineSeparatorRuntime")
+          replacement = r'''// useAVX2Scanner is evaluated only during package initialization. The hot
+          // scanner entry points are assembly tail trampolines whose targets are
+          // installed once and contain no CPU capability branch.
+          func useAVX2Scanner(features CPUFeatures) bool {
+          	return features.Has(CPUFeatureAVX2)
+          }
+
+          func initStringScanner() {
+          	// AVX2 is the demonstrated production width, including on AVX-512
+          	// capable CPUs. Capability checks happen only here.
+          	scanCPUFeatures = detectX86CPUFeatures()
+          	if useAVX2Scanner(scanCPUFeatures) {
+          		selectAVX2Scanner()
+          		scanStringSelectedMinBytes = 32
+          		scanStringProbeMinBytes = 40
+          		scanStringSpecialBackend = "amd64-avx2"
+          		scanStringVectorBytes = 32
+          	}
+          }
+
+          '''
+          path.write_text(source[:start] + replacement + source[end:])
+
+          Path("simd/scan_dispatch_amd64.go").write_text(r'''//go:build goexperiment.simd && amd64
+
+          package simd
+
+          // selectAVX2Scanner installs AVX2 targets into the assembly tail
+          // trampolines. It is called once during package initialization.
+          func selectAVX2Scanner()
+
+          // The runtime scanner entry points preserve the slice's noescape
+          // contract while tail-jumping to the implementation selected at init.
+          //
+          //go:noescape
+          func scanStringSpecialRuntime(src []byte, i int) int
+
+          //go:noescape
+          func scanStringSyntaxRuntime(src []byte, i int) int
+
+          //go:noescape
+          func scanEncodedHTMLSpecialRuntime(src []byte, i int) int
+
+          //go:noescape
+          func scanEncodedHTMLSyntaxRuntime(src []byte, i int) int
+          ''')
+
+          Path("simd/scan_dispatch_amd64.s").write_text(r'''//go:build goexperiment.simd && amd64
+
+          #include "textflag.h"
+
+          DATA scanStringSpecialTarget<>+0(SB)/8, $·scanStringSpecialScalar(SB)
+          GLOBL scanStringSpecialTarget<>(SB), NOPTR, $8
+          DATA scanStringSyntaxTarget<>+0(SB)/8, $·scanStringSyntaxScalar(SB)
+          GLOBL scanStringSyntaxTarget<>(SB), NOPTR, $8
+          DATA scanEncodedHTMLSpecialTarget<>+0(SB)/8, $·scanEncodedHTMLSpecialScalar(SB)
+          GLOBL scanEncodedHTMLSpecialTarget<>(SB), NOPTR, $8
+          DATA scanEncodedHTMLSyntaxTarget<>+0(SB)/8, $·scanEncodedHTMLSyntaxScalar(SB)
+          GLOBL scanEncodedHTMLSyntaxTarget<>(SB), NOPTR, $8
+
+          TEXT ·selectAVX2Scanner(SB), NOSPLIT|NOFRAME, $0-0
+          	MOVQ $·scanStringSpecialAVX2(SB), AX
+          	MOVQ AX, scanStringSpecialTarget<>(SB)
+          	MOVQ $·scanStringSyntaxAVX2(SB), AX
+          	MOVQ AX, scanStringSyntaxTarget<>(SB)
+          	MOVQ $·scanEncodedHTMLSpecialAVX2(SB), AX
+          	MOVQ AX, scanEncodedHTMLSpecialTarget<>(SB)
+          	MOVQ $·scanEncodedHTMLSyntaxAVX2(SB), AX
+          	MOVQ AX, scanEncodedHTMLSyntaxTarget<>(SB)
+          	RET
+
+          // Each entry point keeps the ABI0 argument frame intact and tail-jumps
+          // to a same-signature Go ABI wrapper. The selected target returns
+          // directly to the original Go caller.
+          TEXT ·scanStringSpecialRuntime(SB), NOSPLIT|NOFRAME, $0-40
+          	MOVQ scanStringSpecialTarget<>(SB), AX
+          	JMP AX
+
+          TEXT ·scanStringSyntaxRuntime(SB), NOSPLIT|NOFRAME, $0-40
+          	MOVQ scanStringSyntaxTarget<>(SB), AX
+          	JMP AX
+
+          TEXT ·scanEncodedHTMLSpecialRuntime(SB), NOSPLIT|NOFRAME, $0-40
+          	MOVQ scanEncodedHTMLSpecialTarget<>(SB), AX
+          	JMP AX
+
+          TEXT ·scanEncodedHTMLSyntaxRuntime(SB), NOSPLIT|NOFRAME, $0-40
+          	MOVQ scanEncodedHTMLSyntaxTarget<>(SB), AX
+          	JMP AX
+          ''')
+
+          for old in (Path("simd/noescape_amd64.go"), Path("simd/noescape_amd64.s")):
+              if old.exists():
+                  old.unlink()
+          PY
+          gofmt -w simd/scan_simd_amd64.go simd/scan_dispatch_amd64.go
+          rm .github/workflows/apply-asm-dispatch.yml
+      - name: Commit
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A simd .github/workflows/apply-asm-dispatch.yml
+          git commit -m "perf: tail-dispatch amd64 scanner kernels"
+          git push origin HEAD:perf/zero-runtime-dispatch
