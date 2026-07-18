@@ -36,11 +36,17 @@ trap 'rm -f "$csv"' EXIT HUP INT TERM
 "$benchstat" -format csv "$old" "$new" >"$csv"
 
 awk -F, -v sec_limit="$limit" -v byte_limit="$byte_limit" '
-$2 == "sec/op" || $2 == "B/op" || $2 == "allocs/op" {
-	metric = $2
+$1 == "" {
+	# Every benchstat section starts with one or more header rows. Reset the
+	# tracked metric even for unguarded throughput sections such as B/s; without
+	# this, a positive throughput change inherits sec/op and becomes a false
+	# latency regression.
+	metric = ""
+	if ($2 == "sec/op" || $2 == "B/op" || $2 == "allocs/op") {
+		metric = $2
+	}
 	next
 }
-$1 == "" { next }
 $1 == "geomean" { next }
 metric != "" && $6 ~ /^\+/ {
 	change = $6

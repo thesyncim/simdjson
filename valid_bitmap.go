@@ -27,13 +27,6 @@ import (
 // paths share the grammar walk (validBitmapWalk) and produce identical
 // verdicts. docs/design/structural-decoder.md records the routing rationale.
 
-// stage1ValidatorEnabled gates the bitmap engine to builds with the
-// stage-1 kernels.
-var stage1ValidatorEnabled = simdkernels.Stage1Enabled()
-
-// stage1StreamEnabled selects the batched kernel over the per-block path.
-var stage1StreamEnabled = simdkernels.Stage1StreamEnabled()
-
 const (
 	// validBitmapMinBytes keeps small and mid-size inputs on the recursive
 	// scanner: below this even the sampling blocks would show up in their
@@ -120,24 +113,15 @@ func validBitmapNumberMode(inStr int) uint8 {
 	return vbNumberNine
 }
 
-// validBitmap reports strict validity of src via the stage-1 masks.
-// decided=false means the density sample chose the recursive scanner
-// instead; the result is then meaningless. On arm64 the batched kernel
-// classifies each chunk; elsewhere the per-block path runs directly.
+// validBitmap reports strict validity through the packed stage-1 position
+// stream and Go stage-2 grammar machine. Both backends are available in every
+// supported build; decided=false means the density sample chose the recursive
+// scanner instead and the result is then meaningless.
 func validBitmap(src []byte) (valid, decided bool) {
-	if !stage2MachineEnabled && stage1StreamEnabled && len(src) >= validBitmapSampleBlocks*64 {
-		return validPositionsStreamed(src)
-	}
-	if stage2MachineEnabled {
-		// The grammar walk runs in the stage-2 register machine
-		// (valid_bitmap_stage2.go); the Go walk below stays the fallback
-		// and the differential reference.
-		return validBitmapStreamedAsm(src)
-	}
-	if stage1StreamEnabled {
+	if len(src) < validBitmapSampleBlocks*64 {
 		return validBitmapStreamed(src)
 	}
-	return validBitmapPerBlock(src)
+	return validPositionsStreamed(src)
 }
 
 // validBitmapPerBlock classifies one block at a time. It is the engine on
@@ -160,7 +144,6 @@ func validBitmapPerBlock(src []byte) (valid, decided bool) {
 	skipEscape := -1 // low-surrogate escape already consumed by its high half
 
 	nBlocks := (n + 63) / 64
-	//lint:ignore SA4008 see docs/toolchain.md; block changes in the loop post statement
 	for block := 0; block < nBlocks; block++ {
 		pos := block * 64
 		if pos+64 <= n {

@@ -45,8 +45,7 @@ func takeDecoderState() *decoderState {
 // the forward structural producer. The caller separately checks that its
 // compiled shape has a structural executor.
 func decoderStructuralWorthwhile(src []byte) bool {
-	return len(src) >= decoderStructuralMinBytes && simdkernels.Stage1StreamEnabled() &&
-		uint64(len(src)) <= uint64(^uint32(0))
+	return len(src) >= decoderStructuralMinBytes && uint64(len(src)) <= uint64(^uint32(0))
 }
 
 func acquireDecoderState(src []byte) *decoderState {

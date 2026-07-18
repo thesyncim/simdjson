@@ -11,34 +11,32 @@ import (
 
 // scanAMD64Level selects the vector width once at startup. Dispatch happens
 // through static calls in a switch rather than function values: indirect
-// calls would make escape analysis treat every scanned buffer as leaking,
-// forcing callers' stack storage onto the heap.
+// calls make escape analysis treat scanned buffers as leaking, which moves
+// callers' stack storage onto the heap.
 var scanAMD64Level uint8
 
 const (
 	scanLevelScalar uint8 = iota
 	scanLevelAVX2
-	scanLevelAVX512
 )
 
+func selectAMD64ScannerLevel(features CPUFeatures) uint8 {
+	// AVX-512 remains an experimental direct kernel until it wins across
+	// representative CPU families and short/long input distributions. AVX2 is
+	// the demonstrated production width, including on AVX-512-capable CPUs.
+	if features.Has(CPUFeatureAVX2) {
+		return scanLevelAVX2
+	}
+	return scanLevelScalar
+}
+
 func initStringScanner() {
-	// Both vector levels share the dispatcher thresholds: vector entry
-	// needs 32 remaining bytes (one AVX2 block), and the 16-byte word
-	// probes run only on spans of 40 or more, so a 32-39 byte remainder
-	// enters the vector kernel directly instead of spending probes on half
-	// of it. The AVX-512 kernels hand sub-block tails to the AVX2 kernels,
-	// which finish through the 16-byte or scalar paths. Without AVX2 the
-	// thresholds keep their disabling defaults.
+	// The selected AVX2 entry needs 32 remaining bytes, and the 16-byte word
+	// probes run only on spans of 40 or more. Capability checks happen only
+	// here; hot calls only read the process-constant level below.
 	scanCPUFeatures = detectX86CPUFeatures()
-	switch {
-	case archsimd.X86.AVX512():
-		scanAMD64Level = scanLevelAVX512
-		scanStringSelectedMinBytes = 32
-		scanStringProbeMinBytes = 40
-		scanStringSpecialBackend = "amd64-avx512"
-		scanStringVectorBytes = 64
-	case archsimd.X86.AVX2():
-		scanAMD64Level = scanLevelAVX2
+	scanAMD64Level = selectAMD64ScannerLevel(scanCPUFeatures)
+	if scanAMD64Level == scanLevelAVX2 {
 		scanStringSelectedMinBytes = 32
 		scanStringProbeMinBytes = 40
 		scanStringSpecialBackend = "amd64-avx2"
@@ -47,47 +45,31 @@ func initStringScanner() {
 }
 
 func scanStringSpecialRuntime(src []byte, i int) int {
-	switch scanAMD64Level {
-	case scanLevelAVX512:
-		return scanStringSpecialAVX512(src, i)
-	case scanLevelAVX2:
+	if scanAMD64Level == scanLevelAVX2 {
 		return scanStringSpecialAVX2(src, i)
-	default:
-		return scanStringSpecialScalar(src, i)
 	}
+	return scanStringSpecialScalar(src, i)
 }
 
 func scanStringSyntaxRuntime(src []byte, i int) int {
-	switch scanAMD64Level {
-	case scanLevelAVX512:
-		return scanStringSyntaxAVX512(src, i)
-	case scanLevelAVX2:
+	if scanAMD64Level == scanLevelAVX2 {
 		return scanStringSyntaxAVX2(src, i)
-	default:
-		return scanStringSyntaxScalar(src, i)
 	}
+	return scanStringSyntaxScalar(src, i)
 }
 
 func scanEncodedHTMLSpecialRuntime(src []byte, i int) int {
-	switch scanAMD64Level {
-	case scanLevelAVX512:
-		return scanEncodedHTMLSpecialAVX512(src, i)
-	case scanLevelAVX2:
+	if scanAMD64Level == scanLevelAVX2 {
 		return scanEncodedHTMLSpecialAVX2(src, i)
-	default:
-		return scanEncodedHTMLSpecialScalar(src, i)
 	}
+	return scanEncodedHTMLSpecialScalar(src, i)
 }
 
 func scanEncodedHTMLSyntaxRuntime(src []byte, i int) int {
-	switch scanAMD64Level {
-	case scanLevelAVX512:
-		return scanEncodedHTMLSyntaxAVX512(src, i)
-	case scanLevelAVX2:
+	if scanAMD64Level == scanLevelAVX2 {
 		return scanEncodedHTMLSyntaxAVX2(src, i)
-	default:
-		return scanEncodedHTMLSyntaxScalar(src, i)
 	}
+	return scanEncodedHTMLSyntaxScalar(src, i)
 }
 
 func validUTF8NoLineSeparatorRuntime(src []byte) bool {
@@ -334,7 +316,7 @@ func scanStringSpecialAVX2(src []byte, i int) int {
 		}
 		i += 32
 	}
-	return scanStringSpecialScalar(src, i)
+	return scanStringSpecialSIMD(src, i)
 }
 
 func scanStringSpecialAVX512(src []byte, i int) int {
@@ -402,7 +384,7 @@ func scanStringSyntaxAVX2(src []byte, i int) int {
 		}
 		i += 32
 	}
-	return scanStringSyntaxScalar(src, i)
+	return scanStringSyntaxSIMD(src, i)
 }
 
 func scanStringSyntaxAVX512(src []byte, i int) int {
@@ -434,35 +416,4 @@ func scanStringSyntaxAVX512(src []byte, i int) int {
 		i += 64
 	}
 	return scanStringSyntaxAVX2(src, i)
-}
-
-func detectX86CPUFeatures() CPUFeatures {
-	var features CPUFeatures
-	probes := [...]struct {
-		feature CPUFeature
-		has     bool
-	}{
-		{CPUFeatureAVX, archsimd.X86.AVX()},
-		{CPUFeatureAVX2, archsimd.X86.AVX2()},
-		{CPUFeatureAVX512, archsimd.X86.AVX512()},
-		{CPUFeatureAVX512BITALG, archsimd.X86.AVX512BITALG()},
-		{CPUFeatureAVX512GFNI, archsimd.X86.AVX512GFNI()},
-		{CPUFeatureAVX512VAES, archsimd.X86.AVX512VAES()},
-		{CPUFeatureAVX512VBMI, archsimd.X86.AVX512VBMI()},
-		{CPUFeatureAVX512VBMI2, archsimd.X86.AVX512VBMI2()},
-		{CPUFeatureAVX512VNNI, archsimd.X86.AVX512VNNI()},
-		{CPUFeatureAVX512VPCLMULQDQ, archsimd.X86.AVX512VPCLMULQDQ()},
-		{CPUFeatureAVX512VPOPCNTDQ, archsimd.X86.AVX512VPOPCNTDQ()},
-		{CPUFeatureAVXAES, archsimd.X86.AVXAES()},
-		{CPUFeatureAVXVNNI, archsimd.X86.AVXVNNI()},
-		{CPUFeatureFMA, archsimd.X86.FMA()},
-		{CPUFeatureSHA, archsimd.X86.SHA()},
-		{CPUFeatureVAES, archsimd.X86.VAES()},
-	}
-	for _, probe := range probes {
-		if probe.has {
-			features |= probe.feature.mask()
-		}
-	}
-	return features
 }

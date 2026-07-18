@@ -6,7 +6,7 @@ import (
 
 // Validate returns nil when src is strict JSON.
 func Validate(src []byte) error {
-	if stage1ValidatorEnabled && len(src) >= validBitmapMinBytes {
+	if len(src) >= validBitmapMinBytes {
 		// The bitmap engine can prove validity; only failures re-run the
 		// scalar validator, which produces the exact error offset.
 		if ok, decided := validBitmap(src); decided && ok {

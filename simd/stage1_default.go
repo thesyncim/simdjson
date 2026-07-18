@@ -2,10 +2,11 @@
 
 package simd
 
-// Stage1Enabled reports whether this build provides the stage-1 kernel.
-func Stage1Enabled() bool { return false }
+// Stage1Enabled reports whether this build provides the stage-1 classifier.
+// Scalar builds use the portable SWAR kernel.
+func Stage1Enabled() bool { return true }
 
-// Stage1Block is unreachable in scalar builds; the portable carry kernels
-// Stage1Escaped and Stage1PrefixXOR remain available for callers that
-// supply the block masks from another source.
-func Stage1Block(p *[64]byte, m *Stage1Masks) { panic("simd: stage1 disabled") }
+// Stage1Block classifies one full 64-byte block with the portable SWAR kernel.
+func Stage1Block(block *[64]byte, masks *Stage1Masks) {
+	stage1BlockPortable(block, masks)
+}

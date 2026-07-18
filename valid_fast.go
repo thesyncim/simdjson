@@ -12,7 +12,7 @@ import (
 // stage-1 bitmap engine, which skips whitespace and string interiors in
 // 64-byte masks.
 func validFast(src []byte) bool {
-	if stage1ValidatorEnabled && len(src) >= validBitmapMinBytes {
+	if len(src) >= validBitmapMinBytes {
 		if ok, decided := validBitmap(src); decided {
 			return ok
 		}

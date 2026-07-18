@@ -75,24 +75,32 @@ type Stage1IndexMeta struct {
 	EscCount   uint32
 }
 
-// Stage1RecFromMasks derives one record from a block's classification
-// masks using the portable carry kernels. It is the scalar reference
-// for the batched kernel and works on every build.
+// Stage1RecFromMasks derives one record from a block's classification masks
+// using the portable carry kernels. It is the scalar reference for the batched
+// kernel and works on every build.
 func Stage1RecFromMasks(m *Stage1Masks, st *Stage1Stream, r *Stage1Rec) {
 	escaped := Stage1Escaped(m.Backslash, &st.Carry)
 	quotes := m.Quote &^ escaped
-	inStr := Stage1PrefixXOR(quotes, &st.Carry)
-	closers := quotes &^ inStr
-	openers := quotes & inStr
-	outside := ^(inStr | closers)
-	cand := ^(m.Whitespace | m.Structural | m.Quote | inStr)
+	inString := Stage1PrefixXOR(quotes, &st.Carry)
+
+	// inString includes opening quotes and excludes closing quotes. Combining
+	// it with every unescaped quote therefore excludes both quote boundaries
+	// and the entire string body in one mask.
+	outside := ^(inString | quotes)
+	openers := quotes & inString
+
+	// Raw quotes are excluded rather than only unescaped quotes: an escaped
+	// quote inside a string must not become a scalar candidate. Since cand also
+	// excludes inString, it is already a strict subset of outside.
+	cand := ^(m.Whitespace | m.Structural | m.Quote | inString)
 	starts := cand &^ (cand<<1 | st.Follows)
 	st.Follows = cand >> 63
-	r.Emit = m.Structural&outside | openers | starts&outside
-	r.Scalar = cand & outside
-	r.EscInStr = escaped & inStr
-	r.Bad = m.Control&inStr|m.Control&outside&^m.Whitespace != 0
+
+	r.Emit = (m.Structural|starts)&outside | openers
+	r.Scalar = cand
+	r.EscInStr = escaped & inString
+	r.Bad = m.Control&(inString|outside&^m.Whitespace) != 0
 	r.WsOut = m.Whitespace & outside
-	r.InStr = inStr
+	r.InStr = inString
 	r.NonASCII = m.NonASCII
 }

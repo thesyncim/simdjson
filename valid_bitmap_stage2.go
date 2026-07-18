@@ -7,21 +7,11 @@ import (
 	simdkernels "github.com/thesyncim/simdjson/simd"
 )
 
-// The stage-2 machine (simd/stage2_arm64.s) replaces validBitmapWalk's
-// role on builds that have it: the grammar — pair legality, container
-// kinds, depth, comma/closer placement — runs in a direct-threaded
-// register machine over the emit masks, and the machine records each
-// scalar-start position for the Go-side body checks below. The portable
-// walk remains the engine on every other build and the reference the
-// machine is differentially tested against; both consume identical masks
-// and must produce identical verdicts at identical chunk boundaries.
-
-// stage2MachineEnabled gates the asm grammar machine: it needs the
-// machine itself and the batched stage-1 kernel that feeds it.
-var stage2MachineEnabled = simdkernels.Stage2Enabled() && simdkernels.Stage1StreamEnabled()
-
-// stage2IndexPositionEnabled gates the Go-native forward index writer.
-var stage2IndexPositionEnabled = simdkernels.Stage1StreamEnabled()
+// Stage 2 has two interchangeable Go-facing surfaces: the packed-position
+// machine used by production validation and index construction, and the legacy
+// bitmap API retained for comparison and compatibility. Both are available on
+// portable builds. NativeEnabled below is deliberately narrower: it only
+// selects the bitmap route when that API is backed by a native machine.
 
 // The machine's depth limit must equal the walk's; both reject the open
 // that would exceed it.
@@ -186,9 +176,9 @@ func validScalarTokenAt(src []byte, base unsafe.Pointer, n, j int) bool {
 	var end int
 	switch c := fastByteAt(base, j); {
 	case c == '-' || '0' <= c && c <= '9':
-		var msg string
-		end, msg = scanNumber(src, j)
-		if msg != "" {
+		var ok bool
+		end, ok = scanNumberFast(base, n, j)
+		if !ok {
 			return false
 		}
 	case c == 't':
@@ -209,10 +199,5 @@ func validScalarTokenAt(src []byte, base unsafe.Pointer, n, j int) bool {
 	default:
 		return false
 	}
-	if end < n {
-		if c := fastByteAt(base, end); !isJSONSpaceOrStructural(c) {
-			return false
-		}
-	}
-	return true
+	return end == n || isJSONSpaceOrStructural(fastByteAt(base, end))
 }

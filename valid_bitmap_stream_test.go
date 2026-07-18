@@ -28,7 +28,7 @@ func streamedOracle(t *testing.T, src []byte, label string) {
 			label, refDecided, gpDecided, len(src), src)
 	}
 	asmOK, asmDecided := gpOK, gpDecided
-	if stage2MachineEnabled {
+	if simdkernels.Stage2NativeEnabled() {
 		asmOK, asmDecided = validBitmapStreamedAsm(src)
 		if asmDecided != refDecided {
 			t.Fatalf("%s: decided mismatch: perBlock=%v machine=%v (len %d)\n%.200q",
@@ -178,7 +178,7 @@ func benchmarkBitmapEngines(b *testing.B, doc []byte) {
 			}
 		}
 	})
-	if stage2MachineEnabled {
+	if simdkernels.Stage2NativeEnabled() {
 		b.Run("machine", func(b *testing.B) {
 			b.SetBytes(int64(len(doc)))
 			for i := 0; i < b.N; i++ {
@@ -281,7 +281,7 @@ func TestValidBitmapRouting(t *testing.T) {
 				t.Fatalf("decided: perBlock=%v streamed=%v, want %v (len %d)",
 					refDecided, gpDecided, tc.wantDecided, len(tc.src))
 			}
-			if stage2MachineEnabled {
+			if simdkernels.Stage2NativeEnabled() {
 				asmOK, asmDecided := validBitmapStreamedAsm(tc.src)
 				if asmDecided != tc.wantDecided {
 					t.Fatalf("decided: machine=%v, want %v (len %d)", asmDecided, tc.wantDecided, len(tc.src))

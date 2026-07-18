@@ -91,13 +91,6 @@ type indexOracleBufs struct {
 	ref  []IndexEntry
 }
 
-func stage2IndexSkipIfUnavailable(tb testing.TB) {
-	tb.Helper()
-	if !stage2IndexPositionEnabled {
-		tb.Skip("Go SIMD index machine not available on this build")
-	}
-}
-
 func (b *indexOracleBufs) grow(src []byte) {
 	need := len(src) + 2
 	if cap(b.mach) < need {
@@ -139,7 +132,6 @@ func indexBitmapOracle(t *testing.T, src []byte, bufs *indexOracleBufs, mustAcce
 // counts and next links for nested and empty containers, key and escaped
 // flags, integer tagging, literal bodies, and the scalar terminator rule.
 func TestIndexBitmapCases(t *testing.T) {
-	stage2IndexSkipIfUnavailable(t)
 	var bufs indexOracleBufs
 	accepted := []string{
 		`{}`, `[]`, `5`, `"a"`, `true`, `false`, `null`, `-0.5e+7`,
@@ -179,7 +171,6 @@ func TestIndexBitmapCases(t *testing.T) {
 // (the fallback diverts to the diagnostic parser, as it always has), and
 // kind-mismatched closers.
 func TestIndexBitmapDepthCases(t *testing.T) {
-	stage2IndexSkipIfUnavailable(t)
 	var bufs indexOracleBufs
 	nest := func(depth int) string {
 		var b strings.Builder
@@ -222,7 +213,6 @@ func TestIndexBitmapDepthCases(t *testing.T) {
 // TestIndexBitmapTestSuite runs the whole JSONTestSuite corpus, plain
 // and indentation-wrapped, through the differential.
 func TestIndexBitmapTestSuite(t *testing.T) {
-	stage2IndexSkipIfUnavailable(t)
 	entries, err := os.ReadDir(jsonTestSuiteDir)
 	if err != nil {
 		t.Skip("JSONTestSuite corpus not present")
@@ -260,7 +250,6 @@ func TestIndexBitmapMutations(t *testing.T) {
 	if testing.Short() {
 		t.Skip("mutation differential is not short")
 	}
-	stage2IndexSkipIfUnavailable(t)
 	doc := buildBitmapTestDocument(t)
 	var bufs indexOracleBufs
 	indexBitmapOracle(t, doc, &bufs, true, "base document")
@@ -297,7 +286,6 @@ func TestIndexBitmapMutations(t *testing.T) {
 // TestIndexBitmapTruncations cuts a mid-size document at every engine
 // chunk boundary and a small prefix at every byte.
 func TestIndexBitmapTruncations(t *testing.T) {
-	stage2IndexSkipIfUnavailable(t)
 	doc := buildBitmapTestDocument(t)
 	var bufs indexOracleBufs
 	for cut := 0; cut <= len(doc); cut += validBitmapStreamChunkAsm * 64 {
@@ -316,7 +304,6 @@ func TestIndexBitmapTruncations(t *testing.T) {
 // across arbitrary position-stream splits. Splits deliberately land between
 // opening and closing quotes as well as between ordinary grammar tokens.
 func TestIndexPositionChunkResume(t *testing.T) {
-	stage2IndexSkipIfUnavailable(t)
 	doc := buildBitmapTestDocument(t)
 	n := len(doc)
 	base := unsafe.Pointer(unsafe.SliceData(doc))
@@ -405,7 +392,6 @@ func TestIndexPositionChunkResume(t *testing.T) {
 // before any out-of-bounds write, and the public path maps it to
 // ErrIndexFull through the fallback.
 func TestIndexBitmapStorageBounds(t *testing.T) {
-	stage2IndexSkipIfUnavailable(t)
 	doc := buildBitmapTestDocument(t)
 	need, err := RequiredIndexEntries(doc)
 	if err != nil {
@@ -439,7 +425,6 @@ func TestIndexBitmapStorageBounds(t *testing.T) {
 // TestIndexBitmapPublicWiring proves the public entry point takes the
 // engine on a large committed document and produces the identical index.
 func TestIndexBitmapPublicWiring(t *testing.T) {
-	stage2IndexSkipIfUnavailable(t)
 	doc := buildBitmapTestDocument(t)
 	need, err := RequiredIndexEntries(doc)
 	if err != nil {
@@ -477,7 +462,6 @@ func TestIndexBitmapPublicWiring(t *testing.T) {
 //
 //	GOGC=1 GOEXPERIMENT=simd gotip test -run TestGCCorruptionStage2Index -count=5 -cpu=1,4,8 ./
 func TestGCCorruptionStage2Index(t *testing.T) {
-	stage2IndexSkipIfUnavailable(t)
 	doc := buildBitmapTestDocument(t)
 	need, err := RequiredIndexEntries(doc)
 	if err != nil {
@@ -556,7 +540,6 @@ func TestGCCorruptionStage2Index(t *testing.T) {
 // benchmarkIndexEngines interleaves the portable builder and the engine
 // on one committed document.
 func benchmarkIndexEngines(b *testing.B, doc []byte) {
-	stage2IndexSkipIfUnavailable(b)
 	need, err := RequiredIndexEntries(doc)
 	if err != nil {
 		b.Fatal(err)
