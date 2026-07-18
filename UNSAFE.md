@@ -219,6 +219,9 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `typed_compiled_sequence.go` — `decodeCompiledFloatArrayStructural`
 - `typed_compiled_sequence.go` — `decodeCompiledInt64Slice`
 - `typed_compiled_sequence.go` — `decodeCompiledUint64Slice`
+- `typed_compiled_sequence.go` — `growCompiledFloat64Slice`
+- `typed_compiled_sequence.go` — `growCompiledInt64Slice`
+- `typed_compiled_sequence.go` — `growCompiledUint64Slice`
 - `typed_compiled_sequence.go` — `shortStructuralFloatAt`
 - `typed_compiled_sequence.go` — `zeroTypedArrayTail`
 - `typed_compiled_value.go` — `(*decoderCursor).decodeBytesArray`

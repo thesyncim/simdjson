@@ -88,8 +88,8 @@ func testFusedLargeScalarSliceAllocs[T any](t *testing.T, src []byte) {
 	if total == 0 {
 		t.Fatal("decoded no scalar elements")
 	}
-	if allocs > 3 {
-		t.Fatalf("fresh large scalar slice allocated %.1f times per decode, want <=3", allocs)
+	if allocs > 2 {
+		t.Fatalf("fresh large scalar slice allocated %.1f times per decode, want <=2", allocs)
 	}
 }
 
@@ -107,6 +107,23 @@ func TestFusedLargeScalarSliceAllocs(t *testing.T) {
 		src := []byte(`[` + strings.Repeat("1,", 8191) + `1]`)
 		testFusedLargeScalarSliceAllocs[uint64](t, src)
 	})
+}
+
+func TestFusedNamedScalarSliceUsesGeneralGrowth(t *testing.T) {
+	type scalar int64
+	type scalars []scalar
+	decoder, err := CompileDecoder[scalars](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got scalars
+	if err := decoder.Decode([]byte(`[1,-2,null,4]`), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := scalars{1, -2, 0, 4}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Decode() = %v, want %v", got, want)
+	}
 }
 
 func TestFusedLargeScalarSliceDoesNotReserveForString(t *testing.T) {

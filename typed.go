@@ -491,7 +491,11 @@ type typedNode struct {
 	ready          bool
 	encSimple      bool
 	structuralFast bool
-	emptySliceData unsafe.Pointer
+	// decBuiltinSlice is true only for []int64, []uint64, and []float64.
+	// Their fused loops can grow through the concrete Go type instead of
+	// asking reflection to allocate a separate slice-header object.
+	decBuiltinSlice bool
+	emptySliceData  unsafe.Pointer
 	// decHasReceiver lets containers skip all batching work when their element
 	// graph has no standard JSON or text unmarshaler. The GC-scanned array type
 	// is kept only in uncommon per-decode arena metadata, not every plan node.
@@ -734,6 +738,8 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 		}
 		node.kind = typedSlice
 		node.op = typedOpSlice
+		node.decBuiltinSlice = typ == reflect.TypeFor[[]int64]() ||
+			typ == reflect.TypeFor[[]uint64]() || typ == reflect.TypeFor[[]float64]()
 		node.emptySliceData = makeTypedEmptySliceData(typ)
 		elem, err := c.compile(typ.Elem(), path+"[]")
 		if err != nil {

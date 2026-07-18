@@ -278,7 +278,7 @@ func decodeCompiledInt64Slice(cursor *decoderCursor, node *typedNode, dst unsafe
 	header := (*typedSliceHeader)(dst)
 	if header.cap == 0 {
 		if capacity := initialScalarSliceCapacity(cursor); capacity != 0 {
-			growTypedSlice(node, dst, capacity)
+			growCompiledInt64Slice(node, dst, capacity)
 			header = (*typedSliceHeader)(dst)
 		}
 	}
@@ -296,7 +296,7 @@ func decodeCompiledInt64Slice(cursor *decoderCursor, node *typedNode, dst unsafe
 			}
 		}
 		if index == header.cap {
-			growTypedSlice(node, dst, nextTypedSliceCapacity(header.cap, index+1))
+			growCompiledInt64Slice(node, dst, nextTypedSliceCapacity(header.cap, index+1))
 			header = (*typedSliceHeader)(dst)
 		}
 		header.len = index + 1
@@ -311,7 +311,7 @@ func decodeCompiledUint64Slice(cursor *decoderCursor, node *typedNode, dst unsaf
 	header := (*typedSliceHeader)(dst)
 	if header.cap == 0 {
 		if capacity := initialScalarSliceCapacity(cursor); capacity != 0 {
-			growTypedSlice(node, dst, capacity)
+			growCompiledUint64Slice(node, dst, capacity)
 			header = (*typedSliceHeader)(dst)
 		}
 	}
@@ -329,7 +329,7 @@ func decodeCompiledUint64Slice(cursor *decoderCursor, node *typedNode, dst unsaf
 			}
 		}
 		if index == header.cap {
-			growTypedSlice(node, dst, nextTypedSliceCapacity(header.cap, index+1))
+			growCompiledUint64Slice(node, dst, nextTypedSliceCapacity(header.cap, index+1))
 			header = (*typedSliceHeader)(dst)
 		}
 		header.len = index + 1
@@ -344,7 +344,7 @@ func decodeCompiledFloat64Slice(cursor *decoderCursor, node *typedNode, dst unsa
 	header := (*typedSliceHeader)(dst)
 	if header.cap == 0 {
 		if capacity := initialScalarSliceCapacity(cursor); capacity != 0 {
-			growTypedSlice(node, dst, capacity)
+			growCompiledFloat64Slice(node, dst, capacity)
 			header = (*typedSliceHeader)(dst)
 		}
 	}
@@ -362,7 +362,7 @@ func decodeCompiledFloat64Slice(cursor *decoderCursor, node *typedNode, dst unsa
 			}
 		}
 		if index == header.cap {
-			growTypedSlice(node, dst, nextTypedSliceCapacity(header.cap, index+1))
+			growCompiledFloat64Slice(node, dst, nextTypedSliceCapacity(header.cap, index+1))
 			header = (*typedSliceHeader)(dst)
 		}
 		header.len = index + 1
@@ -371,6 +371,51 @@ func decodeCompiledFloat64Slice(cursor *decoderCursor, node *typedNode, dst unsa
 			return prependDecodePathIndex(retagCompiledError(err, node.elem.typ), index)
 		}
 	}
+}
+
+// The concrete scalar growth helpers use an ordinary built-in allocation for
+// the exact built-in slice types handled by the fused loops. The immutable plan
+// flag comes from reflect type identity, so each pointer conversion below is to
+// the destination's actual type. reflect.MakeSlice must also allocate a slice-
+// header object; these operations need only the backing array. Defined slice or
+// element types retain the reflection path.
+func growCompiledInt64Slice(node *typedNode, dst unsafe.Pointer, capacity int) {
+	if !node.decBuiltinSlice {
+		growTypedSlice(node, dst, capacity)
+		return
+	}
+	current := *(*[]int64)(dst)
+	next := make([]int64, len(current), capacity)
+	if len(current) != 0 {
+		copy(next, current)
+	}
+	*(*[]int64)(dst) = next
+}
+
+func growCompiledUint64Slice(node *typedNode, dst unsafe.Pointer, capacity int) {
+	if !node.decBuiltinSlice {
+		growTypedSlice(node, dst, capacity)
+		return
+	}
+	current := *(*[]uint64)(dst)
+	next := make([]uint64, len(current), capacity)
+	if len(current) != 0 {
+		copy(next, current)
+	}
+	*(*[]uint64)(dst) = next
+}
+
+func growCompiledFloat64Slice(node *typedNode, dst unsafe.Pointer, capacity int) {
+	if !node.decBuiltinSlice {
+		growTypedSlice(node, dst, capacity)
+		return
+	}
+	current := *(*[]float64)(dst)
+	next := make([]float64, len(current), capacity)
+	if len(current) != 0 {
+		copy(next, current)
+	}
+	*(*[]float64)(dst) = next
 }
 
 // initialScalarSliceCapacity counts the delimiters of a large top-level
