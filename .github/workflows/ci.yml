@@ -42,6 +42,15 @@ jobs:
       - name: Build pinned Go tip
         run: ./scripts/bootstrap-gotip.sh "$RUNNER_TEMP/gotip"
 
+      - name: Portable stage-1 candidate correctness
+        run: $RUNNER_TEMP/gotip/bin/go test ./simd -run '^TestStage1PortableCandidates$' -count=1
+
+      - name: Portable stage-1 candidate benchmark
+        run: >-
+          $RUNNER_TEMP/gotip/bin/go test ./simd -run '^$'
+          -bench '^BenchmarkStage1(Escaped|Rec)Portable$'
+          -benchtime=1s -count=12 -cpu=1
+
       - name: Tests, pure Go
         run: $RUNNER_TEMP/gotip/bin/go test ./...
 
