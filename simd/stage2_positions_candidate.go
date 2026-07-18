@@ -25,6 +25,7 @@ func Stage2PositionsCursorCandidate(base *byte, positions []uint32, kinds *[Stag
 	nscalars := 0
 	var j int
 	var cls uint64
+	var c byte
 
 	next := func() int {
 		j := int(*(*uint32)(pos))
@@ -287,7 +288,7 @@ func Stage2PositionsCursorCandidate(base *byte, positions []uint32, kinds *[Stag
 		goto done
 	}
 	j = int(*(*uint32)(pos))
-	c := *(*byte)(unsafe.Add(basep, j))
+	c = *(*byte)(unsafe.Add(basep, j))
 	pos = unsafe.Add(pos, 4)
 	switch uint64(stage2Class[c]) {
 	case stage2ccQ:
