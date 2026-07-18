@@ -12,6 +12,15 @@ import (
 var scanSink int
 var copySink byte
 
+//go:noinline
+func scanStackBackedString() int {
+	var src [128]byte
+	for i := range src {
+		src[i] = 'a'
+	}
+	return scanStringSpecialRuntime(src[:], 0)
+}
+
 func TestSIMDScannerDispatch(t *testing.T) {
 	info := Current()
 	backend := info.StringBackend
@@ -40,6 +49,14 @@ func TestSIMDScannerDispatch(t *testing.T) {
 	}
 	if runtime.GOARCH == "amd64" && !info.Features.Has(CPUFeatureAVX2) {
 		t.Fatalf("amd64 SIMD backend features = %v, want AVX2", info.Features)
+	}
+}
+
+func TestSIMDScannerDispatchKeepsInputOnStack(t *testing.T) {
+	if allocs := testing.AllocsPerRun(1000, func() {
+		scanSink = scanStackBackedString()
+	}); allocs != 0 {
+		t.Fatalf("stack-backed scanner allocs = %v, want 0", allocs)
 	}
 }
 
