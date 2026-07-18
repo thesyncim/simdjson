@@ -65,38 +65,47 @@ var stage1PortableClass = func() (table [256]uint64) {
 	return table
 }()
 
-// stage1BlockPortable classifies one 64-byte block with a compact lookup and
-// bit-sliced accumulator. Each group of eight bytes becomes six mask bytes;
-// those bytes are placed directly into their final 64-bit block masks.
+func stage1Pack8(block *[64]byte, offset int) uint64 {
+	return stage1PortableClass[block[offset+0]] |
+		stage1PortableClass[block[offset+1]]<<1 |
+		stage1PortableClass[block[offset+2]]<<2 |
+		stage1PortableClass[block[offset+3]]<<3 |
+		stage1PortableClass[block[offset+4]]<<4 |
+		stage1PortableClass[block[offset+5]]<<5 |
+		stage1PortableClass[block[offset+6]]<<6 |
+		stage1PortableClass[block[offset+7]]<<7
+}
+
+// stage1BlockPortable classifies one 64-byte block. The eight groups are
+// intentionally unrolled: this removes loop/index bookkeeping from the scalar
+// fallback and lets the compiler keep the packed class words in registers.
 func stage1BlockPortable(block *[64]byte, out *Stage1Masks) {
-	var whitespace, structural, quote, backslash, control uint64
-	var nonASCII uint64
-	for group := 0; group < 8; group++ {
-		bytes := block[group*8:]
-		packed := stage1PortableClass[bytes[0]] |
-			stage1PortableClass[bytes[1]]<<1 |
-			stage1PortableClass[bytes[2]]<<2 |
-			stage1PortableClass[bytes[3]]<<3 |
-			stage1PortableClass[bytes[4]]<<4 |
-			stage1PortableClass[bytes[5]]<<5 |
-			stage1PortableClass[bytes[6]]<<6 |
-			stage1PortableClass[bytes[7]]<<7
-		shift := uint(group * 8)
-		whitespace |= packed & 0xff << shift
-		structural |= packed >> 8 & 0xff << shift
-		quote |= packed >> 16 & 0xff << shift
-		backslash |= packed >> 24 & 0xff << shift
-		control |= packed >> 32 & 0xff << shift
-		nonASCII |= packed >> 40
-	}
+	p0 := stage1Pack8(block, 0)
+	p1 := stage1Pack8(block, 8)
+	p2 := stage1Pack8(block, 16)
+	p3 := stage1Pack8(block, 24)
+	p4 := stage1Pack8(block, 32)
+	p5 := stage1Pack8(block, 40)
+	p6 := stage1Pack8(block, 48)
+	p7 := stage1Pack8(block, 56)
+
 	*out = Stage1Masks{
-		Whitespace: whitespace,
-		Structural: structural,
-		Quote:      quote,
-		Backslash:  backslash,
-		Control:    control,
-		NonASCII:   nonASCII != 0,
+		Whitespace: stage1Plane(p0, 0, 0) | stage1Plane(p1, 0, 8) | stage1Plane(p2, 0, 16) | stage1Plane(p3, 0, 24) |
+			stage1Plane(p4, 0, 32) | stage1Plane(p5, 0, 40) | stage1Plane(p6, 0, 48) | stage1Plane(p7, 0, 56),
+		Structural: stage1Plane(p0, 8, 0) | stage1Plane(p1, 8, 8) | stage1Plane(p2, 8, 16) | stage1Plane(p3, 8, 24) |
+			stage1Plane(p4, 8, 32) | stage1Plane(p5, 8, 40) | stage1Plane(p6, 8, 48) | stage1Plane(p7, 8, 56),
+		Quote: stage1Plane(p0, 16, 0) | stage1Plane(p1, 16, 8) | stage1Plane(p2, 16, 16) | stage1Plane(p3, 16, 24) |
+			stage1Plane(p4, 16, 32) | stage1Plane(p5, 16, 40) | stage1Plane(p6, 16, 48) | stage1Plane(p7, 16, 56),
+		Backslash: (p0 >> 24 & 0xff) | (p1 >> 24 & 0xff << 8) | (p2 >> 24 & 0xff << 16) | (p3 >> 24 & 0xff << 24) |
+			(p4 >> 24 & 0xff << 32) | (p5 >> 24 & 0xff << 40) | (p6 >> 24 & 0xff << 48) | (p7 >> 24 & 0xff << 56),
+		Control: (p0 >> 32 & 0xff) | (p1 >> 32 & 0xff << 8) | (p2 >> 32 & 0xff << 16) | (p3 >> 32 & 0xff << 24) |
+			(p4 >> 32 & 0xff << 32) | (p5 >> 32 & 0xff << 40) | (p6 >> 32 & 0xff << 48) | (p7 >> 32 & 0xff << 56),
+		NonASCII: (p0|p1|p2|p3|p4|p5|p6|p7)&(0xff<<40) != 0,
 	}
+}
+
+func stage1Plane(packed uint64, plane, shift uint) uint64 {
+	return (packed >> plane & 0xff) << shift
 }
 
 func stage1ByteEqExact(x uint64, value byte) uint64 {
