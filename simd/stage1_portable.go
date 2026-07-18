@@ -14,7 +14,7 @@ import "math/bits"
 type Stage1Masks struct {
 	Whitespace uint64 // space, tab, line feed, carriage return
 	Structural uint64 // { } [ ] : ,
-	Quote      uint64 // unescaped quotes only
+	Quote      uint64 // every raw quote; escaped quotes are removed by stage 1
 	Backslash  uint64 // every backslash
 	Control    uint64 // bytes below 0x20 (whitespace included)
 	NonASCII   bool   // any byte at or above 0x80 in the block
@@ -27,31 +27,50 @@ type Stage1Carry struct {
 	InString uint64 // all-ones when the next block starts inside a string
 }
 
-// Stage1Escaped resolves which characters are escaped by backslash
-// sequences, updating the carry. This is the branchless odd-length
-// backslash-run algorithm from simdjson.
+const stage1EvenBits = uint64(0x5555555555555555)
+
+// Stage1Escaped resolves the bytes escaped by backslash runs and updates the
+// block-boundary carry. The common paths avoid the full odd-run arithmetic:
+// blocks without backslashes only forward a pending carry, while isolated
+// backslashes directly produce their shifted target mask.
 func Stage1Escaped(backslash uint64, carry *Stage1Carry) uint64 {
+	carryEscaped := carry.Escaped
 	if backslash == 0 {
-		escaped := carry.Escaped
 		carry.Escaped = 0
-		return escaped
+		return carryEscaped
 	}
-	backslash &^= carry.Escaped
-	followsEscape := backslash<<1 | carry.Escaped
-	const evenBits = uint64(0x5555555555555555)
-	oddSequenceStarts := backslash & ^evenBits & ^followsEscape
+
+	// A carry consumes a backslash in lane zero. Remove it before looking for
+	// adjacent active backslashes; otherwise a boundary escape can make an
+	// isolated run appear dense and can incorrectly start another escape.
+	backslash &^= carryEscaped
+	followsEscape := backslash<<1 | carryEscaped
+	if backslash&followsEscape == 0 {
+		carry.Escaped = backslash >> 63
+		return followsEscape
+	}
+
+	// General odd-length backslash-run resolution from simdjson. Adding each
+	// odd-positioned run start to the run mask propagates through that run;
+	// the shifted sum then selects exactly the escaped target bytes.
+	oddSequenceStarts := backslash & ^(stage1EvenBits | followsEscape)
 	sequencesStartingOnEven, overflow := bits.Add64(oddSequenceStarts, backslash, 0)
 	carry.Escaped = overflow
-	invert := sequencesStartingOnEven << 1
-	return (evenBits ^ invert) & followsEscape
+	return (stage1EvenBits ^ sequencesStartingOnEven<<1) & followsEscape
 }
 
-// Stage1PrefixXOR computes for each bit the parity of all bits at or
-// below it; with the unescaped-quote mask as input the result marks
-// string interiors from each opening quote through the byte before its
-// closing quote. The carry flips the whole block when it starts inside a
-// string.
+// Stage1PrefixXOR computes for each bit the parity of all bits at or below it;
+// with the unescaped-quote mask as input the result marks string interiors
+// from each opening quote through the byte before its closing quote. The carry
+// flips the whole block when it starts inside a string.
 func Stage1PrefixXOR(quotes uint64, carry *Stage1Carry) uint64 {
+	// Quote-free blocks are common in long strings, whitespace, and numeric
+	// arrays. Their output is exactly the incoming string state and the carry
+	// cannot change, avoiding the six-instruction dependency chain below.
+	if quotes == 0 {
+		return carry.InString
+	}
+
 	m := quotes
 	m ^= m << 1
 	m ^= m << 2
