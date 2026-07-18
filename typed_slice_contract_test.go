@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -63,6 +64,82 @@ func diffUint64Slice(t *testing.T, s string) {
 	}
 	if wantErr == nil && !reflect.DeepEqual(want, got) {
 		t.Fatalf("[]uint64 %q: value mismatch: stdlib=%v ours=%v", s, want, got)
+	}
+}
+
+func testFusedLargeScalarSliceAllocs[T any](t *testing.T, src []byte) {
+	t.Helper()
+	decoder, err := CompileDecoder[[]T](DecoderOptions{ZeroCopy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var warm []T
+	if err := decoder.Decode(src, &warm); err != nil {
+		t.Fatal(err)
+	}
+	total := 0
+	allocs := testing.AllocsPerRun(500, func() {
+		var got []T
+		if err := decoder.Decode(src, &got); err != nil {
+			panic(err)
+		}
+		total += len(got)
+	})
+	if total == 0 {
+		t.Fatal("decoded no scalar elements")
+	}
+	if allocs > 3 {
+		t.Fatalf("fresh large scalar slice allocated %.1f times per decode, want <=3", allocs)
+	}
+}
+
+func TestFusedLargeScalarSliceAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector adds bookkeeping allocations")
+	}
+	t.Run("int64", func(t *testing.T) {
+		testFusedLargeScalarSliceAllocs[int64](t, intArrayJSON(8192))
+	})
+	t.Run("float64", func(t *testing.T) {
+		testFusedLargeScalarSliceAllocs[float64](t, floatArrayJSON(8192))
+	})
+	t.Run("uint64", func(t *testing.T) {
+		src := []byte(`[` + strings.Repeat("1,", 8191) + `1]`)
+		testFusedLargeScalarSliceAllocs[uint64](t, src)
+	})
+}
+
+func TestFusedLargeScalarSliceDoesNotReserveForString(t *testing.T) {
+	for _, src := range []string{
+		`["` + strings.Repeat("value,", 1024) + `"]`,
+		`[0,"` + strings.Repeat("value,", 1024) + `"]`,
+	} {
+		decoder, err := CompileDecoder[[]float64](DecoderOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []float64
+		if err := decoder.Decode([]byte(src), &got); err == nil {
+			t.Fatal("string decoded into []float64")
+		}
+		if cap(got) > 4 {
+			t.Fatalf("invalid string array reserved capacity %d, want <=4", cap(got))
+		}
+	}
+}
+
+func TestFusedLargeScalarSliceBoundsInvalidReservation(t *testing.T) {
+	src := []byte(`[0,[` + strings.Repeat("0,", 4096) + `0]]`)
+	decoder, err := CompileDecoder[[]float64](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []float64
+	if err := decoder.Decode(src, &got); err == nil {
+		t.Fatal("nested array decoded into []float64")
+	}
+	if limit := (len(src) + 1) / 2; cap(got) > limit {
+		t.Fatalf("invalid nested array reserved capacity %d, want <=%d", cap(got), limit)
 	}
 }
 

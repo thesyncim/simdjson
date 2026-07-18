@@ -1,8 +1,11 @@
 package simdjson
 
 import (
+	"bytes"
 	"unsafe"
 )
+
+const scalarSliceReserveMinBytes = 4096
 
 func (cursor *decoderCursor) decodeCompiledSlice(node *typedNode, dst unsafe.Pointer) error {
 	if i := cursor.i; i < len(cursor.src) && cursor.src[i] == '[' && cursor.depth < cursor.maxDepth {
@@ -273,6 +276,12 @@ func (cursor *decoderCursor) decodeCompiledSliceStructural(node *typedNode, dst 
 
 func decodeCompiledInt64Slice(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
 	header := (*typedSliceHeader)(dst)
+	if header.cap == 0 {
+		if capacity := initialScalarSliceCapacity(cursor); capacity != 0 {
+			growTypedSlice(node, dst, capacity)
+			header = (*typedSliceHeader)(dst)
+		}
+	}
 	for index, first := 0, true; ; index, first = index+1, false {
 		if !scalarSliceAdvance(cursor, first) {
 			more, err := cursor.NextArrayElement(first)
@@ -300,6 +309,12 @@ func decodeCompiledInt64Slice(cursor *decoderCursor, node *typedNode, dst unsafe
 
 func decodeCompiledUint64Slice(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
 	header := (*typedSliceHeader)(dst)
+	if header.cap == 0 {
+		if capacity := initialScalarSliceCapacity(cursor); capacity != 0 {
+			growTypedSlice(node, dst, capacity)
+			header = (*typedSliceHeader)(dst)
+		}
+	}
 	for index, first := 0, true; ; index, first = index+1, false {
 		if !scalarSliceAdvance(cursor, first) {
 			more, err := cursor.NextArrayElement(first)
@@ -327,6 +342,12 @@ func decodeCompiledUint64Slice(cursor *decoderCursor, node *typedNode, dst unsaf
 
 func decodeCompiledFloat64Slice(cursor *decoderCursor, node *typedNode, dst unsafe.Pointer) error {
 	header := (*typedSliceHeader)(dst)
+	if header.cap == 0 {
+		if capacity := initialScalarSliceCapacity(cursor); capacity != 0 {
+			growTypedSlice(node, dst, capacity)
+			header = (*typedSliceHeader)(dst)
+		}
+	}
 	for index, first := 0, true; ; index, first = index+1, false {
 		if !scalarSliceAdvance(cursor, first) {
 			more, err := cursor.NextArrayElement(first)
@@ -350,6 +371,40 @@ func decodeCompiledFloat64Slice(cursor *decoderCursor, node *typedNode, dst unsa
 			return prependDecodePathIndex(retagCompiledError(err, node.elem.typ), index)
 		}
 	}
+}
+
+// initialScalarSliceCapacity counts the delimiters of a large top-level
+// scalar array before its first allocation. Numeric and null elements cannot
+// contain a comma or quote, so the count is exact for every valid input
+// accepted by the fused loops. The input-derived cap keeps malformed inputs
+// within the space required by a valid array of one-byte scalars. Small and
+// nested slices retain ordinary growth to avoid adding a prescan to common
+// record-shaped documents.
+func initialScalarSliceCapacity(cursor *decoderCursor) int {
+	if cursor.depth != 1 || len(cursor.src)-cursor.i < scalarSliceReserveMinBytes {
+		return 0
+	}
+	end := len(cursor.src)
+	for end > cursor.i && isJSONWhitespace(cursor.src[end-1]) {
+		end--
+	}
+	if end <= cursor.i || cursor.src[end-1] != ']' {
+		return 0
+	}
+	values := cursor.src[cursor.i : end-1]
+	start := skipSpace(values, 0)
+	if start == len(values) {
+		return 0
+	}
+	values = values[start:]
+	if bytes.IndexByte(values, '"') >= 0 {
+		return 0
+	}
+	capacity := bytes.Count(values, []byte{','}) + 1
+	if limit := (len(values) + 1) / 2; capacity > limit {
+		capacity = limit
+	}
+	return capacity
 }
 
 // scalarSliceAdvance consumes the inline delimiter between two scalar elements:
