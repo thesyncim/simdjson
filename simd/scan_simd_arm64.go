@@ -8,20 +8,6 @@ import (
 	"unsafe"
 )
 
-// ARM64 scanner implementations are bound once during package initialization.
-// Hot calls contain no CPU capability checks; they call the function selected
-// for this process. Today the selected vector implementation is NEON. Keeping
-// selection per kernel allows future DotProd or SVE variants without changing
-// callers or adding feature branches to scanner loops.
-var (
-	scanStringSpecialSelected      = scanStringSpecialScalar
-	scanStringSyntaxSelected       = scanStringSyntaxScalar
-	scanEncodedHTMLSpecialSelected = scanEncodedHTMLSpecialScalar
-	scanEncodedHTMLSyntaxSelected  = scanEncodedHTMLSyntaxScalar
-	validUTF8Selected              = utf8.Valid
-	validUTF8NoLineSelected        = validUTF8NoLineSeparatorGeneric
-)
-
 // The utf8Lookup tables implement the three-lookup UTF-8 classification
 // from Keiser and Lemire, "Validating UTF-8 In Less Than One Instruction
 // Per Byte" (https://arxiv.org/abs/2010.03090): each nibble of a byte pair
@@ -43,17 +29,10 @@ var utf8LookupSecondHigh = [16]uint8{
 }
 
 func initStringScanner() {
-	// The SWAR probes stay: most matches sit within the first 16 bytes and
-	// the span passed to the scanner is the remaining document, not the
-	// string. After the probes miss, the selected NEON scanner takes over once
-	// two full blocks remain. All bindings happen here; calls after package
-	// initialization contain no capability test or backend switch.
-	scanStringSpecialSelected = scanStringSpecialSIMD
-	scanStringSyntaxSelected = scanStringSyntaxSIMD
-	scanEncodedHTMLSpecialSelected = scanEncodedHTMLSpecialSIMD
-	scanEncodedHTMLSyntaxSelected = scanEncodedHTMLSyntaxSIMD
-	validUTF8Selected = validUTF8NEON
-	validUTF8NoLineSelected = validUTF8NoLineSeparatorNEON
+	// NEON is mandatory on Go's arm64 targets, so these wrappers call the
+	// selected kernels directly. This keeps capability checks out of hot calls
+	// without routing slices through function values, which makes stack-backed
+	// parser input escape and adds an allocation.
 	scanStringSelectedMinBytes = 32
 	scanStringProbeMinBytes = 17
 	scanStringSpecialBackend = "arm64-neon"
@@ -65,34 +44,26 @@ func initStringScanner() {
 }
 
 func scanStringSpecialRuntime(src []byte, i int) int {
-	return scanStringSpecialSelected(src, i)
+	return scanStringSpecialSIMD(src, i)
 }
 
 func scanStringSyntaxRuntime(src []byte, i int) int {
-	return scanStringSyntaxSelected(src, i)
+	return scanStringSyntaxSIMD(src, i)
 }
 
 func scanEncodedHTMLSpecialRuntime(src []byte, i int) int {
-	return scanEncodedHTMLSpecialSelected(src, i)
+	return scanEncodedHTMLSpecialSIMD(src, i)
 }
 
 func scanEncodedHTMLSyntaxRuntime(src []byte, i int) int {
-	return scanEncodedHTMLSyntaxSelected(src, i)
+	return scanEncodedHTMLSyntaxSIMD(src, i)
 }
 
+// validUTF8NoLineSeparatorRuntime is validUTF8Runtime's lookup-table
+// classification with the U+2028/U+2029 detection folded into the same
+// pass: the shifted prev1/prev2 vectors the algorithm already computes are
+// exactly what the three-byte sequence E2 80 A8/A9 needs.
 func validUTF8NoLineSeparatorRuntime(src []byte) bool {
-	return validUTF8NoLineSelected(src)
-}
-
-func validUTF8Runtime(src []byte) bool {
-	return validUTF8Selected(src)
-}
-
-// validUTF8NoLineSeparatorNEON is validUTF8NEON's lookup-table classification
-// with U+2028/U+2029 detection folded into the same pass. The shifted
-// prev1/prev2 vectors the algorithm already computes are exactly what the
-// three-byte sequence E2 80 A8/A9 needs.
-func validUTF8NoLineSeparatorNEON(src []byte) bool {
 	if len(src) < 16 {
 		return utf8.Valid(src) && !hasJSONLineSeparatorScalar(src, 0)
 	}
@@ -156,7 +127,7 @@ func validUTF8NoLineSeparatorNEON(src []byte) bool {
 	return utf8.Valid(src[tail:]) && !hasJSONLineSeparatorScalar(src, separatorTail)
 }
 
-func validUTF8NEON(src []byte) bool {
+func validUTF8Runtime(src []byte) bool {
 	if len(src) < 16 {
 		return utf8.Valid(src)
 	}
