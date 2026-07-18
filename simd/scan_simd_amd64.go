@@ -48,19 +48,19 @@ func initStringScanner() {
 }
 
 func scanStringSpecialRuntime(src []byte, i int) int {
-	return scanStringSpecialSelected(src, i)
+	return scanStringSpecialSelected(noescapeBytes(src), i)
 }
 
 func scanStringSyntaxRuntime(src []byte, i int) int {
-	return scanStringSyntaxSelected(src, i)
+	return scanStringSyntaxSelected(noescapeBytes(src), i)
 }
 
 func scanEncodedHTMLSpecialRuntime(src []byte, i int) int {
-	return scanEncodedHTMLSpecialSelected(src, i)
+	return scanEncodedHTMLSpecialSelected(noescapeBytes(src), i)
 }
 
 func scanEncodedHTMLSyntaxRuntime(src []byte, i int) int {
-	return scanEncodedHTMLSyntaxSelected(src, i)
+	return scanEncodedHTMLSyntaxSelected(noescapeBytes(src), i)
 }
 
 func validUTF8NoLineSeparatorRuntime(src []byte) bool {
