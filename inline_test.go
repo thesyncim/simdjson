@@ -106,6 +106,57 @@ func TestInlineCatchAllKeyOwnership(t *testing.T) {
 	})
 }
 
+func TestInlineDecoderScratchCleared(t *testing.T) {
+	decoder, err := CompileDecoder[inlineRaw](DecoderOptions{InlineFields: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoder.root.inlineMap.decMapScratch == 0 || decoder.scratch == nil {
+		t.Fatal("eligible inline map did not receive decoder scratch")
+	}
+	var got inlineRaw
+	if err := decoder.Decode([]byte(`{"id":1,"name":"x","extra":[1,2,3]}`), &got); err != nil {
+		t.Fatal(err)
+	}
+	state := decoder.scratch.take()
+	defer decoder.scratch.release(state)
+	slot := int(decoder.root.inlineMap.decMapScratch - 1)
+	scratch := &state.operation.maps[slot]
+	if scratch.inUse || scratch.entries != 0 {
+		t.Fatalf("released inline scratch remains active: inUse=%v entries=%d", scratch.inUse, scratch.entries)
+	}
+	if !scratch.key.IsValid() || !scratch.key.IsZero() {
+		t.Fatal("released inline key box retained a value")
+	}
+	if !scratch.element.IsValid() || !scratch.element.IsZero() {
+		t.Fatal("released inline element box retained a value")
+	}
+}
+
+func TestInlineDecoderScratchAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector adds bookkeeping allocations")
+	}
+	decoder, err := CompileDecoder[inlineRaw](DecoderOptions{InlineFields: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := []byte(`{"id":1,"name":"x","alpha":true,"beta":[1,2,3],"gamma":"hello","delta":42}`)
+	var warm inlineRaw
+	if err := decoder.Decode(src, &warm); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(1000, func() {
+		var got inlineRaw
+		if err := decoder.Decode(src, &got); err != nil {
+			panic(err)
+		}
+	})
+	if allocs > 10 {
+		t.Fatalf("four inline entries allocated %.1f times per decode, want <=10", allocs)
+	}
+}
+
 // TestInlineCatchAllAny checks a map[string]any catch-all decodes the dynamic
 // shapes and re-emits them.
 func TestInlineCatchAllAny(t *testing.T) {
@@ -368,6 +419,35 @@ func TestInlineConcurrentEncode(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestInlineConcurrentDecode(t *testing.T) {
+	decoder, err := CompileDecoder[inlineRaw](DecoderOptions{InlineFields: true, ZeroCopy: true, Replace: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := []byte(`{"id":9,"name":"n","alpha":1,"beta":"two","gamma":[3,3,3],"delta":true}`)
+	var wait sync.WaitGroup
+	for range 16 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			var got inlineRaw
+			for range 500 {
+				if err := decoder.Decode(src, &got); err != nil {
+					t.Errorf("decode: %v", err)
+					return
+				}
+				if got.ID != 9 || got.Name != "n" || string(got.Extra["alpha"]) != "1" ||
+					string(got.Extra["beta"]) != `"two"` || string(got.Extra["gamma"]) != "[3,3,3]" ||
+					string(got.Extra["delta"]) != "true" {
+					t.Errorf("concurrent decode = %#v", got)
+					return
+				}
+			}
+		}()
+	}
+	wait.Wait()
 }
 
 // BenchmarkInlineEncode measures a populated catch-all with a reused encoder:

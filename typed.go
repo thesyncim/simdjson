@@ -519,10 +519,11 @@ type typedNode struct {
 // typedInlineMap describes a struct's ",inline" map[string]T catch-all: where
 // the map lives in the struct and how one entry value is decoded and encoded.
 type typedInlineMap struct {
-	offset  uintptr
-	mapType reflect.Type
-	elem    *typedNode
-	sorted  bool // emit entries in sorted key order
+	offset        uintptr
+	mapType       reflect.Type
+	elem          *typedNode
+	sorted        bool // emit entries in sorted key order
+	decMapScratch uint32
 	// encKey indexes a reserved encoder-scratch box of the key type. Encoding
 	// copies each member name into it with SetIterKey, avoiding a reflect
 	// allocation per member; values collect into a pooled backing slice so each

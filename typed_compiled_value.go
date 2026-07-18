@@ -45,60 +45,62 @@ func (cursor *decoderCursor) decodeCompiledPointer(node *typedNode, dst unsafe.P
 	}
 }
 
-// inlineDecoder decodes a run of unknown members into one struct's ",inline"
-// catch-all map. It mirrors decodeCompiledMap: a single element and a single
-// key value are allocated once and reused for every member, so a document with
-// N unknown members costs one element allocation rather than N.
-//
-// The reused values are heap backed (reflect.New), never pointers into the
-// destination struct, so this decoder is safe to keep on the heap while the
-// destination lives on a stack that may move. The map header is re-derived from
-// structPtr on each call as a stack local for the same reason.
-type inlineDecoder struct {
-	keyValue     reflect.Value
-	elementValue reflect.Value
-	elementPtr   unsafe.Pointer
-	entries      int
-}
-
-// newInlineDecoder builds the reusable state for a catch-all map. It is called
-// at most once per struct decode, on the first unknown member.
-func newInlineDecoder(inline *typedInlineMap) *inlineDecoder {
+// takeInlineDecoder returns one key and element box for a run of unknown
+// members. Eligible compiled plans reuse cleared boxes across operations;
+// observable or recursively active boxes retain the one-call fallback.
+func (cursor *decoderCursor) takeInlineDecoder(inline *typedInlineMap) *decoderMapScratch {
+	if inline.decMapScratch != 0 && cursor.state != nil && cursor.state.operation != nil {
+		index := int(inline.decMapScratch - 1)
+		if index < len(cursor.state.operation.maps) {
+			scratch := &cursor.state.operation.maps[index]
+			if !scratch.inUse {
+				if !scratch.element.IsValid() {
+					element := reflect.New(inline.elem.typ)
+					scratch.element = element.Elem()
+					scratch.key = reflect.New(inline.mapType.Key()).Elem()
+				}
+				scratch.entries = 0
+				scratch.inUse = true
+				return scratch
+			}
+		}
+	}
 	element := reflect.New(inline.elem.typ)
-	return &inlineDecoder{
-		keyValue:     reflect.New(inline.mapType.Key()).Elem(),
-		elementValue: element.Elem(),
-		elementPtr:   element.UnsafePointer(),
+	return &decoderMapScratch{
+		key:     reflect.New(inline.mapType.Key()).Elem(),
+		element: element.Elem(),
+		inUse:   true,
 	}
 }
 
-// decodeEntry decodes one member into the catch-all, allocating the map on
-// first use. The member name becomes the key, cloned in owned mode so the
-// retained key does not alias the source; the value follows the cursor's
-// ownership rules like any other decode. SetMapIndex copies both key and value
-// into the map, so reusing the source values across members is safe.
-func (d *inlineDecoder) decodeEntry(cursor *decoderCursor, inline *typedInlineMap, structPtr unsafe.Pointer, key string) error {
+// decodeInlineEntry decodes one member into the catch-all, allocating the map on
+// first use. The member name becomes the key, using an already-owned source
+// backing or an independent clone; the value follows the cursor's ownership
+// rules like any other decode. SetMapIndex copies both key and value into the
+// map, so reusing the boxes across members is safe.
+func (d *decoderMapScratch) decodeInlineEntry(cursor *decoderCursor, inline *typedInlineMap, structPtr unsafe.Pointer, key string) error {
 	mapValue := reflect.NewAt(inline.mapType, unsafe.Add(structPtr, inline.offset)).Elem()
 	if mapValue.IsNil() {
 		mapValue.Set(reflect.MakeMap(inline.mapType))
 	}
-	d.elementValue.SetZero()
+	d.element.SetZero()
 	batchedReceivers := d.entries > 0 && inline.elem.decHasReceiver && cursor.beginReceiverBatch()
 	d.entries++
+	elementPtr := d.element.Addr().UnsafePointer()
 	var err error
 	switch inline.elem.kind {
 	case typedStruct:
-		err = cursor.decodeCompiledStruct(inline.elem, d.elementPtr)
+		err = cursor.decodeCompiledStruct(inline.elem, elementPtr)
 	case typedSlice:
-		err = cursor.decodeCompiledSlice(inline.elem, d.elementPtr)
+		err = cursor.decodeCompiledSlice(inline.elem, elementPtr)
 	case typedArray:
-		err = cursor.decodeCompiledArray(inline.elem, d.elementPtr)
+		err = cursor.decodeCompiledArray(inline.elem, elementPtr)
 	case typedPointer:
-		err = cursor.decodeCompiledPointer(inline.elem, d.elementPtr)
+		err = cursor.decodeCompiledPointer(inline.elem, elementPtr)
 	case typedMap:
-		err = cursor.decodeCompiledMap(inline.elem, d.elementPtr)
+		err = cursor.decodeCompiledMap(inline.elem, elementPtr)
 	default:
-		err = cursor.decodeCompiled(inline.elem, d.elementPtr)
+		err = cursor.decodeCompiled(inline.elem, elementPtr)
 	}
 	cursor.endReceiverBatch(batchedReceivers)
 	if err != nil {
@@ -107,8 +109,8 @@ func (d *inlineDecoder) decodeEntry(cursor *decoderCursor, inline *typedInlineMa
 	if cursor.flags&(decoderZeroCopy|decoderSourceOwned) == 0 {
 		key = strings.Clone(key)
 	}
-	d.keyValue.SetString(key)
-	mapValue.SetMapIndex(d.keyValue, d.elementValue)
+	d.key.SetString(key)
+	mapValue.SetMapIndex(d.key, d.element)
 	return nil
 }
 

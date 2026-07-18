@@ -10,12 +10,14 @@ const (
 	decoderMapScratchRetentionBytes = 64 << 10
 )
 
-// decoderMapScratch owns the addressable reflection boxes for one compiled
-// map node. SetMapIndex copies both boxes into the destination map. The boxes
-// are cleared before reuse so cached scratch retains no decoded object graph.
+// decoderMapScratch owns the addressable reflection boxes for one compiled map
+// or inline catch-all. SetMapIndex copies both boxes into the destination map.
+// The boxes are cleared before reuse so cached scratch retains no decoded
+// object graph.
 type decoderMapScratch struct {
 	key     reflect.Value
 	element reflect.Value
+	entries int
 	inUse   bool
 }
 
@@ -75,6 +77,7 @@ func (s *decoderState) resetOperationState() {
 			scratch.element.SetZero()
 		}
 		scratch.inUse = false
+		scratch.entries = 0
 	}
 }
 
@@ -108,13 +111,23 @@ func releaseMapScratch(scratch *decoderMapScratch) {
 	scratch.inUse = false
 }
 
+func releaseInlineMapScratch(scratch *decoderMapScratch) {
+	if scratch == nil {
+		return
+	}
+	scratch.entries = 0
+	releaseMapScratch(scratch)
+}
+
 // prepareDecoderMapScratch assigns fixed operation-state slots only to maps
-// whose key and value boxes cannot be observed by user code. Text key methods,
-// custom value methods, and dynamic interfaces retain the ordinary one-call
-// allocation path. The cumulative shallow box size bounds every cached state.
+// and inline catch-alls whose boxes cannot be observed by user code. Text key
+// methods, native value hooks, and dynamic interfaces retain the ordinary
+// one-call allocation path. The cumulative shallow box size bounds every
+// cached state.
 func prepareDecoderMapScratch(root *typedNode) int {
 	seen := make(map[*typedNode]bool)
 	usedBytes := uintptr(0)
+	scratchBytes := reflect.TypeFor[decoderMapScratch]().Size()
 	slots := 0
 	var visit func(*typedNode)
 	visit = func(node *typedNode) {
@@ -122,16 +135,19 @@ func prepareDecoderMapScratch(root *typedNode) int {
 			return
 		}
 		seen[node] = true
-		if node.kind == typedMap && !node.mapKeyTextDecode && decoderMapScratchSafe(node.elem, make(map[*typedNode]bool)) {
-			boxBytes := node.typ.Key().Size() + node.elem.typ.Size()
-			if boxBytes == 0 {
-				boxBytes = 1
+		assign := func(mapType reflect.Type, elem *typedNode, textKey bool, slot *uint32) {
+			if textKey || !decoderMapScratchSafe(elem, make(map[*typedNode]bool)) {
+				return
 			}
+			boxBytes := scratchBytes + mapType.Key().Size() + elem.typ.Size()
 			if usedBytes <= decoderMapScratchRetentionBytes && boxBytes <= decoderMapScratchRetentionBytes-usedBytes {
 				slots++
-				node.decMapScratch = uint32(slots)
+				*slot = uint32(slots)
 				usedBytes += boxBytes
 			}
+		}
+		if node.kind == typedMap {
+			assign(node.typ, node.elem, node.mapKeyTextDecode, &node.decMapScratch)
 		}
 		switch node.kind {
 		case typedStruct:
@@ -139,6 +155,7 @@ func prepareDecoderMapScratch(root *typedNode) int {
 				visit(node.fields[i].node)
 			}
 			if node.inlineMap != nil {
+				assign(node.inlineMap.mapType, node.inlineMap.elem, false, &node.inlineMap.decMapScratch)
 				visit(node.inlineMap.elem)
 			}
 		case typedSlice, typedArray, typedMap, typedPointer:
@@ -160,6 +177,10 @@ func decoderMapScratchSafe(node *typedNode, visiting map[*typedNode]bool) bool {
 	defer delete(visiting, node)
 	switch node.kind {
 	case typedBool, typedString, typedNumber, typedInt, typedUint, typedFloat, typedBytes:
+		return true
+	case typedUnmarshalerJSON, typedUnmarshalerText:
+		// Standard methods run on detached shadows. A retained receiver cannot
+		// observe the element box copied into the destination map.
 		return true
 	case typedStruct:
 		for i := range node.fields {

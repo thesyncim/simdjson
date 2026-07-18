@@ -28,15 +28,33 @@ func (k *decoderScratchTextKey) UnmarshalText(text []byte) error {
 
 type decoderScratchHook int
 
+var retainedDecoderScratchHooks []*decoderScratchHook
+
 func (v *decoderScratchHook) UnmarshalJSON(src []byte) error {
 	value, err := strconv.Atoi(string(src))
 	*v = decoderScratchHook(value)
+	if retainedDecoderScratchHooks != nil {
+		retainedDecoderScratchHooks = append(retainedDecoderScratchHooks, v)
+	}
 	return err
+}
+
+type decoderScratchNativeHook int
+
+func (v *decoderScratchNativeHook) UnmarshalSimdJSON(cursor DecodeCursor) (DecodeCursor, error) {
+	var value int
+	err := cursor.Int(&value)
+	*v = decoderScratchNativeHook(value)
+	return cursor, err
 }
 
 type decoderScratchRecursive map[string]decoderScratchRecursive
 
 type decoderScratchOversized [decoderMapScratchRetentionBytes]byte
+
+type decoderScratchInlineOversized struct {
+	Extra map[string]decoderScratchOversized `json:",inline"`
+}
 
 func TestDecoderMapScratchEligibility(t *testing.T) {
 	ordinary, err := CompileDecoder[map[string]decoderScratchValue](DecoderOptions{})
@@ -59,8 +77,16 @@ func TestDecoderMapScratchEligibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hook.root.decMapScratch != 0 {
-		t.Fatal("custom-method element received reusable reflection storage")
+	if hook.root.decMapScratch == 0 {
+		t.Fatal("detached standard-method element did not receive decoder scratch")
+	}
+
+	nativeHook, err := CompileDecoder[map[string]decoderScratchNativeHook](DecoderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nativeHook.root.decMapScratch != 0 {
+		t.Fatal("native-hook element received reusable reflection storage")
 	}
 
 	recursive, err := CompileDecoder[decoderScratchRecursive](DecoderOptions{})
@@ -77,6 +103,73 @@ func TestDecoderMapScratchEligibility(t *testing.T) {
 	}
 	if oversized.root.decMapScratch != 0 || oversized.scratch != nil {
 		t.Fatal("oversized map boxes may be retained")
+	}
+
+	inlineOversized, err := CompileDecoder[decoderScratchInlineOversized](DecoderOptions{InlineFields: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inlineOversized.root.inlineMap.decMapScratch != 0 || inlineOversized.scratch != nil {
+		t.Fatal("oversized inline map boxes may be retained")
+	}
+}
+
+func TestDecoderMapStandardReceiverScratchLifetime(t *testing.T) {
+	retainedDecoderScratchHooks = make([]*decoderScratchHook, 0, 4)
+	t.Cleanup(func() { retainedDecoderScratchHooks = nil })
+	decoder, err := CompileDecoder[map[string]decoderScratchHook](DecoderOptions{ZeroCopy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first map[string]decoderScratchHook
+	if err := decoder.Decode([]byte(`{"a":1,"b":2}`), &first); err != nil {
+		t.Fatal(err)
+	}
+	if len(retainedDecoderScratchHooks) != 2 || first["a"] != 1 || first["b"] != 2 {
+		t.Fatalf("first decode: retained=%d map=%v", len(retainedDecoderScratchHooks), first)
+	}
+	firstReceivers := append([]*decoderScratchHook(nil), retainedDecoderScratchHooks...)
+	retainedDecoderScratchHooks = retainedDecoderScratchHooks[:0]
+
+	var second map[string]decoderScratchHook
+	if err := decoder.Decode([]byte(`{"a":3,"b":4}`), &second); err != nil {
+		t.Fatal(err)
+	}
+	if len(retainedDecoderScratchHooks) != 2 || second["a"] != 3 || second["b"] != 4 {
+		t.Fatalf("second decode: retained=%d map=%v", len(retainedDecoderScratchHooks), second)
+	}
+	for i := range firstReceivers {
+		if firstReceivers[i] == retainedDecoderScratchHooks[i] {
+			t.Fatalf("receiver %d reused across operations", i)
+		}
+	}
+	*firstReceivers[0] = 99
+	if first["a"] != 1 || first["b"] != 2 || second["a"] != 3 || second["b"] != 4 {
+		t.Fatal("retained standard receiver aliases a decoded map or later scratch")
+	}
+
+}
+
+func TestDecoderMapStandardReceiverScratchAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector adds bookkeeping allocations")
+	}
+	decoder, err := CompileDecoder[map[string]decoderScratchHook](DecoderOptions{ZeroCopy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := []byte(`{"a":3,"b":4}`)
+	dst := make(map[string]decoderScratchHook, 2)
+	if err := decoder.Decode(src, &dst); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(1000, func() {
+		if err := decoder.Decode(src, &dst); err != nil {
+			panic(err)
+		}
+	})
+	if allocs > 2 {
+		t.Fatalf("two standard-method map entries allocated %.1f times per decode, want <=2", allocs)
 	}
 }
 

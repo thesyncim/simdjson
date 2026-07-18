@@ -41,7 +41,7 @@ func (cursor *decoderCursor) decodeCompiledStruct(node *typedNode, dst unsafe.Po
 	position, first := 0, true
 	// inlineDec stays nil until the first unknown member of a struct that
 	// declares a catch-all, so structs without one add only this word.
-	var inlineDec *inlineDecoder
+	var inlineDec *decoderMapScratch
 	for {
 		var field *typedField
 		var key string
@@ -62,6 +62,7 @@ func (cursor *decoderCursor) decodeCompiledStruct(node *typedNode, dst unsafe.Po
 			return err
 		}
 		if !ok {
+			releaseInlineMapScratch(inlineDec)
 			if cursor.flags&decoderReplace != 0 {
 				resetMissingTypedFields(node, dst, seen)
 			}
@@ -77,9 +78,9 @@ func (cursor *decoderCursor) decodeCompiledStruct(node *typedNode, dst unsafe.Po
 					// The catch-all consumes the member, so it is never
 					// "unknown" and DisallowUnknownFields does not apply.
 					if inlineDec == nil {
-						inlineDec = newInlineDecoder(node.inlineMap)
+						inlineDec = cursor.takeInlineDecoder(node.inlineMap)
 					}
-					if err := inlineDec.decodeEntry(cursor, node.inlineMap, dst, key); err != nil {
+					if err := inlineDec.decodeInlineEntry(cursor, node.inlineMap, dst, key); err != nil {
 						return prependDecodePathField(err, key)
 					}
 					continue
@@ -720,7 +721,7 @@ func (cursor *decoderCursor) decodeCompiledStructStructuralRecord(node *typedNod
 }
 
 func (cursor *decoderCursor) decodeCompiledStructStructuralSlow(node *typedNode, dst unsafe.Pointer, position int, first bool, seen uint64) error {
-	var inlineDec *inlineDecoder
+	var inlineDec *decoderMapScratch
 	for {
 		var field *typedField
 		if uint(position) < uint(len(node.fields)) {
@@ -745,6 +746,7 @@ func (cursor *decoderCursor) decodeCompiledStructStructuralSlow(node *typedNode,
 			return err
 		}
 		if !ok {
+			releaseInlineMapScratch(inlineDec)
 			if cursor.flags&decoderReplace != 0 {
 				resetMissingTypedFields(node, dst, seen)
 			}
@@ -758,9 +760,9 @@ func (cursor *decoderCursor) decodeCompiledStructStructuralSlow(node *typedNode,
 			if field == nil {
 				if node.inlineMap != nil {
 					if inlineDec == nil {
-						inlineDec = newInlineDecoder(node.inlineMap)
+						inlineDec = cursor.takeInlineDecoder(node.inlineMap)
 					}
-					if err := inlineDec.decodeEntry(cursor, node.inlineMap, dst, key); err != nil {
+					if err := inlineDec.decodeInlineEntry(cursor, node.inlineMap, dst, key); err != nil {
 						return prependDecodePathField(err, key)
 					}
 					cursor.syncStructuralValue()
