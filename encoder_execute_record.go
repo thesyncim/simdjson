@@ -92,7 +92,7 @@ func (e *encodeState) encodeStruct(node *typedNode, src unsafe.Pointer) error {
 		}
 		if err != nil {
 			e.depth--
-			return prependEncodePathField(err, node.fields[i].name)
+			return prependEncodePathField(err, node.encPaths[i])
 		}
 	}
 	if node.inlineMap != nil {

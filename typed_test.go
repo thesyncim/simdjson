@@ -42,6 +42,76 @@ func TestTypedDecoderCursorStaysCompact(t *testing.T) {
 	}
 }
 
+func TestTypedCompilerSeparatesDirectionPrograms(t *testing.T) {
+	typ := reflect.TypeFor[typedEdgeValue]()
+	compiler := newTypedCompiler(typedCompileDecode)
+	root, err := compiler.compile(typ, typ.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compiler.encHasMap || compiler.encBackingSlots != 0 || len(compiler.encScratchTypes) != 0 {
+		t.Fatalf("decode compilation reserved encoder scratch: maps=%v backings=%d types=%d",
+			compiler.encHasMap, compiler.encBackingSlots, len(compiler.encScratchTypes))
+	}
+
+	seen := make(map[*typedNode]bool)
+	var visit func(*typedNode)
+	visit = func(node *typedNode) {
+		if node == nil || seen[node] {
+			return
+		}
+		seen[node] = true
+		if node.encFields != nil || node.encNameData != nil || node.encClose != nil || node.encPaths != nil {
+			t.Fatalf("decode node %s retained an encoder field program", node.name)
+		}
+		if node.encKind != typedInvalid || node.encNonAddrKind != typedInvalid || node.encOp != typedOpInvalid {
+			t.Fatalf("decode node %s retained encoder dispatch", node.name)
+		}
+		if node.encScratch != -1 || node.encMapKey != -1 || node.encBacking != noEncoderBackingSlot || node.encScratchLimit != 0 {
+			t.Fatalf("decode node %s retained encoder scratch metadata", node.name)
+		}
+		visit(node.elem)
+		for i := range node.fields {
+			visit(node.fields[i].node)
+		}
+		if node.inlineMap != nil {
+			visit(node.inlineMap.elem)
+		}
+	}
+	visit(root)
+
+	encoderCompiler := newTypedCompiler(typedCompileEncode)
+	encoderRoot, err := encoderCompiler.compile(typ, typ.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen = make(map[*typedNode]bool)
+	visit = func(node *typedNode) {
+		if node == nil || seen[node] {
+			return
+		}
+		seen[node] = true
+		if node.fields != nil || node.fieldTable != nil || node.hopResets != nil || node.reset != nil {
+			t.Fatalf("encode node %s retained a decoder field or reset program", node.name)
+		}
+		if node.kind != typedInvalid || node.op != typedOpInvalid {
+			t.Fatalf("encode node %s retained decoder dispatch", node.name)
+		}
+		if node.decShape != typedDecShapeNone || node.structuralFast || node.decBuiltinSlice ||
+			node.emptySliceData != nil || node.decHasReceiver || node.decMapScratch != 0 || node.allSet != 0 {
+			t.Fatalf("encode node %s retained decoder execution metadata", node.name)
+		}
+		visit(node.elem)
+		for i := range node.encFields {
+			visit(node.encFields[i].node)
+		}
+		if node.inlineMap != nil {
+			visit(node.inlineMap.elem)
+		}
+	}
+	visit(encoderRoot)
+}
+
 type typedTestDocument struct {
 	Items []typedTestRecord `json:"items"`
 	Count uint16            `json:"count"`
