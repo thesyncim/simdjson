@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   portable-stage1-benchmark:
     strategy:
@@ -34,9 +38,9 @@ jobs:
       - name: Candidate benchmarks
         run: >-
           $RUNNER_TEMP/gotip/bin/go test ./simd -run '^$'
-          -bench '^BenchmarkStage1(Escaped|PrefixXOR|Rec)Portable$'
+          -bench '^Benchmark(Stage1(Escaped|PrefixXOR|Rec)Portable|Parse16Digits)$'
           -benchtime=500ms -count=8 -cpu=1
-          | tee "$RUNNER_TEMP/stage1-${RUNNER_ARCH}.txt"
+          | tee "$RUNNER_TEMP/portable-simd-${RUNNER_ARCH}.txt"
       - name: Corpus mask statistics
         working-directory: benchmarks
         env:
