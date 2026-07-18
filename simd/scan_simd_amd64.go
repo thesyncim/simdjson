@@ -9,51 +9,24 @@ import (
 	"unsafe"
 )
 
-// Scanner implementations are selected once during package initialization.
-// Hot calls contain no CPU capability branch; they call the function already
-// bound for this process.
-var (
-	scanStringSpecialSelected      = scanStringSpecialScalar
-	scanStringSyntaxSelected       = scanStringSyntaxScalar
-	scanEncodedHTMLSpecialSelected = scanEncodedHTMLSpecialScalar
-	scanEncodedHTMLSyntaxSelected  = scanEncodedHTMLSyntaxScalar
-)
-
+// useAVX2Scanner is evaluated only during package initialization. The hot
+// scanner entry points are assembly tail trampolines whose targets are
+// installed once and contain no CPU capability branch.
 func useAVX2Scanner(features CPUFeatures) bool {
 	return features.Has(CPUFeatureAVX2)
 }
 
 func initStringScanner() {
 	// AVX2 is the demonstrated production width, including on AVX-512
-	// capable CPUs. Capability checks happen only here; hot calls invoke
-	// the selected implementation directly.
+	// capable CPUs. Capability checks happen only here.
 	scanCPUFeatures = detectX86CPUFeatures()
 	if useAVX2Scanner(scanCPUFeatures) {
-		scanStringSpecialSelected = scanStringSpecialAVX2
-		scanStringSyntaxSelected = scanStringSyntaxAVX2
-		scanEncodedHTMLSpecialSelected = scanEncodedHTMLSpecialAVX2
-		scanEncodedHTMLSyntaxSelected = scanEncodedHTMLSyntaxAVX2
+		selectAVX2Scanner()
 		scanStringSelectedMinBytes = 32
 		scanStringProbeMinBytes = 40
 		scanStringSpecialBackend = "amd64-avx2"
 		scanStringVectorBytes = 32
 	}
-}
-
-func scanStringSpecialRuntime(src []byte, i int) int {
-	return scanStringSpecialSelected(noescapeBytes(src), i)
-}
-
-func scanStringSyntaxRuntime(src []byte, i int) int {
-	return scanStringSyntaxSelected(noescapeBytes(src), i)
-}
-
-func scanEncodedHTMLSpecialRuntime(src []byte, i int) int {
-	return scanEncodedHTMLSpecialSelected(noescapeBytes(src), i)
-}
-
-func scanEncodedHTMLSyntaxRuntime(src []byte, i int) int {
-	return scanEncodedHTMLSyntaxSelected(noescapeBytes(src), i)
 }
 
 func validUTF8NoLineSeparatorRuntime(src []byte) bool {
