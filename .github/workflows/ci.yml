@@ -36,6 +36,19 @@ jobs:
           $RUNNER_TEMP/gotip/bin/go test ./simd -run '^$'
           -bench '^BenchmarkStage1(Escaped|PrefixXOR|Rec)Portable$'
           -benchtime=500ms -count=8 -cpu=1
+      - name: Corpus mask statistics
+        working-directory: benchmarks
+        env:
+          GOEXPERIMENT: simd
+        run: $RUNNER_TEMP/gotip/bin/go test -run '^TestPortableStage1CorpusStats$' -v .
+      - name: Corpus candidate benchmarks
+        working-directory: benchmarks
+        env:
+          GOEXPERIMENT: simd
+        run: >-
+          $RUNNER_TEMP/gotip/bin/go test -run '^$'
+          -bench '^BenchmarkPortableStage1Corpus$'
+          -benchtime=500ms -count=6 -cpu=1 .
 
   test:
     strategy:
