@@ -19,18 +19,11 @@ var (
 )
 
 // Parse16Digits reduces sixteen ASCII decimal digits without validating them.
-// Call All16Digits first when the input is not already known to be digits.
+// The two-word SWAR reducer is faster than the NEON reduction on the native
+// ARM64 benchmark runner, so the public hot path calls it directly. Call
+// All16Digits first when the input is not already known to be digits.
 func Parse16Digits(digits *[16]byte) uint64 {
-	values := archsimd.LoadUint8x16Array(digits).Sub(archsimd.BroadcastUint8x16('0'))
-	weighted10 := values.Mul(archsimd.LoadUint8x16Array(&digitWeights10ARM))
-	lo := weighted10.ExtendLo8ToUint16()
-	hi := weighted10.HiToLo().ExtendLo8ToUint16()
-	pairs := lo.ConcatAddPairs(hi)
-	weighted100 := pairs.Mul(archsimd.LoadUint16x8Array(&digitWeights100ARM))
-	quads := weighted100.ConcatAddPairs(weighted100).ExtendLo4ToUint32()
-	weighted10000 := quads.Mul(archsimd.LoadUint32x4Array(&digitWeights10000ARM))
-	eights := weighted10000.ConcatAddPairs(weighted10000)
-	return uint64(eights.GetElem(0))*100000000 + uint64(eights.GetElem(1))
+	return parse16DigitsScalar(digits)
 }
 
 // Parse16DigitsChecked validates and reduces sixteen ASCII decimal digits in
