@@ -34,7 +34,7 @@ and pins C++ simdjson 4.6.4 at git commit
 <!-- benchpublish:cross-language:start -->
 | Component | Revision |
 |---|---|
-| Go simdjson | `c1f941b8b14a62a1955bf91dedd1c1dcad1dd420` (`dirty=false`) |
+| Go simdjson | `b05b7ce145bb9a3c53301beb2619241180c786ce` (`dirty=false`) |
 | Go compiler | `go1.27-devel_03845e30 Fri Jul 10 12:31:49 2026 -0700 darwin/arm64`, `GOEXPERIMENT=simd` |
 | C++ simdjson | simdjson 4.6.4, commit `1bcf71bd85059ab6574ea1159de9298dcc1212c5`, arm64 implementation |
 | C++ compiler | Apple clang version 21.0.0 (clang-2100.1.1.101) |
@@ -44,13 +44,13 @@ Six approximately 300 ms samples are taken per operation; the median is reported
 
 | Corpus | Digest | C++ | Go | Go speedup |
 |---|---|---:|---:|---:|
-| Canada geometry | `99bfa84117bedba4` | 368.680 us | **351.564 us** | **1.049x** |
-| CITM catalog | `aa5480c889a90335` | 1.015231 ms | **910.895 us** | **1.115x** |
-| Go source | `143678d948841678` | 3.318312 ms | **2.795623 ms** | **1.187x** |
-| Escaped strings | `ceb1fff950644c35` | 70.737 us | **40.159 us** | **1.761x** |
-| Unicode strings | `ceb1fff950644c35` | 23.084 us | **22.405 us** | **1.030x** |
-| Synthea FHIR | `3d3241a500faabe1` | 1.858045 ms | **1.702171 ms** | **1.092x** |
-| Twitter status | `7fd8ebd3db991240` | 695.768 us | **624.397 us** | **1.114x** |
+| Canada geometry | `99bfa84117bedba4` | 346.388 us | **332.159 us** | **1.043x** |
+| CITM catalog | `aa5480c889a90335` | 948.185 us | **852.502 us** | **1.112x** |
+| Go source | `143678d948841678` | 3.088569 ms | **2.641892 ms** | **1.169x** |
+| Escaped strings | `ceb1fff950644c35` | 64.987 us | **39.357 us** | **1.651x** |
+| Unicode strings | `ceb1fff950644c35` | 20.900 us | **19.709 us** | **1.060x** |
+| Synthea FHIR | `3d3241a500faabe1` | 1.721650 ms | **1.505035 ms** | **1.144x** |
+| Twitter status | `7fd8ebd3db991240` | 642.457 us | **581.815 us** | **1.104x** |
 
 ![Absolute C++ and Go semantic-traversal time](chart.svg)
 

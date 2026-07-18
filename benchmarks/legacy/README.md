@@ -16,13 +16,13 @@ Apple M4 Max, one CPU, `go1.26.4 darwin/arm64`, six approximately 300 ms samples
 
 | Corpus | Typed owned | Dynamic owned | Owned encode | Syntax-only `Valid` |
 |---|---:|---:|---:|---:|
-| Canada geometry | 452.8 us | 844.0 us | 803.5 us | 195.3 us |
-| CITM catalog | 1.432 ms | 3.286 ms | 981.6 us | 808.5 us |
-| Go source | 3.373 ms | 7.223 ms | 4.045 ms | 1.593 ms |
-| Escaped strings | 32.5 us | 35.9 us | 21.0 us | 3.5 us |
-| Unicode strings | 12.1 us | 14.6 us | 21.2 us | 1.8 us |
-| Synthea FHIR | 2.853 ms | 5.816 ms | 8.268 ms | 875.6 us |
-| Twitter status | 761.2 us | 1.296 ms | 591.2 us | 238.9 us |
+| Canada geometry | 421.3 us | 775.4 us | 750.9 us | 184.0 us |
+| CITM catalog | 1.395 ms | 2.964 ms | 932.6 us | 751.4 us |
+| Go source | 3.216 ms | 6.418 ms | 3.799 ms | 1.490 ms |
+| Escaped strings | 30.2 us | 32.1 us | 19.2 us | 3.2 us |
+| Unicode strings | 11.1 us | 13.0 us | 19.2 us | 1.7 us |
+| Synthea FHIR | 2.630 ms | 5.186 ms | 7.645 ms | 825.3 us |
+| Twitter status | 712.4 us | 1.137 ms | 557.5 us | 225.5 us |
 
 Sonic's `Valid` accepts invalid UTF-8, so that column is implementation
 context rather than a strict-validation comparison. Compiler and standard-
