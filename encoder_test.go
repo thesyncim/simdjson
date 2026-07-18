@@ -33,6 +33,7 @@ type encodeOmitEmpty struct {
 }
 
 type encodeEdge struct {
+	//lint:ignore SA5008 malformed tag is intentional encoding/json parity input
 	Dash    int     `json:"-,"`
 	Renamed float32 `json:"float 32"`
 	Escaped string  `json:"escaped"`

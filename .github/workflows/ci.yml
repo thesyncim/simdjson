@@ -69,13 +69,10 @@ jobs:
 
       - name: Static analysis
         if: ${{ matrix.primary }}
-        # SA4006 and SA4008 currently misread the goto state machines and a
-        # conventional incrementing block loop under the pinned Go-tip export
-        # format. Keep every other correctness check enabled on production code.
         run: >-
           PATH="$RUNNER_TEMP/gotip/bin:$PATH"
           "$RUNNER_TEMP/bin/staticcheck"
-          -tests=false '-checks=SA*,-SA4006,-SA4008' ./...
+          '-checks=SA*' ./...
 
       - name: Vulnerability scan
         if: ${{ matrix.primary }}

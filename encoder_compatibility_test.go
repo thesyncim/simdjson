@@ -247,6 +247,7 @@ type contractTaggedWins struct {
 
 type contractNoName struct {
 	V int `json:",omitempty"`
+	//lint:ignore SA5008 malformed tag is intentional encoding/json parity input
 	W int `json:","`
 }
 
