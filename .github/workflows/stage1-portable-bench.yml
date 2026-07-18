@@ -17,11 +17,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Upload source snapshot
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: portable-source
+          path: |
+            .
+            !.git
+          include-hidden-files: true
       - name: Build pinned Go tip
         shell: bash
         run: ./scripts/bootstrap-gotip.sh "$RUNNER_TEMP/simdjson-gotip"
@@ -30,7 +38,6 @@ jobs:
         run: |
           "$RUNNER_TEMP/simdjson-gotip/bin/go" version
           uname -a
-          if command -v sysctl >/dev/null 2>&1; then sysctl -n machdep.cpu.brand_string 2>/dev/null || true; fi
           if command -v lscpu >/dev/null 2>&1; then lscpu | sed -n '1,20p'; fi
       - name: Candidate correctness
         shell: bash
