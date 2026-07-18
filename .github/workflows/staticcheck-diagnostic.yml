@@ -1,0 +1,50 @@
+name: staticcheck diagnostic
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staticcheck-diagnostic-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  staticcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Go bootstrap
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.26.4
+          cache: false
+      - name: Build pinned Go tip
+        run: ./scripts/bootstrap-gotip.sh "$RUNNER_TEMP/gotip"
+      - name: Install staticcheck
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          GOBIN="$RUNNER_TEMP/bin" "$RUNNER_TEMP/gotip/bin/go" install honnef.co/go/tools/cmd/staticcheck@v0.8.0-rc.1
+      - name: Staticcheck
+        id: staticcheck
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          PATH="$RUNNER_TEMP/gotip/bin:$PATH" \
+            "$RUNNER_TEMP/bin/staticcheck" '-checks=SA*' ./... \
+            2>&1 | tee "$RUNNER_TEMP/staticcheck.txt"
+      - name: Upload staticcheck output
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: staticcheck-output
+          path: ${{ runner.temp }}/staticcheck.txt
+          if-no-files-found: error
+      - name: Fail on findings
+        if: ${{ steps.staticcheck.outcome == 'failure' }}
+        run: exit 1
