@@ -8,10 +8,10 @@ import (
 	"unsafe"
 )
 
-// Stage1StreamEnabled reports whether production routing selects the batched
-// kernel. The portable implementations remain callable while routing stays
-// disabled pending end-to-end crossover benchmarks.
-func Stage1StreamEnabled() bool { return false }
+// Stage1StreamEnabled reports whether this build provides batched and packed
+// stage-1 producers. Non-arm64 builds use the architecture's Stage1Block
+// classifier when present and the portable SWAR classifier otherwise.
+func Stage1StreamEnabled() bool { return true }
 
 // Stage1BlocksGP is the portable equivalent of the batched SIMD classifier.
 // It preserves carry state across blocks and emits the same Stage1Rec records.
@@ -23,7 +23,7 @@ func Stage1BlocksGP(p *byte, nblocks int, st *Stage1Stream, out *[Stage1ChunkBlo
 	recs := out[:nblocks]
 	for i := range recs {
 		var masks Stage1Masks
-		stage1BlockPortable((*[64]byte)(unsafe.Add(base, i*64)), &masks)
+		Stage1Block((*[64]byte)(unsafe.Add(base, i*64)), &masks)
 		Stage1RecFromMasks(&masks, st, &recs[i])
 	}
 }
@@ -98,7 +98,7 @@ func stage1IndexBlocksPortable(p *byte, nblocks int, base uint32, st *Stage1Inde
 	for block := 0; block < nblocks; block++ {
 		bytes := (*[64]byte)(unsafe.Add(src, block*64))
 		var masks Stage1Masks
-		stage1BlockPortable(bytes, &masks)
+		Stage1Block(bytes, &masks)
 
 		escaped := Stage1Escaped(masks.Backslash, &carry)
 		quotes := masks.Quote &^ escaped
