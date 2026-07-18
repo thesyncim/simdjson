@@ -3,7 +3,7 @@
 package simd
 
 // selectAVX2Scanner installs AVX2 targets into the assembly tail
-// trampolines. Package initialization calls it at most once.
+// trampolines. Package initialization is the only caller.
 func selectAVX2Scanner()
 
 // The runtime scanner entry points preserve the slice's noescape
