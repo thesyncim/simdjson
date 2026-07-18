@@ -7,21 +7,19 @@ import (
 	simdkernels "github.com/thesyncim/simdjson/simd"
 )
 
-// The stage-2 machine (simd/stage2_arm64.s) replaces validBitmapWalk's
-// role on builds that have it: the grammar — pair legality, container
-// kinds, depth, comma/closer placement — runs in a direct-threaded
-// register machine over the emit masks, and the machine records each
-// scalar-start position for the Go-side body checks below. The portable
-// walk remains the engine on every other build and the reference the
-// machine is differentially tested against; both consume identical masks
-// and must produce identical verdicts at identical chunk boundaries.
+// Stage 2 has two interchangeable Go-facing surfaces: the packed-position
+// machine used by production validation and index construction, and the legacy
+// bitmap API retained for comparison and compatibility. Both are available on
+// portable builds. NativeEnabled below is deliberately narrower: it only
+// selects the bitmap route when that API is backed by a native machine.
 
-// stage2MachineEnabled gates the asm grammar machine: it needs the
-// machine itself and the batched stage-1 kernel that feeds it.
-var stage2MachineEnabled = simdkernels.Stage2Enabled() && simdkernels.Stage1StreamEnabled()
+// stage2MachineEnabled gates the native bitmap grammar route. Portable builds
+// keep this false and use validPositionsStreamed, the faster packed-position Go
+// pipeline.
+var stage2MachineEnabled = simdkernels.Stage2NativeEnabled() && simdkernels.Stage1StreamEnabled()
 
 // stage2IndexPositionEnabled gates the Go-native forward index writer.
-var stage2IndexPositionEnabled = simdkernels.Stage1StreamEnabled()
+var stage2IndexPositionEnabled = simdkernels.Stage2Enabled() && simdkernels.Stage1StreamEnabled()
 
 // The machine's depth limit must equal the walk's; both reject the open
 // that would exceed it.
