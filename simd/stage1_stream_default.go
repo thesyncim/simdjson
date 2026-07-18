@@ -62,7 +62,7 @@ func Stage1ValidBlocks(p *byte, nblocks int, base uint32, st *Stage1IndexStream,
 func Stage1ValidBlocksCoarse(p *byte, nblocks int, base uint32, st *Stage1IndexStream, out []uint32, meta *Stage1ValidMeta) int {
 	written := stage1IndexBlocksPortable(p, nblocks, base, st, out, stage1PortableIndexValid, meta, nil)
 	if meta.NonASCII != 0 {
-		meta.NonASCII = uint32(1<<nblocks) - 1
+		meta.NonASCII = ^uint32(0) >> uint(Stage1ChunkBlocks-nblocks)
 	}
 	return written
 }
