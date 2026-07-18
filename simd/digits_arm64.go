@@ -118,11 +118,11 @@ func storeDateTimeParts(dst *[20]byte, year, month, day, hour, minute, second ui
 }
 
 func parseBackend() string {
-	return "arm64-neon"
+	return "scalar"
 }
 
 func parseVectorBytes() int {
-	return 16
+	return 0
 }
 
 func formatBackend() string {
