@@ -6,6 +6,10 @@ func scanStringSpecial(src []byte, i int) int {
 	return simdkernels.Unchecked.IndexStringSpecial(src, i)
 }
 
+func scanStringSpecialScalarUntil(src []byte, i, limit int) int {
+	return simdkernels.Unchecked.IndexStringSpecialScalarUntil(src, i, limit)
+}
+
 func scanStringSpecialLong(src []byte, i int) int {
 	return simdkernels.Unchecked.IndexStringSpecialLong(src, i)
 }

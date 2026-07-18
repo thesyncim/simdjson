@@ -64,6 +64,13 @@ func TestScannerAPINormalizesStart(t *testing.T) {
 		if got, want := IndexStringSpecial(src, start), scanStringSpecialScalar(src, clamped); got != want {
 			t.Errorf("IndexStringSpecial(start=%d) = %d, want %d", start, got, want)
 		}
+		limit := clamped + 17
+		if limit > len(src) {
+			limit = len(src)
+		}
+		if got, want := Unchecked.IndexStringSpecialScalarUntil(src, clamped, limit), scanStringSpecialScalarUntil(src, clamped, limit); got != want {
+			t.Errorf("Unchecked.IndexStringSpecialScalarUntil(start=%d, limit=%d) = %d, want %d", clamped, limit, got, want)
+		}
 		if got, want := IndexStringSpecialLong(src, start), scanStringSpecialScalar(src, clamped); got != want {
 			t.Errorf("IndexStringSpecialLong(start=%d) = %d, want %d", start, got, want)
 		}

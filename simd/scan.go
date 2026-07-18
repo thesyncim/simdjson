@@ -17,6 +17,12 @@ func (UncheckedScans) IndexStringSpecial(src []byte, start int) int {
 	return scanStringSpecial(src, start)
 }
 
+// IndexStringSpecialScalarUntil scans [start, limit) with the portable
+// word-at-a-time kernel. It requires 0 <= start <= limit <= len(src).
+func (UncheckedScans) IndexStringSpecialScalarUntil(src []byte, start, limit int) int {
+	return scanStringSpecialScalarUntil(src, start, limit)
+}
+
 // IndexStringSpecialLong is the unchecked form of the package function.
 func (UncheckedScans) IndexStringSpecialLong(src []byte, start int) int {
 	return scanStringSpecialLong(src, start)

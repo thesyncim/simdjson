@@ -261,12 +261,64 @@ func (b *tapeBuilder) stringFast(start int, flags uint8) tapeParseStatus {
 			scanStart += 8
 		}
 	}
+	if indexStringPrefixProbeEnabled && len(b.src) <= indexStringPrefixProbeMaxDocumentBytes {
+		return b.stringFastPrefix(start, scanStart, flags)
+	}
 	end, escaped, ok := scanJSONStringFastFrom(b.src, b.base, scanStart)
 	if !ok {
 		return tapeParseInvalid
 	}
 	if escaped {
 		flags |= tapeFlagEscaped
+	}
+	if len(b.entries) == cap(b.entries) {
+		return tapeParseFull
+	}
+	entry := len(b.entries)
+	b.entries = b.entries[:entry+1]
+	b.entries[entry] = IndexEntry{start: uint32(start), end: uint32(end), next: 1, info: packInfo(0, String, flags)}
+	b.i = end
+	return tapeParseOK
+}
+
+func (b *tapeBuilder) stringFastPrefix(start, scanStart int, flags uint8) tapeParseStatus {
+	limit := scanStart + indexStringPrefixProbeBytes
+	if limit > len(b.src) {
+		limit = len(b.src)
+	}
+	end := 0
+	j := scanStringSpecialScalarUntil(b.src, scanStart, limit)
+	if j == limit {
+		scanStart = limit
+	} else {
+		switch c := b.src[j]; {
+		case c == '"':
+			end = j + 1
+		case c == '\\':
+			scanStart = j
+		case c < 0x20:
+			return tapeParseInvalid
+		default:
+			next, bad := scanStringUnicodeRun(b.src, j)
+			if bad >= 0 {
+				return tapeParseInvalid
+			}
+			if next < len(b.src) && b.src[next] == '"' {
+				end = next + 1
+			} else {
+				scanStart = next
+			}
+		}
+	}
+	if end == 0 {
+		var escaped, ok bool
+		end, escaped, ok = scanJSONStringFastFrom(b.src, b.base, scanStart)
+		if !ok {
+			return tapeParseInvalid
+		}
+		if escaped {
+			flags |= tapeFlagEscaped
+		}
 	}
 	if len(b.entries) == cap(b.entries) {
 		return tapeParseFull

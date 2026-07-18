@@ -727,6 +727,42 @@ func TestStrictStringValidation(t *testing.T) {
 	}
 }
 
+func TestBuildIndexStringPrefixBoundary(t *testing.T) {
+	cases := []struct {
+		name  string
+		tail  string
+		valid bool
+	}{
+		{name: "quote", tail: `"`, valid: true},
+		{name: "escape", tail: `\ntail"`, valid: true},
+		{name: "non-ascii", tail: `étail"`, valid: true},
+		{name: "control", tail: string([]byte{0x1f}) + `tail"`},
+	}
+	for _, tc := range cases {
+		for _, offset := range []int{15, 16, 17} {
+			t.Run(tc.name+"/"+strconv.Itoa(offset), func(t *testing.T) {
+				// stringFast consumes the first eight payload bytes itself. Offset
+				// is relative to the bounded prefix scanner that follows.
+				src := []byte(`"` + strings.Repeat("a", 8+offset) + tc.tail)
+				if got := json.Valid(src); got != tc.valid {
+					t.Fatalf("fixture validity = %v, want %v: %q", got, tc.valid, src)
+				}
+				tape, err := BuildIndex(src, make([]IndexEntry, len(src)))
+				if tc.valid {
+					if err != nil {
+						t.Fatal(err)
+					}
+					if tape.Len() != 1 {
+						t.Fatalf("index length = %d, want 1", tape.Len())
+					}
+				} else if err == nil {
+					t.Fatal("BuildIndex accepted invalid string")
+				}
+			})
+		}
+	}
+}
+
 func TestScalarValidators(t *testing.T) {
 	validNumbers := [][]byte{
 		[]byte(`0`),
