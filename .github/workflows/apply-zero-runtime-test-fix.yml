@@ -1,0 +1,75 @@
+name: apply zero-runtime test fix
+
+on:
+  push:
+    branches: [perf/zero-runtime-dispatch]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: perf/zero-runtime-dispatch
+          fetch-depth: 0
+      - name: Update policy helper and test
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          scan = Path("simd/scan_simd_amd64.go")
+          source = scan.read_text()
+          if "func useAVX2Scanner(" not in source:
+              source = source.replace(
+                  "func initStringScanner() {",
+                  "func useAVX2Scanner(features CPUFeatures) bool {\n\treturn features.Has(CPUFeatureAVX2)\n}\n\nfunc initStringScanner() {",
+                  1,
+              )
+          source = source.replace(
+              "if scanCPUFeatures.Has(CPUFeatureAVX2) {",
+              "if useAVX2Scanner(scanCPUFeatures) {",
+              1,
+          )
+          scan.write_text(source)
+
+          Path("simd/scan_policy_amd64_test.go").write_text(r'''//go:build goexperiment.simd && amd64
+
+          package simd
+
+          import "testing"
+
+          func TestAMD64ScannerSelectionRequiresProvenWidth(t *testing.T) {
+          	cases := []struct {
+          		name     string
+          		features CPUFeatures
+          		want     bool
+          	}{
+          		{"scalar", 0, false},
+          		{"avx2", CPUFeatureAVX2.mask(), true},
+          		{"avx512 alone", CPUFeatureAVX512.mask(), false},
+          		{"avx512 cpu uses avx2", CPUFeatureAVX2.mask() | CPUFeatureAVX512.mask(), true},
+          	}
+          	for _, tc := range cases {
+          		t.Run(tc.name, func(t *testing.T) {
+          			if got := useAVX2Scanner(tc.features); got != tc.want {
+          				t.Fatalf("useAVX2Scanner(%v) = %v, want %v", tc.features, got, tc.want)
+          			}
+          		})
+          	}
+          }
+          ''')
+          PY
+          gofmt -w simd/scan_simd_amd64.go simd/scan_policy_amd64_test.go
+          rm .github/workflows/apply-zero-runtime-test-fix.yml
+      - name: Commit
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add simd/scan_simd_amd64.go simd/scan_policy_amd64_test.go .github/workflows/apply-zero-runtime-test-fix.yml
+          git commit -m "test: cover init-time amd64 scanner selection"
+          git push origin HEAD:perf/zero-runtime-dispatch
