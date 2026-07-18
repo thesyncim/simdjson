@@ -2,12 +2,16 @@
 
 package simd
 
-// Stage2Enabled reports whether this build provides the legacy bitmap grammar
-// machine. Production validation uses the packed-position machine instead.
-func Stage2Enabled() bool { return false }
+// Stage2Enabled reports whether this build provides a stage-2 grammar backend.
+// Portable builds use the Go-native machine.
+func Stage2Enabled() bool { return true }
 
-// Stage2Walk is unreachable on builds without the machine; callers must
-// gate on Stage2Enabled.
+// Stage2NativeEnabled reports whether Stage2Walk is backed by a native bitmap
+// machine. Portable builds return false so production routing prefers the
+// packed-position Go machine.
+func Stage2NativeEnabled() bool { return false }
+
+// Stage2Walk provides the legacy bitmap API through the Go-native machine.
 func Stage2Walk(base *byte, emit []uint64, kinds *[Stage2KindsLen]byte, scalars []uint32, st *Stage2State) int {
-	panic("simd: stage-2 machine not available on this build")
+	return Stage2WalkGo(base, emit, kinds, scalars, st)
 }
