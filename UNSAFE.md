@@ -170,6 +170,8 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `simd/stage1_arm64.go` — `Stage1Block`
 - `simd/stage1_index_arm64.go` — `stage1IndexBlocks`
 - `simd/stage1_stream_arm64.go` — `Stage1BlocksGP`
+- `simd/stage1_stream_default.go` — `Stage1BlocksGP`
+- `simd/stage1_stream_default.go` — `stage1IndexBlocksPortable`
 - `simd/stage2_cursor_go.go` — `stage2CursorColonGap`
 - `simd/stage2_cursor_go.go` — `stage2CursorGo`
 - `simd/stage2_go.go` — `Stage2PositionsTrusted`
