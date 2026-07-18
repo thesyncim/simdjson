@@ -12,9 +12,12 @@ import (
 const portableEvenBits = uint64(0x5555555555555555)
 
 type portableCorpus struct {
-	name  string
-	bytes int64
-	masks []simdkernels.Stage1Masks
+	name      string
+	src       []byte
+	bytes     int64
+	masks     []simdkernels.Stage1Masks
+	emit      []uint64
+	positions []uint32
 }
 
 func loadPortableCorpora(tb testing.TB) []portableCorpus {
@@ -30,6 +33,9 @@ func loadPortableCorpora(tb testing.TB) []portableCorpus {
 		}
 		nblocks := (len(src) + 63) / 64
 		masks := make([]simdkernels.Stage1Masks, nblocks)
+		emit := make([]uint64, nblocks)
+		var stream simdkernels.Stage1Stream
+		positionsCount := 0
 		for block := 0; block < nblocks; block++ {
 			var bytes [64]byte
 			for i := range bytes {
@@ -38,11 +44,20 @@ func loadPortableCorpora(tb testing.TB) []portableCorpus {
 			start := block * 64
 			copy(bytes[:], src[start:min(start+64, len(src))])
 			simdkernels.Stage1Block(&bytes, &masks[block])
+			var rec simdkernels.Stage1Rec
+			simdkernels.Stage1RecFromMasks(&masks[block], &stream, &rec)
+			emit[block] = rec.Emit
+			positionsCount += bits.OnesCount64(rec.Emit)
 		}
+		positionsStorage := make([]uint32, positionsCount+flattenSlack)
+		written := flattenPositions(emit, positionsStorage)
 		corpora = append(corpora, portableCorpus{
-			name:  strings.TrimSuffix(name, ".json.zst"),
-			bytes: int64(len(src)),
-			masks: masks,
+			name:      strings.TrimSuffix(name, ".json.zst"),
+			src:       src,
+			bytes:     int64(len(src)),
+			masks:     masks,
+			emit:      emit,
+			positions: positionsStorage[:written],
 		})
 	}
 	return corpora
