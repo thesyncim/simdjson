@@ -268,8 +268,11 @@ published at the baseline.
 - Behavioral work compares against the pinned commit with differential tests.
 - Hot-path work uses `scripts/bench-gate.sh` with interleaved rounds on the same
   compiler and machine.
-- A maintained benchmark may not regress by more than 3%; `B/op` and
-  `allocs/op` may not regress.
+- A maintained benchmark may not regress by more than 2%. `allocs/op` has a
+  strict zero-regression threshold. The `B/op` checker ignores changes no
+  larger than 0.01%, the display-resolution floor needed to reject reproduced
+  cross-process noise; this is not an accepted memory-growth budget, and a
+  repeatable increase still requires investigation.
 - Public behavior changes require an ADR and external-package tests.
 - Deleted fuzz targets must have every useful disk and source seed migrated.
 - Counts in this file remain fixed; progress is reported as a delta from this
