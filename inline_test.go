@@ -3,6 +3,7 @@ package simdjson
 import (
 	"encoding/json"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -64,6 +65,45 @@ func TestInlineCatchAllRoundTrip(t *testing.T) {
 	if string(out) != wantOut {
 		t.Fatalf("encode = %s, want %s", out, wantOut)
 	}
+}
+
+func TestInlineCatchAllKeyOwnership(t *testing.T) {
+	t.Run("shared owned source", func(t *testing.T) {
+		decoder, err := CompileDecoder[inlineRaw](DecoderOptions{InlineFields: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := []byte(`{"id":1,"name":"owned","plain":true,"escaped\u002dkey":2}`)
+		var got inlineRaw
+		if err := decoder.Decode(src, &got); err != nil {
+			t.Fatal(err)
+		}
+		for i := range src {
+			src[i] = 'x'
+		}
+		runtime.GC()
+		if got.Name != "owned" || string(got.Extra["plain"]) != "true" || string(got.Extra["escaped-key"]) != "2" {
+			t.Fatalf("owned catch-all changed after source mutation: %#v", got)
+		}
+	})
+
+	t.Run("key clone before source ownership", func(t *testing.T) {
+		decoder, err := CompileDecoder[inlineOnly](DecoderOptions{InlineFields: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := []byte(`{"plain":true}`)
+		var got inlineOnly
+		if err := decoder.Decode(src, &got); err != nil {
+			t.Fatal(err)
+		}
+		for i := range src {
+			src[i] = 'x'
+		}
+		if string(got.Extra["plain"]) != "true" {
+			t.Fatalf("catch-all key or value aliases caller source: %#v", got.Extra)
+		}
+	})
 }
 
 // TestInlineCatchAllAny checks a map[string]any catch-all decodes the dynamic

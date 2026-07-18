@@ -104,7 +104,7 @@ func (d *inlineDecoder) decodeEntry(cursor *decoderCursor, inline *typedInlineMa
 	if err != nil {
 		return err
 	}
-	if cursor.flags&decoderZeroCopy == 0 {
+	if cursor.flags&(decoderZeroCopy|decoderSourceOwned) == 0 {
 		key = strings.Clone(key)
 	}
 	d.keyValue.SetString(key)
