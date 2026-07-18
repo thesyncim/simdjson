@@ -14,8 +14,12 @@ concurrency:
 
 jobs:
   benchmark:
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Build pinned Go tip
@@ -34,7 +38,7 @@ jobs:
         run: |
           set -o pipefail
           "$RUNNER_TEMP/simdjson-gotip/bin/go" test ./... -count=1 \
-            2>&1 | tee "$RUNNER_TEMP/purego-tests.txt"
+            2>&1 | tee "$RUNNER_TEMP/purego-tests-${RUNNER_ARCH}.txt"
       - name: SIMD correctness
         shell: bash
         env:
@@ -42,7 +46,7 @@ jobs:
         run: |
           set -o pipefail
           "$RUNNER_TEMP/simdjson-gotip/bin/go" test ./... -count=1 \
-            2>&1 | tee "$RUNNER_TEMP/simd-tests.txt"
+            2>&1 | tee "$RUNNER_TEMP/simd-tests-${RUNNER_ARCH}.txt"
       - name: Pure-Go kernels
         shell: bash
         env:
@@ -52,7 +56,7 @@ jobs:
           "$RUNNER_TEMP/simdjson-gotip/bin/go" test ./simd \
             -run '^$' -bench '^(BenchmarkStage1|BenchmarkParse16Digits|BenchmarkScan)' \
             -benchmem -benchtime=1s -count=8 -cpu=1 \
-            2>&1 | tee "$RUNNER_TEMP/purego-kernels.txt"
+            2>&1 | tee "$RUNNER_TEMP/purego-kernels-${RUNNER_ARCH}.txt"
       - name: SIMD kernels
         shell: bash
         env:
@@ -62,7 +66,7 @@ jobs:
           "$RUNNER_TEMP/simdjson-gotip/bin/go" test ./simd \
             -run '^$' -bench '^(BenchmarkStage1|BenchmarkParse16Digits|BenchmarkScan)' \
             -benchmem -benchtime=1s -count=8 -cpu=1 \
-            2>&1 | tee "$RUNNER_TEMP/simd-kernels.txt"
+            2>&1 | tee "$RUNNER_TEMP/simd-kernels-${RUNNER_ARCH}.txt"
       - name: Pure-Go end-to-end
         shell: bash
         env:
@@ -72,7 +76,7 @@ jobs:
           "$RUNNER_TEMP/simdjson-gotip/bin/go" test . \
             -run '^$' -bench '^(BenchmarkPortableBackend|BenchmarkValidate|BenchmarkBuildIndex)' \
             -benchmem -benchtime=1s -count=8 -cpu=1 \
-            2>&1 | tee "$RUNNER_TEMP/purego-end-to-end.txt"
+            2>&1 | tee "$RUNNER_TEMP/purego-end-to-end-${RUNNER_ARCH}.txt"
       - name: SIMD end-to-end
         shell: bash
         env:
@@ -82,11 +86,11 @@ jobs:
           "$RUNNER_TEMP/simdjson-gotip/bin/go" test . \
             -run '^$' -bench '^(BenchmarkPortableBackend|BenchmarkValidate|BenchmarkBuildIndex)' \
             -benchmem -benchtime=1s -count=8 -cpu=1 \
-            2>&1 | tee "$RUNNER_TEMP/simd-end-to-end.txt"
+            2>&1 | tee "$RUNNER_TEMP/simd-end-to-end-${RUNNER_ARCH}.txt"
       - name: Upload comparison
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: backend-comparison-${{ runner.os }}-${{ runner.arch }}
+          name: backend-comparison-${{ matrix.runner }}-${{ runner.arch }}
           path: ${{ runner.temp }}/*.txt
           if-no-files-found: error
