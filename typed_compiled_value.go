@@ -146,13 +146,23 @@ func (cursor *decoderCursor) decodeCompiledMap(node *typedNode, dst unsafe.Point
 		mapValue.Set(reflect.MakeMap(node.typ))
 	}
 	keyType := node.typ.Key()
-	element := reflect.New(node.elem.typ)
-	elementPtr := element.UnsafePointer()
-	elementValue := element.Elem()
+	scratch := cursor.takeMapScratch(node)
+	var elementValue reflect.Value
+	var elementPtr unsafe.Pointer
+	var keyValue reflect.Value
+	if scratch != nil {
+		elementValue = scratch.element
+		elementPtr = scratch.element.Addr().UnsafePointer()
+		keyValue = scratch.key
+	} else {
+		element := reflect.New(node.elem.typ)
+		elementValue = element.Elem()
+		elementPtr = element.UnsafePointer()
+		keyValue = reflect.New(keyType).Elem()
+	}
 	// One reusable key box serves every entry: SetMapIndex copies the key into
 	// the map, so the box is reset per entry instead of allocating one each
 	// time. The text unmarshaler, when present, is bound to the box once.
-	keyValue := reflect.New(keyType).Elem()
 	var keyUnmarshaler encoding.TextUnmarshaler
 	if node.mapKeyTextDecode {
 		keyUnmarshaler = keyValue.Addr().Interface().(encoding.TextUnmarshaler)
@@ -160,9 +170,11 @@ func (cursor *decoderCursor) decodeCompiledMap(node *typedNode, dst unsafe.Point
 	for first := true; ; first = false {
 		key, ok, err := cursor.NextObjectField(first)
 		if err != nil {
+			releaseMapScratch(scratch)
 			return err
 		}
 		if !ok {
+			releaseMapScratch(scratch)
 			return nil
 		}
 		elementValue.SetZero()
@@ -184,9 +196,11 @@ func (cursor *decoderCursor) decodeCompiledMap(node *typedNode, dst unsafe.Point
 		}
 		cursor.endReceiverBatch(batchedReceivers)
 		if entryErr != nil {
+			releaseMapScratch(scratch)
 			return prependDecodePathField(entryErr, key)
 		}
 		if keyErr := setMapKeyValue(keyValue, keyUnmarshaler, node, keyType, key); keyErr != nil {
+			releaseMapScratch(scratch)
 			return prependDecodePathField(&DecodeError{Offset: cursor.i, Type: keyType, Reason: keyErr.Error()}, key)
 		}
 		mapValue.SetMapIndex(keyValue, elementValue)

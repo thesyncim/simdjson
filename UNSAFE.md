@@ -78,7 +78,7 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `encoder_execute_sequence.go` — `(*encodeState).encodeStructSlice`
 - `encoder_execute_value.go` — `(*encodeState).encodeAny`
 - `encoder_execute_value.go` — `(*encodeState).encodeMap`
-- `encoder_execute_value.go` — `(*encodeState).encodeMapOneShot`
+- `encoder_execute_value.go` — `(*encodeState).encodeMapValue`
 - `encoder_execute_value.go` — `(*encodeState).encodeNonAddressable`
 - `encoder_execute_value.go` — `(*encodeState).encodeNonAddressableMarshaler`
 - `encoder_execute_value.go` — `(*encodeState).encodeQuoted`
@@ -101,13 +101,11 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `index_positions.go` — `indexPositionsFallbackNumberMode`
 - `marshaler.go` — `(*decoderCursor).decodeViaTextUnmarshaler`
 - `marshaler.go` — `(*decoderCursor).decodeViaUnmarshaler`
+- `marshaler.go` — `(*decoderCursor).receiverAt`
 - `marshaler.go` — `(*encodeState).encodeMarshaler`
 - `marshaler.go` — `(*encodeState).encodeMarshalerKind`
-- `marshaler.go` — `copiedLoadedPointerReceiverAt`
-- `marshaler.go` — `copiedPointerReceiverAt`
 - `marshaler.go` — `copyMethodReceiverBack`
 - `marshaler.go` — `pointerInterfaceAt`
-- `marshaler.go` — `receiverAt`
 - `marshaler.go` — `valueInterfaceAt`
 - `node.go` — `(Node).Bool`
 - `node.go` — `(Node).Float64`
@@ -188,6 +186,7 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `typed.go` — `(Decoder[T]).decodeStructural`
 - `typed.go` — `copyTypedSlice`
 - `typed.go` — `decodeTypedDocument`
+- `typed.go` — `decodeTypedDocumentScratch`
 - `typed.go` — `fieldNameHash`
 - `typed.go` — `growTypedSlice`
 - `typed.go` — `makeTypedEmptySliceData`
@@ -208,8 +207,10 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `typed_compiled_record.go` — `structuralPackedFieldAt`
 - `typed_compiled_record.go` — `structuralTapePosition`
 - `typed_compiled_sequence.go` — `(*decoderCursor).decodeCompiledArray`
+- `typed_compiled_sequence.go` — `(*decoderCursor).decodeCompiledArrayReceivers`
 - `typed_compiled_sequence.go` — `(*decoderCursor).decodeCompiledArrayStructural`
 - `typed_compiled_sequence.go` — `(*decoderCursor).decodeCompiledSlice`
+- `typed_compiled_sequence.go` — `(*decoderCursor).decodeCompiledSliceReceivers`
 - `typed_compiled_sequence.go` — `(*decoderCursor).decodeCompiledSliceStructural`
 - `typed_compiled_sequence.go` — `decodeCompiledFloat64Array3Structural`
 - `typed_compiled_sequence.go` — `decodeCompiledFloat64ArrayStructural`

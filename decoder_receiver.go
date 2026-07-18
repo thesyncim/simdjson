@@ -6,7 +6,6 @@ const (
 	decoderReceiverArenaValues = 8
 	decoderReceiverArenaBytes  = 64 << 10
 	decoderReceiverArenaSlots  = 8
-	decoderReceiverCacheSlots  = 32
 )
 
 // decoderReceiverArena owns one current GC-scanned array of detached method
@@ -19,10 +18,11 @@ type decoderReceiverArena struct {
 	next      int
 }
 
-type decoderReceiverState struct {
+type decoderOperationState struct {
 	first    decoderReceiverArena
 	overflow *decoderReceiverOverflow
 	batch    int
+	maps     []decoderMapScratch
 }
 
 // decoderReceiverOverflow is allocated only for a graph that reaches more
@@ -31,32 +31,6 @@ type decoderReceiverState struct {
 type decoderReceiverOverflow struct {
 	arenas [decoderReceiverArenaSlots - 1]decoderReceiverArena
 	count  int
-}
-
-// decoderReceiverStateCache keeps only small bookkeeping objects. Typed
-// receiver arrays are cleared before return and are never cached because user
-// methods may retain their elements. A fixed channel bounds process retention
-// while avoiding sync.Pool churn across frequent garbage collections.
-var decoderReceiverStateCache = make(chan *decoderState, decoderReceiverCacheSlots)
-
-func takeDecoderReceiverState() *decoderState {
-	select {
-	case state := <-decoderReceiverStateCache:
-		return state
-	default:
-		return &decoderState{receivers: new(decoderReceiverState)}
-	}
-}
-
-func releaseDecoderReceiverState(state *decoderState) {
-	state.strings = nil
-	state.resetReceiverArenas()
-	state.structural = decoderStructuralTape{}
-	state.structuralActive = false
-	select {
-	case decoderReceiverStateCache <- state:
-	default:
-	}
 }
 
 // prepareDecoderReceivers builds typed receiver-array types once and then
@@ -138,26 +112,26 @@ func decoderReceiverArrayType(node *typedNode) reflect.Type {
 
 func (c *decoderCursor) beginReceiverBatch() bool {
 	if c.state == nil {
-		c.state = takeDecoderReceiverState()
+		c.state = new(decoderState)
 	}
-	if c.state.receivers == nil {
-		c.state.receivers = new(decoderReceiverState)
+	if c.state.operation == nil {
+		c.state.operation = new(decoderOperationState)
 	}
-	c.state.receivers.batch++
+	c.state.operation.batch++
 	return true
 }
 
 func (c *decoderCursor) endReceiverBatch(active bool) {
 	if active {
-		c.state.receivers.batch--
+		c.state.operation.batch--
 	}
 }
 
 func (c *decoderCursor) nextReceiverShadow(node *typedNode, source reflect.Value) (reflect.Value, bool) {
-	if c.state == nil || c.state.receivers == nil || c.state.receivers.batch == 0 || !node.decHasReceiver {
+	if c.state == nil || c.state.operation == nil || c.state.operation.batch == 0 || !node.decHasReceiver {
 		return reflect.Value{}, false
 	}
-	state := c.state.receivers
+	state := c.state.operation
 	arena := &state.first
 	if arena.node == nil {
 		arena.node = node
@@ -198,11 +172,7 @@ func (c *decoderCursor) nextReceiverShadow(node *typedNode, source reflect.Value
 	return value.Addr(), true
 }
 
-func (s *decoderState) resetReceiverArenas() {
-	state := s.receivers
-	if state == nil {
-		return
-	}
+func (state *decoderOperationState) resetReceivers() {
 	// Receiver arrays are operation-local because user methods may retain an
 	// element. Clear every reflect.Value before the metadata is pooled; retained
 	// element pointers keep their typed backing alive independently.

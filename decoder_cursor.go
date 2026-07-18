@@ -77,7 +77,7 @@ type decoderState struct {
 	strings          []byte
 	structural       decoderStructuralTape
 	structuralActive bool
-	receivers        *decoderReceiverState
+	operation        *decoderOperationState
 }
 
 // newDecoderCursor starts decoding src with opts.
@@ -109,11 +109,11 @@ func newDecoderCursor(src []byte, opts DecoderOptions) decoderCursor {
 	}
 }
 
-func (c *decoderCursor) releaseTransientState() {
+func (c *decoderCursor) releasePlanState(plan *decoderPlanState) {
 	if c.state == nil {
 		return
 	}
-	releaseDecoderReceiverState(c.state)
+	plan.release(c.state)
 	c.state = nil
 }
 

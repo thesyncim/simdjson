@@ -28,6 +28,12 @@ func TestTypedDecoderCursorStaysCompact(t *testing.T) {
 	if size := unsafe.Sizeof(decoderCursor{}); size > 64 {
 		t.Fatalf("typed decoder cursor size = %d bytes, want <= 64", size)
 	}
+	// typedNode is the immutable program walked by every compiled decode and
+	// encode. Six cache lines preserves its established density as uncommon
+	// operation scratch is added beside the hot program.
+	if size := unsafe.Sizeof(typedNode{}); size > 384 {
+		t.Fatalf("typed plan node size = %d bytes, want <= 384", size)
+	}
 	// typedEncField is stored one-per-field in the compiled encoder program and
 	// walked linearly while encoding; 40 bytes keeps the field table dense so
 	// the walk stays cache-friendly on wide structs.

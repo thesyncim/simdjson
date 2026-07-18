@@ -71,6 +71,7 @@ type Decoder[T any] struct {
 	rootSlice  *typedNode
 	options    DecoderOptions
 	structural bool
+	scratch    *decoderPlanState
 }
 
 // CompileDecoder builds a decoder for T. Scalar and field dispatch use the
@@ -88,11 +89,13 @@ func CompileDecoder[T any](opts DecoderOptions) (Decoder[T], error) {
 	}
 	prepareTypedResets(root, make(map[*typedNode]bool))
 	prepareDecoderReceivers(root)
+	mapSlots := prepareDecoderMapScratch(root)
 	structural := typedStructuralCandidate(root, make(map[*typedNode]bool))
 	rootSliceType := reflect.TypeFor[[]T]()
 	return Decoder[T]{
 		root:       root,
 		structural: structural,
+		scratch:    newDecoderPlanState(mapSlots, root.decHasReceiver),
 		rootSlice: &typedNode{
 			kind:           typedSlice,
 			encKind:        typedSlice,
@@ -178,22 +181,19 @@ func (plan Decoder[T]) Decode(src []byte, dst *T) error {
 	if plan.structural && decoderStructuralWorthwhile(src) {
 		return plan.decodeStructural(src, dst)
 	}
+	if plan.scratch != nil {
+		return decodeTypedDocumentScratch(src, plan.options, plan.root, unsafe.Pointer(dst), plan.scratch)
+	}
 	return decodeTypedDocument(src, plan.options, plan.root, unsafe.Pointer(dst), nil)
 }
 
-// decodeTypedDocument is the single whole-document cursor contract. A nil
-// state selects the raw cursor; an eligible structural state selects the
-// forward executor unless stage 1 declined the input. Both engines share root
-// dispatch, error propagation, and exact-document finalization here.
+// decodeTypedDocument is the single whole-document cursor contract. A nil or
+// operation-only state selects the raw cursor; an eligible structural state
+// selects the forward executor unless stage 1 declined the input. Both engines
+// share root dispatch, error propagation, and exact-document finalization here.
 func decodeTypedDocument(src []byte, options DecoderOptions, root *typedNode, dst unsafe.Pointer, state *decoderState) error {
 	cursor := newDecoderCursor(src, options)
-	if state == nil && root.decHasReceiver {
-		// Escaped-string arenas and detached standard-method receiver metadata
-		// may be created lazily. Their backing storage has its own lifetime, so
-		// return only the cleared state header after this document finishes.
-		defer cursor.releaseTransientState()
-	}
-	structural := state != nil && !state.structural.bad
+	structural := state != nil && state.structuralActive && !state.structural.bad
 	if state != nil {
 		cursor.state = state
 		if !structural {
@@ -234,6 +234,14 @@ func decodeTypedDocument(src []byte, options DecoderOptions, root *typedNode, ds
 	return cursor.Finish()
 }
 
+// decodeTypedDocumentScratch checks out isolated operation state for plans
+// with reusable map boxes or detached standard-method receivers.
+func decodeTypedDocumentScratch(src []byte, options DecoderOptions, root *typedNode, dst unsafe.Pointer, plan *decoderPlanState) error {
+	state := plan.take()
+	defer plan.release(state)
+	return decodeTypedDocument(src, options, root, dst, state)
+}
+
 //go:noinline
 func (plan Decoder[T]) decodeStructural(src []byte, dst *T) error {
 	state := acquireDecoderState(src)
@@ -256,8 +264,9 @@ func (plan Decoder[T]) DecodePrefix(src []byte, dst *T) (int, error) {
 		return 0, fmt.Errorf("simdjson: typed Decode destination is nil")
 	}
 	cursor := newDecoderCursor(src, plan.options)
-	if plan.root.decHasReceiver {
-		defer cursor.releaseTransientState()
+	if plan.scratch != nil {
+		cursor.state = plan.scratch.take()
+		defer cursor.releasePlanState(plan.scratch)
 	}
 	cursor.skipSpace()
 	var err error
@@ -288,8 +297,9 @@ func (plan Decoder[T]) DecodeArray(src []byte, dst []T) ([]T, error) {
 		return dst[:0], fmt.Errorf("simdjson: zero Decoder")
 	}
 	cursor := newDecoderCursor(src, plan.options)
-	if plan.rootSlice.decHasReceiver {
-		defer cursor.releaseTransientState()
+	if plan.scratch != nil {
+		cursor.state = plan.scratch.take()
+		defer cursor.releasePlanState(plan.scratch)
 	}
 	cursor.skipSpace()
 	if err := cursor.decodeCompiledSlice(plan.rootSlice, unsafe.Pointer(&dst)); err != nil {
@@ -491,6 +501,9 @@ type typedNode struct {
 	// pointer, slice, or map. Only these pay the non-addressable flag when
 	// encoded as a map value or interface content.
 	encHasPtrMarshaler bool
+	// decMapScratch is the one-based slot for reusable map key and value boxes.
+	// Zero keeps maps with observable boxes on the one-call allocation path.
+	decMapScratch uint32
 	// inlineMap is the ",inline" catch-all for a struct: unknown members
 	// decode into it and its entries re-emit at the struct's own level. It
 	// is nil for every struct without one, so structs pay nothing for the

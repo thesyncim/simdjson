@@ -61,7 +61,7 @@ func releaseDecoderState(state *decoderState) {
 	// Escaped output strings own their arena backing independently. Dropping
 	// the slice prevents a later decode from mutating that retained output.
 	state.strings = nil
-	state.resetReceiverArenas()
+	state.resetOperationState()
 	state.structuralActive = false
 	state.structural.resetForPool()
 	decoderStatePool.Put(state)
