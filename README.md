@@ -65,6 +65,12 @@ Without `GOEXPERIMENT=simd`, simdjson keeps the same API and behavior while
 using its portable Go implementations. The exact support and compiler-update
 policy is documented in [`docs/toolchain.md`](docs/toolchain.md).
 
+`GOEXPERIMENT=simd` is a compiler switch, not a CPU-dispatch override. A
+SIMD-enabled binary snapshots runtime CPU features during package
+initialization and keeps a safe portable implementation for unsupported
+machines. The selected scanner calls do not repeat feature probes while
+processing input.
+
 ## Quick start
 
 ```go
@@ -631,14 +637,26 @@ CPU features.
 
 All APIs have portable fallbacks; every vector load is length-guarded.
 Runtime capabilities are read once and implementation choices are fixed
-during package initialization:
+during package initialization. On amd64 the hot scanner uses static calls
+behind a process-constant level so stack-backed inputs remain allocation-free.
+AVX-512 scanner kernels are retained for differential testing and direct
+benchmarking, but are not selected automatically until they demonstrate a win
+across representative CPU families and short/long input distributions.
 
 | Runtime | String scanning | Decimal parse | Decimal and time format |
 |---|---|---|---|
 | arm64 | NEON on sustained runs; overlap-vector tails | NEON 16-digit reduction | NEON 16-digit and RFC3339 formatting |
-| amd64 with AVX-512 | 64-byte AVX-512 | AVX 16-digit reduction | Scalar SWAR |
-| amd64 with AVX2 | 32-byte AVX2 | AVX 16-digit reduction | Scalar SWAR |
+| amd64 with AVX2 (including AVX-512 CPUs) | 32-byte AVX2 | AVX 16-digit reduction | Scalar SWAR |
 | Other build or CPU | Scalar Go | Scalar Go | Scalar SWAR |
+
+ARM64 NEON is the only alternate scanner ISA implemented today. PMULL may be
+reported by `Current().Features`, but it does not select a different scanner;
+DotProd, SVE, and SVE2 kernels require separate implementations and measured
+dispatch policy before they can be advertised as active backends.
+
+Pull requests run matched pure-Go and SIMD correctness, scanner/kernel, and
+end-to-end benchmarks on native amd64 and native ARM64 runners. Raw artifacts
+are named per architecture so results cannot overwrite each other.
 
 Kernel microbenchmarks live in the root and comparison modules; release claims
 use the end-to-end corpus contracts in the [benchmark record](benchmarks/README.md).
