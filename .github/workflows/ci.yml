@@ -17,7 +17,7 @@ jobs:
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       GOTOOLCHAIN: local
     steps:
@@ -36,11 +36,14 @@ jobs:
           $RUNNER_TEMP/gotip/bin/go test ./simd -run '^$'
           -bench '^BenchmarkStage1(Escaped|PrefixXOR|Rec)Portable$'
           -benchtime=500ms -count=8 -cpu=1
+          | tee "$RUNNER_TEMP/stage1-${RUNNER_ARCH}.txt"
       - name: Corpus mask statistics
         working-directory: benchmarks
         env:
           GOEXPERIMENT: simd
-        run: $RUNNER_TEMP/gotip/bin/go test -run '^TestPortableStage1CorpusStats$' -v .
+        run: >-
+          $RUNNER_TEMP/gotip/bin/go test -run '^TestPortableStage1CorpusStats$' -v .
+          | tee "$RUNNER_TEMP/stage1-corpus-stats-${RUNNER_ARCH}.txt"
       - name: Corpus candidate benchmarks
         working-directory: benchmarks
         env:
@@ -49,6 +52,28 @@ jobs:
           $RUNNER_TEMP/gotip/bin/go test -run '^$'
           -bench '^BenchmarkPortableStage1Corpus$'
           -benchtime=500ms -count=6 -cpu=1 .
+          | tee "$RUNNER_TEMP/stage1-corpus-${RUNNER_ARCH}.txt"
+      - name: Stage2 cursor correctness
+        working-directory: benchmarks
+        env:
+          GOEXPERIMENT: simd
+        run: $RUNNER_TEMP/gotip/bin/go test -run '^TestStage2PositionsCursorCorpora$' -count=1 .
+      - name: Stage2 cursor benchmarks
+        working-directory: benchmarks
+        env:
+          GOEXPERIMENT: simd
+        run: >-
+          $RUNNER_TEMP/gotip/bin/go test -run '^$'
+          -bench '^BenchmarkStage2PositionsCursor$'
+          -benchtime=750ms -count=8 -cpu=1 .
+          | tee "$RUNNER_TEMP/stage2-positions-${RUNNER_ARCH}.txt"
+      - name: Upload benchmark output
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: portable-kernel-${{ matrix.runner }}
+          path: ${{ runner.temp }}/*.txt
+          if-no-files-found: warn
 
   test:
     strategy:
