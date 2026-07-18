@@ -19,12 +19,16 @@ var (
 	scanEncodedHTMLSyntaxSelected  = scanEncodedHTMLSyntaxScalar
 )
 
+func useAVX2Scanner(features CPUFeatures) bool {
+	return features.Has(CPUFeatureAVX2)
+}
+
 func initStringScanner() {
 	// AVX2 is the demonstrated production width, including on AVX-512
 	// capable CPUs. Capability checks happen only here; hot calls invoke
 	// the selected implementation directly.
 	scanCPUFeatures = detectX86CPUFeatures()
-	if scanCPUFeatures.Has(CPUFeatureAVX2) {
+	if useAVX2Scanner(scanCPUFeatures) {
 		scanStringSpecialSelected = scanStringSpecialAVX2
 		scanStringSyntaxSelected = scanStringSyntaxAVX2
 		scanEncodedHTMLSpecialSelected = scanEncodedHTMLSpecialAVX2
