@@ -9,34 +9,26 @@ import (
 	"unsafe"
 )
 
-// scanAMD64Level selects the vector width once at startup. Dispatch happens
-// through static calls in a switch rather than function values: indirect
-// calls make escape analysis treat scanned buffers as leaking, which moves
-// callers' stack storage onto the heap.
-var scanAMD64Level uint8
-
-const (
-	scanLevelScalar uint8 = iota
-	scanLevelAVX2
+// Scanner implementations are selected once during package initialization.
+// Hot calls contain no CPU capability branch; they call the function already
+// bound for this process.
+var (
+	scanStringSpecialSelected      = scanStringSpecialScalar
+	scanStringSyntaxSelected       = scanStringSyntaxScalar
+	scanEncodedHTMLSpecialSelected = scanEncodedHTMLSpecialScalar
+	scanEncodedHTMLSyntaxSelected  = scanEncodedHTMLSyntaxScalar
 )
 
-func selectAMD64ScannerLevel(features CPUFeatures) uint8 {
-	// AVX-512 remains an experimental direct kernel until it wins across
-	// representative CPU families and short/long input distributions. AVX2 is
-	// the demonstrated production width, including on AVX-512-capable CPUs.
-	if features.Has(CPUFeatureAVX2) {
-		return scanLevelAVX2
-	}
-	return scanLevelScalar
-}
-
 func initStringScanner() {
-	// The selected AVX2 entry needs 32 remaining bytes, and the 16-byte word
-	// probes run only on spans of 40 or more. Capability checks happen only
-	// here; hot calls only read the process-constant level below.
+	// AVX2 is the demonstrated production width, including on AVX-512
+	// capable CPUs. Capability checks happen only here; hot calls invoke
+	// the selected implementation directly.
 	scanCPUFeatures = detectX86CPUFeatures()
-	scanAMD64Level = selectAMD64ScannerLevel(scanCPUFeatures)
-	if scanAMD64Level == scanLevelAVX2 {
+	if scanCPUFeatures.Has(CPUFeatureAVX2) {
+		scanStringSpecialSelected = scanStringSpecialAVX2
+		scanStringSyntaxSelected = scanStringSyntaxAVX2
+		scanEncodedHTMLSpecialSelected = scanEncodedHTMLSpecialAVX2
+		scanEncodedHTMLSyntaxSelected = scanEncodedHTMLSyntaxAVX2
 		scanStringSelectedMinBytes = 32
 		scanStringProbeMinBytes = 40
 		scanStringSpecialBackend = "amd64-avx2"
@@ -45,31 +37,19 @@ func initStringScanner() {
 }
 
 func scanStringSpecialRuntime(src []byte, i int) int {
-	if scanAMD64Level == scanLevelAVX2 {
-		return scanStringSpecialAVX2(src, i)
-	}
-	return scanStringSpecialScalar(src, i)
+	return scanStringSpecialSelected(noescapeBytes(src), i)
 }
 
 func scanStringSyntaxRuntime(src []byte, i int) int {
-	if scanAMD64Level == scanLevelAVX2 {
-		return scanStringSyntaxAVX2(src, i)
-	}
-	return scanStringSyntaxScalar(src, i)
+	return scanStringSyntaxSelected(noescapeBytes(src), i)
 }
 
 func scanEncodedHTMLSpecialRuntime(src []byte, i int) int {
-	if scanAMD64Level == scanLevelAVX2 {
-		return scanEncodedHTMLSpecialAVX2(src, i)
-	}
-	return scanEncodedHTMLSpecialScalar(src, i)
+	return scanEncodedHTMLSpecialSelected(noescapeBytes(src), i)
 }
 
 func scanEncodedHTMLSyntaxRuntime(src []byte, i int) int {
-	if scanAMD64Level == scanLevelAVX2 {
-		return scanEncodedHTMLSyntaxAVX2(src, i)
-	}
-	return scanEncodedHTMLSyntaxScalar(src, i)
+	return scanEncodedHTMLSyntaxSelected(noescapeBytes(src), i)
 }
 
 func validUTF8NoLineSeparatorRuntime(src []byte) bool {
