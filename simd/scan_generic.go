@@ -17,23 +17,43 @@ func scanStringSpecialScalar(src []byte, i int) int {
 }
 
 func scanStringSpecialScalarUntil(src []byte, i, limit int) int {
-	for i+16 <= limit {
-		x := binary.LittleEndian.Uint64(src[i:])
-		if m := stringSpecialMask(x); m != 0 {
-			return i + bits.TrailingZeros64(m)/8
+	start := i
+	for i+32 <= limit {
+		m0 := stringSpecialMask(binary.LittleEndian.Uint64(src[i:]))
+		m1 := stringSpecialMask(binary.LittleEndian.Uint64(src[i+8:]))
+		m2 := stringSpecialMask(binary.LittleEndian.Uint64(src[i+16:]))
+		m3 := stringSpecialMask(binary.LittleEndian.Uint64(src[i+24:]))
+		if m0|m1|m2|m3 != 0 {
+			if m0 != 0 {
+				return i + bits.TrailingZeros64(m0)/8
+			}
+			if m1 != 0 {
+				return i + 8 + bits.TrailingZeros64(m1)/8
+			}
+			if m2 != 0 {
+				return i + 16 + bits.TrailingZeros64(m2)/8
+			}
+			return i + 24 + bits.TrailingZeros64(m3)/8
 		}
-		x = binary.LittleEndian.Uint64(src[i+8:])
-		if m := stringSpecialMask(x); m != 0 {
-			return i + 8 + bits.TrailingZeros64(m)/8
-		}
-		i += 16
+		i += 32
 	}
-	if i+8 <= limit {
-		x := binary.LittleEndian.Uint64(src[i:])
-		if m := stringSpecialMask(x); m != 0 {
+	for i+8 <= limit {
+		m := stringSpecialMask(binary.LittleEndian.Uint64(src[i:]))
+		if m != 0 {
 			return i + bits.TrailingZeros64(m)/8
 		}
 		i += 8
+	}
+	if i == limit {
+		return limit
+	}
+	if tail := limit - 8; tail >= start {
+		// The overlapped bytes before i were already proved clean by a prior
+		// word. A match in the final word is therefore necessarily at or after i.
+		if m := stringSpecialMask(binary.LittleEndian.Uint64(src[tail:])); m != 0 {
+			return tail + bits.TrailingZeros64(m)/8
+		}
+		return limit
 	}
 	for i < limit {
 		c := src[i]
@@ -46,24 +66,42 @@ func scanStringSpecialScalarUntil(src []byte, i, limit int) int {
 }
 
 func scanStringSyntaxScalar(src []byte, i int) int {
+	start := i
 	limit := len(src)
-	for i+16 <= limit {
-		x := binary.LittleEndian.Uint64(src[i:])
-		if m := stringSyntaxMask(x); m != 0 {
-			return i + bits.TrailingZeros64(m)/8
+	for i+32 <= limit {
+		m0 := stringSyntaxMask(binary.LittleEndian.Uint64(src[i:]))
+		m1 := stringSyntaxMask(binary.LittleEndian.Uint64(src[i+8:]))
+		m2 := stringSyntaxMask(binary.LittleEndian.Uint64(src[i+16:]))
+		m3 := stringSyntaxMask(binary.LittleEndian.Uint64(src[i+24:]))
+		if m0|m1|m2|m3 != 0 {
+			if m0 != 0 {
+				return i + bits.TrailingZeros64(m0)/8
+			}
+			if m1 != 0 {
+				return i + 8 + bits.TrailingZeros64(m1)/8
+			}
+			if m2 != 0 {
+				return i + 16 + bits.TrailingZeros64(m2)/8
+			}
+			return i + 24 + bits.TrailingZeros64(m3)/8
 		}
-		x = binary.LittleEndian.Uint64(src[i+8:])
-		if m := stringSyntaxMask(x); m != 0 {
-			return i + 8 + bits.TrailingZeros64(m)/8
-		}
-		i += 16
+		i += 32
 	}
-	if i+8 <= limit {
-		x := binary.LittleEndian.Uint64(src[i:])
-		if m := stringSyntaxMask(x); m != 0 {
+	for i+8 <= limit {
+		m := stringSyntaxMask(binary.LittleEndian.Uint64(src[i:]))
+		if m != 0 {
 			return i + bits.TrailingZeros64(m)/8
 		}
 		i += 8
+	}
+	if i == limit {
+		return limit
+	}
+	if tail := limit - 8; tail >= start {
+		if m := stringSyntaxMask(binary.LittleEndian.Uint64(src[tail:])); m != 0 {
+			return tail + bits.TrailingZeros64(m)/8
+		}
+		return limit
 	}
 	for i < limit {
 		c := src[i]
@@ -76,50 +114,102 @@ func scanStringSyntaxScalar(src []byte, i int) int {
 }
 
 func scanEncodedHTMLSyntaxScalar(src []byte, i int) int {
-	const highBits = 0x8080808080808080
-	for i+8 <= len(src) {
+	start := i
+	limit := len(src)
+	for i+16 <= limit {
+		x0 := binary.LittleEndian.Uint64(src[i:])
+		x1 := binary.LittleEndian.Uint64(src[i+8:])
+		m0 := byteEqMask(x0|htmlQuoteAmpFold, '&') |
+			byteEqMask(x0, '\\') |
+			((x0 - 0x2020202020202020) & ^x0 & 0x8080808080808080) |
+			byteEqMask(x0|htmlAngleBracketFold, '>')
+		m1 := byteEqMask(x1|htmlQuoteAmpFold, '&') |
+			byteEqMask(x1, '\\') |
+			((x1 - 0x2020202020202020) & ^x1 & 0x8080808080808080) |
+			byteEqMask(x1|htmlAngleBracketFold, '>')
+		if m0|m1 != 0 {
+			if m0 != 0 {
+				return i + bits.TrailingZeros64(m0)/8
+			}
+			return i + 8 + bits.TrailingZeros64(m1)/8
+		}
+		i += 16
+	}
+	for i+8 <= limit {
 		x := binary.LittleEndian.Uint64(src[i:])
 		m := byteEqMask(x|htmlQuoteAmpFold, '&') |
 			byteEqMask(x, '\\') |
-			((x - 0x2020202020202020) & ^x & highBits) |
+			((x - 0x2020202020202020) & ^x & 0x8080808080808080) |
 			byteEqMask(x|htmlAngleBracketFold, '>')
 		if m != 0 {
 			return i + bits.TrailingZeros64(m)/8
 		}
 		i += 8
 	}
-	for i < len(src) {
+	if i == limit {
+		return limit
+	}
+	if tail := limit - 8; tail >= start {
+		x := binary.LittleEndian.Uint64(src[tail:])
+		m := byteEqMask(x|htmlQuoteAmpFold, '&') |
+			byteEqMask(x, '\\') |
+			((x - 0x2020202020202020) & ^x & 0x8080808080808080) |
+			byteEqMask(x|htmlAngleBracketFold, '>')
+		if m != 0 {
+			return tail + bits.TrailingZeros64(m)/8
+		}
+		return limit
+	}
+	for i < limit {
 		c := src[i]
 		if c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' || c < 0x20 {
 			return i
 		}
 		i++
 	}
-	return len(src)
+	return limit
 }
 
 func scanEncodedHTMLSpecialScalar(src []byte, i int) int {
-	const highBits = 0x8080808080808080
-	for i+8 <= len(src) {
+	start := i
+	limit := len(src)
+	for i+16 <= limit {
+		x0 := binary.LittleEndian.Uint64(src[i:])
+		x1 := binary.LittleEndian.Uint64(src[i+8:])
+		m0 := htmlStringSpecialMask(x0)
+		m1 := htmlStringSpecialMask(x1)
+		if m0|m1 != 0 {
+			if m0 != 0 {
+				return i + bits.TrailingZeros64(m0)/8
+			}
+			return i + 8 + bits.TrailingZeros64(m1)/8
+		}
+		i += 16
+	}
+	for i+8 <= limit {
 		x := binary.LittleEndian.Uint64(src[i:])
-		m := byteEqMask(x|htmlQuoteAmpFold, '&') |
-			byteEqMask(x, '\\') |
-			((x - 0x2020202020202020) & ^x & highBits) |
-			(x & highBits) |
-			byteEqMask(x|htmlAngleBracketFold, '>')
-		if m != 0 {
+		if m := htmlStringSpecialMask(x); m != 0 {
 			return i + bits.TrailingZeros64(m)/8
 		}
 		i += 8
 	}
-	for i < len(src) {
+	if i == limit {
+		return limit
+	}
+	if tail := limit - 8; tail >= start {
+		if m := htmlStringSpecialMask(binary.LittleEndian.Uint64(src[tail:])); m != 0 {
+			return tail + bits.TrailingZeros64(m)/8
+		}
+		return limit
+	}
+	for i < limit {
 		c := src[i]
 		if c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' || c < 0x20 || c >= 0x80 {
 			return i
 		}
 		i++
 	}
-	return len(src)
+	return limit
 }
 
 func hasJSONLineSeparatorScalar(src []byte, start int) bool {
