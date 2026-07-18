@@ -23,7 +23,7 @@ func storeDateTimeParts(dst *[20]byte, year, month, day, hour, minute, second ui
 }
 
 func parseBackend() string {
-	return "scalar-swar"
+	return "scalar"
 }
 
 func parseVectorBytes() int {
