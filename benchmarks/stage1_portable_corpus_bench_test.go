@@ -54,12 +54,12 @@ func portableEscapedFast(backslash uint64, carry *simdkernels.Stage1Carry) uint6
 		carry.Escaped = 0
 		return carryEsc
 	}
+	backslash &^= carryEsc
 	followsEscape := backslash<<1 | carryEsc
 	if backslash&followsEscape == 0 {
 		carry.Escaped = backslash >> 63
 		return followsEscape
 	}
-	backslash &^= carryEsc
 	oddSequenceStarts := backslash & ^(portableEvenBits | followsEscape)
 	sum, overflow := bits.Add64(oddSequenceStarts, backslash, 0)
 	carry.Escaped = overflow
@@ -111,8 +111,11 @@ func TestPortableStage1CorpusStats(t *testing.T) {
 			}
 			if m.Backslash == 0 {
 				slashZero++
-			} else if m.Backslash&(m.Backslash<<1|carry.Escaped) == 0 {
-				slashIsolated++
+			} else {
+				backslash := m.Backslash &^ carry.Escaped
+				if backslash&(backslash<<1|carry.Escaped) == 0 {
+					slashIsolated++
+				}
 			}
 			simdkernels.Stage1Escaped(m.Backslash, &carry)
 		}
