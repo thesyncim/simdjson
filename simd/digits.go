@@ -24,7 +24,10 @@ func All16Digits(digits *[16]byte) bool {
 // digits" (https://lemire.me/blog/2018/10/03/quickly-parsing-eight-digits/).
 // Call All8Digits first when the input is not already known to be digits.
 func Parse8Digits(digits *[8]byte) uint64 {
-	x := binary.LittleEndian.Uint64(digits[:])
+	return parse8DigitsWord(binary.LittleEndian.Uint64(digits[:]))
+}
+
+func parse8DigitsWord(x uint64) uint64 {
 	x = (x & 0x0f0f0f0f0f0f0f0f) * 2561 >> 8
 	x = (x & 0x00ff00ff00ff00ff) * 6553601 >> 16
 	return (x & 0x0000ffff0000ffff) * 42949672960001 >> 32
@@ -81,10 +84,21 @@ func nonDigitMask8(x uint64) uint64 {
 	return ((x + digitUpper) | (x - digitLower)) & digitHigh
 }
 
+// parse16DigitsScalar is the portable equivalent of the vector reduction. It
+// loads each half once, reduces both halves with the established eight-digit
+// SWAR kernel, then combines them in base 10^8. This avoids the old serial
+// sixteen-step multiply dependency chain.
 func parse16DigitsScalar(digits *[16]byte) uint64 {
-	var value uint64
-	for _, digit := range digits {
-		value = value*10 + uint64(digit-'0')
+	hi := parse8DigitsWord(binary.LittleEndian.Uint64(digits[:8]))
+	lo := parse8DigitsWord(binary.LittleEndian.Uint64(digits[8:]))
+	return hi*100_000_000 + lo
+}
+
+func parse16DigitsCheckedScalar(digits *[16]byte) (uint64, bool) {
+	hiWord := binary.LittleEndian.Uint64(digits[:8])
+	loWord := binary.LittleEndian.Uint64(digits[8:])
+	if nonDigitMask8(hiWord)|nonDigitMask8(loWord) != 0 {
+		return 0, false
 	}
-	return value
+	return parse8DigitsWord(hiWord)*100_000_000 + parse8DigitsWord(loWord), true
 }
