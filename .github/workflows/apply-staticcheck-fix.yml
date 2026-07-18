@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ github.event.pull_request.head.ref }}
-      - name: Apply exact fixes and remove temporary workflows
+      - name: Apply exact source fixes
         shell: bash
         run: |
           python3 - <<'PY'
@@ -29,23 +29,26 @@ jobs:
           text = test_path.read_text()
           old = "\t\tquotes := state & state>>3 & state>>11"
           new = "\t\tquotes := state & (state >> 3) & (state >> 11)"
-          if text.count(old) != 1:
-              raise SystemExit(f"expected one quote-mask expression, found {text.count(old)}")
-          test_path.write_text(text.replace(old, new))
+          if text.count(old) == 1:
+              test_path.write_text(text.replace(old, new))
+          elif text.count(new) != 1:
+              raise SystemExit("quote-mask expression is in an unexpected state")
 
           bitmap_path = Path("valid_bitmap.go")
           text = bitmap_path.read_text()
           old = "\t//lint:ignore SA4008 see docs/toolchain.md; block changes in the loop post statement\n"
-          if text.count(old) != 1:
-              raise SystemExit(f"expected one stale lint directive, found {text.count(old)}")
-          bitmap_path.write_text(text.replace(old, ""))
-
-          Path(".github/workflows/staticcheck-debug.yml").unlink(missing_ok=True)
-          Path(".github/workflows/apply-staticcheck-fix.yml").unlink(missing_ok=True)
+          if text.count(old) == 1:
+              bitmap_path.write_text(text.replace(old, ""))
+          elif text.count(old) != 0:
+              raise SystemExit("stale lint directive is in an unexpected state")
           PY
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add simd/stage1_portable_test.go valid_bitmap.go .github/workflows
+          git add simd/stage1_portable_test.go valid_bitmap.go
           git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "Source fixes already applied"
+            exit 0
+          fi
           git commit -m "test: fix staticcheck diagnostics"
           git push origin HEAD:${{ github.event.pull_request.head.ref }}
