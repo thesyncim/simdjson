@@ -13,14 +13,6 @@ import (
 // portable builds. NativeEnabled below is deliberately narrower: it only
 // selects the bitmap route when that API is backed by a native machine.
 
-// stage2MachineEnabled gates the native bitmap grammar route. Portable builds
-// keep this false and use validPositionsStreamed, the faster packed-position Go
-// pipeline.
-var stage2MachineEnabled = simdkernels.Stage2NativeEnabled() && simdkernels.Stage1StreamEnabled()
-
-// stage2IndexPositionEnabled gates the Go-native forward index writer.
-var stage2IndexPositionEnabled = simdkernels.Stage2Enabled() && simdkernels.Stage1StreamEnabled()
-
 // The machine's depth limit must equal the walk's; both reject the open
 // that would exceed it.
 const _ = uint(simdkernels.Stage2MaxDepth-defaultMaxDepth) + uint(defaultMaxDepth-simdkernels.Stage2MaxDepth)

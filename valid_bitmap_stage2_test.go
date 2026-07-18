@@ -162,7 +162,7 @@ func stage2Differential(t *testing.T, src []byte, chunkWords int, label string) 
 
 func stage2SkipIfUnavailable(tb testing.TB) {
 	tb.Helper()
-	if !stage2MachineEnabled {
+	if !simdkernels.Stage2NativeEnabled() {
 		tb.Skip("stage-2 machine not available on this build")
 	}
 }

@@ -126,7 +126,7 @@ func BuildIndexOptions(src []byte, storage []IndexEntry, opts IndexOptions) (Ind
 	// the exact error. The depth gate keeps callers' tighter limits with
 	// the builder that enforces them.
 	fallbackNumberMode := uint8(tapeNumberScalar)
-	if stage2IndexPositionEnabled && maxDepth >= fastWalkMaxDepth &&
+	if maxDepth >= fastWalkMaxDepth &&
 		len(src) >= validBitmapMinBytes && len(src) < indexBitmapMaxBytes {
 		if entries, ok := buildIndexPositions(src, storage); ok {
 			return Index{src: src, entries: entries}, nil

@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 func portableBackendJSON() []byte {
@@ -23,24 +24,29 @@ func portableBackendJSON() []byte {
 	return []byte(b.String())
 }
 
+func portableBackendValidRecursive(src []byte) bool {
+	n := len(src)
+	base := unsafe.Pointer(unsafe.SliceData(src))
+	i, c := nextSignificantFast(base, n, 0)
+	if i >= n {
+		return false
+	}
+	i, ok := validValueFast(src, base, n, i, c, 0)
+	return ok && skipSpaceFast(base, n, i) == n
+}
+
 func BenchmarkPortableBackendValid(b *testing.B) {
 	src := portableBackendJSON()
 	b.Run("recursive", func(b *testing.B) {
-		old := stage1ValidatorEnabled
-		stage1ValidatorEnabled = false
-		defer func() { stage1ValidatorEnabled = old }()
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			if !Valid(src) {
+			if !portableBackendValidRecursive(src) {
 				b.Fatal("invalid")
 			}
 		}
 	})
 	b.Run("portable-stage12", func(b *testing.B) {
-		old := stage1ValidatorEnabled
-		stage1ValidatorEnabled = true
-		defer func() { stage1ValidatorEnabled = old }()
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
@@ -59,13 +65,10 @@ func BenchmarkPortableBackendBuildIndex(b *testing.B) {
 	}
 	storage := make([]IndexEntry, count)
 	b.Run("tape-builder", func(b *testing.B) {
-		old := stage2IndexPositionEnabled
-		stage2IndexPositionEnabled = false
-		defer func() { stage2IndexPositionEnabled = old }()
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			index, err := BuildIndex(src, storage)
+			index, err := buildIndexReference(src, storage)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -73,9 +76,6 @@ func BenchmarkPortableBackendBuildIndex(b *testing.B) {
 		}
 	})
 	b.Run("portable-stage12", func(b *testing.B) {
-		old := stage2IndexPositionEnabled
-		stage2IndexPositionEnabled = true
-		defer func() { stage2IndexPositionEnabled = old }()
 		b.SetBytes(int64(len(src)))
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {

@@ -162,9 +162,6 @@ func TestUTF8FourByteClassSweep(t *testing.T) {
 // byte range.
 func buildBitmapUTF8Document(t *testing.T) (doc []byte, padStart, padEnd int) {
 	t.Helper()
-	if !stage1ValidatorEnabled {
-		t.Skip("stage-1 kernels not built")
-	}
 	pad := strings.Repeat("a", 96)
 	type record struct {
 		Name  string   `json:"name"`
