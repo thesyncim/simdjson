@@ -52,7 +52,7 @@ func TestSIMDScannerDispatch(t *testing.T) {
 	}
 }
 
-func TestSIMDScannerDispatchKeepsInputOnStack(t *testing.T) {
+func TestSIMDScannerDispatchStaysOnStack(t *testing.T) {
 	if allocs := testing.AllocsPerRun(1000, func() {
 		scanSink = scanStackBackedString()
 	}); allocs != 0 {

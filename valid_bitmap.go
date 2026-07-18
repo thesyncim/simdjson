@@ -144,7 +144,6 @@ func validBitmapPerBlock(src []byte) (valid, decided bool) {
 	skipEscape := -1 // low-surrogate escape already consumed by its high half
 
 	nBlocks := (n + 63) / 64
-	//lint:ignore SA4008 see docs/toolchain.md; block changes in the loop post statement
 	for block := 0; block < nBlocks; block++ {
 		pos := block * 64
 		if pos+64 <= n {

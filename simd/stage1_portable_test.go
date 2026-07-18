@@ -141,7 +141,7 @@ func TestStage1PrefixXORMatchesReference(t *testing.T) {
 		state ^= state << 13
 		state ^= state >> 7
 		state ^= state << 17
-		quotes := state & state>>3 & state>>11
+		quotes := state & (state >> 3) & (state >> 11)
 		if round%5 == 0 {
 			quotes = 0 // exercise the quote-free fast path with both carry states
 		}
