@@ -11,6 +11,32 @@ permissions:
   contents: read
 
 jobs:
+  portable-stage1-benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install Go bootstrap
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.26.4
+          cache: false
+      - name: Build pinned Go tip
+        run: ./scripts/bootstrap-gotip.sh "$RUNNER_TEMP/gotip"
+      - name: Candidate correctness
+        run: $RUNNER_TEMP/gotip/bin/go test ./simd -run '^TestStage1PortableCandidates$' -count=1
+      - name: Candidate benchmarks
+        run: >-
+          $RUNNER_TEMP/gotip/bin/go test ./simd -run '^$'
+          -bench '^BenchmarkStage1(Escaped|PrefixXOR|Rec)Portable$'
+          -benchtime=500ms -count=8 -cpu=1
+
   test:
     strategy:
       fail-fast: false
