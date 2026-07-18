@@ -48,28 +48,21 @@ func loadPortableCorpora(tb testing.TB) []portableCorpus {
 	return corpora
 }
 
-func portableEscapedFast(backslash uint64, carry *simdkernels.Stage1Carry) uint64 {
-	carryEsc := carry.Escaped
+func portableEscapedBaseline(backslash uint64, carry *simdkernels.Stage1Carry) uint64 {
 	if backslash == 0 {
+		escaped := carry.Escaped
 		carry.Escaped = 0
-		return carryEsc
+		return escaped
 	}
-	backslash &^= carryEsc
-	followsEscape := backslash<<1 | carryEsc
-	if backslash&followsEscape == 0 {
-		carry.Escaped = backslash >> 63
-		return followsEscape
-	}
-	oddSequenceStarts := backslash & ^(portableEvenBits | followsEscape)
+	backslash &^= carry.Escaped
+	followsEscape := backslash<<1 | carry.Escaped
+	oddSequenceStarts := backslash & ^portableEvenBits & ^followsEscape
 	sum, overflow := bits.Add64(oddSequenceStarts, backslash, 0)
 	carry.Escaped = overflow
 	return (portableEvenBits ^ sum<<1) & followsEscape
 }
 
-func portablePrefixFast(quotes uint64, carry *simdkernels.Stage1Carry) uint64 {
-	if quotes == 0 {
-		return carry.InString
-	}
+func portablePrefixBaseline(quotes uint64, carry *simdkernels.Stage1Carry) uint64 {
 	m := quotes
 	m ^= m << 1
 	m ^= m << 2
@@ -82,19 +75,20 @@ func portablePrefixFast(quotes uint64, carry *simdkernels.Stage1Carry) uint64 {
 	return m
 }
 
-func portableRecFast(m *simdkernels.Stage1Masks, st *simdkernels.Stage1Stream, r *simdkernels.Stage1Rec) {
-	escaped := portableEscapedFast(m.Backslash, &st.Carry)
+func portableRecBaseline(m *simdkernels.Stage1Masks, st *simdkernels.Stage1Stream, r *simdkernels.Stage1Rec) {
+	escaped := portableEscapedBaseline(m.Backslash, &st.Carry)
 	quotes := m.Quote &^ escaped
-	inStr := portablePrefixFast(quotes, &st.Carry)
-	outside := ^(inStr | quotes)
+	inStr := portablePrefixBaseline(quotes, &st.Carry)
+	closers := quotes &^ inStr
 	openers := quotes & inStr
+	outside := ^(inStr | closers)
 	cand := ^(m.Whitespace | m.Structural | m.Quote | inStr)
 	starts := cand &^ (cand<<1 | st.Follows)
 	st.Follows = cand >> 63
-	r.Emit = (m.Structural|starts)&outside | openers
-	r.Scalar = cand
+	r.Emit = m.Structural&outside | openers | starts&outside
+	r.Scalar = cand & outside
 	r.EscInStr = escaped & inStr
-	r.Bad = m.Control&(inStr|outside&^m.Whitespace) != 0
+	r.Bad = m.Control&inStr|m.Control&outside&^m.Whitespace != 0
 	r.WsOut = m.Whitespace & outside
 	r.InStr = inStr
 	r.NonASCII = m.NonASCII
@@ -129,24 +123,24 @@ func TestPortableStage1CorpusStats(t *testing.T) {
 
 func BenchmarkPortableStage1Corpus(b *testing.B) {
 	for _, corpus := range loadPortableCorpora(b) {
-		b.Run(corpus.name+"/current", func(b *testing.B) {
+		b.Run(corpus.name+"/baseline", func(b *testing.B) {
+			var st simdkernels.Stage1Stream
+			var rec simdkernels.Stage1Rec
+			b.SetBytes(corpus.bytes)
+			for n := 0; n < b.N; n++ {
+				for i := range corpus.masks {
+					portableRecBaseline(&corpus.masks[i], &st, &rec)
+				}
+			}
+			stage1PortableBenchSink = rec.Emit ^ rec.Scalar ^ rec.InStr
+		})
+		b.Run(corpus.name+"/final", func(b *testing.B) {
 			var st simdkernels.Stage1Stream
 			var rec simdkernels.Stage1Rec
 			b.SetBytes(corpus.bytes)
 			for n := 0; n < b.N; n++ {
 				for i := range corpus.masks {
 					simdkernels.Stage1RecFromMasks(&corpus.masks[i], &st, &rec)
-				}
-			}
-			stage1PortableBenchSink = rec.Emit ^ rec.Scalar ^ rec.InStr
-		})
-		b.Run(corpus.name+"/fast", func(b *testing.B) {
-			var st simdkernels.Stage1Stream
-			var rec simdkernels.Stage1Rec
-			b.SetBytes(corpus.bytes)
-			for n := 0; n < b.N; n++ {
-				for i := range corpus.masks {
-					portableRecFast(&corpus.masks[i], &st, &rec)
 				}
 			}
 			stage1PortableBenchSink = rec.Emit ^ rec.Scalar ^ rec.InStr
