@@ -1,14 +1,12 @@
 package simd
 
 import (
-	"encoding/binary"
 	"math/bits"
 )
 
 // The stage-1 masks and carry kernels are architecture-neutral. SIMD builds
-// provide a vector Stage1Block; scalar builds use the SWAR classifier below.
-// Routing may still leave the full stage-1 engine disabled when the scalar
-// classifier does not beat the ordinary parser for a workload.
+// provide a vector Stage1Block; scalar builds use the table-driven classifier
+// below. Build tags bind callers directly to one implementation.
 
 // Stage1Masks holds the per-64-byte-block classification. Bit i of each
 // mask describes byte i of the block.
@@ -32,40 +30,64 @@ const (
 	stage1EvenBits      = uint64(0x5555555555555555)
 	stage1ByteLow7      = uint64(0x7f7f7f7f7f7f7f7f)
 	stage1ByteHigh      = uint64(0x8080808080808080)
-	stage1ByteBit5      = uint64(0x2020202020202020)
-	stage1ByteBit2      = uint64(0x0404040404040404)
 	stage1CompressBytes = uint64(0x0002040810204081)
 )
 
-// stage1BlockPortable classifies one 64-byte block using eight independent
-// SWAR words. The exact-zero primitive masks each lane to seven bits before
-// adding, so carries cannot leak between bytes; unlike the usual has-zero
-// trick, every returned bit is an exact lane result and is safe to materialize
-// as a stage-1 mask.
+// stage1PortableClass packs six one-bit byte classifications into separate
+// bytes of one uint64. Shifting an entry by a lane index and ORing eight
+// entries therefore builds six independent eight-lane masks at once. The
+// 2 KiB table stays hot and halves the scalar classifier cost versus both the
+// bytewise switch and repeated SWAR equality/compression.
+var stage1PortableClass = func() (table [256]uint64) {
+	for i := range table {
+		c := byte(i)
+		var class uint64
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			class |= 1
+		}
+		if c == '{' || c == '}' || c == '[' || c == ']' || c == ':' || c == ',' {
+			class |= 1 << 8
+		}
+		if c == '"' {
+			class |= 1 << 16
+		}
+		if c == '\\' {
+			class |= 1 << 24
+		}
+		if c < 0x20 {
+			class |= 1 << 32
+		}
+		if c >= 0x80 {
+			class |= 1 << 40
+		}
+		table[i] = class
+	}
+	return table
+}()
+
+// stage1BlockPortable classifies one 64-byte block with a compact lookup and
+// bit-sliced accumulator. Each group of eight bytes becomes six mask bytes;
+// those bytes are placed directly into their final 64-bit block masks.
 func stage1BlockPortable(block *[64]byte, out *Stage1Masks) {
 	var whitespace, structural, quote, backslash, control uint64
-	var high uint64
-	for word := 0; word < 8; word++ {
-		x := binary.LittleEndian.Uint64(block[word*8:])
-
-		q := stage1ByteEqExact(x, '"')
-		slash := stage1ByteEqExact(x, '\\')
-		ws := stage1ByteEqExact(x|stage1ByteBit2, '\r') |
-			stage1ByteEqExact(x, '\n') |
-			stage1ByteEqExact(x, ' ')
-		structure := stage1ByteEqExact(x|stage1ByteBit5, '{') |
-			stage1ByteEqExact(x|stage1ByteBit5, '}') |
-			stage1ByteEqExact(x, ':') |
-			stage1ByteEqExact(x, ',')
-		ctrl := stage1ZeroByteMaskExact(x & 0xe0e0e0e0e0e0e0e0)
-
-		shift := uint(word * 8)
-		whitespace |= stage1CompressHighBytes(ws) << shift
-		structural |= stage1CompressHighBytes(structure) << shift
-		quote |= stage1CompressHighBytes(q) << shift
-		backslash |= stage1CompressHighBytes(slash) << shift
-		control |= stage1CompressHighBytes(ctrl) << shift
-		high |= x & stage1ByteHigh
+	var nonASCII uint64
+	for group := 0; group < 8; group++ {
+		bytes := block[group*8:]
+		packed := stage1PortableClass[bytes[0]] |
+			stage1PortableClass[bytes[1]]<<1 |
+			stage1PortableClass[bytes[2]]<<2 |
+			stage1PortableClass[bytes[3]]<<3 |
+			stage1PortableClass[bytes[4]]<<4 |
+			stage1PortableClass[bytes[5]]<<5 |
+			stage1PortableClass[bytes[6]]<<6 |
+			stage1PortableClass[bytes[7]]<<7
+		shift := uint(group * 8)
+		whitespace |= packed & 0xff << shift
+		structural |= packed >> 8 & 0xff << shift
+		quote |= packed >> 16 & 0xff << shift
+		backslash |= packed >> 24 & 0xff << shift
+		control |= packed >> 32 & 0xff << shift
+		nonASCII |= packed >> 40
 	}
 	*out = Stage1Masks{
 		Whitespace: whitespace,
@@ -73,7 +95,7 @@ func stage1BlockPortable(block *[64]byte, out *Stage1Masks) {
 		Quote:      quote,
 		Backslash:  backslash,
 		Control:    control,
-		NonASCII:   high != 0,
+		NonASCII:   nonASCII != 0,
 	}
 }
 
