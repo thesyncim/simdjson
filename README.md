@@ -2,6 +2,11 @@
 
 [![ci](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml/badge.svg)](https://github.com/thesyncim/simdjson/actions/workflows/ci.yml)
 
+This is an independent Go implementation, not the C++
+[`simdjson`](https://github.com/simdjson/simdjson) project. The relationship to
+upstream algorithms and test material is recorded in
+[`docs/provenance.md`](docs/provenance.md).
+
 Strict, high-performance JSON for Go, written entirely in Go. `Unmarshal` and
 `Marshal` are drop-in replacements for their `encoding/json` counterparts;
 compiled per-type codecs, structural indexes, and vector kernels built on Go's

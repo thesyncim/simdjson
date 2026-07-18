@@ -57,6 +57,33 @@ func assertEncoderScratchBudgets(t *testing.T, scratch *encoderScratch) {
 }
 
 func TestEncoderScratchDropsOversizedMap(t *testing.T) {
+	t.Run("cold-scratch", func(t *testing.T) {
+		enc, err := CompileEncoder[map[int]uint64](EncoderOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, pool := dedicatedEncoderScratch(&enc)
+		n := oversizedEncoderMapLen(unsafe.Sizeof(uint64(0)))
+		huge := make(map[int]uint64, n)
+		for i := 0; i < n; i++ {
+			huge[i] = uint64(i)
+		}
+		out, err := enc.AppendJSON(nil, &huge)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !Valid(out) {
+			t.Fatal("oversized map produced invalid JSON")
+		}
+		returned := pool.Get().(*encoderScratch)
+		assertEncoderScratchBudgets(t, returned)
+		if cap(returned.mapEntries) != 0 || cap(returned.mapKeyArena) != 0 {
+			t.Fatalf("oversized map populated cold scratch: entries=%d arena=%d",
+				cap(returned.mapEntries), cap(returned.mapKeyArena))
+		}
+		pool.Put(returned)
+	})
+
 	t.Run("pointer-bearing", func(t *testing.T) {
 		shared := uint64(7)
 		tiny := map[int]*uint64{1: &shared, 2: nil}

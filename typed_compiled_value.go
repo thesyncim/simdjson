@@ -315,7 +315,7 @@ func dynamicDecodeNode(typ reflect.Type) (*typedNode, error) {
 		cached := entry.(*dynamicDecodeEntry)
 		return cached.node, cached.err
 	}
-	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode)}
+	compiler := newTypedCompiler(typedCompileDecode)
 	node, err := compiler.compile(typ, typ.String())
 	if err == nil {
 		prepareTypedResets(node, make(map[*typedNode]bool))

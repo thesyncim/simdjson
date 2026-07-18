@@ -44,7 +44,9 @@ func dynamicEncodeNode(typ reflect.Type, escapeHTML bool) (*typedNode, error) {
 		cached := entry.(*dynamicEncodeEntry)
 		return cached.node, cached.err
 	}
-	compiler := typedCompiler{nodes: make(map[reflect.Type]*typedNode), escapeHTML: escapeHTML, dynamic: true}
+	compiler := newTypedCompiler(typedCompileEncode)
+	compiler.escapeHTML = escapeHTML
+	compiler.dynamic = true
 	node, err := compiler.compile(typ, typ.String())
 	if err == nil {
 		computeEncPtrMarshaler(node, make(map[*typedNode]bool))
@@ -131,7 +133,7 @@ func (e *encodeState) encodeDynamicValue(value reflect.Value) error {
 	box.value.Elem().Set(value)
 	e.depth++
 	var encodeErr error
-	if entry.node.kind == typedMap {
+	if entry.node.baseKind == typedMap {
 		encodeErr = e.encodeMapValue(entry.node, box.value.Elem(), box)
 	} else {
 		encodeErr = e.encodeNonAddressable(entry.node, box.value.UnsafePointer())
@@ -362,6 +364,9 @@ func (e *encodeState) releaseMapScratch(entries []mapEncodeEntry, keyArena []byt
 		return
 	}
 	scratch := e.scratch
+	// A nested call may return its operation-local backing while the outer call
+	// still owns the original pooled slice. Keep the first returned backing and
+	// let the outer release leave that occupied slot unchanged.
 	if scratch == nil || scratch.mapEntries != nil {
 		return
 	}
@@ -433,7 +438,7 @@ func mapKeyName(node *typedNode, key reflect.Value) (string, error) {
 // that need escaping, so they are wrapped directly; strings are encoded and
 // then re-encoded as string contents, like encoding/json.
 func (e *encodeState) encodeQuoted(node *typedNode, src unsafe.Pointer) error {
-	if node.kind == typedPointer {
+	if node.baseKind == typedPointer {
 		pointer := *(*unsafe.Pointer)(src)
 		if pointer == nil {
 			e.dst = append(e.dst, "null"...)
@@ -442,7 +447,7 @@ func (e *encodeState) encodeQuoted(node *typedNode, src unsafe.Pointer) error {
 		node = node.elem
 		src = pointer
 	}
-	if node.kind == typedString {
+	if node.baseKind == typedString {
 		inner := appendEncodedJSONString(nil, *(*string)(src), e.escapeHTML)
 		e.dst = appendEncodedJSONString(e.dst, string(inner), false)
 		return nil

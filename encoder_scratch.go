@@ -102,7 +102,13 @@ func newEncoderScratchPool(types []reflect.Type, backingSlots int, hasMap bool) 
 	}
 	types = append([]reflect.Type(nil), types...)
 	return &sync.Pool{New: func() any {
-		scratch := &encoderScratch{marshalers: make([]encoderMarshalerScratch, len(types))}
+		// A non-nil empty slice marks a cold map scratch slot as available.
+		// Borrowers replace it with nil, while oversized operations never borrow;
+		// this prevents an oversized first encode from seeding the pool.
+		scratch := &encoderScratch{
+			marshalers: make([]encoderMarshalerScratch, len(types)),
+			mapEntries: make([]mapEncodeEntry, 0),
+		}
 		if backingSlots > 1 {
 			scratch.valueBackings = make([]reflect.Value, backingSlots)
 		}

@@ -49,12 +49,10 @@ type Encoder[T any] struct {
 func CompileEncoder[T any](opts EncoderOptions) (Encoder[T], error) {
 	typ := reflect.TypeFor[T]()
 	escapeHTML := !opts.DisableHTMLEscaping
-	compiler := typedCompiler{
-		nodes:          make(map[reflect.Type]*typedNode),
-		escapeHTML:     escapeHTML,
-		inlineFields:   opts.InlineFields,
-		inlineUnsorted: opts.UnsortedInlineFields,
-	}
+	compiler := newTypedCompiler(typedCompileEncode)
+	compiler.escapeHTML = escapeHTML
+	compiler.inlineFields = opts.InlineFields
+	compiler.inlineUnsorted = opts.UnsortedInlineFields
 	root, err := compiler.compile(typ, typ.String())
 	if err != nil {
 		return Encoder[T]{}, err

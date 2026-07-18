@@ -51,6 +51,7 @@ fi
 
 echo "baseline: $(git -C "$root" rev-parse --short "$baseline_commit")  rounds: $rounds  benchtime: $benchtime" >&2
 echo "benchdir: $benchdir  max significant sec/op regression: $regression_limit%" >&2
+echo "max significant B/op regression: ${BENCH_B_PER_OP_REGRESSION_LIMIT:-0.01}%; allocs/op: 0%" >&2
 
 git -C "$root" worktree add --force --detach "$work/baseline" "$baseline_commit" >/dev/null 2>&1 ||
 	git -C "$work/baseline" checkout --force "$baseline_commit" >/dev/null 2>&1
@@ -62,8 +63,15 @@ git -C "$root" worktree add --force --detach "$work/baseline" "$baseline_commit"
 : >"$work/new.txt"
 round=0
 while [ "$round" -lt "$rounds" ]; do
-	"$work/old.test" -test.run '^$' -test.bench "$pattern" -test.benchtime "$benchtime" >>"$work/old.txt" 2>&1
-	"$work/new.test" -test.run '^$' -test.bench "$pattern" -test.benchtime "$benchtime" >>"$work/new.txt" 2>&1
+	# Alternate execution order so thermal state, frequency ramp, and other
+	# first-process effects are distributed evenly between the two binaries.
+	if [ $((round % 2)) -eq 0 ]; then
+		"$work/old.test" -test.run '^$' -test.bench "$pattern" -test.benchtime "$benchtime" >>"$work/old.txt" 2>&1
+		"$work/new.test" -test.run '^$' -test.bench "$pattern" -test.benchtime "$benchtime" >>"$work/new.txt" 2>&1
+	else
+		"$work/new.test" -test.run '^$' -test.bench "$pattern" -test.benchtime "$benchtime" >>"$work/new.txt" 2>&1
+		"$work/old.test" -test.run '^$' -test.bench "$pattern" -test.benchtime "$benchtime" >>"$work/old.txt" 2>&1
+	fi
 	round=$((round + 1))
 done
 

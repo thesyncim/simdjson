@@ -79,10 +79,8 @@ type Decoder[T any] struct {
 // growing dynamic slices, and inserting map entries.
 func CompileDecoder[T any](opts DecoderOptions) (Decoder[T], error) {
 	typ := reflect.TypeFor[T]()
-	compiler := typedCompiler{
-		nodes:        make(map[reflect.Type]*typedNode),
-		inlineFields: opts.InlineFields,
-	}
+	compiler := newTypedCompiler(typedCompileDecode)
+	compiler.inlineFields = opts.InlineFields
 	root, err := compiler.compile(typ, typ.String())
 	if err != nil {
 		return Decoder[T]{}, err
@@ -98,10 +96,8 @@ func CompileDecoder[T any](opts DecoderOptions) (Decoder[T], error) {
 		scratch:    newDecoderPlanState(mapSlots, root.decHasReceiver),
 		rootSlice: &typedNode{
 			kind:           typedSlice,
-			encKind:        typedSlice,
 			baseKind:       typedSlice,
 			op:             typedOpSlice,
-			encOp:          typedOpSlice,
 			typ:            rootSliceType,
 			name:           rootSliceType.String(),
 			elem:           root,
@@ -560,8 +556,20 @@ type typedField struct {
 	op      typedOp
 }
 
+type typedCompileMode uint8
+
+const (
+	typedCompileDecode typedCompileMode = iota
+	typedCompileEncode
+)
+
+// typedCompiler still constructs the shared pre-split node graph, but mode
+// identifies the public plan that owns the graph. Keeping the direction at the
+// compiler boundary lets decode-only and encode-only construction move out in
+// independently benchmarked steps without changing executor layout first.
 type typedCompiler struct {
 	nodes           map[reflect.Type]*typedNode
+	mode            typedCompileMode
 	encScratchTypes []reflect.Type
 	encBackingSlots int
 	encHasMap       bool
@@ -577,6 +585,21 @@ type typedCompiler struct {
 	// tag is inert and a ",inline" map compiles as an ordinary named field, so
 	// the feature is opt-in and free for every type that does not request it.
 	inlineFields bool
+}
+
+func newTypedCompiler(mode typedCompileMode) typedCompiler {
+	return typedCompiler{
+		nodes: make(map[reflect.Type]*typedNode),
+		mode:  mode,
+	}
+}
+
+func (c *typedCompiler) compilesEncode() bool {
+	return c.mode == typedCompileEncode
+}
+
+func (c *typedCompiler) compilesDecode() bool {
+	return c.mode == typedCompileDecode
 }
 
 // compileInlineMap records a struct's ",inline" catch-all. The field must be a
@@ -602,11 +625,15 @@ func (c *typedCompiler) compileInlineMap(node *typedNode, structType reflect.Typ
 	if err != nil {
 		return err
 	}
-	inline := &typedInlineMap{
-		offset: offset, mapType: mapType, elem: elem, sorted: !c.inlineUnsorted,
-		encKey: -1, encBacking: noEncoderBackingSlot,
-		encScratchLimit: encoderMapScratchLimit(mapType.Elem()),
+	inline := &typedInlineMap{offset: offset, mapType: mapType, elem: elem}
+	if !c.compilesEncode() {
+		node.inlineMap = inline
+		return nil
 	}
+	inline.sorted = !c.inlineUnsorted
+	inline.encKey = -1
+	inline.encBacking = noEncoderBackingSlot
+	inline.encScratchLimit = encoderMapScratchLimit(mapType.Elem())
 	// Reuse the same pooled scratch as encodeMap: one map iterator and entry
 	// slice per encode, plus a reserved key box and a pooled value backing, so
 	// a populated catch-all encodes without per-member allocation.
@@ -656,22 +683,42 @@ func (c *typedCompiler) compile(typ reflect.Type, path string) (*typedNode, erro
 		if !c.applyInterfaceKinds(node, typ) {
 			return nil, err
 		}
-		if node.kind == typedInvalid && node.encKind == typedInvalid {
+		if c.compilesDecode() {
+			if node.kind == typedInvalid {
+				return nil, err
+			}
+		} else if node.encKind == typedInvalid {
 			return nil, err
 		}
+		c.clearOppositeDirection(node)
 		c.nodes[typ] = node
 		return node, nil
 	}
 	node.baseKind = node.kind
-	node.encKind = node.kind
-	node.encOp = node.op
-	node.encNonAddrKind = node.encKind
+	if c.compilesEncode() {
+		node.encKind = node.kind
+		node.encOp = node.op
+		node.encNonAddrKind = node.encKind
+	}
 	c.applyInterfaceKinds(node, typ)
+	c.clearOppositeDirection(node)
 	return node, nil
+}
+
+func (c *typedCompiler) clearOppositeDirection(node *typedNode) {
+	if c.compilesDecode() {
+		node.encKind = typedInvalid
+		node.encNonAddrKind = typedInvalid
+		node.encOp = typedOpInvalid
+	} else {
+		node.kind = typedInvalid
+		node.op = typedOpInvalid
+	}
 }
 
 // compileStructural fills node with typ's structural layout.
 func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, path string) error {
+	decode := c.compilesDecode()
 	if typ == jsonNumberReflectType {
 		node.kind = typedNumber
 		node.op = typedOpNumber
@@ -738,9 +785,11 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 		}
 		node.kind = typedSlice
 		node.op = typedOpSlice
-		node.decBuiltinSlice = typ == reflect.TypeFor[[]int64]() ||
-			typ == reflect.TypeFor[[]uint64]() || typ == reflect.TypeFor[[]float64]()
-		node.emptySliceData = makeTypedEmptySliceData(typ)
+		if decode {
+			node.decBuiltinSlice = typ == reflect.TypeFor[[]int64]() ||
+				typ == reflect.TypeFor[[]uint64]() || typ == reflect.TypeFor[[]float64]()
+			node.emptySliceData = makeTypedEmptySliceData(typ)
+		}
 		elem, err := c.compile(typ.Elem(), path+"[]")
 		if err != nil {
 			return err
@@ -769,32 +818,37 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 			return c.unsupported(typ, path, "unsupported map key type")
 		}
 		node.mapKeyKind = keyKind
-		node.mapKeyTextDecode = reflect.PointerTo(typ.Key()).Implements(textUnmarshalerReflectType)
-		// encoding/json only consults the value method set for key encoding.
-		node.mapKeyTextEncode = typ.Key().Implements(textMarshalerReflectType)
+		if decode {
+			node.mapKeyTextDecode = reflect.PointerTo(typ.Key()).Implements(textUnmarshalerReflectType)
+		} else {
+			// encoding/json only consults the value method set for key encoding.
+			node.mapKeyTextEncode = typ.Key().Implements(textMarshalerReflectType)
+		}
 		node.kind = typedMap
 		node.op = typedOpMap
-		c.encHasMap = true
-		if !c.dynamic {
-			// Reserve an addressable box of the key type in the encoder
-			// scratch so encodeMap copies each member name into it with
-			// SetIterKey instead of letting reflect box a fresh key; values
-			// collect into the pooled valueBacking for independent slots.
-			node.encMapKey = int32(len(c.encScratchTypes))
-			c.encScratchTypes = append(c.encScratchTypes, typ.Key())
-			node.encBacking = encoderBackingSlot(c.encBackingSlots)
-			c.encBackingSlots++
+		if !decode {
+			c.encHasMap = true
+			if !c.dynamic {
+				// Reserve an addressable box of the key type in the encoder
+				// scratch so encodeMap copies each member name into it with
+				// SetIterKey instead of letting reflect box a fresh key; values
+				// collect into the pooled valueBacking for independent slots.
+				node.encMapKey = int32(len(c.encScratchTypes))
+				c.encScratchTypes = append(c.encScratchTypes, typ.Key())
+				node.encBacking = encoderBackingSlot(c.encBackingSlots)
+				c.encBackingSlots++
+			}
+			node.encScratchLimit = encoderMapScratchLimit(typ.Elem())
 		}
 		elem, err := c.compile(typ.Elem(), path+"[key]")
 		if err != nil {
 			return err
 		}
 		node.elem = elem
-		node.encScratchLimit = encoderMapScratchLimit(typ.Elem())
 	case reflect.Struct:
 		node.kind = typedStruct
 		node.op = typedOpStruct
-		node.encSimple = true
+		node.encSimple = !decode
 		for _, resolved := range resolveStructFields(typ) {
 			if resolved.inline && c.inlineFields {
 				if err := c.compileInlineMap(node, typ, resolved, path); err != nil {
@@ -810,179 +864,187 @@ func (c *typedCompiler) compileStructural(node *typedNode, typ reflect.Type, pat
 			if hopErr != nil {
 				return hopErr
 			}
-			fieldIndex := len(node.fields)
-			compiledField := typedField{
-				name:   resolved.name,
-				offset: offset,
-				node:   fieldNode,
-				op:     fieldNode.op,
-				pos:    int32(fieldIndex),
-				hop:    -1,
-			}
+			fieldHop := int16(-1)
 			if hops != nil {
-				node.encSimple = false
-				compiledField.hop = int16(len(node.fieldHops))
+				fieldHop = int16(len(node.fieldHops))
 				node.fieldHops = append(node.fieldHops, hops)
-				// The embedded pointer slot is not a leaf field, so replace
-				// style resets must clear it explicitly.
-				node.hopResets = append(node.hopResets, hops[0].offset)
-			}
-			encField := typedEncField{
-				encName:   "," + string(appendEncodedJSONString(nil, resolved.name, c.escapeHTML)) + ":",
-				node:      fieldNode,
-				offset:    offset,
-				hop:       compiledField.hop,
-				encOp:     fieldNode.encOp,
-				omitEmpty: resolved.omitEmpty,
-			}
-			if resolved.omitEmpty {
-				node.encSimple = false
-			}
-			if resolved.quoted {
-				quotedNode := fieldNode
-				if quotedNode.kind == typedPointer && resolved.typ.Name() == "" {
-					quotedNode = quotedNode.elem
+				if decode {
+					// The embedded pointer slot is not a leaf field, so replace
+					// style resets must clear it explicitly.
+					node.hopResets = append(node.hopResets, hops[0].offset)
+				} else {
+					node.encSimple = false
 				}
-				switch quotedNode.baseKind {
-				case typedBool, typedString, typedNumber, typedInt, typedUint, typedFloat:
-					// encoding/json sets the quoted flag by kind but its
-					// marshaler and unmarshaler paths ignore it, so custom
-					// methods keep their own dispatch on each side.
-					if compiledField.op != typedOpUnmarshaler {
-						compiledField.op = typedOpQuoted
+			}
+			if decode {
+				fieldIndex := len(node.fields)
+				field := typedField{
+					name: resolved.name, offset: offset, node: fieldNode,
+					op: fieldNode.op, pos: int32(fieldIndex), hop: fieldHop,
+				}
+				if resolved.quoted {
+					quotedNode := fieldNode
+					if quotedNode.kind == typedPointer && resolved.typ.Name() == "" {
+						quotedNode = quotedNode.elem
 					}
-					if encField.encOp != typedOpMarshaler {
-						encField.encOp = typedOpQuoted
+					switch quotedNode.baseKind {
+					case typedBool, typedString, typedNumber, typedInt, typedUint, typedFloat:
+						if field.op != typedOpUnmarshaler {
+							field.op = typedOpQuoted
+						}
 					}
 				}
-			}
-			node.encFields = append(node.encFields, encField)
-			node.encPaths = append(node.encPaths, resolved.name)
-			if fieldIndex < 64 {
-				compiledField.seen = uint64(1) << fieldIndex
-			}
-			name := resolved.name
-			if len(name) <= 7 {
-				for byteIndex := range len(name) {
-					c := name[byteIndex]
-					compiledField.key |= uint64(c) << (byteIndex * 8)
-					if lower := c | 0x20; 'a' <= lower && lower <= 'z' {
-						compiledField.keyFold |= 0x20 << (byteIndex * 8)
+				if fieldIndex < 64 {
+					field.seen = uint64(1) << fieldIndex
+				}
+				name := resolved.name
+				if len(name) <= 7 {
+					for byteIndex := range len(name) {
+						char := name[byteIndex]
+						field.key |= uint64(char) << (byteIndex * 8)
+						if lower := char | 0x20; 'a' <= lower && lower <= 'z' {
+							field.keyFold |= 0x20 << (byteIndex * 8)
+						}
 					}
-				}
-				compiledField.key |= uint64('"') << (len(name) * 8)
-				if len(name) <= 6 {
-					compiledField.key |= uint64(':') << ((len(name) + 1) * 8)
-					compiledField.keyMask = ^uint64(0) >> ((6 - len(name)) * 8)
-				} else {
-					compiledField.keyMask = ^uint64(0)
-				}
-				compiledField.keyLen = uint8(len(name))
-			} else if len(name) <= 255 {
-				for byteIndex := range 8 {
-					c := name[byteIndex]
-					compiledField.key |= uint64(c) << (byteIndex * 8)
-					if lower := c | 0x20; 'a' <= lower && lower <= 'z' {
-						compiledField.keyFold |= 0x20 << (byteIndex * 8)
+					field.key |= uint64('"') << (len(name) * 8)
+					if len(name) <= 6 {
+						field.key |= uint64(':') << ((len(name) + 1) * 8)
+						field.keyMask = ^uint64(0) >> ((6 - len(name)) * 8)
+					} else {
+						field.keyMask = ^uint64(0)
 					}
+					field.keyLen = uint8(len(name))
+				} else if len(name) <= 255 {
+					for byteIndex := range 8 {
+						char := name[byteIndex]
+						field.key |= uint64(char) << (byteIndex * 8)
+						if lower := char | 0x20; 'a' <= lower && lower <= 'z' {
+							field.keyFold |= 0x20 << (byteIndex * 8)
+						}
+					}
+					field.keyMask = ^uint64(0)
+					field.keyLen = uint8(len(name))
 				}
-				compiledField.keyMask = ^uint64(0)
-				compiledField.keyLen = uint8(len(name))
-			}
-			node.fields = append(node.fields, compiledField)
-		}
-		node.structuralFast = node.inlineMap == nil
-		for i := range node.fields {
-			field := &node.fields[i]
-			if field.hop >= 0 || field.keyMask == 0 || field.keyLen > 7 {
-				node.structuralFast = false
-				break
-			}
-			switch field.op {
-			// BEGIN GENERATED TYPED STRUCTURAL FIELD ELIGIBILITY
-			case typedOpBool, typedOpString, typedOpInt64, typedOpFloat64, typedOpStruct, typedOpSlice, typedOpArray:
-			// END GENERATED TYPED STRUCTURAL FIELD ELIGIBILITY
-			default:
-				node.structuralFast = false
-			}
-		}
-		if node.structuralFast {
-			node.decShape = compileTypedDecShape(node.fields)
-		}
-		if node.encSimple {
-			fuseSimpleStructFields(node)
-			for i := 0; i+1 < len(node.encFields); i += 2 {
-				node.encFields[i].pairOp = classifyTypedEncPair(node.encFields[i].encOp, node.encFields[i+1].encOp)
-			}
-			if len(node.encFields) != 0 {
-				node.encFields[0].encName = node.encFields[0].encName[1:]
-			}
-			const blockBytes = 16
-			// A wide store is safe when successful encoding is guaranteed to
-			// overwrite every byte through its end. Keep the last short-name
-			// tail out of the packed table so AppendJSON never modifies bytes
-			// past its result.
-			tailMin := 1 // closing brace
-			for i := len(node.encFields) - 1; i >= 0; i-- {
-				field := &node.encFields[i]
-				valueMin := minimumTypedEncodedBytes(field.node, field.encOp)
-				if valueMin >= blockBytes-tailMin {
-					tailMin = blockBytes
-				} else {
-					tailMin += valueMin
-				}
-				n := len(field.encName)
-				if n <= blockBytes && tailMin >= blockBytes-n {
-					field.encNameLen = uint8(n)
-				}
-				if n >= blockBytes-tailMin {
-					tailMin = blockBytes
-				} else {
-					tailMin += n
-				}
-			}
-			for i := range node.encFields {
-				field := &node.encFields[i]
-				block := len(node.encNameData) / blockBytes
-				if field.encNameLen != 0 && block <= int(^uint16(0)) {
-					field.encNameBlock = uint16(block)
-					start := len(node.encNameData)
-					node.encNameData = append(node.encNameData, make([]byte, blockBytes)...)
-					copy(node.encNameData[start:], field.encName)
-				} else {
-					field.encNameLen = 0
-				}
-			}
-		}
-		if len(node.fields) <= 64 {
-			if len(node.fields) == 64 {
-				node.allSet = ^uint64(0)
+				node.fields = append(node.fields, field)
 			} else {
-				node.allSet = uint64(1)<<len(node.fields) - 1
-			}
-		}
-		// A fold-based fast match must never shadow another field's exact
-		// match, so folding is disabled where two field names fold together.
-		for i := range node.fields {
-			for j := range node.fields {
-				if i != j && strings.EqualFold(node.fields[i].name, node.fields[j].name) {
-					node.fields[i].keyFold = 0
+				encField := typedEncField{
+					encName: "," + string(appendEncodedJSONString(nil, resolved.name, c.escapeHTML)) + ":",
+					node:    fieldNode, offset: offset, hop: fieldHop,
+					encOp: fieldNode.encOp, omitEmpty: resolved.omitEmpty,
+				}
+				if resolved.quoted {
+					quotedNode := fieldNode
+					if quotedNode.baseKind == typedPointer && resolved.typ.Name() == "" {
+						quotedNode = quotedNode.elem
+					}
+					switch quotedNode.baseKind {
+					case typedBool, typedString, typedNumber, typedInt, typedUint, typedFloat:
+						if encField.encOp != typedOpMarshaler {
+							encField.encOp = typedOpQuoted
+						}
+					}
+				}
+				node.encFields = append(node.encFields, encField)
+				node.encPaths = append(node.encPaths, resolved.name)
+				if resolved.omitEmpty {
+					node.encSimple = false
 				}
 			}
 		}
-		if len(node.fields) >= 8 {
-			tableSize := 16
-			for tableSize < len(node.fields)*2 {
-				tableSize *= 2
-			}
-			node.fieldTable = make([]int16, tableSize)
-			node.fieldTableMask = uint32(tableSize - 1)
+		if decode {
+			node.structuralFast = node.inlineMap == nil
 			for i := range node.fields {
-				slot := fieldNameHash(node.fields[i].name) & node.fieldTableMask
-				for node.fieldTable[slot] != 0 {
-					slot = (slot + 1) & node.fieldTableMask
+				field := &node.fields[i]
+				if field.hop >= 0 || field.keyMask == 0 || field.keyLen > 7 {
+					node.structuralFast = false
+					break
 				}
-				node.fieldTable[slot] = int16(i + 1)
+				switch field.op {
+				// BEGIN GENERATED TYPED STRUCTURAL FIELD ELIGIBILITY
+				case typedOpBool, typedOpString, typedOpInt64, typedOpFloat64, typedOpStruct, typedOpSlice, typedOpArray:
+				// END GENERATED TYPED STRUCTURAL FIELD ELIGIBILITY
+				default:
+					node.structuralFast = false
+				}
+			}
+			if node.structuralFast {
+				node.decShape = compileTypedDecShape(node.fields)
+			}
+			if len(node.fields) <= 64 {
+				if len(node.fields) == 64 {
+					node.allSet = ^uint64(0)
+				} else {
+					node.allSet = uint64(1)<<len(node.fields) - 1
+				}
+			}
+			// A fold-based fast match must never shadow another field's exact match.
+			for i := range node.fields {
+				for j := range node.fields {
+					if i != j && strings.EqualFold(node.fields[i].name, node.fields[j].name) {
+						node.fields[i].keyFold = 0
+					}
+				}
+			}
+			if len(node.fields) >= 8 {
+				tableSize := 16
+				for tableSize < len(node.fields)*2 {
+					tableSize *= 2
+				}
+				node.fieldTable = make([]int16, tableSize)
+				node.fieldTableMask = uint32(tableSize - 1)
+				for i := range node.fields {
+					slot := fieldNameHash(node.fields[i].name) & node.fieldTableMask
+					for node.fieldTable[slot] != 0 {
+						slot = (slot + 1) & node.fieldTableMask
+					}
+					node.fieldTable[slot] = int16(i + 1)
+				}
+			}
+		} else {
+			if node.encSimple {
+				fuseSimpleStructFields(node)
+				for i := 0; i+1 < len(node.encFields); i += 2 {
+					node.encFields[i].pairOp = classifyTypedEncPair(node.encFields[i].encOp, node.encFields[i+1].encOp)
+				}
+				if len(node.encFields) != 0 {
+					node.encFields[0].encName = node.encFields[0].encName[1:]
+				}
+				const blockBytes = 16
+				// A wide store is safe when successful encoding is guaranteed to
+				// overwrite every byte through its end. Keep the last short-name
+				// tail out of the packed table so AppendJSON never modifies bytes
+				// past its result.
+				tailMin := 1 // closing brace
+				for i := len(node.encFields) - 1; i >= 0; i-- {
+					field := &node.encFields[i]
+					valueMin := minimumTypedEncodedBytes(field.node, field.encOp)
+					if valueMin >= blockBytes-tailMin {
+						tailMin = blockBytes
+					} else {
+						tailMin += valueMin
+					}
+					n := len(field.encName)
+					if n <= blockBytes && tailMin >= blockBytes-n {
+						field.encNameLen = uint8(n)
+					}
+					if n >= blockBytes-tailMin {
+						tailMin = blockBytes
+					} else {
+						tailMin += n
+					}
+				}
+				for i := range node.encFields {
+					field := &node.encFields[i]
+					block := len(node.encNameData) / blockBytes
+					if field.encNameLen != 0 && block <= int(^uint16(0)) {
+						field.encNameBlock = uint16(block)
+						start := len(node.encNameData)
+						node.encNameData = append(node.encNameData, make([]byte, blockBytes)...)
+						copy(node.encNameData[start:], field.encName)
+					} else {
+						field.encNameLen = 0
+					}
+				}
 			}
 		}
 	default:
@@ -1045,21 +1107,24 @@ func (c *typedCompiler) applyInterfaceKinds(node *typedNode, typ reflect.Type) b
 	}
 	pointerType := reflect.PointerTo(typ)
 	applied := false
-	if pointerType.Implements(unmarshalerSimdReflectType) {
-		// Native hooks remain opt-in. Decode uses owned receiver/cursor state;
-		// encode uses ordinary GC-visible receiver ownership. There is no
-		// layout-sensitive fast mode.
-		node.kind = typedUnmarshalerSimd
-		node.op = typedOpUnmarshaler
-		applied = true
-	} else if typ.Implements(jsonUnmarshalerReflectType) || pointerType.Implements(jsonUnmarshalerReflectType) {
-		node.kind = typedUnmarshalerJSON
-		node.op = typedOpUnmarshaler
-		applied = true
-	} else if typ.Implements(textUnmarshalerReflectType) || pointerType.Implements(textUnmarshalerReflectType) {
-		node.kind = typedUnmarshalerText
-		node.op = typedOpUnmarshaler
-		applied = true
+	if c.compilesDecode() {
+		if pointerType.Implements(unmarshalerSimdReflectType) {
+			// Native hooks remain opt-in. Decode uses owned receiver/cursor state;
+			// encode uses ordinary GC-visible receiver ownership. There is no
+			// layout-sensitive fast mode.
+			node.kind = typedUnmarshalerSimd
+			node.op = typedOpUnmarshaler
+			applied = true
+		} else if typ.Implements(jsonUnmarshalerReflectType) || pointerType.Implements(jsonUnmarshalerReflectType) {
+			node.kind = typedUnmarshalerJSON
+			node.op = typedOpUnmarshaler
+			applied = true
+		} else if typ.Implements(textUnmarshalerReflectType) || pointerType.Implements(textUnmarshalerReflectType) {
+			node.kind = typedUnmarshalerText
+			node.op = typedOpUnmarshaler
+			applied = true
+		}
+		return applied
 	}
 	if typ == timeReflectType {
 		node.encKind = typedTime
@@ -1099,7 +1164,8 @@ func (c *typedCompiler) applyInterfaceKinds(node *typedNode, typ reflect.Type) b
 		node.encOp = typedOpMarshaler
 		applied = true
 	}
-	if !c.dynamic && (typ.Implements(jsonMarshalerReflectType) || typ.Implements(textMarshalerReflectType)) {
+	if !c.dynamic &&
+		(typ.Implements(jsonMarshalerReflectType) || typ.Implements(textMarshalerReflectType)) {
 		node.encScratch = int32(len(c.encScratchTypes))
 		c.encScratchTypes = append(c.encScratchTypes, typ)
 	}
