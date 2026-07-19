@@ -1,30 +1,28 @@
-name: performance
+name: validation only - amd64 v3 direct dispatch
 
-# Manual until a matching dedicated runner is registered. Hosted runners are
-# intentionally used only for directional backend comparisons, not hard gates.
+# Disposable validation wiring for codex/amd64-v3-direct-validation.
+# Do not merge this workflow into main.
 on:
   workflow_dispatch:
-    inputs:
-      baseline:
-        description: Git ref to compare against
-        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: performance-${{ github.event.pull_request.number || github.ref }}
+  group: amd64-v3-direct-validation-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  benchmark-contracts:
-    # This label is intentionally dedicated: shared hosted runners are too
-    # noisy to make a statistically significant regression gate authoritative.
-    runs-on: [self-hosted, linux, arm64, simdjson-performance]
+  amd64-v3-direct-validation:
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       GOTOOLCHAIN: local
-      BASELINE: ${{ inputs.baseline }}
+      GOAMD64: v3
+      BASELINE: 8d0f7838de75c07368e9a8232e2cf9489a4d36ec
+      BENCH_B_PER_OP_REGRESSION_LIMIT: "0.01"
+      GOTIP: ${{ runner.temp }}/gotip/bin/go
+      BENCHSTAT: ${{ runner.temp }}/bin/benchstat
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -34,35 +32,51 @@ jobs:
         uses: ./.github/actions/setup-gotip
         with:
           destination: ${{ runner.temp }}/gotip
-          cache-scope: performance
+          cache-scope: amd64-v3-direct-validation
 
       - name: Install pinned benchstat
         run: |
           mkdir -p "$RUNNER_TEMP/bin"
-          GOBIN="$RUNNER_TEMP/bin" "$RUNNER_TEMP/gotip/bin/go" install golang.org/x/perf/cmd/benchstat@v0.0.0-20260610192853-712aea8b4705
+          GOBIN="$RUNNER_TEMP/bin" "$GOTIP" install golang.org/x/perf/cmd/benchstat@v0.0.0-20260610192853-712aea8b4705
 
-      - name: High-level corpus gate
-        run: >-
-          ./scripts/bench-gate.sh
-          -b "$BASELINE" -n 12 -t 500ms -r 2
+      - name: Scanner backend string gate
+        continue-on-error: true
         env:
-          GOTIP: ${{ runner.temp }}/gotip/bin/go
-          BENCHSTAT: ${{ runner.temp }}/bin/benchstat
+          TMPDIR: ${{ runner.temp }}/scanner-backend
+        run: >-
+          ./scripts/bench-gate.sh -d simd
+          -b "$BASELINE" -n 12 -t 500ms -r 2
+          '^BenchmarkScannerBackend/string/(ascii|quote-end)/(32|55|56|64|128|512|4096)$'
 
-      - name: Resource-after-spike gate
-        run: >-
-          ./scripts/bench-gate.sh -d .
-          -b "$BASELINE" -n 12 -t 500ms -r 2
-          '^Benchmark(EncodeTinyAfterHuge|StructuralTapeTinyAfterHuge|CodecMarshalSmall|MarshalSmall)$'
+      - name: Selected stop-position gate
+        continue-on-error: true
         env:
-          GOTIP: ${{ runner.temp }}/gotip/bin/go
-          BENCHSTAT: ${{ runner.temp }}/bin/benchstat
+          TMPDIR: ${{ runner.temp }}/stop-position
+        run: >-
+          ./scripts/bench-gate.sh -d simd
+          -b "$BASELINE" -n 12 -t 500ms -r 2
+          '^BenchmarkScannerStopPosition/.*/selected$'
 
-      - name: Hook and field-dispatch gate
-        run: >-
-          ./scripts/bench-gate.sh -d .
-          -b "$BASELINE" -n 12 -t 500ms -r 2
-          '^Benchmark(FieldSetLookup|HookEncodeSmall|HookDecodeSmall|HookDecodeUnknownField)$'
+      - name: High-level valid and index gate
+        continue-on-error: true
         env:
-          GOTIP: ${{ runner.temp }}/gotip/bin/go
-          BENCHSTAT: ${{ runner.temp }}/bin/benchstat
+          TMPDIR: ${{ runner.temp }}/high-level
+        run: >-
+          ./scripts/bench-gate.sh -d tests/stdlib
+          -b "$BASELINE" -n 12 -t 500ms -r 2
+          '^BenchmarkHighLevelCorpus/.*/(valid|index)/simdjson$'
+
+      - name: Upload benchmark logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: amd64-v3-direct-validation-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/scanner-backend/simdjson-bench-gate-*/old.txt
+            ${{ runner.temp }}/scanner-backend/simdjson-bench-gate-*/new.txt
+            ${{ runner.temp }}/stop-position/simdjson-bench-gate-*/old.txt
+            ${{ runner.temp }}/stop-position/simdjson-bench-gate-*/new.txt
+            ${{ runner.temp }}/high-level/simdjson-bench-gate-*/old.txt
+            ${{ runner.temp }}/high-level/simdjson-bench-gate-*/new.txt
+          if-no-files-found: warn
+          retention-days: 7
