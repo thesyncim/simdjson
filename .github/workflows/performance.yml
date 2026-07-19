@@ -32,6 +32,9 @@ jobs:
           destination: ${{ runner.temp }}/gotip
           cache-scope: amd64-v3-direct-validation
 
+      - name: Validate amd64 v3 correctness
+        run: GOEXPERIMENT=simd "$RUNNER_TEMP/gotip/bin/go" test ./...
+
       - name: Install pinned benchstat
         env:
           GOTIP: ${{ runner.temp }}/gotip/bin/go
