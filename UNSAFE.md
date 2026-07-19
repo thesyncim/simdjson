@@ -169,7 +169,6 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `simd/scan_simd_amd64.go` — `scanStringSpecialAVX512`
 - `simd/scan_simd_amd64.go` — `scanStringSyntaxAVX2`
 - `simd/scan_simd_amd64.go` — `scanStringSyntaxAVX512`
-- `simd/scan_simd_amd64.go` — `validUTF8Runtime`
 - `simd/scan_simd_arm64.go` — `validUTF8NoLineSeparatorRuntime`
 - `simd/scan_simd_arm64.go` — `validUTF8Runtime`
 - `simd/stage1_amd64.go` — `Stage1Block`
