@@ -1,13 +1,8 @@
 name: performance
 
-# Manual until a matching dedicated runner is registered. Hosted runners are
-# intentionally used only for directional backend comparisons, not hard gates.
-on:
-  workflow_dispatch:
-    inputs:
-      baseline:
-        description: Git ref to compare against
-        required: true
+# Validation-only hosted proof for the amd64 UTF-8 safe point. Do not merge
+# this workflow commit into the production branch or main.
+on: workflow_dispatch
 
 permissions:
   contents: read
@@ -18,13 +13,18 @@ concurrency:
 
 jobs:
   benchmark-contracts:
-    # This label is intentionally dedicated: shared hosted runners are too
-    # noisy to make a statistically significant regression gate authoritative.
-    runs-on: [self-hosted, linux, arm64, simdjson-performance]
-    timeout-minutes: 60
+    name: benchmark-contracts (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     env:
       GOTOOLCHAIN: local
-      BASELINE: ${{ inputs.baseline }}
+      BASELINE: e57e82451965a0b7c579c308b366635c2fe7f9cb
+      BENCH_B_PER_OP_REGRESSION_LIMIT: "0.01"
+      TMPDIR: /tmp
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -34,12 +34,22 @@ jobs:
         uses: ./.github/actions/setup-gotip
         with:
           destination: ${{ runner.temp }}/gotip
-          cache-scope: performance
+          cache-scope: performance-hosted-${{ matrix.runner }}
 
       - name: Install pinned benchstat
         run: |
           mkdir -p "$RUNNER_TEMP/bin"
           GOBIN="$RUNNER_TEMP/bin" "$RUNNER_TEMP/gotip/bin/go" install golang.org/x/perf/cmd/benchstat@v0.0.0-20260610192853-712aea8b4705
+
+      - name: Seed benchmark-only harness into exact baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_id=$(printf '%s' "$GITHUB_WORKSPACE" | cksum | cut -d ' ' -f 1)
+          work="$TMPDIR/simdjson-bench-gate-$repo_id"
+          mkdir -p "$work"
+          git worktree add --force --detach "$work/baseline" "$BASELINE"
+          cp simd/utf8_backend_bench_test.go "$work/baseline/simd/"
 
       - name: High-level corpus gate
         run: >-
@@ -49,20 +59,29 @@ jobs:
           GOTIP: ${{ runner.temp }}/gotip/bin/go
           BENCHSTAT: ${{ runner.temp }}/bin/benchstat
 
-      - name: Resource-after-spike gate
+      - name: Direct UTF-8 backend gate
         run: >-
-          ./scripts/bench-gate.sh -d .
+          ./scripts/bench-gate.sh -d simd
           -b "$BASELINE" -n 12 -t 500ms -r 2
-          '^Benchmark(EncodeTinyAfterHuge|StructuralTapeTinyAfterHuge|CodecMarshalSmall|MarshalSmall)$'
+          '^BenchmarkValidUTF8Backend/(ascii|mixed|invalid-early|invalid-late)/(64|512|4096)/(selected|stdlib)$'
         env:
           GOTIP: ${{ runner.temp }}/gotip/bin/go
           BENCHSTAT: ${{ runner.temp }}/bin/benchstat
 
-      - name: Hook and field-dispatch gate
+      - name: Repeated non-ASCII index gate
         run: >-
           ./scripts/bench-gate.sh -d .
           -b "$BASELINE" -n 12 -t 500ms -r 2
-          '^Benchmark(FieldSetLookup|HookEncodeSmall|HookDecodeSmall|HookDecodeUnknownField)$'
+          '^BenchmarkBuildIndexStringPolicy/RepeatedNonASCII/1024B$'
+        env:
+          GOTIP: ${{ runner.temp }}/gotip/bin/go
+          BENCHSTAT: ${{ runner.temp }}/bin/benchstat
+
+      - name: Unicode validation and decode gate
+        run: >-
+          ./scripts/bench-gate.sh -d tests/stdlib
+          -b "$BASELINE" -n 12 -t 500ms -r 2
+          '^BenchmarkHighLevelCorpus/string_unicode[.]json[.]zst/(valid|decode-any|decode-typed)/simdjson.*$'
         env:
           GOTIP: ${{ runner.temp }}/gotip/bin/go
           BENCHSTAT: ${{ runner.temp }}/bin/benchstat
