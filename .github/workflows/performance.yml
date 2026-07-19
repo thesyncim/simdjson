@@ -1,7 +1,7 @@
 name: performance
 
-# Manual until a matching dedicated runner is registered. Hosted runners are
-# intentionally used only for directional backend comparisons, not hard gates.
+# Candidate-only direct gate. This validation branch alternates baseline and
+# candidate binaries on one hosted VM; the workflow change is never merged.
 on:
   workflow_dispatch:
     inputs:
@@ -18,9 +18,11 @@ concurrency:
 
 jobs:
   benchmark-contracts:
-    # This label is intentionally dedicated: shared hosted runners are too
-    # noisy to make a statistically significant regression gate authoritative.
-    runs-on: [self-hosted, linux, arm64, simdjson-performance]
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
       GOTOOLCHAIN: local
@@ -49,20 +51,20 @@ jobs:
           GOTIP: ${{ runner.temp }}/gotip/bin/go
           BENCHSTAT: ${{ runner.temp }}/bin/benchstat
 
-      - name: Resource-after-spike gate
+      - name: Scanner kernel gate
         run: >-
-          ./scripts/bench-gate.sh -d .
+          ./scripts/bench-gate.sh -d simd
           -b "$BASELINE" -n 12 -t 500ms -r 2
-          '^Benchmark(EncodeTinyAfterHuge|StructuralTapeTinyAfterHuge|CodecMarshalSmall|MarshalSmall)$'
+          '^BenchmarkScanner(Backend|StopPosition)'
         env:
           GOTIP: ${{ runner.temp }}/gotip/bin/go
           BENCHSTAT: ${{ runner.temp }}/bin/benchstat
 
-      - name: Hook and field-dispatch gate
+      - name: Scanner end-to-end gate
         run: >-
           ./scripts/bench-gate.sh -d .
           -b "$BASELINE" -n 12 -t 500ms -r 2
-          '^Benchmark(FieldSetLookup|HookEncodeSmall|HookDecodeSmall|HookDecodeUnknownField)$'
+          '^Benchmark(BuildIndex$|BuildIndexLarge$|BuildIndexStringPolicy|BuildIndexPointerCompiled$|DecodeSmall$|DecodeLargeReused$|EncodeLarge$|Validate)'
         env:
           GOTIP: ${{ runner.temp }}/gotip/bin/go
           BENCHSTAT: ${{ runner.temp }}/bin/benchstat
