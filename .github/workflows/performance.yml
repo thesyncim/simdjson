@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        runner: [ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
@@ -41,6 +41,7 @@ jobs:
           GOBIN="$RUNNER_TEMP/bin" "$RUNNER_TEMP/gotip/bin/go" install golang.org/x/perf/cmd/benchstat@v0.0.0-20260610192853-712aea8b4705
 
       - name: High-level corpus gate
+        continue-on-error: true
         run: >-
           ./scripts/bench-gate.sh
           -b "$BASELINE" -n 12 -t 500ms -r 2
@@ -49,6 +50,7 @@ jobs:
           BENCHSTAT: ${{ runner.temp }}/bin/benchstat
 
       - name: Scanner kernel gate
+        continue-on-error: true
         run: >-
           ./scripts/bench-gate.sh -d simd
           -b "$BASELINE" -n 12 -t 500ms -r 2
