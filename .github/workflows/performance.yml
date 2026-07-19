@@ -1,13 +1,9 @@
 name: performance
 
-# Manual until a matching dedicated runner is registered. Hosted runners are
-# intentionally used only for directional backend comparisons, not hard gates.
+# Validation-only hosted proof for the ARM64 scanner crossover. This workflow
+# commit must not be merged: publication gates remain on dedicated runners.
 on:
   workflow_dispatch:
-    inputs:
-      baseline:
-        description: Git ref to compare against
-        required: true
 
 permissions:
   contents: read
@@ -17,14 +13,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  benchmark-contracts:
-    # This label is intentionally dedicated: shared hosted runners are too
-    # noisy to make a statistically significant regression gate authoritative.
-    runs-on: [self-hosted, linux, arm64, simdjson-performance]
+  direct-interleaved-gates:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
       GOTOOLCHAIN: local
-      BASELINE: ${{ inputs.baseline }}
+      BASELINE: e57e82451965a0b7c579c308b366635c2fe7f9cb
+      BENCH_B_PER_OP_REGRESSION_LIMIT: 0.01
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -34,7 +33,7 @@ jobs:
         uses: ./.github/actions/setup-gotip
         with:
           destination: ${{ runner.temp }}/gotip
-          cache-scope: performance
+          cache-scope: crossover-validation-${{ runner.arch }}
 
       - name: Install pinned benchstat
         run: |
@@ -49,20 +48,20 @@ jobs:
           GOTIP: ${{ runner.temp }}/gotip/bin/go
           BENCHSTAT: ${{ runner.temp }}/bin/benchstat
 
-      - name: Resource-after-spike gate
+      - name: Scanner kernel gate
         run: >-
-          ./scripts/bench-gate.sh -d .
+          ./scripts/bench-gate.sh -d simd
           -b "$BASELINE" -n 12 -t 500ms -r 2
-          '^Benchmark(EncodeTinyAfterHuge|StructuralTapeTinyAfterHuge|CodecMarshalSmall|MarshalSmall)$'
+          '^BenchmarkScanner(Backend|StopPosition)$'
         env:
           GOTIP: ${{ runner.temp }}/gotip/bin/go
           BENCHSTAT: ${{ runner.temp }}/bin/benchstat
 
-      - name: Hook and field-dispatch gate
+      - name: Root scanner-path gate
         run: >-
           ./scripts/bench-gate.sh -d .
           -b "$BASELINE" -n 12 -t 500ms -r 2
-          '^Benchmark(FieldSetLookup|HookEncodeSmall|HookDecodeSmall|HookDecodeUnknownField)$'
+          '^Benchmark(BuildIndex|Decode|Valid|PortableBackend)'
         env:
           GOTIP: ${{ runner.temp }}/gotip/bin/go
           BENCHSTAT: ${{ runner.temp }}/bin/benchstat
