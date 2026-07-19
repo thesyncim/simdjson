@@ -30,6 +30,8 @@ var utf8LookupSecondHigh = [16]uint8{
 	230, 174, 186, 186, 1, 1, 1, 1,
 }
 
+const scanARM64StringCrossoverBytes = 48
+
 func initStringScanner() {
 	// NEON is mandatory on Go's arm64 targets, so these wrappers call the
 	// selected kernels directly. This keeps capability checks out of hot calls
@@ -48,46 +50,64 @@ func initStringScanner() {
 func scanStringSpecial(src []byte, i int) int {
 	start := i
 	remaining := len(src) - i
-	if remaining >= scanStringProbeMinBytes {
+	if remaining >= 16 {
 		if m := stringSpecialMask(binary.LittleEndian.Uint64(src[i:])); m != 0 {
 			return i + bits.TrailingZeros64(m)/8
 		}
-		i += 8
-		if m := stringSpecialMask(binary.LittleEndian.Uint64(src[i:])); m != 0 {
+		if m := stringSpecialMask(binary.LittleEndian.Uint64(src[i+8:])); m != 0 {
+			return i + 8 + bits.TrailingZeros64(m)/8
+		}
+		i += 16
+		if remaining >= scanARM64StringCrossoverBytes {
+			// Clear one more word before NEON so early string ends do not pay
+			// vector setup; a 48-byte input still leaves 24 vector bytes.
+			if m := stringSpecialMask(binary.LittleEndian.Uint64(src[i:])); m != 0 {
+				return i + bits.TrailingZeros64(m)/8
+			}
+			return scanStringSpecialSIMD(src, i+8)
+		}
+	}
+
+	// Finish short spans with the same two-word scalar loop as the portable
+	// scanner. Keeping it in this direct entry avoids another function call.
+	limit := len(src)
+	for i+16 <= limit {
+		x := binary.LittleEndian.Uint64(src[i:])
+		if m := stringSpecialMask(x); m != 0 {
+			return i + bits.TrailingZeros64(m)/8
+		}
+		x = binary.LittleEndian.Uint64(src[i+8:])
+		if m := stringSpecialMask(x); m != 0 {
+			return i + 8 + bits.TrailingZeros64(m)/8
+		}
+		i += 16
+	}
+	if i+8 <= limit {
+		x := binary.LittleEndian.Uint64(src[i:])
+		if m := stringSpecialMask(x); m != 0 {
 			return i + bits.TrailingZeros64(m)/8
 		}
 		i += 8
 	}
-	if len(src)-i >= scanStringSelectedMinBytes {
-		return scanStringSpecialRuntime(src, i)
-	}
-	for i+8 <= len(src) {
-		if m := stringSpecialMask(binary.LittleEndian.Uint64(src[i:])); m != 0 {
-			return i + bits.TrailingZeros64(m)/8
-		}
-		i += 8
-	}
-	if i == len(src) {
+	if i == limit {
 		return i
 	}
-	if tail := len(src) - 8; tail >= start {
-		// The bytes of the final word that precede i were already cleared,
-		// so a match found here is at or after i. Guarding on start rather
-		// than zero keeps the overlap inside this call's span: bytes before
-		// start were never cleared and could yield a stale match.
+	if tail := limit - 8; tail >= start {
+		// Bytes before i were already cleared, so an overlapping final word
+		// cannot return a stale match from before the remaining tail.
 		if m := stringSpecialMask(binary.LittleEndian.Uint64(src[tail:])); m != 0 {
 			return tail + bits.TrailingZeros64(m)/8
 		}
-		return len(src)
+		return limit
 	}
-	for i < len(src) {
+	for i < limit {
 		c := src[i]
 		if c == '"' || c == '\\' || c < 0x20 || c >= 0x80 {
 			return i
 		}
 		i++
 	}
-	return len(src)
+	return limit
 }
 
 func scanStringSpecialRuntime(src []byte, i int) int {

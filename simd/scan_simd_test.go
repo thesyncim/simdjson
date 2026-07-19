@@ -61,6 +61,29 @@ func TestSIMDScannerDispatch(t *testing.T) {
 	}
 }
 
+func TestARM64ScannerCrossoverMatchesScalar(t *testing.T) {
+	if runtime.GOARCH != "arm64" {
+		t.Skip("ARM64 scanner policy")
+	}
+	for _, length := range []int{39, 40, 47, 48} {
+		clean := longScanCase(length, -1, 0)
+		for start := 0; start <= length; start++ {
+			if got, want := scanStringSpecial(clean, start), scanStringSpecialScalar(clean, start); got != want {
+				t.Fatalf("clean length=%d start=%d: got %d, want %d", length, start, got, want)
+			}
+		}
+
+		for _, special := range []byte{'"', '\\', 0x1f, 0x80} {
+			src := longScanCase(length, length-1, special)
+			for start := 0; start <= length; start++ {
+				if got, want := scanStringSpecial(src, start), scanStringSpecialScalar(src, start); got != want {
+					t.Fatalf("length=%d special=%#02x start=%d: got %d, want %d", length, special, start, got, want)
+				}
+			}
+		}
+	}
+}
+
 func TestSIMDScannerDispatchStaysOnStack(t *testing.T) {
 	if allocs := testing.AllocsPerRun(1000, func() {
 		scanSink = scanStackBackedString()

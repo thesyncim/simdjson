@@ -73,16 +73,27 @@ func BenchmarkScannerStopPosition(b *testing.B) {
 		{name: "38B/quote5", bytes: 38, stop: 5, special: '"'},
 		{name: "38B/quote31", bytes: 38, stop: 31, special: '"'},
 		{name: "38B/quote37", bytes: 38, stop: 37, special: '"'},
+		{name: "39B/clean", bytes: 39, stop: -1},
+		{name: "39B/quote38", bytes: 39, stop: 38, special: '"'},
+		{name: "40B/clean", bytes: 40, stop: -1},
 		{name: "40B/quote39", bytes: 40, stop: 39, special: '"'},
+		{name: "47B/clean", bytes: 47, stop: -1},
+		{name: "47B/quote46", bytes: 47, stop: 46, special: '"'},
+		{name: "48B/clean", bytes: 48, stop: -1},
+		{name: "48B/quote47", bytes: 48, stop: 47, special: '"'},
 	}
 	for _, tc := range cases {
 		b.Run(tc.name, func(b *testing.B) {
 			src := backendScanBytes(tc.bytes, tc.stop, tc.special)
-			if got := Unchecked.IndexStringSpecial(src, 0); got != tc.stop {
-				b.Fatalf("selected stop = %d, want %d", got, tc.stop)
+			want := tc.stop
+			if want < 0 {
+				want = tc.bytes
 			}
-			if got := scanStringSpecialScalar(src, 0); got != tc.stop {
-				b.Fatalf("scalar stop = %d, want %d", got, tc.stop)
+			if got := Unchecked.IndexStringSpecial(src, 0); got != want {
+				b.Fatalf("selected stop = %d, want %d", got, want)
+			}
+			if got := scanStringSpecialScalar(src, 0); got != want {
+				b.Fatalf("scalar stop = %d, want %d", got, want)
 			}
 
 			b.Run("selected", func(b *testing.B) {
