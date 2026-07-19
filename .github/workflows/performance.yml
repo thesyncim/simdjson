@@ -62,7 +62,7 @@ jobs:
         run: >-
           ./scripts/bench-gate.sh -d simd
           -b "$BASELINE" -n 12 -t 500ms -r 2
-          '^BenchmarkScannerStopPosition/.*/selected$'
+          '^BenchmarkScannerStopPosition/.*/.*/selected$'
 
       - name: High-level valid and index gate
         continue-on-error: true
@@ -73,7 +73,7 @@ jobs:
         run: >-
           ./scripts/bench-gate.sh -d tests/stdlib
           -b "$BASELINE" -n 12 -t 500ms -r 2
-          '^BenchmarkHighLevelCorpus/.*/(valid|index)/simdjson$'
+          '^BenchmarkHighLevelCorpus/.*/(valid|index)/(simdjson|simdjson-reused)$'
 
       - name: Upload benchmark logs
         if: always()
