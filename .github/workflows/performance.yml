@@ -21,8 +21,6 @@ jobs:
       GOAMD64: v3
       BASELINE: 8d0f7838de75c07368e9a8232e2cf9489a4d36ec
       BENCH_B_PER_OP_REGRESSION_LIMIT: "0.01"
-      GOTIP: ${{ runner.temp }}/gotip/bin/go
-      BENCHSTAT: ${{ runner.temp }}/bin/benchstat
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -35,6 +33,8 @@ jobs:
           cache-scope: amd64-v3-direct-validation
 
       - name: Install pinned benchstat
+        env:
+          GOTIP: ${{ runner.temp }}/gotip/bin/go
         run: |
           mkdir -p "$RUNNER_TEMP/bin"
           GOBIN="$RUNNER_TEMP/bin" "$GOTIP" install golang.org/x/perf/cmd/benchstat@v0.0.0-20260610192853-712aea8b4705
@@ -42,6 +42,8 @@ jobs:
       - name: Scanner backend string gate
         continue-on-error: true
         env:
+          GOTIP: ${{ runner.temp }}/gotip/bin/go
+          BENCHSTAT: ${{ runner.temp }}/bin/benchstat
           TMPDIR: ${{ runner.temp }}/scanner-backend
         run: >-
           ./scripts/bench-gate.sh -d simd
@@ -51,6 +53,8 @@ jobs:
       - name: Selected stop-position gate
         continue-on-error: true
         env:
+          GOTIP: ${{ runner.temp }}/gotip/bin/go
+          BENCHSTAT: ${{ runner.temp }}/bin/benchstat
           TMPDIR: ${{ runner.temp }}/stop-position
         run: >-
           ./scripts/bench-gate.sh -d simd
@@ -60,6 +64,8 @@ jobs:
       - name: High-level valid and index gate
         continue-on-error: true
         env:
+          GOTIP: ${{ runner.temp }}/gotip/bin/go
+          BENCHSTAT: ${{ runner.temp }}/bin/benchstat
           TMPDIR: ${{ runner.temp }}/high-level
         run: >-
           ./scripts/bench-gate.sh -d tests/stdlib
