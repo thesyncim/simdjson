@@ -161,10 +161,21 @@ measurement: the baseline-corpus fast-path miss is fixed in phase 1
 traffic; the bound is re-measured after both land before any further
 mechanism is considered.
 
-**Gap D — large-document ingest (7.8x of 10x; ~500 MB/s on 466 KiB
-documents vs 1.4-1.9 GB/s elsewhere).** Cause unknown; owned as a profiled
-investigation (window interaction, chunk roll, or enrichment pass), fixed
-or explained with numbers.
+**Gap D — large-document ingest (7.5x of 10x; ~468 MB/s on 466 KiB
+documents vs 1.4-1.9 GB/s elsewhere).** Diagnosed 2026-07-21: the same
+corpus ingests at 800 MB/s through Append but 338 MB/s through ReadFrom,
+so the cost is ReadFrom-specific, not the documents. ReadFrom's one-pass
+fast walk caps its window (extendWalk returns false while the buffer has
+room and the stream is not at EOF, so a mid-fill build cannot be
+invalidated by a later chunk roll), which sends every large document to
+readDocSlow — a structural framing scan to find the extent followed by a
+second build scan, roughly doubling the work Append does in one pass. The
+fix is a bounded tradeoff: walk to the buffered edge and refill-and-retry
+when a document is fully buffered (one scan, at the cost of re-walking a
+document that spans several fills), versus the framer's single structural
+pre-scan for multi-fill documents. Owned as a focused change to the
+corruption-gated stream path; the fast small/mixed rows (the shipped win)
+must not regress.
 
 ## Non-goals
 
