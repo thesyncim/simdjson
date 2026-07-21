@@ -94,6 +94,20 @@ PostgreSQL's documented `@>` semantics as the oracle.
 published alongside the existing competitor scoreboard with the same
 honesty rules: losses reported with causes.
 
+## Placement
+
+All phases live in this repository. The litmus test: anything that needs the
+tape, arena, interner, or shape internals — or that answers "how fast can one
+core do this to documents" — is mechanism and lives here, inheriting the
+differential, corruption, and benchmark gates. Anything that decides which
+operation runs, when, with what guarantees — query languages, planning,
+multi-core scheduling, durability, replication, serving — is policy and
+belongs to a consuming engine repository. The root module stays free of
+third-party dependencies through every phase; comparison tooling with heavy
+dependencies is quarantined in the separate benchmarks module. The v1 API
+boundary (ADR 0001) is the checkpoint for partitioning the exported surface,
+including a possible store subpackage once the layout freezes.
+
 ## Non-goals
 
 Durability, replication, MVCC, SQL/jsonpath planning, multi-core scheduling
