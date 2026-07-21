@@ -63,6 +63,20 @@ type DocSet struct {
 	// docset_shape.go for the representation and its proof obligations.
 	ShapeTapes bool
 
+	// Postings opts the set into the inverted existence and containment layer,
+	// read at each Append like Options: a document's top-level keys and scalar
+	// values are folded into DocSet-owned postings so WhereExists and
+	// WhereContains answer selective predicates by probing a candidate set
+	// rather than scanning every document. Key existence resolves through the
+	// shape index, so it is most effective paired with ShapeTapes — with shapes
+	// off every document is the non-conforming remainder and existence stays
+	// correct but scans; value containment prunes regardless. Set it before the
+	// first Append: enabling it later leaves earlier documents unindexed, and
+	// the query paths detect the gap and fall back to a full scan. Ingest pays
+	// one pass over each document's top-level members. See docset_postings.go
+	// for the representation and its proof obligations.
+	Postings bool
+
 	docs       []Index
 	srcChunk   []byte       // current source arena chunk
 	entryChunk []IndexEntry // current entry arena chunk
@@ -85,6 +99,13 @@ type DocSet struct {
 	widened        map[int][]IndexEntry
 	widenMu        sync.Mutex
 	wideValueTapes bool
+
+	// postings is the inverted existence/containment layer (docset_postings.go),
+	// built at commit under the Postings opt-in and nil until the first indexed
+	// document. It owns its structures and is read by WhereExists and
+	// WhereContains; a partial index (Postings enabled late) is detected and
+	// bypassed, so the pointer being non-nil never forces a stale answer.
+	postings *docPostings
 }
 
 // Arena chunks grow geometrically between fixed bounds, like the interner's:

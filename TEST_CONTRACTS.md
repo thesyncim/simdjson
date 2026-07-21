@@ -125,6 +125,7 @@ typed_hook_test.go
 ```text
 any_test.go
 contains_contract_test.go
+docset_postings_test.go
 docset_test.go
 duplicate_keys_contract_test.go
 field_cursor_test.go
@@ -233,6 +234,7 @@ stream_decode_test.go
 
 ```text
 contains_bench_test.go
+docset_postings_bench_test.go
 docset_shape_bench_test.go
 docset_stream_bench_test.go
 index_tapescan_bench_test.go

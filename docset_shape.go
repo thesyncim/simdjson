@@ -145,7 +145,13 @@ func (s *DocSet) commitDoc(index Index, ref shapeTapeRef) int {
 		s.tapeRefs = append(s.tapeRefs, ref)
 	}
 	s.docs = append(s.docs, index)
-	return len(s.docs) - 1
+	ord := len(s.docs) - 1
+	if s.Postings {
+		// The document is committed and its ordinal live; a narrow shape tape's
+		// values are already in s.narrow, so the postings read the stored form.
+		s.indexPostings(ord, index, ref)
+	}
+	return ord
 }
 
 // shapeTapeCompact converts a just-built, still-uncommitted classic tape to
