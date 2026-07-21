@@ -141,11 +141,30 @@ The fix is a bounded tradeoff — walk to the buffered edge and refill-and-retry
 for fully-buffered documents — in the corruption-gated stream path, without
 regressing the fast small/mixed rows.
 
+## Future: the write path
+
+Mutation is out of scope for the read/space phases above, but it is a planned
+later phase with two hard constraints that shape decisions now: writes must
+penalize reads **not at all** (zero indirection, locks, or versioning on the
+hot read path), and still beat RedisJSON on write throughput. The never-move
+arena discipline is the foundation, not an obstacle: inserts already leave
+every outstanding read valid. Updates and deletes take the MVCC-snapshot form
+— a writer appends the new document version to fresh arena chunks and
+publishes a new snapshot by an atomic swap; readers hold an immutable snapshot
+and resolve handles directly into its tapes, blocking never and paying no
+indirection. Read-path overlays/deltas are rejected precisely because they
+would tax reads; a changed document is re-indexed in one validated pass
+(shape cache and value dictionary amortize a same-shape rewrite), deletes
+tombstone out of the snapshot, and space is reclaimed by background
+compaction off the read path. This is why phase 3 persistence is designed
+log-structured (append-only version log plus a snapshot manifest): writes are
+crash-safe appends, reads mmap a snapshot.
+
 ## Non-goals
 
-Durability, replication, MVCC, query planning beyond ADR 0003's basic surface,
-joins, multi-core scheduling (single-core is the target; sharding is trivial
-caller-side composition), and stable on-disk formats before v1.
+Replication, distributed consensus, query planning beyond ADR 0003's basic
+surface, joins, multi-core scheduling (single-core is the target; sharding is
+trivial caller-side composition), and stable on-disk formats before v1.
 
 ## Standing constraints
 
