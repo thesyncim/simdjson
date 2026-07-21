@@ -36,10 +36,11 @@ Supported: `SELECT` of path projections and aggregates (`COUNT`, `SUM`, `AVG`,
 with aggregates; `ORDER BY`; `LIMIT`.
 
 Explicitly out of scope for "basic": joins, subqueries, window functions,
-mutation/DDL, transactions, and full SQL-dialect coverage. Those belong to the
-future engine. This revises ADR 0002's boundary only to admit a thin, single-
-table, read-only query surface — mechanism plus the minimum policy to be a
-product; everything above stays out.
+SQL mutation/DDL syntax, transactions, and full SQL-dialect coverage. ADR 0004
+now supplies programmatic Store mutation and online posting lifecycle beneath
+this package; it does not expand the SQL grammar. This ADR admits a thin,
+single-table, read-only query surface — mechanism plus the minimum policy to be
+a product; everything above stays out.
 
 ## Execution model
 
@@ -121,5 +122,8 @@ result slice and prebuild the containment needle, and the warmed lookup makes
 no heap allocation. Exact verification remains allocation-free for compact
 tapes and for escaped scalar and object-key spellings of arbitrary length.
 
-Non-goals from ADR 0002 (durability, MVCC, distribution, multi-core, full SQL)
-are unchanged.
+SQL mutation and DDL syntax remain outside this basic query package. ADR 0004
+adds programmatic Store mutation, immutable snapshots, TTL, and online posting
+lifecycle in the root package without creating a reverse dependency from the
+core into `query`. Durability, replication, distribution, multi-core planning,
+and full SQL remain non-goals.

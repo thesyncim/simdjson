@@ -1,0 +1,501 @@
+package simdjson
+
+import (
+	"errors"
+	"fmt"
+	"hash/maphash"
+	"math/bits"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/thesyncim/simdjson/document"
+)
+
+// StoreOptions fixes the representation of chunks created by a Store. The
+// zero value selects 64-document chunks with the ordinary DocSet layout.
+// ShapeTapes, Postings, ValueDict, and IndexOptions have the same semantics as
+// their DocSet counterparts. Options are frozen by the first operation that
+// initializes the Store (currently Put or AddIndex).
+type StoreOptions struct {
+	// ChunkDocuments bounds documents rebuilt by one ordinary mutation. Zero
+	// selects 64; valid explicit values are 1 through 64.
+	ChunkDocuments int
+	// IndexOptions configures each bounded DocSet's structural index.
+	IndexOptions document.IndexOptions
+	// ShapeTapes enables per-chunk shape-deduplicated tapes.
+	ShapeTapes bool
+	// Postings builds the physical posting layer from the first Put.
+	Postings bool
+	// ValueDict enables a value dictionary scoped to each immutable chunk.
+	ValueDict bool
+}
+
+const storeMaxChunkDocuments = 64
+
+// ErrStoreTooLarge reports that the persistent chunk address space is full.
+// The limit is 2^32-1 chunks (at most 274 billion documents with the default
+// chunk size), so reaching it indicates a caller architecture error rather
+// than an ordinary capacity event. The guard prevents uint32 wraparound.
+var ErrStoreTooLarge = errors.New("simdjson: Store chunk address space exhausted")
+
+func maphashString(seed maphash.Seed, key string) uint64 { return maphash.String(seed, key) }
+
+func (o StoreOptions) normalized() (StoreOptions, error) {
+	if o.ChunkDocuments == 0 {
+		o.ChunkDocuments = storeMaxChunkDocuments
+	}
+	if o.ChunkDocuments < 1 || o.ChunkDocuments > storeMaxChunkDocuments {
+		return StoreOptions{}, fmt.Errorf("simdjson: Store ChunkDocuments must be in [1,%d]", storeMaxChunkDocuments)
+	}
+	return o, nil
+}
+
+// A Store is a keyed, mutable collection of JSON documents with immutable
+// snapshots and a lock-free raw read path. Writes are serialized, rebuild at
+// most one bounded document chunk, path-copy only bounded-radix metadata, and
+// publish one new state through an atomic pointer. Deletes rebuild the affected
+// chunk without the document: no tombstone enters a read path and no later
+// compaction is required to restore scan speed.
+//
+// The zero Store is ready to use. Set Options before the first Put or AddIndex,
+// or use NewStore. A Store is safe for concurrent use. Snapshot readers take
+// no writer lock; GetRaw and Range take no lock at all. Get may enter the
+// synchronized shape-tape widening cache described on [Snapshot.Get].
+// A Store must not be copied after first use.
+type Store struct {
+	Options StoreOptions
+
+	mu      sync.Mutex
+	state   atomic.Pointer[storeState]
+	options StoreOptions
+
+	// Writer-only chunk-id sets make allocation and physical-index tracking
+	// O(1). Empty chunk ids are reused, so insert/delete churn cannot grow the
+	// chunk address space; reclamation takes indexed ids directly rather than
+	// rescanning the entire vector after every bounded batch.
+	free          storeIDSet
+	postingChunks storeIDSet
+
+	ttl           storeTTLState
+	expireScratch []storeExpiryItem
+	indexes       map[string]*storeIndexBuild
+	reclaim       *storeIndexReclaim
+}
+
+// NewStore returns an empty Store configured with options. Invalid chunk
+// bounds are reported by the first operation that initializes the Store, so
+// construction itself cannot fail.
+func NewStore(options StoreOptions) *Store {
+	return &Store{Options: options}
+}
+
+type storeState struct {
+	generation uint64
+	count      int
+	chunkCount uint32
+	seed       maphash.Seed
+	options    StoreOptions
+	keys       *storeKeyNode
+	chunks     storeChunkVector
+	indexes    []StoreIndexInfo
+}
+
+type storeChunk struct {
+	docs  DocSet
+	keys  []string
+	ord   []uint8
+	live  uint64
+	count uint8
+}
+
+type storeIDSet struct {
+	ids []uint32
+	pos map[uint32]int
+}
+
+func (s *storeIDSet) add(id uint32) {
+	if s.pos == nil {
+		s.pos = make(map[uint32]int)
+	}
+	if _, exists := s.pos[id]; exists {
+		return
+	}
+	s.pos[id] = len(s.ids)
+	s.ids = append(s.ids, id)
+}
+
+func (s *storeIDSet) remove(id uint32) {
+	pos, exists := s.pos[id]
+	if !exists {
+		return
+	}
+	last := len(s.ids) - 1
+	other := s.ids[last]
+	s.ids[pos] = other
+	s.ids = s.ids[:last]
+	delete(s.pos, id)
+	if pos != last {
+		s.pos[other] = pos
+	}
+}
+
+func newChunkDocSet(options StoreOptions, postings bool) DocSet {
+	return DocSet{
+		Options:         options.IndexOptions,
+		ShapeTapes:      options.ShapeTapes,
+		Postings:        postings,
+		ValueDict:       options.ValueDict,
+		arenaMinSrc:     256,
+		arenaMinEntries: 16,
+	}
+}
+
+// buildStoreChunk is the single bounded rebuild primitive used by inserts,
+// replacements, deletes, expiry batches, index backfill, and index reclaim.
+// live is the exact post-edit slot mask. replaceSlot selects one slot whose
+// bytes come from src; -1 means every remaining document comes from old.
+func buildStoreChunk(options StoreOptions, postings bool, old *storeChunk, live uint64, replaceSlot int, key string, src []byte) (*storeChunk, error) {
+	chunk := &storeChunk{
+		docs: newChunkDocSet(options, postings),
+		keys: make([]string, options.ChunkDocuments),
+		ord:  make([]uint8, options.ChunkDocuments),
+	}
+	if old != nil {
+		copy(chunk.keys, old.keys)
+	}
+	chunk.live = live
+	if old != nil {
+		for removed := old.live &^ live; removed != 0; removed &= removed - 1 {
+			chunk.keys[bits.TrailingZeros64(removed)] = ""
+		}
+	}
+	if replaceSlot >= 0 {
+		chunk.keys[replaceSlot] = key
+	}
+	for bitsLeft := chunk.live; bitsLeft != 0; bitsLeft &= bitsLeft - 1 {
+		i := bits.TrailingZeros64(bitsLeft)
+		doc := src
+		if i != replaceSlot {
+			doc = old.rawSlot(i)
+		}
+		ord, err := chunk.docs.Append(doc)
+		if err != nil {
+			return nil, err
+		}
+		chunk.ord[i] = uint8(ord)
+		chunk.count++
+	}
+	if chunk.count == 0 {
+		return nil, nil
+	}
+	return chunk, nil
+}
+
+func rebuildStoreChunk(options StoreOptions, postings bool, old *storeChunk, slot int, key string, src []byte, keep bool) (*storeChunk, error) {
+	var live uint64
+	if old != nil {
+		live = old.live
+	}
+	mask := uint64(1) << uint(slot)
+	if keep {
+		live |= mask
+		return buildStoreChunk(options, postings, old, live, slot, key, src)
+	}
+	return buildStoreChunk(options, postings, old, live&^mask, -1, "", nil)
+}
+
+func cloneStoreChunk(options StoreOptions, postings bool, old *storeChunk) (*storeChunk, error) {
+	if old == nil {
+		return nil, nil
+	}
+	return buildStoreChunk(options, postings, old, old.live, -1, "", nil)
+}
+
+func (c *storeChunk) rawSlot(slot int) []byte {
+	return c.docs.docs[c.ord[slot]].src
+}
+
+func (s *Store) initLocked() (*storeState, error) {
+	if state := s.state.Load(); state != nil {
+		return state, nil
+	}
+	options, err := s.Options.normalized()
+	if err != nil {
+		return nil, err
+	}
+	s.options = options
+	s.free.pos = make(map[uint32]int)
+	state := &storeState{seed: maphash.MakeSeed(), options: options}
+	s.state.Store(state)
+	return state, nil
+}
+
+// Put validates src and atomically inserts or replaces key. It copies src and
+// a newly inserted key; callers may reuse them after return. created reports
+// whether key was absent.
+//
+// A failed validation leaves the Store and every Snapshot unchanged.
+func (s *Store) Put(key string, src []byte) (created bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.initLocked()
+	if err != nil {
+		return false, err
+	}
+	hash := maphash.String(state.seed, key)
+	loc, found := storeKeyLookup(state.keys, hash, key)
+	if found {
+		old := state.chunks.get(loc.chunk)
+		storedKey := old.keys[loc.slot]
+		chunk, err := rebuildStoreChunk(state.options, s.postingsRequiredLocked(), old, int(loc.slot), storedKey, src, true)
+		if err != nil {
+			return false, err
+		}
+		next := *state
+		next.generation++
+		next.chunks = state.chunks.set(loc.chunk, chunk)
+		s.noteChunkPostingsLocked(loc.chunk, old, chunk)
+		s.noteIndexesForChunkLocked(loc.chunk, old, chunk)
+		next.indexes = s.indexInfosLocked()
+		s.state.Store(&next)
+		return false, nil
+	}
+
+	if len(s.free.ids) == 0 && state.chunks.count == ^uint32(0) {
+		return false, ErrStoreTooLarge
+	}
+	key = strings.Clone(key)
+	chunkID, slot, old := s.allocateSlotLocked(state)
+	chunk, err := rebuildStoreChunk(state.options, s.postingsRequiredLocked(), old, slot, key, src, true)
+	if err != nil {
+		return false, err
+	}
+	next := *state
+	next.generation++
+	next.count++
+	loc = storeLocation{chunk: chunkID, slot: uint8(slot)}
+	next.keys = storeKeyInsert(state.keys, hash, key, loc)
+	if chunkID == state.chunks.count {
+		next.chunks, _ = state.chunks.append(chunk)
+	} else {
+		next.chunks = state.chunks.set(chunkID, chunk)
+	}
+	if old == nil {
+		next.chunkCount++
+	}
+	s.noteChunkPostingsLocked(chunkID, old, chunk)
+	if int(chunk.count) == state.options.ChunkDocuments {
+		s.removeFreeLocked(chunkID)
+	} else {
+		s.addFreeLocked(chunkID)
+	}
+	s.noteIndexesForChunkLocked(chunkID, old, chunk)
+	next.indexes = s.indexInfosLocked()
+	s.state.Store(&next)
+	return true, nil
+}
+
+// Delete atomically removes key and reports whether it existed. The affected
+// chunk is rebuilt without the document, so scans see a dense DocSet and the
+// delete creates neither a tombstone nor future compaction work. Snapshots
+// obtained before Delete remain valid and continue to see their old version.
+func (s *Store) Delete(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleteLocked(key)
+}
+
+func (s *Store) deleteLocked(key string) bool {
+	state := s.state.Load()
+	if state == nil {
+		return false
+	}
+	hash := maphash.String(state.seed, key)
+	loc, found := storeKeyLookup(state.keys, hash, key)
+	if !found {
+		return false
+	}
+	old := state.chunks.get(loc.chunk)
+	chunk, err := rebuildStoreChunk(state.options, s.postingsRequiredLocked(), old, int(loc.slot), "", nil, false)
+	if err != nil {
+		panic("simdjson: rebuilding validated Store chunk: " + err.Error())
+	}
+	next := *state
+	next.generation++
+	next.count--
+	next.keys = storeKeyDelete(state.keys, hash, key)
+	next.chunks = state.chunks.set(loc.chunk, chunk)
+	if chunk == nil {
+		next.chunkCount--
+	}
+	s.noteChunkPostingsLocked(loc.chunk, old, chunk)
+	s.addFreeLocked(loc.chunk)
+	if s.ttl.remove(key) {
+		s.notifyExpiryLocked()
+	}
+	s.noteIndexesForChunkLocked(loc.chunk, old, chunk)
+	next.indexes = s.indexInfosLocked()
+	s.state.Store(&next)
+	return true
+}
+
+func (s *Store) allocateSlotLocked(state *storeState) (uint32, int, *storeChunk) {
+	if len(s.free.ids) == 0 {
+		return state.chunks.count, 0, nil
+	}
+	id := s.free.ids[len(s.free.ids)-1]
+	chunk := state.chunks.get(id)
+	if chunk == nil {
+		return id, 0, nil
+	}
+	limitMask := ^uint64(0)
+	if state.options.ChunkDocuments < 64 {
+		limitMask = uint64(1)<<uint(state.options.ChunkDocuments) - 1
+	}
+	free := ^chunk.live & limitMask
+	if free == 0 {
+		panic("simdjson: full Store chunk in free set")
+	}
+	return id, bits.TrailingZeros64(free), chunk
+}
+
+func (s *Store) addFreeLocked(id uint32) {
+	s.free.add(id)
+}
+
+func (s *Store) removeFreeLocked(id uint32) {
+	s.free.remove(id)
+}
+
+func (s *Store) noteChunkPostingsLocked(id uint32, old, next *storeChunk) {
+	oldIndexed := old != nil && old.docs.Postings
+	nextIndexed := next != nil && next.docs.Postings
+	if oldIndexed == nextIndexed {
+		return
+	}
+	if nextIndexed {
+		s.postingChunks.add(id)
+	} else {
+		s.postingChunks.remove(id)
+	}
+}
+
+// Snapshot returns the Store's current immutable view. It is O(1), never
+// blocks a writer, and remains valid while later writes publish new views.
+func (s *Store) Snapshot() Snapshot {
+	return Snapshot{state: s.state.Load()}
+}
+
+// Len returns the number of keys in the current snapshot.
+func (s *Store) Len() int {
+	state := s.state.Load()
+	if state == nil {
+		return 0
+	}
+	return state.count
+}
+
+// Generation returns the monotonically increasing publication number. Zero is
+// the empty initial state; every successful mutation publishes the next value.
+func (s *Store) Generation() uint64 {
+	state := s.state.Load()
+	if state == nil {
+		return 0
+	}
+	return state.generation
+}
+
+// A Snapshot is a logically immutable Store view. Its zero value is an empty
+// snapshot. It is safe for concurrent use and remains valid independently of
+// later Store mutations. GetRaw takes no lock, clock call, TTL branch, or
+// allocation; Get may populate an equivalent memoized shape-tape widening.
+type Snapshot struct {
+	state *storeState
+}
+
+// Len returns the number of keys visible in s.
+func (s Snapshot) Len() int {
+	if s.state == nil {
+		return 0
+	}
+	return s.state.count
+}
+
+// Generation returns the publication generation captured by s.
+func (s Snapshot) Generation() uint64 {
+	if s.state == nil {
+		return 0
+	}
+	return s.state.generation
+}
+
+// GetRaw returns key's exact JSON bytes as a read-only borrowed RawValue.
+func (s Snapshot) GetRaw(key string) (RawValue, bool) {
+	if s.state == nil {
+		return RawValue{}, false
+	}
+	hash := maphash.String(s.state.seed, key)
+	loc, ok := storeKeyLookup(s.state.keys, hash, key)
+	if !ok {
+		return RawValue{}, false
+	}
+	chunk := s.state.chunks.get(loc.chunk)
+	if chunk == nil || chunk.live&(uint64(1)<<loc.slot) == 0 {
+		return RawValue{}, false
+	}
+	return RawValue{src: chunk.rawSlot(int(loc.slot))}, true
+}
+
+// Get returns key's navigable Index. Shape-taped chunks may take their widening
+// mutex and allocate once to memoize this document's equivalent classic tape,
+// exactly like DocSet.Doc; GetRaw is the lock- and allocation-free path when
+// exact JSON bytes are sufficient.
+func (s Snapshot) Get(key string) (Index, bool) {
+	if s.state == nil {
+		return Index{}, false
+	}
+	hash := maphash.String(s.state.seed, key)
+	loc, ok := storeKeyLookup(s.state.keys, hash, key)
+	if !ok {
+		return Index{}, false
+	}
+	chunk := s.state.chunks.get(loc.chunk)
+	if chunk == nil || chunk.live&(uint64(1)<<loc.slot) == 0 {
+		return Index{}, false
+	}
+	return chunk.docs.Doc(int(chunk.ord[loc.slot])), true
+}
+
+// Range visits live keys in stable chunk/slot order until fn returns false.
+// Values borrow the Snapshot. Range itself allocates nothing.
+func (s Snapshot) Range(fn func(key string, value RawValue) bool) {
+	if s.state == nil {
+		return
+	}
+	s.state.chunks.each(func(_ uint32, chunk *storeChunk) bool {
+		for live := chunk.live; live != 0; live &= live - 1 {
+			slot := bits.TrailingZeros64(live)
+			if !fn(chunk.keys[slot], RawValue{src: chunk.rawSlot(slot)}) {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// GetRaw is the current-snapshot convenience form of Snapshot.GetRaw.
+func (s *Store) GetRaw(key string) (RawValue, bool) { return s.Snapshot().GetRaw(key) }
+
+// Get is the current-snapshot convenience form of Snapshot.Get.
+func (s *Store) Get(key string) (Index, bool) { return s.Snapshot().Get(key) }
+
+// postingsRequiredLocked includes online index builds in addition to the
+// representation selected at construction. store_index.go supplies the
+// dynamic half; this default keeps the core independent when no DDL exists.
+func (s *Store) postingsRequiredLocked() bool {
+	if s.options.Postings {
+		return true
+	}
+	return s.hasPostingsIndexLocked()
+}

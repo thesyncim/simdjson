@@ -144,24 +144,25 @@ The fix is a bounded tradeoff — walk to the buffered edge and refill-and-retry
 for fully-buffered documents — in the corruption-gated stream path, without
 regressing the fast small/mixed rows.
 
-## Future: the write path
+## Mutable write path (landed)
 
-Mutation is out of scope for the read/space phases above, but it is a planned
-later phase with two hard constraints that shape decisions now: writes must
-penalize reads **not at all** (zero indirection, locks, or versioning on the
-hot read path), and still beat RedisJSON on write throughput. The never-move
-arena discipline is the foundation, not an obstacle: inserts already leave
-every outstanding read valid. Updates and deletes take the MVCC-snapshot form
-— a writer appends the new document version to fresh arena chunks and
-publishes a new snapshot by an atomic swap; readers hold an immutable snapshot
-and resolve handles directly into its tapes, blocking never and paying no
-indirection. Read-path overlays/deltas are rejected precisely because they
-would tax reads; a changed document is re-indexed in one validated pass
-(shape cache and value dictionary amortize a same-shape rewrite), deletes
-tombstone out of the snapshot, and space is reclaimed by background
-compaction off the read path. This is why phase 3 persistence is designed
-log-structured (append-only version log plus a snapshot manifest): writes are
-crash-safe appends, reads mmap a snapshot.
+ADR 0004 replaces the earlier append-version/tombstone proposal with bounded
+immutable chunks and persistent metadata. The hard reader constraint remains:
+`Snapshot.GetRaw` takes no lock, clock call, TTL/version branch, or allocation.
+The implementation is stronger on delete behavior than the original plan:
+deletes rebuild one at-most-64-document `DocSet` densely, empty ids are reused,
+and persistent-radix traversal skips nil subtrees. No tombstone enters a scan
+and no background compaction is required to restore read speed.
+
+The root `Store` now provides keyed insert/replace/delete, immutable concurrent
+snapshots, publication generations, an external zero-read-tax TTL heap with
+batched expiry, and online posting add/backfill/drop/reclaim. Full contracts,
+operational tuning, and measured write/read costs are in ADR 0004 and
+`docs/store.md`.
+
+Persistence remains separate. A future WAL or manifest can record successful
+publication generations, but it must not introduce a read-time overlay or
+weaken the immutable snapshot lifetime.
 
 ## Non-goals
 

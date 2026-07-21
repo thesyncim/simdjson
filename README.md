@@ -134,6 +134,46 @@ Ownership is uniform: an `Index` and its nodes borrow the source and the entry
 storage; `DocSet` and the caches own their arenas, and nothing they hand out is
 invalidated by growth.
 
+## Mutable documents, TTL, and online indexes
+
+`Store` adds keyed updates and deletes while publishing immutable snapshots.
+`Snapshot.GetRaw` takes no lock, makes no clock call, inspects no tombstone, and
+allocates nothing:
+
+```go
+store := simdjson.NewStore(simdjson.StoreOptions{
+	ChunkDocuments: 8, // write-heavy; zero selects the read/space default of 64
+	ShapeTapes:      true,
+})
+
+if _, err := store.Put("session:42", []byte(`{"user":42,"state":"open"}`)); err != nil {
+	return err
+}
+before := store.Snapshot()
+
+store.SetTTL("session:42", 30*time.Minute)
+store.Put("session:42", []byte(`{"user":42,"state":"active"}`)) // preserves TTL
+store.Delete("session:42")
+
+// The old immutable view remains valid after both mutations.
+raw, ok := before.GetRaw("session:42")
+```
+
+TTL lives in a writer-side indexed four-ary heap—one mutable node per expiring
+key, no stale deadline generations—and due keys are grouped by chunk and
+published in one delete batch. `RunExpiry` sleeps until the next deadline;
+ordinary reads pay literally no TTL branch or time lookup.
+
+Online posting indexes publish as `Building`, dual-maintain concurrent writes,
+backfill in caller-bounded chunk batches, and become `Ready` at complete
+coverage. Snapshot probes remain exact during build through per-chunk scan
+fallback. Dropping detaches the logical index immediately; physical reclamation
+is also caller-bounded and never performs a hidden full-store completion scan.
+
+The complete API, ownership rules, expiration semantics, tuning table,
+complexity bounds, zero-allocation recipes, operational counters, and Redis
+comparison boundary are in [Mutable Store operations](docs/store.md).
+
 ## Performance
 
 Single core, Apple M4 Max, pinned Go development toolchain with
@@ -148,6 +188,9 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Lookup primitives (probe hit, hashed `Get`) | 3.8–6.4 ns |
 | Extract one field across a document set | 8.1 ns/doc |
 | Extract a typed `int64` column | 12 ns/doc |
+| Immutable `Store.GetRaw` point read | 19-21 ns, 0 allocations |
+| Change an existing TTL | 43 ns, 0 allocations |
+| Native-bitmap SIMD `AND` vs scalar | 2.1-2.6x six-run median, 0 allocations |
 
 One caveat belongs next to that table: a one-shot, single-path lookup on a
 document seen once favors non-validating scanners — gjson scans only for the
@@ -179,6 +222,7 @@ define the methodology, gates, comparison boundaries, and pinned toolchains.
 | Borrowed selection or repeated document navigation | `RawValue`, `Index`/`Node`, or `Parse`/`Value` |
 | Batches of documents, columnar field extraction | `DocSet`, `ShapeCache`, `KeyInterner` |
 | SQL-shaped projection, filtering, grouping, and aggregation | `query.Query.RunInto`, `query.Result`, `query.Workspace` |
+| Keyed updates, deletes, TTL, snapshots, and online postings | `Store`, `Snapshot`, `StoreStats` |
 
 The advanced document APIs are moving into `document` during the pre-v1
 migration. JSON kind values already use `document.Kind`; the remaining package
@@ -201,7 +245,9 @@ invalidation rule. `Index` and its nodes also borrow caller-provided entry
 storage; a node obtained from an owning `Value` keeps that value's backing
 arrays alive itself. `DocSet`, `ShapeCache`, and `KeyInterner` own their arena
 storage and are single-writer: values they hand out stay valid as they grow,
-and concurrent reads are safe once writing stops.
+and concurrent reads are safe once writing stops. `Store` serializes mutations
+and publishes immutable snapshots; snapshot reads are concurrent-safe and never
+block a writer. Values returned by a snapshot borrow that snapshot's storage.
 
 Compiled encoders, decoders, keys, and pointers are immutable and safe for
 concurrent use. Destinations and source buffers remain caller-owned; each
@@ -214,6 +260,7 @@ concurrent use. Destinations and source buffers remain caller-owned; each
 - [Resource and input limits](docs/contracts/limits.md)
 - [Unsafe inventory](UNSAFE.md)
 - [Architecture and safety](docs/architecture.md)
+- [Mutable Store operations](docs/store.md)
 - [Security policy](SECURITY.md)
 - [Contributing and local gates](CONTRIBUTING.md)
 

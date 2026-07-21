@@ -119,6 +119,43 @@ large observation confirms exact presizing, even above 256 KiB. A smaller
 observation replaces the estimate. Therefore 256 KiB is an outlier-confirmation
 threshold, not an output-size or retained-memory ceiling.
 
+### Mutable Store
+
+`StoreOptions.ChunkDocuments` must be from 1 through 64; zero selects 64. The
+limit bounds documents rebuilt by an ordinary mutation, index-maintenance step,
+or one affected chunk in an expiry batch. It is not a byte-size limit: a single
+document may approach the structural-index limits above, and a chunk of large
+documents can retain correspondingly large source and tape storage.
+
+Chunk addresses are `uint32`. `Put` returns `ErrStoreTooLarge` before an append
+could wrap the persistent vector's address space. Empty ids are reused, making
+the theoretical limit unreachable under ordinary churn, but this is not a
+process memory budget.
+
+Each live Store key is present in the immutable key directory and one chunk
+slot. Each expiring key adds exactly one writer-side heap node and position-map
+entry; changing a TTL does not add a generation. Each physical posting chunk
+appears exactly once in writer reclamation metadata, even when multiple logical
+posting index names share it.
+
+Snapshots pin every immutable node, chunk, source arena, tape, and physical
+index version reachable from their publication state. Holding old snapshots
+while updating hot keys intentionally retains old versions. The package cannot
+bound that memory without invalidating the snapshot contract; applications must
+bound snapshot age or count according to their workload.
+
+A building online index temporarily retains the immutable chunk-vector root
+captured by `AddIndex` so its bounded cursor cannot miss an original live
+chunk. Coverage is a sparse-paged bitmap: dense populated pages cost one bit per
+chunk, while empty historical address ranges retain no pages. Reaching `Ready`
+or dropping the definition releases the root; completion also collapses the
+coverage bitmap to an implicit all-live state.
+
+`BackfillIndex`, `ReclaimIndexes`, and `ExpireDue` accept caller work limits.
+A non-positive limit means all currently eligible work, which may be large.
+Production event loops should normally choose a positive batch size and expose
+`Store.Stats`/`Snapshot.AppendIndexes` as progress metrics.
+
 ## Limits that applications must add
 
 The package does not provide a process-wide memory budget, total-stream byte or

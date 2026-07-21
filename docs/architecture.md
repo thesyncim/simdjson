@@ -26,6 +26,12 @@ overlap checks, and scanner metadata remain inside this package.
 `internal/floatconv` isolates non-inlinable Eisel-Lemire conversion and its
 generated table behind one typed call; root retains grammar and fallback policy.
 
+`internal/bitset` owns allocation-free dense posting `AND`, `OR`, and
+`AND-NOT`. Stable Go uses the unrolled scalar backend. The pinned Go 1.27 SIMD
+window replaces only the word kernel on ARM64 and AMD64; sparse/dense policy
+stays with the caller so a vector kernel cannot force a losing representation
+conversion.
+
 The pre-v1 `simd` package retains decimal classification, eight-digit parsing,
 fixed-width decimal formatting, JSON float and time formatting, plus effective
 backend reporting. CPU capability checks and selection policy remain internal.
@@ -57,6 +63,7 @@ bounds and lifetime are already established by typed state.
 | `Index`, Index-derived `Node`, and `RawValue` | Borrow validated source and, for an index, caller-provided entry storage. | Keep both buffers alive and immutable until all handles are discarded. A `Node` obtained from an owning `Value` instead pins that value's backing arrays. |
 | Reader views and cursors | Borrow the reader's rolling buffer. | Invalid after the next advancing operation or `Close`. |
 | Encoder and writer output | Returned bytes belong to the caller. | Source graphs must not overlap output capacity being appended to. |
+| `Store` snapshot values | Borrow immutable chunks reachable from the snapshot state. | Keep the snapshot or a derived handle alive; later writes never invalidate it. |
 
 Borrowing avoids a copy; it never hides a pointer. Compiled plans contain no
 source or destination pointer and are immutable after construction. Mutable
@@ -66,6 +73,24 @@ Destination addressing uses offsets, sizes, and pointer hops supplied by
 `reflect.Type`. Pointers are allocated and slice bounds established before an
 element address is formed. Default decoding merges like `encoding/json`;
 replace mode deliberately resets absent state.
+
+## Mutable Store publication
+
+`Store` is the only root type that combines mutation with concurrent reads.
+Mutation is serialized; readers retain an immutable state pointer. The keyed
+HAMT and chunk radix vector are path-copied, and a changed document chunk is
+built completely before atomic publication. TTL and index-lifecycle structures
+remain writer-only. `Snapshot.GetRaw` therefore never locks, reads a clock,
+checks a tombstone, or consults mutable metadata. `Snapshot.Get` retains the
+existing `DocSet.Doc` contract: the first access to a compact shape tape may
+enter a synchronized memoization cache and allocate its equivalent classic
+tape.
+
+Deleted rows are absent from the rebuilt dense `DocSet`; deleted chunks are nil
+radix leaves. Tree traversal skips nil subtrees, while writer-side reusable-id
+sets prevent address growth under churn. TTL expiry and physical index removal
+reuse the same bounded chunk rebuild as explicit mutation. Detailed invariants,
+complexity, and rejected alternatives are in ADR 0004.
 
 ## Typed plans and specialization
 

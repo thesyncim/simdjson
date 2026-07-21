@@ -136,6 +136,15 @@
 // object keys to dense identifiers for engines that group fields across
 // documents.
 //
+// A [Store] adds keyed insert, replace, delete, TTL, immutable [Snapshot]
+// publication, and online posting lifecycle. Snapshot GetRaw reads are
+// lock-free, clock-free, and allocation-free. Deletes rebuild one bounded
+// dense chunk without tombstones; [Store.ExpireDue] groups expiry deletes by
+// chunk; [Store.BackfillIndex] and [Store.ReclaimIndexes] let an event loop
+// bound maintenance work. Buffered snapshot probes append matching keys into
+// caller storage. See docs/store.md for ownership, expiry semantics,
+// operational counters, and tuning.
+//
 // [ShapeCache] compiles the layouts of recurring flat objects: Resolve
 // fingerprints an object's key sequence, [Shape.Field] resolves a field
 // name to its fixed position once per layout, and [FieldRef.In] reads that

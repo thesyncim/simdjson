@@ -15,7 +15,7 @@ because it records the implementation incident that created it.
 | `DEC` | Typed decode selection, merge/replace, fields, and destination reuse | `encoding/json` | Type/field matrix and reuse sequences | Typed decode parity | Race, checkptr, portable/SIMD | PR |
 | `ENC` | Typed and dynamic encode acceptance, bytes, tags, ordering, and errors | `encoding/json` | Value/type matrix and error paths | Encode parity and round-trip | Race, checkptr, hook validation | PR |
 | `HOOK` | Standard and native method dispatch, output integrity, and receiver semantics | `encoding/json` plus documented native-hook contract | Addressability, error, panic, and retention matrix | Hook integrity/operation sequence | Race, checkptr, forced GC | PR and weekly scheduled |
-| `DOC` | `RawValue`, `Value`, `Index`, `Node`, iterators, duplicate keys, and JSON Pointer | RFC 6901, generic traversal, `encoding/json` materialization | Navigation/accessor/iteration matrix | Pointer/index/navigation parity | Portable/SIMD, checkptr | PR and weekly scheduled |
+| `DOC` | `RawValue`, `Value`, `Index`, `Node`, `Store`, snapshots, indexes, TTL, iterators, duplicate keys, and JSON Pointer | RFC 6901, generic traversal, `encoding/json` materialization, reference map/clock | Navigation/accessor/iteration/mutation matrix | Pointer/index/navigation/store parity | Portable/SIMD, race, checkptr | PR and weekly scheduled |
 | `STREAM` | Framing, fragmentation, reader state, cursors, offsets, limits, and writer state | `json.Decoder`, `json.Encoder`, scalar framer, state model | Fragmented fixtures and operation sequences | Stream state-machine parity | Race, portable/SIMD | PR and weekly scheduled |
 | `XFORM` | Compact, indent, canonicalize, and token-writer output | `json.Compact`, `json.Indent`, documented ordering | Formatting and writer-state matrix | Transform parity | Portable/SIMD | PR |
 | `OWN` | Borrowing, mutation, GC visibility, concurrency, and invalidation | Documented ownership model | Lifetime/mutation/concurrency matrix | Cross-GC operation sequences | Race, checkptr, `GOGC=1` | PR and release |
@@ -149,6 +149,7 @@ raw_trusted_test.go
 shape_column_test.go
 shape_column_typed_test.go
 shape_test.go
+store_test.go
 value_accessors_contract_test.go
 value_iteration_contract_test.go
 value_spans_contract_test.go
@@ -204,6 +205,7 @@ encoder_scratch_poison_test.go
 encoder_scratch_test.go
 encoder_sequence_fuzz_test.go
 marshal_hint_test.go
+query/workspace_test.go
 resource_retention_test.go
 ```
 
@@ -222,6 +224,7 @@ internal/kernels/stage1_portable_test.go
 internal/kernels/stage1_stream_test.go
 internal/kernels/stage1_test.go
 internal/kernels/stage2_index_test.go
+internal/bitset/ops_test.go
 ```
 
 ### `API`
@@ -233,6 +236,7 @@ parity_test.go
 race_off_test.go
 race_on_test.go
 stream_decode_test.go
+store_example_test.go
 ```
 
 ### `PERF`
@@ -253,6 +257,7 @@ query/query_bench_test.go
 shape_bench_test.go
 shape_column_bench_test.go
 shape_column_typed_bench_test.go
+store_bench_test.go
 typed_bench_test.go
 typed_hook_bench_test.go
 benchmarks/bench_test.go

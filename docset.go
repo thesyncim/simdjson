@@ -107,6 +107,14 @@ type DocSet struct {
 	// bypassed, so the pointer being non-nil never forces a stale answer.
 	postings *docPostings
 
+	// Arena minima are internal construction hints. Zero preserves the bulk
+	// DocSet policy below; bounded immutable Store chunks select smaller first
+	// allocations so a one-document rewrite does not buy stream-sized arenas.
+	// The branch is paid only when a new arena chunk is allocated, never on a
+	// read or on an Append that fits the current chunk.
+	arenaMinSrc     int
+	arenaMinEntries int
+
 	// ValueDict opts the set into the corpus-wide value dictionary, read at
 	// each Append like ShapeTapes: a value span that recurs across the set —
 	// an enum string, a label, a repeated sub-object — is interned once into
@@ -158,6 +166,20 @@ const (
 	docSetMaxEntryChunk = 64 << 10
 )
 
+func (s *DocSet) sourceChunkMinimum() int {
+	if s.arenaMinSrc > 0 {
+		return s.arenaMinSrc
+	}
+	return docSetMinSrcChunk
+}
+
+func (s *DocSet) entryChunkMinimum() int {
+	if s.arenaMinEntries > 0 {
+		return s.arenaMinEntries
+	}
+	return docSetMinEntryChunk
+}
+
 // Len returns the number of stored documents.
 func (s *DocSet) Len() int {
 	return len(s.docs)
@@ -193,7 +215,7 @@ func (s *DocSet) Append(src []byte) (int, error) {
 	// previously returned views survive; on failure the copied bytes are
 	// still uncommitted arena tail and restoring the length removes them.
 	if len(s.srcChunk)+len(src) > cap(s.srcChunk) {
-		s.srcChunk = make([]byte, 0, docSetChunkCap(cap(s.srcChunk), len(src), docSetMinSrcChunk, docSetMaxSrcChunk))
+		s.srcChunk = make([]byte, 0, docSetChunkCap(cap(s.srcChunk), len(src), s.sourceChunkMinimum(), docSetMaxSrcChunk))
 	}
 	mark := len(s.srcChunk)
 	s.srcChunk = append(s.srcChunk, src...)
@@ -217,7 +239,7 @@ func (s *DocSet) Append(src []byte) (int, error) {
 // header, zero for classic documents.
 func (s *DocSet) buildDoc(src []byte) (Index, shapeTapeRef, error) {
 	if cap(s.entryChunk) == 0 {
-		s.entryChunk = make([]IndexEntry, 0, docSetMinEntryChunk)
+		s.entryChunk = make([]IndexEntry, 0, s.entryChunkMinimum())
 	}
 	used := len(s.entryChunk)
 	free := s.entryChunk[used:]
@@ -251,7 +273,7 @@ func (s *DocSet) buildDoc(src []byte) (Index, shapeTapeRef, error) {
 	}
 	index, ref := s.shapeTapeCompact(index)
 	n := len(index.entries)
-	chunk := make([]IndexEntry, n, docSetChunkCap(cap(s.entryChunk), n, docSetMinEntryChunk, docSetMaxEntryChunk))
+	chunk := make([]IndexEntry, n, docSetChunkCap(cap(s.entryChunk), n, s.entryChunkMinimum(), docSetMaxEntryChunk))
 	copy(chunk, index.entries)
 	s.entryChunk = chunk
 	return Index{src: src, entries: chunk[:n:n]}, ref, nil
