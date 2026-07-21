@@ -11,29 +11,34 @@ import (
 
 	"github.com/thesyncim/simdjson"
 	"github.com/thesyncim/simdjson/document"
+	"github.com/thesyncim/simdjson/query"
 )
 
 // This file measures our side of the RedisJSON comparison: what it costs, in
 // bytes and single-core nanoseconds, to hold the corpora in a DocSet and run
-// the five scenarios against it with today's public API — the same primitives
-// the query subpackage will compile a plan onto once it lands. The classic
-// variants are the honest pre-optimization DocSet (16-byte-per-entry tape, no
-// dedup); the shape-tape variants measure the space lever on top of it:
-// DocSet.ShapeTapes stores each conforming document as a bare value array with
-// its keys deduplicated into the shape cache.
+// the five scenarios against it. The three query-shaped scenarios — filtered
+// scan, scalar aggregate, and group-by aggregate — run through the query
+// subpackage's compiled executor (ADR 0003), so the scoreboard times the real
+// query engine, not a hand-rolled stand-in; the whole-corpus column projection
+// runs through it too. The point-read and pointer scan stay DocSet primitives
+// (the JSON.GET analogue is a single-document resolve, not a query plan), and
+// containment stays the Node.Contains primitive — the capability edge, kept as
+// its cheapest spelling. The classic variants are the honest pre-optimization
+// DocSet (16-byte-per-entry tape, no dedup); the shape-tape variants measure the
+// space lever on top of it: DocSet.ShapeTapes stores each conforming document as
+// a bare value array with its keys deduplicated into the shape cache.
 //
-// The scenarios mirror ADR 0003 and the RediSearch commands run-redis.sh
-// times:
+// The scenarios mirror ADR 0003 and the RediSearch commands run-redis.sh times:
 //
-//   - projection: resolve one field across the corpus (DocSet.AppendPointer /
-//     ShapeCache.AppendField), and a single-document probe by ordinal — the
-//     JSON.GET analogue;
-//   - filtered scan: count documents whose ContainKey equals ContainValue, a
-//     full column scan with a scalar predicate — the FT.SEARCH TAG filter;
-//   - scalar aggregate: SUM a numeric field across the corpus via
-//     ShapeCache.AppendFieldInt64 and a reduce — FT.AGGREGATE REDUCE SUM;
-//   - group-by aggregate: intern each ContainKey value with a KeyInterner and
-//     accumulate per group — FT.AGGREGATE GROUPBY;
+//   - projection: resolve one field across the corpus (DocSet.AppendPointer, and
+//     the query executor's SELECT <field> column), and a single-document probe
+//     by ordinal — the JSON.GET analogue;
+//   - filtered scan: SELECT COUNT(*) WHERE ContainKey = ContainValue, the
+//     compiled equality predicate — the FT.SEARCH TAG filter;
+//   - scalar aggregate: SELECT SUM(SumField) reduced over the typed column —
+//     FT.AGGREGATE REDUCE SUM;
+//   - group-by aggregate: SELECT ContainKey, COUNT(*) GROUP BY ContainKey, whose
+//     result cardinality is the group count — FT.AGGREGATE GROUPBY;
 //   - containment: RawContains of {ContainKey: ContainValue} against each
 //     document — a structural predicate RedisJSON and RediSearch have no
 //     operator for.
@@ -130,6 +135,16 @@ func timeMin(reps int, fn func()) int64 {
 	return best
 }
 
+// countValue reads the single COUNT cell of a one-column, one-row aggregate
+// result as an int64, the shape SELECT COUNT(*) returns.
+func countValue(r query.Result) int64 {
+	if len(r.Columns) == 0 || len(r.Columns[0].Cells) == 0 {
+		return 0
+	}
+	n, _ := r.Columns[0].Cells[0].Int64()
+	return n
+}
+
 // MeasureCorpus ingests the corpus in dir into a DocSet with the given options
 // and measures space and the manifest's scenarios. reps is the repetition
 // count for every timed section (minimum wins).
@@ -200,20 +215,29 @@ func MeasureCorpus(dir string, m Manifest, hashKeys, shapeTapes bool, reps int) 
 		}
 	}
 	if m.Class != "heterogeneous" {
-		var cache simdjson.ShapeCache
-		var fcol []simdjson.RawValue
-		fcol = cache.AppendField(fcol[:0], set, m.ExtractField) // warm the cache
+		// Whole-corpus column projection through the query executor: SELECT
+		// <ExtractField>. For a single top-level field the executor extracts the
+		// same fused ShapeCache.AppendField column the primitive did, now behind
+		// the compiled plan the scoreboard exists to measure. The projection's
+		// null cells are the absent values, so the non-null count is the present
+		// count the pointer pass recorded (these anchor fields are never an
+		// explicit null).
+		projQ := query.Select(query.Path(m.ExtractField))
+		var projRes query.Result
 		v.ProjectColumnNS = timeMin(reps, func() {
-			fcol = cache.AppendField(fcol[:0], set, m.ExtractField)
+			projRes, err = projQ.Run(set)
 		})
+		if err != nil {
+			return v, err
+		}
 		hits := 0
-		for _, rv := range fcol {
-			if rv.Kind() != document.Invalid {
+		for _, cell := range projRes.Columns[0].Cells {
+			if !cell.IsNull() {
 				hits++
 			}
 		}
 		if hits != v.ExtractHits {
-			return v, fmt.Errorf("%s: column projection found %d hits, pointer found %d", m.Name, hits, v.ExtractHits)
+			return v, fmt.Errorf("%s: query projection found %d non-null values, pointer found %d present", m.Name, hits, v.ExtractHits)
 		}
 	}
 
@@ -242,57 +266,33 @@ func MeasureCorpus(dir string, m Manifest, hashKeys, shapeTapes bool, reps int) 
 
 	// The filter/group/containment scenarios all key off ContainKey.
 	if m.ContainKey != "" {
-		contain, err := simdjson.CompilePointer("/" + m.ContainKey)
-		if err != nil {
-			return v, err
-		}
-		want := []byte(`"` + m.ContainValue + `"`)
-
-		// Filtered scan: column scan of ContainKey with a scalar equality.
-		count := 0
+		// Filtered scan through the query executor: SELECT COUNT(*) WHERE
+		// ContainKey = ContainValue — the compiled equality predicate over the
+		// extracted column, the engine's own filtered count.
+		filterQ := query.Select(query.Count()).Where(query.Cmp(m.ContainKey, query.Eq, m.ContainValue))
+		var filterRes query.Result
 		v.FilterNS = timeMin(reps, func() {
-			col, err = set.AppendPointer(col[:0], contain)
-			count = 0
-			for _, rv := range col {
-				if bytes.Equal(rv.Bytes(), want) {
-					count++
-				}
-			}
+			filterRes, err = filterQ.Run(set)
 		})
 		if err != nil {
 			return v, err
 		}
-		v.FilterCount = count
+		v.FilterCount = int(countValue(filterRes))
 
-		// Group-by: intern every present ContainKey value and count distinct
-		// groups, plus one NULL group when any document lacks the field — SQL
-		// GROUP BY semantics, matching RediSearch's single empty-tag group.
-		var groups int
+		// Group-by aggregate through the query executor: SELECT ContainKey,
+		// COUNT(*) GROUP BY ContainKey. The result cardinality is the group
+		// count — one row per distinct value plus the null group for documents
+		// missing the field, the SQL semantics groupCardinality models and the
+		// single empty-tag group RediSearch collects.
+		groupQ := query.Select(query.Path(m.ContainKey), query.Count()).GroupBy(m.ContainKey)
+		var groupRes query.Result
 		v.GroupNS = timeMin(reps, func() {
-			col, err = set.AppendPointer(col[:0], contain)
-			var in simdjson.KeyInterner
-			missing := false
-			for _, rv := range col {
-				if rv.Kind() == document.Invalid {
-					missing = true
-					continue
-				}
-				s, ok, terr := rv.Text()
-				if terr != nil || !ok || s == "" {
-					missing = true // non-string, empty, or malformed: the NULL group
-					continue
-				}
-				in.InternString(s)
-			}
-			groups = in.Len()
-			if missing {
-				groups++
-			}
+			groupRes, err = groupQ.Run(set)
 		})
 		if err != nil {
 			return v, err
 		}
-		v.GroupCount = groups
+		v.GroupCount = groupRes.RowCount
 
 		// Containment: {ContainKey: ContainValue} against each document. This
 		// is the many-documents form RawContains documents — the needle is
@@ -322,24 +322,22 @@ func MeasureCorpus(dir string, m Manifest, hashKeys, shapeTapes bool, reps int) 
 		v.ContainCount = cc
 	}
 
-	// Scalar aggregate: SUM SumField across the corpus. The typed column
-	// parses each cell at scan speed; the reduce is a plain int64 add over the
-	// dense values under the validity mask.
+	// Scalar aggregate through the query executor: SELECT SUM(SumField). The
+	// executor parses the typed numeric column at scan speed and reduces it; the
+	// exact int64 sum of these corpora is within float64's integer range, so the
+	// observed value read back off the result cell is exact.
 	if m.SumField != "" {
-		var cache simdjson.ShapeCache
-		var vals []int64
-		var valid []bool
-		var sum int64
+		sumQ := query.Select(query.Sum(m.SumField))
+		var sumRes query.Result
 		v.SumNS = timeMin(reps, func() {
-			vals, valid = cache.AppendFieldInt64(vals[:0], valid[:0], set, m.SumField)
-			sum = 0
-			for i, ok := range valid {
-				if ok {
-					sum += vals[i]
-				}
-			}
+			sumRes, err = sumQ.Run(set)
 		})
-		v.SumObserved = sum
+		if err != nil {
+			return v, err
+		}
+		if f, ok := sumRes.Columns[0].Cells[0].Float64(); ok {
+			v.SumObserved = int64(f)
+		}
 	}
 
 	runtime.KeepAlive(set)

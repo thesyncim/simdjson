@@ -129,17 +129,30 @@ func (p *plan) selectRows(ctx *execCtx) []int {
 }
 
 // candidateRows is the selective seam. It returns the rows the WHERE predicate
-// must be tested against, or nil meaning "every row". Today it always returns
-// nil — the full columnar scan tests every row — which is the right policy for
-// an unselective predicate and the honest default for the phase-0/1 surface.
+// must be tested against, or nil meaning "every row" — the full columnar scan.
 //
-// A postings index (ADR 0002 Gap B) plugs in here: for a selective predicate
-// it would return a narrowed candidate slice built from the predicate's
-// indexed leaves, and selectRows would verify each candidate with the same
-// per-row eval, so the accepted-rows contract and everything downstream are
-// unchanged — only the candidate enumeration gets cheaper.
+// When the DocSet opted into the inverted posting layer (DocSet.Postings) and
+// the predicate has a leaf the postings can answer, candidateRows returns a
+// narrowed candidate slice built from the predicate's postable leaves (see
+// candidates.go), and selectRows verifies each candidate with the same per-row
+// eval — so the accepted-rows contract and everything downstream are unchanged,
+// only the candidate enumeration gets cheaper. Without postings, or for a
+// predicate no leaf can prune, it returns nil and the full scan stands.
 func (p *plan) candidateRows(ctx *execCtx) []int {
-	return nil
+	if p.where == nil || !ctx.s.Postings {
+		return nil
+	}
+	rows, ok := p.where.candidates(ctx.s)
+	if !ok {
+		return nil // no postable leaf bounds the predicate: full scan
+	}
+	if rows == nil {
+		// A postable predicate that matches no row: an empty candidate set, not
+		// "every row". Hand back a non-nil empty slice so selectRows selects
+		// nothing rather than falling into the full scan.
+		return []int{}
+	}
+	return rows
 }
 
 // runProjection builds one result row per selected document. A projection can

@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/thesyncim/simdjson"
+	"github.com/thesyncim/simdjson/document"
 )
 
 // An Op is a scalar comparison operator for Cmp.
@@ -156,13 +157,16 @@ func floatLiteral(f float64) literal {
 
 // A compiledPredicate is a WHERE tree resolved for repeated evaluation: leaf
 // predicates reference a column by index, comparisons carry their classified
-// literal, and containment carries its validated needle bytes.
+// literal, and containment carries its validated needle bytes. A leaf also
+// carries its posting probe (postNone when unpostable), the descriptor
+// candidates.go uses to prune candidate rows through DocSet.Postings.
 type compiledPredicate struct {
 	kind   predKind
 	col    int
 	op     Op
 	lit    scalar
 	needle []byte
+	probe  postProbe
 	kids   []*compiledPredicate
 }
 
@@ -179,22 +183,50 @@ func compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error
 		if err != nil {
 			return nil, err
 		}
-		return &compiledPredicate{kind: predCmp, col: col, op: p.op, lit: classifyLiteral(lit)}, nil
+		cp := &compiledPredicate{kind: predCmp, col: col, op: p.op, lit: classifyLiteral(lit)}
+		// Equality over a single top-level field prunes through the value
+		// postings; every other operator is a range the scalar buckets do not
+		// answer, and a nested path is not indexed.
+		if p.op == Eq && reg.paths[col].single {
+			if needle, ok := eqNeedle(cp.lit); ok {
+				cp.probe = postProbe{kind: postEq, path: reg.paths[col].name, needle: needle}
+			}
+		}
+		return cp, nil
 	case predContains:
 		col, err := reg.add(p.path)
 		if err != nil {
 			return nil, err
 		}
-		if err := validateJSON(p.json); err != nil {
+		scalarNeedle, err := containsNeedleScalar(p.json)
+		if err != nil {
 			return nil, fmt.Errorf("query: Contains literal: %w", err)
 		}
-		return &compiledPredicate{kind: predContains, col: col, needle: []byte(p.json)}, nil
-	case predExists, predIsNull:
+		cp := &compiledPredicate{kind: predContains, col: col, needle: []byte(p.json)}
+		// Only a scalar needle over a single top-level field prunes: the value
+		// buckets index scalars, and a structured needle would fall to a full
+		// scan inside WhereContains anyway, so leaving it unpostable avoids
+		// scanning twice.
+		if scalarNeedle && reg.paths[col].single {
+			cp.probe = postProbe{kind: postContains, path: reg.paths[col].name, needle: cp.needle}
+		}
+		return cp, nil
+	case predExists:
 		col, err := reg.add(p.path)
 		if err != nil {
 			return nil, err
 		}
-		return &compiledPredicate{kind: p.kind, col: col}, nil
+		cp := &compiledPredicate{kind: predExists, col: col}
+		if reg.paths[col].single {
+			cp.probe = postProbe{kind: postExists, path: reg.paths[col].name}
+		}
+		return cp, nil
+	case predIsNull:
+		col, err := reg.add(p.path)
+		if err != nil {
+			return nil, err
+		}
+		return &compiledPredicate{kind: predIsNull, col: col}, nil
 	case predAnd, predOr, predNot:
 		kids := make([]*compiledPredicate, 0, len(p.kids))
 		for _, kid := range p.kids {
@@ -210,16 +242,26 @@ func compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error
 	}
 }
 
-// validateJSON reports whether s is exactly one JSON document, the requirement
-// RawContains places on a containment needle. It reuses the core validator by
-// building the needle's index once.
-func validateJSON(s string) error {
+// containsNeedleScalar validates that s is exactly one JSON document — the
+// requirement RawContains places on a containment needle — and reports whether
+// that document is a scalar (as opposed to an array or object). It reuses the
+// core validator by building the needle's index once; the root kind then tells
+// the compiler whether the value postings can prune the leaf.
+func containsNeedleScalar(s string) (bool, error) {
 	entries, err := simdjson.RequiredIndexEntries([]byte(s))
 	if err != nil {
-		return err
+		return false, err
 	}
-	_, err = simdjson.BuildIndex([]byte(s), make([]simdjson.IndexEntry, entries))
-	return err
+	idx, err := simdjson.BuildIndex([]byte(s), make([]simdjson.IndexEntry, entries))
+	if err != nil {
+		return false, err
+	}
+	switch idx.Root().Kind() {
+	case document.Array, document.Object:
+		return false, nil
+	default:
+		return true, nil
+	}
 }
 
 // eval evaluates the predicate for one row against the extracted columns.

@@ -141,6 +141,8 @@ lazy_navigation_contract_test.go
 lazy_scalar_contract_test.go
 lazy_test.go
 pointer_rfc6901_test.go
+query/parse_test.go
+query/postings_test.go
 query/query_test.go
 raw_trusted_test.go
 shape_column_test.go
@@ -244,6 +246,7 @@ index_tapescan_bench_test.go
 multidoc_bench_test.go
 parser_bench_test.go
 portable_backend_bench_test.go
+query/postings_bench_test.go
 query/query_bench_test.go
 shape_bench_test.go
 shape_column_bench_test.go
