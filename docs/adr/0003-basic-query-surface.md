@@ -64,8 +64,9 @@ library gains no query dependency; the subpackage depends on the core.
 
 ## Competitive target and acceptance
 
-RedisJSON + RediSearch, pinned images via docker (the pgbaseline harness
-pattern), single connection, single shard — the single-core rule both sides.
+RedisJSON + RediSearch, pinned images via docker (the redisbench harness
+under benchmarks/), single connection, single shard — the single-core rule
+both sides.
 Scenarios on shared corpora: path projection, filtered scan, scalar
 aggregation, and group-by aggregation, against `JSON.GET` / `FT.SEARCH` /
 `FT.AGGREGATE`. Acceptance: at or above parity on every scenario single-core,
@@ -77,8 +78,8 @@ rules as the gjson/sonic scoreboard.
 
 - **Postings (Gap B) move to next**: selective `WHERE` needs them; the
   `RawContains` verifier they prune for has landed.
-- **Value dictionary (Gap A) continues**: it is the store's space, still
-  racing the JSONB baseline, and orthogonal to the query surface.
+- **Value dictionary (Gap A) continues**: it is the store's space margin over
+  RedisJSON's uncompressed keyspace, and orthogonal to the query surface.
 - The query surface is the new headline deliverable; the ADR 0002 substrate is
   its execution layer.
 
