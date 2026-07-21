@@ -247,28 +247,36 @@ func (s *DocSet) postingsReady() bool {
 // return the same set; postings only change its cost. The result is freshly
 // allocated and owned by the caller.
 func (s *DocSet) WhereExists(path string) []int {
+	return s.AppendWhereExists(nil, path)
+}
+
+// AppendWhereExists is [DocSet.WhereExists] with caller-owned result storage.
+// It appends the ascending result to dst and returns the extended slice,
+// preserving dst's prior contents. With enough destination capacity it makes
+// no heap allocation, whether it uses postings or the exact scan fallback.
+func (s *DocSet) AppendWhereExists(dst []int, path string) []int {
 	if !s.postingsReady() {
-		return s.whereExistsScan(path)
+		return s.appendWhereExistsScan(dst, path)
 	}
 	p := s.postings
-	var res []int
+	mark := len(dst)
 	if id, ok := p.keys.LookupString(path); ok && int(id) < len(p.keyShapes) {
 		for _, sid := range p.keyShapes[id] {
 			for _, ord := range p.shapeDocs[sid] {
-				res = append(res, int(ord))
+				dst = append(dst, int(ord))
 			}
 		}
 	}
 	for _, ord := range p.remainder {
 		if _, ok := s.docs[ord].Root().Get(path); ok {
-			res = append(res, int(ord))
+			dst = append(dst, int(ord))
 		}
 	}
 	// The per-shape and remainder lists are each ascending but interleaved
 	// across shapes; every ordinal appears once by the storage partition, so a
 	// sort orders the union without deduplication.
-	sort.Ints(res)
-	return res
+	sort.Ints(dst[mark:])
+	return dst
 }
 
 // whereExistsScan is WhereExists's full-scan fallback: it tests each document
@@ -277,20 +285,23 @@ func (s *DocSet) WhereExists(path string) []int {
 // through Get on its tape, so the scan is a fair columnar baseline and never
 // materializes a shape tape. Ordinals are produced in ascending order.
 func (s *DocSet) whereExistsScan(path string) []int {
+	return s.appendWhereExistsScan(nil, path)
+}
+
+func (s *DocSet) appendWhereExistsScan(dst []int, path string) []int {
 	key := CompileKey(path)
-	var res []int
 	for i := range s.docs {
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
 			if _, ok := r.rec.fieldOrd(key.key, key.hash); ok {
-				res = append(res, i)
+				dst = append(dst, i)
 			}
 			continue
 		}
 		if _, ok := s.docs[i].Root().GetCompiled(key); ok {
-			res = append(res, i)
+			dst = append(dst, i)
 		}
 	}
-	return res
+	return dst
 }
 
 // WhereContains returns, in ascending order, the ordinals of the documents
@@ -311,77 +322,126 @@ func (s *DocSet) whereExistsScan(path string) []int {
 // stack scratch; it never calls Doc or materializes a classic tape. The result
 // is freshly allocated and owned by the caller.
 func (s *DocSet) WhereContains(path string, needle []byte) ([]int, error) {
+	return s.AppendWhereContains(nil, path, needle)
+}
+
+// AppendWhereContains is [DocSet.WhereContains] with caller-owned result
+// storage. It appends the ascending exact result to dst, preserving dst's prior
+// contents; an invalid needle returns dst unchanged with the validation error.
+// Call [DocSet.AppendWhereContainsIndex] when the same prebuilt needle is reused
+// and a warmed operation must allocate no parsing scratch.
+func (s *DocSet) AppendWhereContains(dst []int, path string, needle []byte) ([]int, error) {
 	n, err := containsIndex(needle)
 	if err != nil {
-		return nil, err
+		return dst, err
 	}
-	root := n.Root()
+	return s.AppendWhereContainsIndex(dst, path, n), nil
+}
+
+// AppendWhereContainsIndex is [DocSet.AppendWhereContains] for a needle that
+// has already been validated and indexed. It appends to dst and performs no
+// heap allocation when dst has enough capacity, including on the exact scan
+// fallback. The Index and its source must remain alive for the call.
+func (s *DocSet) AppendWhereContainsIndex(dst []int, path string, needle Index) []int {
+	root := needle.Root()
 	valueHash, scalar := postValueHash(root)
 	if !scalar || !s.postingsReady() {
-		return s.whereContainsScan(path, root), nil
+		return s.appendWhereContainsScan(dst, path, root)
 	}
 	bucket := postBucket(hashKeyString(path), valueHash)
-	var res []int
 	key := CompileKey(path)
-	var wide IndexEntry
 	for _, ord := range s.postings.value[bucket] {
-		if v, ok := s.fieldNodeAt(int(ord), key, &wide); ok && v.Contains(root) {
-			res = append(res, int(ord))
+		if s.fieldContainsAt(int(ord), key, root) {
+			dst = append(dst, int(ord))
 		}
 	}
 	// Candidates are ascending and already deduplicated, so verified survivors
 	// come out ascending and unique with no further work.
-	return res, nil
+	return dst
 }
 
 // whereContainsScan is WhereContains's full-scan fallback and the reference its
 // pruned path must equal: every document's value at path tested against the
 // needle with the same Node.Contains verifier. Ordinals are produced ascending.
 func (s *DocSet) whereContainsScan(path string, needle Node) []int {
-	var res []int
-	key := CompileKey(path)
-	var wide IndexEntry
-	for i := range s.docs {
-		if v, ok := s.fieldNodeAt(i, key, &wide); ok && v.Contains(needle) {
-			res = append(res, i)
-		}
-	}
-	return res
+	return s.appendWhereContainsScan(nil, path, needle)
 }
 
-// fieldNodeAt resolves one top-level field without materializing a
-// shape-deduplicated document. A narrow value is widened into caller-owned
-// scratch, whose address stays valid for the immediate accessor or containment
-// check; a wide shape value and a classic lookup borrow their stored tapes.
-// The proven shape makes absence exact, and classic lookup preserves the
-// last-duplicate-key rule.
-func (s *DocSet) fieldNodeAt(doc int, key CompiledKey, wide *IndexEntry) (Node, bool) {
+func (s *DocSet) appendWhereContainsScan(dst []int, path string, needle Node) []int {
+	key := CompileKey(path)
+	for i := range s.docs {
+		if s.fieldContainsAt(i, key, needle) {
+			dst = append(dst, i)
+		}
+	}
+	return dst
+}
+
+// fieldContainsAt resolves one top-level field and applies exact containment
+// without widening a shape tape. Narrow shape values need special treatment:
+// forming a Node for one would make its temporary widened IndexEntry escape
+// through the recursive containment evaluator. Flat shape values are scalars
+// or empty containers, so narrowContains can decide them directly from the
+// compact entry and validated source bytes. Wide shape and classic entries
+// already have stable storage and use the ordinary evaluator.
+func (s *DocSet) fieldContainsAt(doc int, key CompiledKey, needle Node) bool {
 	if r := s.shapeTapeRefAt(doc); r.rec != nil {
 		ord, ok := r.rec.fieldOrd(key.key, key.hash)
 		if !ok {
-			return Node{}, false
+			return false
 		}
 		stored := &s.docs[doc]
 		if r.narrow {
-			*wide = s.narrow[int(r.off+ord)].widen()
-			return Node{src: &stored.src[0], entry: wide}, true
+			return narrowContains(stored.src, s.narrow[int(r.off+ord)], needle)
 		}
-		return Node{src: &stored.src[0], entry: &stored.entries[ord]}, true
+		return (Node{src: &stored.src[0], entry: &stored.entries[ord]}).Contains(needle)
 	}
-	return s.docs[doc].Root().GetCompiled(key)
+	v, ok := s.docs[doc].Root().GetCompiled(key)
+	return ok && v.Contains(needle)
+}
+
+// narrowContains evaluates containment for a flat object's compact member.
+// A shape-compatible container has no children, so its result reduces to the
+// empty-container laws; scalar equality uses the same exact kernels as
+// Node.Contains, including decoded string and arbitrary-precision decimal
+// equality.
+func narrowContains(src []byte, value shapeNarrowValue, needle Node) bool {
+	kind := document.Kind((value.info & infoKindMask) >> infoKindShift)
+	if kind != needle.Kind() {
+		return false
+	}
+	raw := src[value.start():value.end()]
+	switch kind {
+	case document.Null:
+		return true
+	case document.Bool:
+		want, _ := needle.Bool()
+		return (raw[0] == 't') == want
+	case document.Number:
+		want, _ := needle.NumberBytes()
+		return jsonNumberEqual(raw, want)
+	case document.String:
+		return rawJSONStringEqual(raw, uint8(value.info>>infoFlagsShift), needle.Raw().Bytes(), needle.entry.flags())
+	case document.Array:
+		n, _ := needle.ArrayLen()
+		return n == 0
+	case document.Object:
+		n, _ := needle.ObjectLen()
+		return n == 0
+	default:
+		return false
+	}
 }
 
 // postKeyHash returns an object key's path hash — the content hash of its
 // decoded spelling, so it agrees with hashKeyString of a query path. A clean
-// key hashes its source alias; an escaped key decodes through a small stack
-// buffer first, matching how the containment verifier resolves keys.
+// key hashes its source alias; an escaped key is decoded as a byte stream, so
+// arbitrarily long spellings need no temporary materialization.
 func postKeyHash(key Node) uint32 {
 	if content, ok := key.StringBytes(); ok {
 		return hashKeyContent(content)
 	}
-	var buf [48]byte
-	decoded, _ := key.AppendText(buf[:0])
-	return hashKeyContent(decoded)
+	return hashDecodedJSONString(key.Raw().Bytes())
 }
 
 // The value bucket tags separate scalar kinds so that unequal values of
@@ -435,9 +495,7 @@ func postValueHash(v Node) (uint64, bool) {
 		if content, clean := v.StringBytes(); clean {
 			return postScalarBucket(postTagString, postFNV(content)), true
 		}
-		var buf [64]byte
-		decoded, _ := v.AppendText(buf[:0])
-		return postScalarBucket(postTagString, postFNV(decoded)), true
+		return postScalarBucket(postTagString, postDecodedStringFNV(v.Raw().Bytes())), true
 	default:
 		return 0, false
 	}
@@ -474,4 +532,61 @@ func postFNV(b []byte) uint64 {
 		h = (h ^ uint64(c)) * postFNVPrime
 	}
 	return h
+}
+
+// postDecodedStringFNV hashes the decoded content of one validated escaped
+// JSON string without allocating a decoded copy.
+func postDecodedStringFNV(raw []byte) uint64 {
+	h := uint64(postFNVOffset)
+	it := jsonStringByteIter{raw: raw[1 : len(raw)-1]}
+	for {
+		b, ok := it.next()
+		if !ok {
+			return h
+		}
+		h = (h ^ uint64(b)) * postFNVPrime
+	}
+}
+
+// hashDecodedJSONString computes the lookup hash of one validated escaped
+// JSON string's decoded content. The key hash includes decoded length and a
+// possibly overlapping final eight-byte word, so the first pass counts bytes
+// and the second folds complete words while retaining a rolling last-eight
+// window. Both passes are bounded streaming decoders.
+func hashDecodedJSONString(raw []byte) uint32 {
+	content := raw[1 : len(raw)-1]
+	count := 0
+	it := jsonStringByteIter{raw: content}
+	for {
+		_, ok := it.next()
+		if !ok {
+			break
+		}
+		count++
+	}
+
+	h := keyHashInit(count)
+	it = jsonStringByteIter{raw: content}
+	var word, last uint64
+	for i := 0; i < count; i++ {
+		b, _ := it.next()
+		word |= uint64(b) << (8 * uint(i&7))
+		if i < 8 {
+			last |= uint64(b) << (8 * uint(i))
+		} else {
+			last = last>>8 | uint64(b)<<56
+		}
+		if i&7 == 7 {
+			if i+1 < count {
+				h = keyHashMix(h, word)
+			}
+			word = 0
+		}
+	}
+	if count >= 8 {
+		h = keyHashMix(h, last)
+	} else {
+		h = keyHashMix(h, word)
+	}
+	return keyHashFinish(h)
 }

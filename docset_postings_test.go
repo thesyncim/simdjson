@@ -23,6 +23,7 @@ package simdjson
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/simdjson/document"
@@ -87,12 +88,12 @@ func postingsAdversarialCorpus() []string {
 	return append(docs,
 		`{"id":100,"status":"open","score":1e2,"active":true}`, // score equals 100
 		`{"id":101,"status":"open","tags":[1,2,3],"active":false}`,
-		`{"id":102,"tags":["open","x"],"note":"a\tb"}`,  // array of strings, escaped value
-		`{"id":103,"a":1,"a":2}`,                        // duplicate key: last wins
-		`{"id":104,"a":2,"a":1}`,                        // duplicate key, other order
-		`{"abc":"v","status":null}`,                // escaped key decoding to abc, null value
-		`{"nested":{"status":"open"},"status":"deep"}`,  // nested object, top-level status
-		`{"score":100,"status":"open"}`,                 // integer 100 vs 1e2
+		`{"id":102,"tags":["open","x"],"note":"a\tb"}`,     // array of strings, escaped value
+		`{"id":103,"a":1,"a":2}`,                           // duplicate key: last wins
+		`{"id":104,"a":2,"a":1}`,                           // duplicate key, other order
+		`{"abc":"v","status":null}`,                        // escaped key decoding to abc, null value
+		`{"nested":{"status":"open"},"status":"deep"}`,     // nested object, top-level status
+		`{"score":100,"status":"open"}`,                    // integer 100 vs 1e2
 		`{"id":105,"status":"z","score":-0,"active":true}`, // negative-zero value
 		`42`, `"open"`, `null`, `true`, `[1,2,3]`, `["open"]`, // non-object roots
 		`[{"status":"open"}]`, // array root
@@ -174,6 +175,163 @@ func TestDocSetPostingsInvalidNeedle(t *testing.T) {
 	appendAll(t, s, []string{`{"a":1}`, `{"a":1}`})
 	if _, err := s.WhereContains("a", []byte(`{`)); err == nil {
 		t.Fatal("WhereContains with invalid needle: want error, got nil")
+	}
+}
+
+func TestPostDecodedStringHashes(t *testing.T) {
+	for n := 0; n <= 33; n++ {
+		raw := []byte(`"` + strings.Repeat(`\u0061`, n) + `"`)
+		decoded := strings.Repeat("a", n)
+		if got, want := hashDecodedJSONString(raw), hashKeyString(decoded); got != want {
+			t.Fatalf("decoded key hash length %d = %#x, want %#x", n, got, want)
+		}
+		if got, want := postDecodedStringFNV(raw), postFNV([]byte(decoded)); got != want {
+			t.Fatalf("decoded value hash length %d = %#x, want %#x", n, got, want)
+		}
+	}
+	for _, test := range []struct {
+		raw, decoded string
+	}{
+		{`"a\n\tb"`, "a\n\tb"},
+		{`"\u00e9"`, "é"},
+		{`"\uD83D\uDE00é"`, "😀é"},
+	} {
+		if got, want := hashDecodedJSONString([]byte(test.raw)), hashKeyString(test.decoded); got != want {
+			t.Errorf("decoded key hash %s = %#x, want %#x", test.raw, got, want)
+		}
+		if got, want := postDecodedStringFNV([]byte(test.raw)), postFNV([]byte(test.decoded)); got != want {
+			t.Errorf("decoded value hash %s = %#x, want %#x", test.raw, got, want)
+		}
+	}
+}
+
+// TestDocSetPostingsAppendBuffers pins the caller-owned storage contract. The
+// append forms must preserve an existing prefix, agree with the convenience
+// APIs, and leave that prefix untouched when needle validation fails.
+func TestDocSetPostingsAppendBuffers(t *testing.T) {
+	docs := postingsAdversarialCorpus()
+	variants := []struct {
+		name string
+		set  *DocSet
+	}{
+		{"postings", &DocSet{Postings: true}},
+		{"postings+shapes", &DocSet{Postings: true, ShapeTapes: true}},
+		{"late-enable-fallback", &DocSet{ShapeTapes: true}},
+	}
+	for i := range variants {
+		v := &variants[i]
+		if v.name == "late-enable-fallback" {
+			appendAll(t, v.set, docs[:len(docs)/2])
+			v.set.Postings = true
+			appendAll(t, v.set, docs[len(docs)/2:])
+		} else {
+			appendAll(t, v.set, docs)
+		}
+
+		prefix := []int{-2, -1}
+		wantExists := append(append([]int(nil), prefix...), v.set.WhereExists("status")...)
+		if got := v.set.AppendWhereExists(append([]int(nil), prefix...), "status"); !equalInts(got, wantExists) {
+			t.Fatalf("%s: AppendWhereExists = %v, want %v", v.name, got, wantExists)
+		}
+
+		wantContains, err := v.set.WhereContains("status", []byte(`"open"`))
+		if err != nil {
+			t.Fatalf("%s: WhereContains: %v", v.name, err)
+		}
+		wantContains = append(append([]int(nil), prefix...), wantContains...)
+		gotContains, err := v.set.AppendWhereContains(append([]int(nil), prefix...), "status", []byte(`"open"`))
+		if err != nil {
+			t.Fatalf("%s: AppendWhereContains: %v", v.name, err)
+		}
+		if !equalInts(gotContains, wantContains) {
+			t.Fatalf("%s: AppendWhereContains = %v, want %v", v.name, gotContains, wantContains)
+		}
+
+		needle := refIndex(t, `"open"`)
+		if got := v.set.AppendWhereContainsIndex(append([]int(nil), prefix...), "status", needle); !equalInts(got, wantContains) {
+			t.Fatalf("%s: AppendWhereContainsIndex = %v, want %v", v.name, got, wantContains)
+		}
+
+		gotInvalid, err := v.set.AppendWhereContains(append([]int(nil), prefix...), "status", []byte(`{`))
+		if err == nil {
+			t.Fatalf("%s: AppendWhereContains invalid needle: want error", v.name)
+		}
+		if !equalInts(gotInvalid, prefix) {
+			t.Fatalf("%s: AppendWhereContains invalid needle changed dst: got %v, want %v", v.name, gotInvalid, prefix)
+		}
+	}
+}
+
+// TestDocSetPostingsAppendSteadyAllocs proves that callers can remove the
+// result allocation and repeated needle-index allocation from a hot lookup.
+func TestDocSetPostingsAppendSteadyAllocs(t *testing.T) {
+	s := &DocSet{Postings: true, ShapeTapes: true, Options: document.IndexOptions{HashKeys: true}}
+	docs := postingsAdversarialCorpus()
+	longEscaped := `"` + strings.Repeat(`\u0061`, 96) + `"`
+	longKey := `"` + strings.Repeat(`\u0062`, 96) + `"`
+	for range 3 {
+		docs = append(docs, `{"status":`+longEscaped+`,"empty_array":[],"empty_object":{}}`)
+		docs = append(docs, `{"payload":{`+longKey+`:1}}`)
+	}
+	appendAll(t, s, docs)
+	needle := refIndex(t, `"open"`)
+	escapedNeedle := refIndex(t, longEscaped)
+	emptyArrayNeedle := refIndex(t, `[]`)
+	emptyObjectNeedle := refIndex(t, `{}`)
+	objectNeedle := refIndex(t, `{`+longKey+`:1}`)
+
+	exists := make([]int, 0, len(docs))
+	contains := make([]int, 0, len(docs))
+	escaped := make([]int, 0, len(docs))
+	emptyArray := make([]int, 0, len(docs))
+	emptyObject := make([]int, 0, len(docs))
+	object := make([]int, 0, len(docs))
+	exists = s.AppendWhereExists(exists, "status")
+	contains = s.AppendWhereContainsIndex(contains, "status", needle)
+	escaped = s.AppendWhereContainsIndex(escaped, "status", escapedNeedle)
+	emptyArray = s.AppendWhereContainsIndex(emptyArray, "empty_array", emptyArrayNeedle)
+	emptyObject = s.AppendWhereContainsIndex(emptyObject, "empty_object", emptyObjectNeedle)
+	object = s.AppendWhereContainsIndex(object, "payload", objectNeedle)
+	if len(exists) == 0 || len(contains) == 0 {
+		t.Fatalf("warmup returned empty results: exists=%v contains=%v", exists, contains)
+	}
+	if len(escaped) != 3 || len(emptyArray) != 3 || len(emptyObject) != 3 || len(object) != 3 {
+		t.Fatalf("warmup mismatch: escaped=%v array=%v empty-object=%v object=%v", escaped, emptyArray, emptyObject, object)
+	}
+
+	if n := testing.AllocsPerRun(100, func() {
+		exists = s.AppendWhereExists(exists[:0], "status")
+	}); n != 0 {
+		t.Fatalf("AppendWhereExists allocated %.1f times per warmed lookup", n)
+	}
+	if n := testing.AllocsPerRun(100, func() {
+		contains = s.AppendWhereContainsIndex(contains[:0], "status", needle)
+	}); n != 0 {
+		t.Fatalf("AppendWhereContainsIndex allocated %.1f times per warmed lookup", n)
+	}
+	if n := testing.AllocsPerRun(100, func() {
+		escaped = s.AppendWhereContainsIndex(escaped[:0], "status", escapedNeedle)
+		emptyArray = s.AppendWhereContainsIndex(emptyArray[:0], "empty_array", emptyArrayNeedle)
+		emptyObject = s.AppendWhereContainsIndex(emptyObject[:0], "empty_object", emptyObjectNeedle)
+		object = s.AppendWhereContainsIndex(object[:0], "payload", objectNeedle)
+	}); n != 0 {
+		t.Fatalf("AppendWhereContainsIndex allocated %.1f times across escaped scalar, empty-container, and object lookups", n)
+	}
+
+	// Enabling postings after ingest deliberately selects the exact scan
+	// fallback; caller-owned storage must remove allocations there as well.
+	fallback := &DocSet{ShapeTapes: true, Options: document.IndexOptions{HashKeys: true}}
+	appendAll(t, fallback, docs)
+	fallback.Postings = true
+	fallbackExists := make([]int, 0, len(docs))
+	fallbackObject := make([]int, 0, len(docs))
+	fallbackExists = fallback.AppendWhereExists(fallbackExists, "status")
+	fallbackObject = fallback.AppendWhereContainsIndex(fallbackObject, "payload", objectNeedle)
+	if n := testing.AllocsPerRun(100, func() {
+		fallbackExists = fallback.AppendWhereExists(fallbackExists[:0], "status")
+		fallbackObject = fallback.AppendWhereContainsIndex(fallbackObject[:0], "payload", objectNeedle)
+	}); n != 0 {
+		t.Fatalf("buffered posting scan fallbacks allocated %.1f times per warmed pair", n)
 	}
 }
 

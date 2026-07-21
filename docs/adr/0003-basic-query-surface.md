@@ -115,7 +115,11 @@ ordinary compiled predicate over every gathered row, and the bounded
 differential requires accelerated results to equal both the dense executor and
 an independent reference across classic, hashed, narrow/wide shape-taped, and
 dictionary-backed storage. Buffered sparse gathers are separately held to zero
-steady-state allocations.
+steady-state allocations. The posting probes they consume have the same
+contract through `AppendWhereExists` and `AppendWhereContainsIndex`: reuse the
+result slice and prebuild the containment needle, and the warmed lookup makes
+no heap allocation. Exact verification remains allocation-free for compact
+tapes and for escaped scalar and object-key spellings of arbitrary length.
 
 Non-goals from ADR 0002 (durability, MVCC, distribution, multi-core, full SQL)
 are unchanged.

@@ -118,6 +118,12 @@ The layer around that core, one line each:
   on a `simdjson.ShapeCache` extracts one field across every document through
   cached object layouts; `cache.AppendFieldInt64(dst, valid, &set, "user_id")`
   produces a dense typed column with a validity mask in the same pass.
+- **Buffered posting queries** — with `DocSet.Postings` enabled,
+  `rows = set.AppendWhereExists(rows[:0], "status")` and
+  `rows = set.AppendWhereContainsIndex(rows[:0], "status", needle)` reuse the
+  caller's result storage. Build the needle index once; warmed lookups allocate
+  nothing, including long escaped strings and exact verification over compact
+  shape tapes.
 
 Ownership is uniform: an `Index` and its nodes borrow the source and the entry
 storage; `DocSet` and the caches own their arenas, and nothing they hand out is

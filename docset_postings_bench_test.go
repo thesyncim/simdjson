@@ -96,8 +96,12 @@ func BenchmarkPostingsContains(b *testing.B) {
 	for _, matches := range postingsSelectivities {
 		docs := postingsContainsCorpus(postingsBenchCount, matches, target)
 		set := postingsBenchSet(b, docs, false)
+		needleIndex, err := containsIndex(needle)
+		if err != nil {
+			b.Fatal(err)
+		}
 		// Confirm the two paths agree before timing either.
-		want := set.whereContainsScan("s0_f02", mustRoot(b, needle))
+		want := set.whereContainsScan("s0_f02", needleIndex.Root())
 		got, err := set.WhereContains("s0_f02", needle)
 		if err != nil || len(got) != len(want) {
 			b.Fatalf("match=%d: WhereContains=%d scan=%d err=%v", matches, len(got), len(want), err)
@@ -111,6 +115,15 @@ func BenchmarkPostingsContains(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
+				postingsBenchSink = len(res)
+			}
+		})
+		b.Run(fmt.Sprintf("match=%d/postings-buffered", matches), func(b *testing.B) {
+			res := make([]int, 0, postingsBenchCount)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				res = set.AppendWhereContainsIndex(res[:0], "s0_f02", needleIndex)
 				postingsBenchSink = len(res)
 			}
 		})
@@ -142,6 +155,15 @@ func BenchmarkPostingsExists(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				postingsBenchSink = len(set.WhereExists("opt_field"))
+			}
+		})
+		b.Run(fmt.Sprintf("match=%d/postings-buffered", matches), func(b *testing.B) {
+			res := make([]int, 0, postingsBenchCount)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				res = set.AppendWhereExists(res[:0], "opt_field")
+				postingsBenchSink = len(res)
 			}
 		})
 		b.Run(fmt.Sprintf("match=%d/scan", matches), func(b *testing.B) {

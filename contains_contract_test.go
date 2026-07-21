@@ -163,6 +163,37 @@ func TestContainsInvalidNode(t *testing.T) {
 	}
 }
 
+// TestContainsEscapedStringSteadyAllocs guards the incremental two-escaped-
+// string path. Its inputs exceed the former stack materialization buffer, so
+// any regression to decode-then-compare is visible as a heap allocation.
+func TestContainsEscapedStringSteadyAllocs(t *testing.T) {
+	a := []byte(`"` + strings.Repeat(`\u0061`, 96) + `\u00e9"`)
+	b := []byte(`"` + strings.Repeat(`\u0061`, 96) + `\u00E9"`)
+	haystack := mustBuildIndex(t, a).Root()
+	needle := mustBuildIndex(t, b).Root()
+	if !haystack.Contains(needle) {
+		t.Fatal("equivalent escaped strings did not contain one another")
+	}
+	if n := testing.AllocsPerRun(100, func() {
+		containsBenchSink = haystack.Contains(needle)
+	}); n != 0 {
+		t.Fatalf("Contains allocated %.1f times for two long escaped strings", n)
+	}
+
+	keyA := `"` + strings.Repeat(`\u0061`, 96) + `\u00e9"`
+	keyB := `"` + strings.Repeat(`\u0061`, 96) + `\u00E9"`
+	haystack = mustBuildIndex(t, []byte(`{`+keyA+`:1,"other":2}`)).Root()
+	needle = mustBuildIndex(t, []byte(`{`+keyB+`:1}`)).Root()
+	if !haystack.Contains(needle) {
+		t.Fatal("equivalent long escaped object keys did not match")
+	}
+	if n := testing.AllocsPerRun(100, func() {
+		containsBenchSink = haystack.Contains(needle)
+	}); n != 0 {
+		t.Fatalf("Contains allocated %.1f times for a long escaped object key", n)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // The naive reference evaluator.
 // ---------------------------------------------------------------------------

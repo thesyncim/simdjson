@@ -74,9 +74,10 @@ shape-deduplicated dual-width tapes cut clustered-corpus tape storage 48% at a
 99% dedup rate (retained bytes 938 -> 606 MiB on the 1M-document synthetic
 set), and single-core ingest ran 0.5-2.2 GB/s depending on document size.
 Extraction is 5-12 ns/document on conforming corpora. The value dictionary
-(Gap A) targets real corpora rich in repeated values; existence and
-containment await the posting layer (Gap B). These feed the ADR 0003 harness
-that compares them to RedisJSON.
+(Gap A) targets real corpora rich in repeated values; the landed posting layer
+answers existence and exact containment sublinearly and feeds ADR 0003's
+selection-pushdown executor. These feed the ADR 0003 harness that compares them
+to RedisJSON.
 
 ## Phases
 
@@ -91,11 +92,13 @@ entries natively; oversize documents fall back to wide.
 DocSet (source arenas, tapes, shapes, interner, postings) for zero-parse
 reopen. Formats are explicitly unstable before v1.
 
-**Phase 4 - the inverted layer.** Key-existence postings via interner x shapes
-(key ID -> shape set -> documents, already implicit in shape-deduplicated
+**Phase 4 - the inverted layer (landed).** Key-existence postings via interner
+x shapes (key ID -> shape set -> documents, implicit in shape-deduplicated
 storage); (path hash, value hash) -> document postings for containment
-candidate pruning, verified by **RawContains**, a containment evaluator whose
-semantics follow the documented JSON containment model (landed). This is the
+candidate pruning, verified by the exact `Node.Contains` evaluator. Buffered
+forms accept caller-owned result storage and a prebuilt needle index, and are
+held to zero steady-state allocations even for narrow shape tapes, long
+escaped strings, escaped object keys, and empty containers. This is the
 execution layer for ADR 0003's `WHERE`.
 
 ## Placement

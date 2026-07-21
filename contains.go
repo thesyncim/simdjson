@@ -1,6 +1,11 @@
 package simdjson
 
-import "github.com/thesyncim/simdjson/document"
+import (
+	"unicode/utf16"
+	"unicode/utf8"
+
+	"github.com/thesyncim/simdjson/document"
+)
 
 // JSONB-compatible containment.
 //
@@ -13,8 +18,8 @@ import "github.com/thesyncim/simdjson/document"
 // phase 4 prunes containment candidates with postings that this evaluator
 // then verifies.
 //
-// The evaluation is one structural recursion with no allocation on clean
-// input. Object members resolve through the Get lookup ladder, so an
+// The evaluation is one structural recursion with no heap allocation on any
+// validated input. Object members resolve through the Get lookup ladder, so an
 // enriched haystack (document.IndexOptions.HashKeys) rejects non-matching
 // members on one hash-word compare: the needle key is hashed once and
 // gates every member of the probed object. Array containment pre-filters
@@ -64,10 +69,10 @@ import "github.com/thesyncim/simdjson/document"
 // contained in nothing.
 //
 // The Nodes may come from different documents, or from the same one.
-// Contains does not allocate except for needle strings or keys that
-// contain escape sequences too long for a small stack buffer. The cost is
-// one haystack lookup per needle object member and, for arrays, one scan
-// of the haystack array per needle element.
+// Contains does not allocate. The cost is one haystack lookup per clean needle
+// object member and, for arrays, one scan of the haystack array per needle
+// element. An escaped needle key takes an allocation-free object scan because
+// its decoded spelling is deliberately not materialized.
 func (v Node) Contains(needle Node) bool {
 	if v.Kind() == document.Array {
 		switch needle.Kind() {
@@ -154,15 +159,26 @@ func objectContains(h, n Node) bool {
 		if !ok {
 			return true
 		}
-		k := containsKeyText(key)
-		hv, ok := h.Get(k)
+		content, clean := key.StringBytes()
+		var hv Node
+		if clean {
+			hv, ok = h.Get(ownedBytesString(content))
+		} else {
+			hv, ok = objectGetEscapedKey(h, key)
+		}
 		if !ok {
 			// The key is absent from the haystack. Every duplicate of a
 			// key resolves the same lookup, so shadowing cannot save it.
 			return false
 		}
 		if !nodeContains(hv, value) {
-			if effective, _ := n.Get(k); effective.entry == value.entry {
+			var effective Node
+			if clean {
+				effective, _ = n.Get(ownedBytesString(content))
+			} else {
+				effective, _ = objectGetEscapedKey(n, key)
+			}
+			if effective.entry == value.entry {
 				return false
 			}
 			// A later duplicate shadows this member; that occurrence
@@ -171,16 +187,22 @@ func objectContains(h, n Node) bool {
 	}
 }
 
-// containsKeyText returns key's decoded text for a Get lookup. An
-// unescaped key aliases the source; an escaped key decodes through a
-// small stack buffer, allocating only when the decoded key outgrows it.
-func containsKeyText(key Node) string {
-	if content, ok := key.StringBytes(); ok {
-		return ownedBytesString(content)
+// objectGetEscapedKey resolves an escaped needle key without materializing its
+// decoded spelling. It scans to the last equal key, preserving Get's duplicate
+// rule, while rawJSONStringEqual incrementally decodes both sides in constant
+// space. Clean needle keys stay on Get's hash-accelerated path above.
+func objectGetEscapedKey(object, key Node) (Node, bool) {
+	it, _ := object.ObjectIter()
+	var found Node
+	for {
+		candidate, value, ok := it.Next()
+		if !ok {
+			return found, found.entry != nil
+		}
+		if stringNodesEqual(candidate, key) {
+			found = value
+		}
 	}
-	var buf [48]byte
-	decoded, _ := key.AppendText(buf[:0])
-	return ownedBytesString(decoded)
 }
 
 // arrayContains reports whether every element of needle array n is
@@ -245,12 +267,85 @@ func stringNodesEqual(a, b Node) bool {
 	case aClean && bClean:
 		return bytesEqualString(ac, ownedBytesString(bc))
 	case aClean:
-		return tapeKeyEqual(b.Raw().Bytes(), tapeFlagEscaped, ownedBytesString(ac))
+		return tapeKeyEqual(b.Raw().Bytes(), b.entry.flags(), ownedBytesString(ac))
 	case bClean:
-		return tapeKeyEqual(a.Raw().Bytes(), tapeFlagEscaped, ownedBytesString(bc))
+		return tapeKeyEqual(a.Raw().Bytes(), a.entry.flags(), ownedBytesString(bc))
 	default:
-		var buf [48]byte
-		decoded, _ := a.AppendText(buf[:0])
-		return tapeKeyEqual(b.Raw().Bytes(), tapeFlagEscaped, ownedBytesString(decoded))
+		return rawJSONStringEqual(a.Raw().Bytes(), a.entry.flags(), b.Raw().Bytes(), b.entry.flags())
 	}
+}
+
+// rawJSONStringEqual compares two validated JSON string spellings by decoded
+// UTF-8 content. A clean side remains a direct source alias. When both sides
+// contain escapes, two tiny incremental decoders meet byte-for-byte instead
+// of materializing either spelling; even arbitrarily long escaped strings are
+// therefore allocation-free.
+func rawJSONStringEqual(a []byte, aFlags uint8, b []byte, bFlags uint8) bool {
+	aEscaped := aFlags&tapeFlagEscaped != 0
+	bEscaped := bFlags&tapeFlagEscaped != 0
+	switch {
+	case !aEscaped && !bEscaped:
+		return bytesEqualString(a[1:len(a)-1], ownedBytesString(b[1:len(b)-1]))
+	case !aEscaped:
+		return tapeKeyEqual(b, bFlags, ownedBytesString(a[1:len(a)-1]))
+	case !bEscaped:
+		return tapeKeyEqual(a, aFlags, ownedBytesString(b[1:len(b)-1]))
+	}
+
+	ai := jsonStringByteIter{raw: a[1 : len(a)-1]}
+	bi := jsonStringByteIter{raw: b[1 : len(b)-1]}
+	for {
+		ab, aok := ai.next()
+		bb, bok := bi.next()
+		if aok != bok || aok && ab != bb {
+			return false
+		}
+		if !aok {
+			return true
+		}
+	}
+}
+
+// jsonStringByteIter decodes one byte at a time from the inside of a validated
+// JSON string. Unicode escapes can yield up to four UTF-8 bytes, held inline;
+// validation guarantees complete escapes and valid surrogate pairing.
+type jsonStringByteIter struct {
+	raw     []byte
+	i       int
+	encoded [utf8.UTFMax]byte
+	pos     uint8
+	n       uint8
+}
+
+func (it *jsonStringByteIter) next() (byte, bool) {
+	if it.pos < it.n {
+		b := it.encoded[it.pos]
+		it.pos++
+		return b, true
+	}
+	if it.i == len(it.raw) {
+		return 0, false
+	}
+	b := it.raw[it.i]
+	if b != '\\' {
+		it.i++
+		return b, true
+	}
+	it.i++
+	if it.raw[it.i] != 'u' {
+		b = decodedSimpleEscape(it.raw[it.i])
+		it.i++
+		return b, true
+	}
+	u, _ := hex4(it.raw, it.i+1)
+	it.i += 5
+	r := rune(u)
+	if 0xD800 <= r && r <= 0xDBFF {
+		lo, _ := hex4(it.raw, it.i+2)
+		r = utf16.DecodeRune(r, rune(lo))
+		it.i += 6
+	}
+	it.n = uint8(utf8.EncodeRune(it.encoded[:], r))
+	it.pos = 1
+	return it.encoded[0], true
 }

@@ -128,9 +128,13 @@
 // shared arena storage whose bytes never move, so handles stay valid as the
 // set grows; its ReadFrom ingests an entire stream of concatenated or
 // NDJSON documents directly into the arena. [DocSet.AppendPointer] resolves
-// one compiled pointer across every document into a columnar result, and a
-// [KeyInterner] maps object keys to dense identifiers for engines that
-// group fields across documents.
+// one compiled pointer across every document into a columnar result. With
+// postings enabled, [DocSet.WhereExists] and [DocSet.WhereContains] provide
+// convenience queries; [DocSet.AppendWhereExists] and
+// [DocSet.AppendWhereContainsIndex] reuse caller-owned result and prebuilt
+// needle storage for zero-allocation warmed lookups. A [KeyInterner] maps
+// object keys to dense identifiers for engines that group fields across
+// documents.
 //
 // [ShapeCache] compiles the layouts of recurring flat objects: Resolve
 // fingerprints an object's key sequence, [Shape.Field] resolves a field
