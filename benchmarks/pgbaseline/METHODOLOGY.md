@@ -37,11 +37,15 @@ and taking the minimum of the rest.
 
 ## Our side
 
-`ours.go` ingests the identical corpora into a `DocSet` (HashKeys off and on)
+`ours.go` ingests the identical corpora into a `DocSet` (HashKeys off and
+on, and — the phase-1 configuration — ShapeTapes over the enriched build)
 and reports retained bytes from the arena and structure sizes — source
 arenas, entry arenas, and, as later phases land, shapes, interner, and
-postings. Space is retained bytes at rest, not allocation traffic. Timings
-use the same single-core discipline as every benchmark in this repository.
+postings. Space is retained bytes at rest, not allocation traffic; entry
+counts come from `DocSet.Stats`, which never widens a shape-taped document.
+The acceptance ratios judge one configuration end to end — the shape-tape
+variant when measured — never a cherry-picked mix. Timings use the same
+single-core discipline as every benchmark in this repository.
 
 ## Comparison rules
 

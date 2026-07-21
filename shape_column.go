@@ -60,11 +60,28 @@ import (
 // Shapes that lack name skip resolution for their whole run and take the
 // exact lookup directly.
 //
+// A shape-taped document (DocSet.ShapeTapes) skips the routing machinery
+// entirely: its shape was byte-proven at ingest, so extraction is one
+// memoized ordinal lookup and one value-array index — no header proof, no
+// key verification, no suffix scan — and absence in the shape is absence in
+// the document, exactly.
+//
 // AppendField grows c and follows its concurrency rule: one cache per
 // worker.
 func (c *ShapeCache) AppendField(dst []RawValue, s *DocSet, name string) []RawValue {
 	fs := newFieldScan(name)
+	var th shapeTapeHint
 	for i := range s.docs {
+		if r := s.shapeTapeRefAt(i); r.rec != nil {
+			doc := &s.docs[i]
+			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
+				v := &doc.entries[ord]
+				dst = append(dst, RawValue{src: doc.src[v.start:v.end]})
+			} else {
+				dst = append(dst, RawValue{})
+			}
+			continue
+		}
 		root := s.docs[i].Root()
 		if root.entry == nil {
 			dst = append(dst, RawValue{})
@@ -311,7 +328,9 @@ func appendFieldGet(dst []RawValue, root Node, key CompiledKey) []RawValue {
 // lacking a name, takes the exact lookup for that name, under
 // [FieldRef.In]'s contract and its documented residual deviation. Beyond
 // dst's growth, the call allocates only its per-name state, independent of
-// s.Len().
+// s.Len(). Shape-taped documents (DocSet.ShapeTapes) bypass the fold: their
+// proven shape resolves every name to a memoized ordinal and each column
+// reads its value entry directly, under AppendField's exactness argument.
 //
 // AppendFields grows c and follows its concurrency rule: one cache per
 // worker.
@@ -341,8 +360,37 @@ func (c *ShapeCache) AppendFields(dst [][]RawValue, s *DocSet, names ...string) 
 		streak     int
 		backoff    int
 		skip       int
+		// The shape-taped inline cache: one proven ordinal per name for the
+		// value-array documents, allocated on the first such document so
+		// classic sets pay nothing.
+		tapeRec  *shapeRecord
+		tapeOrds []int32
 	)
 	for i := range s.docs {
+		if r := s.shapeTapeRefAt(i); r.rec != nil {
+			doc := &s.docs[i]
+			if r.rec != tapeRec {
+				tapeRec = r.rec
+				if tapeOrds == nil {
+					tapeOrds = make([]int32, len(names))
+				}
+				for j := range keys {
+					tapeOrds[j] = -1
+					if o, ok := tapeRec.fieldOrd(keys[j].key, keys[j].hash); ok {
+						tapeOrds[j] = int32(o)
+					}
+				}
+			}
+			for j, ord := range tapeOrds {
+				if ord >= 0 {
+					v := &doc.entries[ord]
+					dst[j] = append(dst[j], RawValue{src: doc.src[v.start:v.end]})
+				} else {
+					dst[j] = append(dst[j], RawValue{})
+				}
+			}
+			continue
+		}
 		root := s.docs[i].Root()
 		var shape Shape
 		var ok bool

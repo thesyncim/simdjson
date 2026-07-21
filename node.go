@@ -455,9 +455,18 @@ func (v Node) Pointer(pointer string) (Node, bool, error) {
 // PointerCompiled resolves a precompiled JSON Pointer relative to v with the
 // same absence and array-index error semantics as [Node.Pointer].
 func (v Node) PointerCompiled(pointer CompiledPointer) (Node, bool, error) {
+	return v.pointerTokens(pointer.tokens)
+}
+
+// pointerTokens resolves a compiled pointer's remaining tokens relative to v
+// under PointerCompiled's exact semantics. It is the shared tail: the
+// shape-deduplicated batch walk (docset_shape.go) resolves a pointer's first
+// token against the stored shape and descends the rest through this loop, so
+// both routes share one semantics by construction.
+func (v Node) pointerTokens(tokens []compiledPointerToken) (Node, bool, error) {
 	cur := v
-	for i := range pointer.tokens {
-		token := pointer.tokens[i]
+	for i := range tokens {
+		token := tokens[i]
 		switch cur.Kind() {
 		case document.Object:
 			// Get's dispatch, with the token's compile-time hash standing in

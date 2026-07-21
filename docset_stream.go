@@ -227,10 +227,15 @@ func (s *DocSet) readDoc(d *docSetStream, pos *int) error {
 				return s.readDocSlow(d, start, pos)
 			}
 		}
+		// The build's full entry count feeds the headroom statistics: a dedup
+		// compaction commits fewer entries, but the next build still needs
+		// classic-tape room in the chunk tail before it can compact.
+		built := len(index.entries)
+		index, ref := s.shapeTapeCompact(index)
 		s.entryChunk = s.entryChunk[:len(s.entryChunk)+len(index.entries)]
 		s.srcChunk = s.srcChunk[:end]
-		s.docs = append(s.docs, index)
-		d.record(end-start, len(index.entries))
+		s.commitDoc(index, ref)
+		d.record(end-start, built)
 		*pos = end
 		return nil
 	}
@@ -257,7 +262,7 @@ func (s *DocSet) readDocSlow(d *docSetStream, start int, pos *int) error {
 	// buffered byte: a root number legitimately ends there, and anything
 	// else is truncation, which buildDoc rejects with its exact diagnosis.
 	end := start + fr.framed
-	index, err := s.buildDoc(s.srcChunk[start:end:end])
+	index, ref, err := s.buildDoc(s.srcChunk[start:end:end])
 	if err != nil {
 		if !framed && d.readErr != nil {
 			// The stream broke mid-document; the read failure, not the
@@ -266,9 +271,13 @@ func (s *DocSet) readDocSlow(d *docSetStream, start int, pos *int) error {
 		}
 		return fmt.Errorf("simdjson: invalid document at input offset %d: %w", d.offset(start), err)
 	}
+	built := len(index.entries)
+	if ref.rec != nil {
+		built = 2*built + 1 // the classic count, for the headroom statistics
+	}
 	s.srcChunk = s.srcChunk[:end]
-	s.docs = append(s.docs, index)
-	d.record(end-start, len(index.entries))
+	s.commitDoc(index, ref)
+	d.record(end-start, built)
 	*pos = end
 	return nil
 }

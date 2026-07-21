@@ -15,14 +15,19 @@ import (
 
 // This file measures our side of the baseline: what it costs, in bytes and
 // single-core nanoseconds, to hold the phase-0 corpora in a DocSet and run
-// the comparison queries against it with today's public API. The numbers
-// are the honest pre-optimization starting point the ADR asks for: the
-// classic 16-byte-per-entry tape, no shape-deduplicated tapes, no postings,
-// no containment evaluator.
+// the comparison queries against it with today's public API. The classic
+// variants are the honest pre-optimization starting point the ADR asks for
+// — the 16-byte-per-entry tape, no postings, no containment evaluator — and
+// the shape-tape variants measure the phase-1 lever on top of it:
+// DocSet.ShapeTapes stores each conforming document as a bare value array
+// with its keys deduplicated into the shape cache.
 
 // OursVariant holds one corpus measured under one DocSet configuration.
 type OursVariant struct {
 	HashKeys bool `json:"hash_keys"`
+	// ShapeTapes marks the phase-1 storage mode: shape-deduplicated tapes
+	// for conforming documents, classic tapes for the rest.
+	ShapeTapes bool `json:"shape_tapes,omitempty"`
 
 	// Ingest is the minimum wall time for DocSet.ReadFrom over the whole
 	// NDJSON corpus (validate + index + arena copy), from memory.
@@ -32,12 +37,16 @@ type OursVariant struct {
 	// DocSet: runtime.MemStats.HeapAlloc after ingest and full GC, minus
 	// the same reading before, with the input buffer released. It includes
 	// arena slack and per-document headers; ModeledBytes is the analytic
-	// floor: SourceBytes + 16 bytes per structural index entry. The gap
-	// between the two is allocator/arena overhead (and the key-hash
-	// enrichment when HashKeys is on).
-	RetainedBytes int64 `json:"retained_bytes"`
-	Entries       int64 `json:"entries"`
-	ModeledBytes  int64 `json:"modeled_bytes"`
+	// floor: SourceBytes + 16 bytes per stored structural entry, plus 16
+	// bytes of header per shape-taped document. The gap between the two is
+	// allocator/arena overhead (and the key-hash enrichment when HashKeys
+	// is on). Entries counts every stored 16-byte entry — classic tapes
+	// plus value arrays — via DocSet.Stats, which never widens a document;
+	// ShapeTapedDocs is how many documents dedup admitted.
+	RetainedBytes  int64 `json:"retained_bytes"`
+	Entries        int64 `json:"entries"`
+	ShapeTapedDocs int64 `json:"shape_taped_docs,omitempty"`
+	ModeledBytes   int64 `json:"modeled_bytes"`
 
 	// Whole-corpus query costs, minimum over repetitions, in nanoseconds
 	// for the full pass (divide by Docs for per-document cost).
@@ -106,8 +115,8 @@ func timeMin(reps int, fn func()) int64 {
 // MeasureCorpus ingests the corpus in dir into a DocSet with the given
 // options and measures space and the manifest's queries. reps is the
 // repetition count for every timed section (minimum wins).
-func MeasureCorpus(dir string, m Manifest, hashKeys bool, reps int) (OursVariant, error) {
-	v := OursVariant{HashKeys: hashKeys}
+func MeasureCorpus(dir string, m Manifest, hashKeys, shapeTapes bool, reps int) (OursVariant, error) {
+	v := OursVariant{HashKeys: hashKeys, ShapeTapes: shapeTapes}
 
 	base := heapAlloc()
 	buf, err := os.ReadFile(filepath.Join(dir, "docs.ndjson"))
@@ -120,7 +129,10 @@ func MeasureCorpus(dir string, m Manifest, hashKeys bool, reps int) (OursVariant
 	// COPY reads a freshly written file from the page cache).
 	var set *simdjson.DocSet
 	v.IngestNS = timeMin(reps, func() {
-		s := &simdjson.DocSet{Options: document.IndexOptions{HashKeys: hashKeys}}
+		s := &simdjson.DocSet{
+			Options:    document.IndexOptions{HashKeys: hashKeys},
+			ShapeTapes: shapeTapes,
+		}
 		if _, err2 := s.ReadFrom(bytes.NewReader(buf)); err2 != nil {
 			err = err2
 		}
@@ -134,15 +146,18 @@ func MeasureCorpus(dir string, m Manifest, hashKeys bool, reps int) (OursVariant
 	}
 
 	// Space: release the input, settle the heap, and charge everything
-	// still live above the pre-read baseline to the DocSet.
+	// still live above the pre-read baseline to the DocSet. Entry counts
+	// come from Stats, never Doc: widening a shape-taped document would
+	// materialize the classic tape this variant exists to drop.
 	buf = nil
 	if retained := int64(heapAlloc()) - int64(base); retained > 0 {
 		v.RetainedBytes = retained
 	}
-	for i := range set.Len() {
-		v.Entries += int64(set.Doc(i).Len())
-	}
-	v.ModeledBytes = m.SourceBytes + v.Entries*int64(unsafe.Sizeof(simdjson.IndexEntry{}))
+	entrySize := int64(unsafe.Sizeof(simdjson.IndexEntry{}))
+	st := set.Stats()
+	v.Entries = st.TapeEntries + st.ValueEntries
+	v.ShapeTapedDocs = int64(st.ShapeTaped)
+	v.ModeledBytes = m.SourceBytes + v.Entries*entrySize + v.ShapeTapedDocs*entrySize
 
 	// Queries. Every predicate below is a full column scan via
 	// AppendPointer — the pre-postings baseline.
@@ -269,20 +284,25 @@ func (v OursVariant) Verify(m Manifest) []string {
 	return bad
 }
 
-// MeasureDir measures one corpus directory under both HashKeys settings.
+// MeasureDir measures one corpus directory under both HashKeys settings and,
+// on top of the enriched configuration, the phase-1 shape-tape mode. Every
+// variant must reproduce the manifest's expected counts before its numbers
+// mean anything.
 func MeasureDir(dir string, reps int) (OursCorpus, error) {
 	m, err := ReadManifest(dir)
 	if err != nil {
 		return OursCorpus{}, err
 	}
 	c := OursCorpus{Manifest: m}
-	for _, hk := range []bool{false, true} {
-		v, err := MeasureCorpus(dir, m, hk, reps)
+	for _, cfg := range []struct{ hashKeys, shapeTapes bool }{
+		{false, false}, {true, false}, {true, true},
+	} {
+		v, err := MeasureCorpus(dir, m, cfg.hashKeys, cfg.shapeTapes, reps)
 		if err != nil {
-			return c, fmt.Errorf("%s hashkeys=%t: %v", m.Name, hk, err)
+			return c, fmt.Errorf("%s hashkeys=%t shapetapes=%t: %v", m.Name, cfg.hashKeys, cfg.shapeTapes, err)
 		}
 		if bad := v.Verify(m); len(bad) != 0 {
-			return c, fmt.Errorf("%s hashkeys=%t: verification failed: %v", m.Name, hk, bad)
+			return c, fmt.Errorf("%s hashkeys=%t shapetapes=%t: verification failed: %v", m.Name, cfg.hashKeys, cfg.shapeTapes, bad)
 		}
 		c.Variants = append(c.Variants, v)
 	}

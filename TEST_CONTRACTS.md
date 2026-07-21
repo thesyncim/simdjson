@@ -151,6 +151,7 @@ value_spans_contract_test.go
 ### `STREAM`
 
 ```text
+docset_shape_test.go
 docset_stream_test.go
 reader_differential_test.go
 reader_io_contract_test.go
@@ -230,6 +231,7 @@ stream_decode_test.go
 
 ```text
 contains_bench_test.go
+docset_shape_bench_test.go
 docset_stream_bench_test.go
 index_tapescan_bench_test.go
 multidoc_bench_test.go

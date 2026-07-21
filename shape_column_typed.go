@@ -65,7 +65,29 @@ const (
 // worker.
 func (c *ShapeCache) AppendFieldInt64(dst []int64, valid []bool, s *DocSet, name string) ([]int64, []bool) {
 	fs := newFieldScan(name)
+	var th shapeTapeHint
 	for i := range s.docs {
+		if r := s.shapeTapeRefAt(i); r.rec != nil {
+			// A shape-taped document's proven value entry takes the same
+			// kernel dispatch as a proven positional read below.
+			var n int64
+			var ok bool
+			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
+				doc := &s.docs[i]
+				e := &doc.entries[ord]
+				if e.info&infoIntNumberMask == infoIntNumberBits {
+					n, ok = tapeInt64(&doc.src[0], e.start, e.end)
+				} else {
+					n, ok = (Node{src: &doc.src[0], entry: e}).Int64()
+				}
+				if !ok {
+					n = 0
+				}
+			}
+			dst = append(dst, n)
+			valid = append(valid, ok)
+			continue
+		}
 		root := s.docs[i].Root()
 		if root.entry == nil {
 			dst = append(dst, 0)
@@ -110,7 +132,22 @@ func (c *ShapeCache) AppendFieldInt64(dst []int64, valid []bool, s *DocSet, name
 // per worker.
 func (c *ShapeCache) AppendFieldFloat64(dst []float64, valid []bool, s *DocSet, name string) ([]float64, []bool) {
 	fs := newFieldScan(name)
+	var th shapeTapeHint
 	for i := range s.docs {
+		if r := s.shapeTapeRefAt(i); r.rec != nil {
+			var f float64
+			var ok bool
+			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
+				doc := &s.docs[i]
+				f, ok = (Node{src: &doc.src[0], entry: &doc.entries[ord]}).Float64()
+				if !ok {
+					f = 0
+				}
+			}
+			dst = append(dst, f)
+			valid = append(valid, ok)
+			continue
+		}
 		root := s.docs[i].Root()
 		if root.entry == nil {
 			dst = append(dst, 0)
@@ -144,7 +181,19 @@ func (c *ShapeCache) AppendFieldFloat64(dst []float64, valid []bool, s *DocSet, 
 // worker.
 func (c *ShapeCache) AppendFieldBool(dst []bool, valid []bool, s *DocSet, name string) ([]bool, []bool) {
 	fs := newFieldScan(name)
+	var th shapeTapeHint
 	for i := range s.docs {
+		if r := s.shapeTapeRefAt(i); r.rec != nil {
+			var b bool
+			var ok bool
+			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
+				doc := &s.docs[i]
+				b, ok = (Node{src: &doc.src[0], entry: &doc.entries[ord]}).Bool()
+			}
+			dst = append(dst, b)
+			valid = append(valid, ok)
+			continue
+		}
 		root := s.docs[i].Root()
 		if root.entry == nil {
 			dst = append(dst, false)

@@ -70,13 +70,25 @@ func msLabel(ms float64, label string) struct {
 	}{ms, label}
 }
 
-func (c OursCorpus) variant(hashKeys bool) *OursVariant {
+func (c OursCorpus) variant(hashKeys, shapeTapes bool) *OursVariant {
 	for i := range c.Variants {
-		if c.Variants[i].HashKeys == hashKeys {
+		if c.Variants[i].HashKeys == hashKeys && c.Variants[i].ShapeTapes == shapeTapes {
 			return &c.Variants[i]
 		}
 	}
 	return nil
+}
+
+// acceptanceVariant is the configuration the acceptance table judges: the
+// phase-1 shape-tape mode over the enriched build when measured, otherwise
+// the enriched classic build (pre-phase-1 artifacts). One configuration
+// carries every ratio — space, ingest, and queries are never cherry-picked
+// from different variants.
+func (c OursCorpus) acceptanceVariant() *OursVariant {
+	if v := c.variant(true, true); v != nil {
+		return v
+	}
+	return c.variant(true, false)
 }
 
 // bestExtractNS is the variant's best whole-corpus extraction pass.
@@ -146,7 +158,7 @@ type ratios struct {
 
 func deriveRatios(c OursCorpus, pg *pgMetrics) ratios {
 	var r ratios
-	v := c.variant(true)
+	v := c.acceptanceVariant()
 	if v == nil || pg == nil {
 		return r
 	}
@@ -222,34 +234,49 @@ func BuildReport(res OursResults, logs map[string]PGLog) string {
 	w("\n")
 
 	w("## Space at rest\n\n")
-	w("Ours is the measured live-heap delta of the DocSet (arenas, headers,\nslack); modeled is source + 16 B/entry, the analytic floor. PG sizes are\nafter VACUUM ANALYZE.\n\n")
-	w("| corpus | ours (hash) | ours (nohash) | modeled | PG table | PG gin path_ops | PG gin ops | ours/PG(table+path) |\n")
-	w("|---|---:|---:|---:|---:|---:|---:|---:|\n")
+	w("Ours is the measured live-heap delta of the DocSet (arenas, headers,\nslack); modeled is source + 16 B/entry (+16 B/header per shape-taped\ndocument), the analytic floor. The dedup columns are the phase-1\nshape-tape mode: conforming documents store value entries only, keys\ndeduplicated into the shape cache; tape cut is the entry storage it\ndropped against the classic tape. PG sizes are after VACUUM ANALYZE. The\nratio judges the dedup variant when measured, classic otherwise.\n\n")
+	w("| corpus | ours (hash) | ours (dedup) | tape cut | dedup docs | modeled | modeled dedup | PG table | PG gin path_ops | ours/PG(table+path) |\n")
+	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, c := range corpora {
 		m := c.Manifest
-		vh, vn := c.variant(true), c.variant(false)
+		vh, vd := c.variant(true, false), c.variant(true, true)
 		pg, ok := pgm[m.Name]
 		row := deriveRatios(c, &pg)
-		pgTable, pgPath, pgOps, ratio := "n/a", "n/a", "n/a", "n/a"
+		dedup, cut, dedupDocs, dedupModeled := "n/a", "n/a", "n/a", "n/a"
+		if vd != nil {
+			dedup = fmtMiB(vd.RetainedBytes)
+			dedupModeled = fmtMiB(vd.ModeledBytes)
+			dedupDocs = fmt.Sprintf("%d%%", 100*vd.ShapeTapedDocs/int64(max(m.Docs, 1)))
+			if vh.Entries > 0 {
+				classicTape := vh.Entries * 16
+				dedupTape := vd.Entries*16 + vd.ShapeTapedDocs*16
+				cut = fmt.Sprintf("%.0f%%", 100*(1-float64(dedupTape)/float64(classicTape)))
+			}
+		}
+		pgTable, pgPath, ratio := "n/a", "n/a", "n/a"
 		if ok {
-			pgTable, pgPath, pgOps = fmtMiB(pg.sizeTable), fmtMiB(pg.sizeGinPath), fmtMiB(pg.sizeGinOps)
+			pgTable, pgPath = fmtMiB(pg.sizeTable), fmtMiB(pg.sizeGinPath)
 			ratio = fmtRatio(row.space)
 		}
-		w("| %s | %s | %s | %s | %s | %s | %s | %s |\n",
-			m.Name, fmtMiB(vh.RetainedBytes), fmtMiB(vn.RetainedBytes), fmtMiB(vh.ModeledBytes),
-			pgTable, pgPath, pgOps, ratio)
+		w("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
+			m.Name, fmtMiB(vh.RetainedBytes), dedup, cut, dedupDocs,
+			fmtMiB(vh.ModeledBytes), dedupModeled, pgTable, pgPath, ratio)
 	}
 	w("\n")
 
 	w("## Ingest\n\n")
-	w("Single core both sides. Ours: ReadFrom (validate + index + arena copy;\nno key postings yet). PG: COPY, then each CREATE INDEX separately.\n\n")
-	w("| corpus | ours (hash) | ours (nohash) | PG COPY | + gin path_ops build | gin ops build (fu=on) | (fu=off) | ours/(COPY+path) |\n")
-	w("|---|---:|---:|---:|---:|---:|---:|---:|\n")
+	w("Single core both sides. Ours: ReadFrom (validate + index + arena copy;\nno key postings yet); the dedup column adds the shape-tape conformance\nproof and value compaction. PG: COPY, then each CREATE INDEX separately.\n\n")
+	w("| corpus | ours (hash) | ours (dedup) | ours (nohash) | PG COPY | + gin path_ops build | gin ops build (fu=on) | (fu=off) | ours/(COPY+path) |\n")
+	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, c := range corpora {
 		m := c.Manifest
-		vh, vn := c.variant(true), c.variant(false)
+		vh, vn, vd := c.variant(true, false), c.variant(false, false), c.variant(true, true)
 		pg, ok := pgm[m.Name]
 		row := deriveRatios(c, &pg)
+		dedupC := "n/a"
+		if vd != nil {
+			dedupC = fmtMBps(m.SourceBytes, vd.IngestNS)
+		}
 		copyC, pathC, opsC, opsNoFuC, ratio := "n/a", "n/a", "n/a", "n/a", "n/a"
 		if ok {
 			copyC = fmtMS(pg.copyMS)
@@ -258,24 +285,33 @@ func BuildReport(res OursResults, logs map[string]PGLog) string {
 			opsNoFuC = fmtMS(pg.createOpsNoFu)
 			ratio = fmtRatio(row.ingest)
 		}
-		w("| %s | %s | %s | %s | %s | %s | %s | %s |\n",
-			m.Name, fmtMBps(m.SourceBytes, vh.IngestNS), fmtMBps(m.SourceBytes, vn.IngestNS),
+		w("| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
+			m.Name, fmtMBps(m.SourceBytes, vh.IngestNS), dedupC, fmtMBps(m.SourceBytes, vn.IngestNS),
 			copyC, pathC, opsC, opsNoFuC, ratio)
 	}
 	w("\n")
 
 	w("## Point extraction\n\n")
 	w("Full scan of one top-level field, per document. PG: `SELECT\ncount(doc->>'f') FROM t` over N rows. Ours: AppendPointer and, on\nclustered corpora, the ShapeCache column path. Single row: PG by ctid vs\nours Doc(i)+PointerCompiled.\n\n")
-	w("| corpus | ours pointer | ours column | PG seq per row | PG/ours | PG ctid row | ours single doc |\n")
-	w("|---|---:|---:|---:|---:|---:|---:|\n")
+	w("| corpus | ours pointer | ours column | dedup pointer | dedup column | PG seq per row | PG/ours | PG ctid row | ours single doc |\n")
+	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, c := range corpora {
 		m := c.Manifest
-		v := c.variant(true)
+		v := c.variant(true, false)
+		vd := c.variant(true, true)
 		pg, ok := pgm[m.Name]
 		row := deriveRatios(c, &pg)
 		colNS := "n/a"
 		if v.ExtractColumnNS > 0 {
 			colNS = fmtNSPerDoc(v.ExtractColumnNS, m.Docs)
+		}
+		dedupPtr, dedupCol, single := "n/a", "n/a", v.SingleDocNS
+		if vd != nil {
+			dedupPtr = fmtNSPerDoc(vd.ExtractPointerNS, m.Docs)
+			if vd.ExtractColumnNS > 0 {
+				dedupCol = fmtNSPerDoc(vd.ExtractColumnNS, m.Docs)
+			}
+			single = vd.SingleDocNS
 		}
 		pgRow, ratio, ctid := "n/a", "n/a", "n/a"
 		if ok {
@@ -283,8 +319,8 @@ func BuildReport(res OursResults, logs map[string]PGLog) string {
 			ratio = fmtRatio(row.extract)
 			ctid = fmtMS(pg.ctidMS)
 		}
-		w("| %s | %s | %s | %s | %s | %s | %d ns |\n",
-			m.Name, fmtNSPerDoc(v.ExtractPointerNS, m.Docs), colNS, pgRow, ratio, ctid, v.SingleDocNS)
+		w("| %s | %s | %s | %s | %s | %s | %s | %s | %d ns |\n",
+			m.Name, fmtNSPerDoc(v.ExtractPointerNS, m.Docs), colNS, dedupPtr, dedupCol, pgRow, ratio, ctid, single)
 	}
 	w("\n")
 
@@ -294,7 +330,7 @@ func BuildReport(res OursResults, logs map[string]PGLog) string {
 	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, c := range corpora {
 		m := c.Manifest
-		v := c.variant(true)
+		v := c.acceptanceVariant()
 		pg, ok := pgm[m.Name]
 		row := deriveRatios(c, &pg)
 		cols := []string{
@@ -404,9 +440,14 @@ func BuildReport(res OursResults, logs map[string]PGLog) string {
 	w("  existence/containment rows show what each side bought: PG existence\n")
 	w("  with gin jsonb_ops beats our full scan wherever selectivity is low —\n")
 	w("  until phase 4 lands postings, that loss is structural.\n")
-	w("- Space today is the classic tape: 16 B/entry on top of the source, so\n")
-	w("  the ADR predicts we lose the space rows at phase 0. That starting\n")
-	w("  point is the point of this report.\n")
+	w("- The dedup variant is phase 1's shape-tape mode. Its space and query\n")
+	w("  rows apply only where documents conform (flat object roots matching a\n")
+	w("  recurring shape): the clustered synthetics dedup nearly everything,\n")
+	w("  while nested real corpora (tweets, CITM performances) stay classic and\n")
+	w("  keep phase 0's numbers — their space losses are TOAST compression\n")
+	w("  territory, owned by phase 3, not by representation. The single-doc\n")
+	w("  probe on a dedup variant reports the widening contract's steady state:\n")
+	w("  its first probe per document materializes the classic tape.\n")
 	for _, c := range corpora {
 		m := c.Manifest
 		if pg, ok := pgm[m.Name]; ok && pg.sizeTable > 0 && pg.sizeTable < m.SourceBytes {

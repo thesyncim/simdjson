@@ -2,6 +2,7 @@ package simdjson
 
 import (
 	"errors"
+	"sync"
 	"unsafe"
 
 	"github.com/thesyncim/simdjson/document"
@@ -22,6 +23,11 @@ import (
 //	entry arena    chunk: [ e(0) | e(1) | e(2) |  spare )
 //	docs[i] = Index{src, entries}: subslices of the two arenas
 //
+// Under the opt-in ShapeTapes mode a conforming document's e(i) holds only
+// its value entries — the classic tape's keys live once in a compiled shape
+// — with a per-document header alongside; docset_shape.go owns that
+// representation and its contracts.
+//
 // Growth within an Append is transactional: the document's bytes land in the
 // source chunk's uncommitted tail first, the index builds into the entry
 // chunk's tail, and only success extends the committed lengths over both.
@@ -40,10 +46,34 @@ type DocSet struct {
 	// pass over the entries at build time and accelerates every Get after it.
 	Options document.IndexOptions
 
+	// ShapeTapes opts the set into shape-deduplicated tapes, read at each
+	// Append like Options: a document whose root is a flat non-empty object
+	// byte-matching a compiled shape of the set's internal cache stores one
+	// entry per member value instead of the classic tape, roughly halving
+	// tape storage on shape-clustered corpora and letting the batch
+	// extractors index value arrays directly. Semantics never change — every
+	// lookup, extractor, and Doc result is identical to classic storage —
+	// but Doc's cost does: its first call on a shape-taped document
+	// materializes and permanently caches the classic tape (see Doc). Set it
+	// before the first Append. Ingest pays a per-document conformance check;
+	// non-conforming documents are stored classic, unchanged. See
+	// docset_shape.go for the representation and its proof obligations.
+	ShapeTapes bool
+
 	docs       []Index
 	srcChunk   []byte       // current source arena chunk
 	entryChunk []IndexEntry // current entry arena chunk
 	scratch    []IndexEntry // spill tape for documents the entry chunk cannot hold
+
+	// Shape-tape state (docset_shape.go): tapeRefs is empty or docs-aligned
+	// and holds each document's dedup header; shapes is the internal cache
+	// the ingest conformance gate resolves against; widened caches the
+	// classic tapes Doc has re-materialized, under widenMu so concurrent
+	// reads stay safe once appending stops.
+	tapeRefs []shapeTapeRef
+	shapes   ShapeCache
+	widened  map[int][]IndexEntry
+	widenMu  sync.Mutex
 }
 
 // Arena chunks grow geometrically between fixed bounds, like the interner's:
@@ -64,7 +94,20 @@ func (s *DocSet) Len() int {
 // Doc returns the Index over the ith document. The Index borrows the set's
 // arenas and remains valid across later Appends. An out-of-range ordinal
 // panics like an out-of-range slice index.
+//
+// Under ShapeTapes, a shape-taped document's classic tape no longer exists,
+// so Doc's first call on it synthesizes one — an allocation and one pass
+// over the members — and caches it for the set's lifetime: later calls
+// return the same storage, handles stay stable, and concurrent Doc calls
+// remain safe once appending stops. The result is identical to the Index
+// classic storage would have returned. The space cost is the honest flip
+// side: widening a document re-buys the classic tape the mode dropped, so
+// engines wanting the space win extract through the batch primitives, which
+// read the deduplicated form directly.
 func (s *DocSet) Doc(i int) Index {
+	if r := s.shapeTapeRefAt(i); r.rec != nil {
+		return s.widenShapeTape(i, r)
+	}
 	return s.docs[i]
 }
 
@@ -82,13 +125,12 @@ func (s *DocSet) Append(src []byte) (int, error) {
 	}
 	mark := len(s.srcChunk)
 	s.srcChunk = append(s.srcChunk, src...)
-	index, err := s.buildDoc(s.srcChunk[mark:len(s.srcChunk):len(s.srcChunk)])
+	index, ref, err := s.buildDoc(s.srcChunk[mark:len(s.srcChunk):len(s.srcChunk)])
 	if err != nil {
 		s.srcChunk = s.srcChunk[:mark]
 		return 0, err
 	}
-	s.docs = append(s.docs, index)
-	return len(s.docs) - 1, nil
+	return s.commitDoc(index, ref), nil
 }
 
 // buildDoc indexes one arena-resident document into the entry arena. It first
@@ -97,8 +139,11 @@ func (s *DocSet) Append(src []byte) (int, error) {
 // into the spill tape and moves its exact entry count into a fresh chunk while
 // the entries are cache-hot; a precount pass (RequiredIndexEntries) would
 // instead rescan every document's source, which benchmarks slower than the
-// occasional spill copy.
-func (s *DocSet) buildDoc(src []byte) (Index, error) {
+// occasional spill copy. Under ShapeTapes a conforming document is compacted
+// to its value entries between build and commit (shapeTapeCompact), so key
+// entries never reach committed storage; the returned ref is its dedup
+// header, zero for classic documents.
+func (s *DocSet) buildDoc(src []byte) (Index, shapeTapeRef, error) {
 	if cap(s.entryChunk) == 0 {
 		s.entryChunk = make([]IndexEntry, 0, docSetMinEntryChunk)
 	}
@@ -113,14 +158,15 @@ func (s *DocSet) buildDoc(src []byte) (Index, error) {
 			// the invariant ever broke, extending would expose garbage, so
 			// fail closed: the document keeps the storage it was built in and
 			// the chunk stays unchanged.
-			return index, nil
+			return index, shapeTapeRef{}, nil
 		}
 		index.entries = index.entries[:n:n]
-		s.entryChunk = s.entryChunk[:used+n]
-		return index, nil
+		index, ref := s.shapeTapeCompact(index)
+		s.entryChunk = s.entryChunk[:used+len(index.entries)]
+		return index, ref, nil
 	}
 	if !errors.Is(err, document.ErrIndexFull) {
-		return Index{}, err
+		return Index{}, shapeTapeRef{}, err
 	}
 	// One entry is recorded per value or key, and each spans at least one
 	// distinct source byte, so len(src)+2 entries always suffice.
@@ -129,13 +175,14 @@ func (s *DocSet) buildDoc(src []byte) (Index, error) {
 	}
 	index, err = buildIndexOptions(src, s.scratch[:0], s.Options)
 	if err != nil {
-		return Index{}, err
+		return Index{}, shapeTapeRef{}, err
 	}
+	index, ref := s.shapeTapeCompact(index)
 	n := len(index.entries)
 	chunk := make([]IndexEntry, n, docSetChunkCap(cap(s.entryChunk), n, docSetMinEntryChunk, docSetMaxEntryChunk))
 	copy(chunk, index.entries)
 	s.entryChunk = chunk
-	return Index{src: src, entries: chunk[:n:n]}, nil
+	return Index{src: src, entries: chunk[:n:n]}, ref, nil
 }
 
 // docSetChunkCap sizes the next arena chunk: double the previous within
@@ -169,9 +216,46 @@ func docSetChunkCap(prev, need, min, max int) int {
 // Resolution semantics per document are exactly Index.PointerCompiled's: an
 // invalid array-index token for an array target stops the batch, returning
 // dst truncated to its original length and the token's error.
+//
+// A shape-taped document resolves the first token against its stored shape —
+// one memoized ordinal per shape, no key bytes touched — and descends any
+// remaining tokens from the value through the ordinary compiled-pointer
+// loop, so both storage forms share one resolution semantics.
 func (s *DocSet) AppendPointer(dst []RawValue, pointer CompiledPointer) ([]RawValue, error) {
 	mark := len(dst)
+	var hint shapeTapeHint
+	var key0 CompiledKey
+	if len(pointer.tokens) > 0 {
+		key0 = CompiledKey{key: pointer.tokens[0].text, hash: pointer.tokens[0].hash}
+	}
 	for i := range s.docs {
+		if r := s.shapeTapeRefAt(i); r.rec != nil {
+			doc := &s.docs[i]
+			if len(pointer.tokens) == 0 {
+				// The empty pointer selects the root; its span is the header's.
+				dst = append(dst, RawValue{src: doc.src[r.start:r.end]})
+				continue
+			}
+			ord := hint.lookup(r.rec, key0)
+			if ord < 0 {
+				dst = append(dst, RawValue{})
+				continue
+			}
+			node := Node{src: &doc.src[0], entry: &doc.entries[ord]}
+			if rest := pointer.tokens[1:]; len(rest) > 0 {
+				next, ok, err := node.pointerTokens(rest)
+				if err != nil {
+					return dst[:mark], err
+				}
+				if !ok {
+					dst = append(dst, RawValue{})
+					continue
+				}
+				node = next
+			}
+			dst = append(dst, node.Raw())
+			continue
+		}
 		node, ok, err := s.docs[i].PointerCompiled(pointer)
 		if err != nil {
 			return dst[:mark], err

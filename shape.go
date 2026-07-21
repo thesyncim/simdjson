@@ -82,6 +82,11 @@ func shapeFinish(h uint64) uint64 {
 type shapeField struct {
 	raw     string // raw content; FieldRef.In verifies documents against this
 	decoded string // decoded name; Shape.Field matches against this
+	// info is the key's tape entry info word — String kind, the key flag,
+	// and the escaped flag when the raw spelling contains escapes — so a
+	// shape-deduplicated tape (docset_shape.go) can resynthesize the classic
+	// key entry bit-for-bit without re-scanning the spelling.
+	info uint32
 }
 
 // shapeRecord is one compiled shape. Records are immutable after compile and
@@ -103,6 +108,11 @@ type shapeRecord struct {
 	// obeys Get's last-duplicate rule. Nil for the empty shape.
 	table []uint32
 	mask  uint32
+	// dupKeys records that two members share one decoded name. Lookups stay
+	// exact — the table already applies the last-duplicate rule — but a
+	// shape-deduplicated tape (docset_shape.go) declines such shapes: its
+	// per-member proofs assume each spelling names one member.
+	dupKeys bool
 }
 
 // A ShapeCache compiles and caches object shapes for [ShapeCache.Resolve]. It
@@ -341,14 +351,20 @@ func (c *ShapeCache) compile(v Node, count int, fp uint64) *shapeRecord {
 			default:
 				hash = hashKeyString(decoded)
 			}
-			rec.fields[m] = shapeField{raw: raw, decoded: decoded}
+			info := packInfo(0, document.String, tapeFlagKey|ke.flags()&tapeFlagEscaped)
+			rec.fields[m] = shapeField{raw: raw, decoded: decoded, info: info}
 			// Claim the first free slot in the name's chain, or overwrite the
 			// chain's equal earlier duplicate so the later ordinal wins, the
 			// Node.Get duplicate rule. The table is at most half full, so a
 			// free slot always exists and the loop terminates.
 			for slot := hash & rec.mask; ; slot = (slot + 1) & rec.mask {
 				stored := rec.table[slot]
-				if stored == 0 || rec.fields[stored-1].decoded == decoded {
+				if stored == 0 {
+					rec.table[slot] = uint32(m) + 1
+					break
+				}
+				if rec.fields[stored-1].decoded == decoded {
+					rec.dupKeys = true
 					rec.table[slot] = uint32(m) + 1
 					break
 				}
@@ -478,16 +494,31 @@ func (s Shape) Len() int {
 // cache the FieldRef.
 func (s Shape) Field(name string) (FieldRef, bool) {
 	rec := s.rec
-	if rec == nil || rec.table == nil {
+	if rec == nil {
 		return FieldRef{}, false
 	}
-	for slot := hashKeyString(name) & rec.mask; ; slot = (slot + 1) & rec.mask {
+	ord, ok := rec.fieldOrd(name, hashKeyString(name))
+	if !ok {
+		return FieldRef{}, false
+	}
+	return FieldRef{rec: rec, ord: ord}, true
+}
+
+// fieldOrd is Field past the hash: it probes the name table with the query's
+// precomputed lookup hash, which must be hashKeyString(name). Compiled keys
+// and pointer tokens carry that hash already, so the batch paths resolve a
+// field per shape without rehashing the query.
+func (rec *shapeRecord) fieldOrd(name string, hash uint32) (uint32, bool) {
+	if rec.table == nil {
+		return 0, false
+	}
+	for slot := hash & rec.mask; ; slot = (slot + 1) & rec.mask {
 		stored := rec.table[slot]
 		if stored == 0 {
-			return FieldRef{}, false
+			return 0, false
 		}
 		if rec.fields[stored-1].decoded == name {
-			return FieldRef{rec: rec, ord: stored - 1}, true
+			return stored - 1, true
 		}
 	}
 }
