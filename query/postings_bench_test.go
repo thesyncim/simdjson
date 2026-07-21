@@ -11,12 +11,11 @@ import (
 // Benchmarks for the postings-accelerated WHERE: the same filter at four
 // selectivities, run once with the inverted postings on (DocSet.Postings) and
 // once off (the full columnar scan), so the ratio at each selectivity shows the
-// primitive's pruning propagating up to the query layer. Equality prunes a cheap
-// per-row compare, so its win is bounded by the O(rows) column extraction that
-// precedes selection; containment prunes an expensive per-row RawContains, so
-// the postings avoid nearly all of it and the win is large and grows with
-// selectivity — the honest shape of where the 490x primitive lands at the query
-// tier.
+// primitive's pruning propagating up to the query layer. Selective posting
+// ordinals are pushed into sparse column gathers, so equality and containment
+// both avoid O(corpus) extraction; the exact compiled predicate still rechecks
+// every gathered candidate. The 100% row prices the deliberate dense fallback
+// once random gather no longer wins.
 
 const selBenchDocs = 20000
 

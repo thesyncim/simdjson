@@ -19,12 +19,14 @@
 //		Limit(10)
 //	result, err := q.Run(&docs)
 //
-// The executor is column-oriented: it extracts each needed path as a column
-// off the tape, evaluates WHERE as a full columnar scan (a documented seam
-// left for postings-accelerated selection), reduces aggregates over the typed
-// columns, groups by interning group keys, and sorts and truncates the small
-// result. A compiled query is immutable and safe to Run concurrently; each Run
-// owns its transient scan state.
+// The executor is column-oriented. Without an applicable posting bound it
+// extracts each needed path as a dense column and evaluates WHERE in one full
+// scan. With a selective bound it pushes the posting ordinals into extraction:
+// [simdjson.ShapeCache.AppendFieldRows] and
+// [simdjson.DocSet.AppendPointerRows] gather only candidate cells, then the
+// same compiled predicate rechecks them exactly before reduction, grouping,
+// ordering, and limiting. A compiled query is immutable and safe to Run
+// concurrently; each Run owns its transient scan state.
 //
 // # Value semantics
 //

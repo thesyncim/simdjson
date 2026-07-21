@@ -138,7 +138,9 @@
 // position from any same-shape document after verifying the key bytes, so a
 // mis-routed document degrades to a Get fallback rather than a wrong field.
 // [ShapeCache.AppendField] and [ShapeCache.AppendFields] fuse that machinery
-// into batch extraction over a DocSet, and AppendFieldInt64,
+// into batch extraction over a DocSet; [ShapeCache.AppendFieldRows] and
+// [DocSet.AppendPointerRows] gather caller-selected ordinals without scanning
+// or widening the rest. AppendFieldInt64,
 // AppendFieldFloat64, and AppendFieldBool produce dense typed columns with
 // validity masks in the same pass.
 //

@@ -47,13 +47,17 @@ The query compiles to a small plan IR (a programmatic builder is the IR; the
 SQL text parser produces it). The executor is column-oriented:
 
 - projections and aggregates read typed/raw columns directly off the tape;
-- a `WHERE` predicate is a per-row test over the needed columns, run as a full
-  columnar scan when unselective and pruned through postings when selective;
+- a `WHERE` predicate with no useful posting bound is a dense per-row scan;
+  when the posting result covers at most half the corpus, selection is pushed
+  below materialization and `AppendFieldRows` / `AppendPointerRows` gather only
+  candidate cells from compact tapes before the exact predicate recheck;
 - `GROUP BY` interns each group key and accumulates per group;
 - results are columnar, streamed or materialized.
 
-Cost stays at the primitives' single-core numbers because the plan is fixed
-before the scan and the scan is one pass over the arenas.
+The sparse path is O(candidates), preserves posting order and multiplicity,
+and never widens a shape-deduplicated tape. The dense path remains one pass
+over the arenas; the conservative half-corpus crossover avoids paying random
+gather when a streaming scan is cheaper.
 
 ## API
 
@@ -92,6 +96,26 @@ rules as the gjson/sonic scoreboard.
 2. `GROUP BY`, `ORDER BY`, `LIMIT`.
 3. The SQL-text parser for the subset.
 4. The RedisJSON/RediSearch scoreboard.
+
+## Post-acceptance performance result
+
+The first query-tier postings implementation still extracted every value and
+numeric column before consulting its candidate seam. On the 20,000-document
+selectivity benchmark that left scalar equality at 35.9-38.2 ns/document even
+when only 0.1% of rows matched. Selection pushdown changes that row to
+0.094-0.095 ns/source-document (1.87-1.91 microseconds/query), a 399x reduction
+in elapsed time and a 954x reduction in allocated bytes (about 4.21 MB to
+4.4 KB). At 1% it measures 0.71-0.73 ns/document and at 10% 7.08-7.16
+ns/document. These are six-run, 300 ms samples on Apple M4 Max, Go 1.26.1,
+darwin/arm64; the benchmark source and full selectivity sweep live in
+`query/postings_bench_test.go`.
+
+Correctness does not trust the posting hash. Accelerated queries still run the
+ordinary compiled predicate over every gathered row, and the bounded
+differential requires accelerated results to equal both the dense executor and
+an independent reference across classic, hashed, narrow/wide shape-taped, and
+dictionary-backed storage. Buffered sparse gathers are separately held to zero
+steady-state allocations.
 
 Non-goals from ADR 0002 (durability, MVCC, distribution, multi-core, full SQL)
 are unchanged.

@@ -381,3 +381,93 @@ func (s *DocSet) AppendPointer(dst []RawValue, pointer CompiledPointer) ([]RawVa
 	}
 	return dst, nil
 }
+
+// AppendPointerRows is the sparse-gather form of [DocSet.AppendPointer]. It
+// resolves pointer only for the document ordinals in rows, in the order
+// supplied, and appends one RawValue per ordinal to dst. Duplicate ordinals
+// produce duplicate values; an out-of-range ordinal panics like [DocSet.Doc].
+// Absence, error rollback, borrowing, compiled-token, duplicate-key, and value
+// dictionary semantics are exactly AppendPointer's.
+//
+// A shape-taped document resolves the first token against its proven shape and
+// reads its narrow or wide value entry directly, so gathering selected rows
+// never widens their compact tapes. This makes the method suitable for query
+// engines applying an inverted posting list before materializing projected or
+// aggregate columns: its work is O(len(rows)), not O(s.Len()).
+func (s *DocSet) AppendPointerRows(dst []RawValue, rows []int, pointer CompiledPointer) ([]RawValue, error) {
+	mark := len(dst)
+	var hint shapeTapeHint
+	var key0 CompiledKey
+	if len(pointer.tokens) > 0 {
+		key0 = CompiledKey{key: pointer.tokens[0].text, hash: pointer.tokens[0].hash}
+	}
+	for _, i := range rows {
+		if r := s.shapeTapeRefAt(i); r.rec != nil {
+			doc := &s.docs[i]
+			if len(pointer.tokens) == 0 {
+				dst = append(dst, RawValue{src: doc.src[r.start:r.end]})
+				continue
+			}
+			ord := hint.lookup(r.rec, key0)
+			if ord < 0 {
+				dst = append(dst, RawValue{})
+				continue
+			}
+			rest := pointer.tokens[1:]
+			if len(rest) == 0 {
+				if r.narrow {
+					nv := s.narrow[r.off+uint32(ord)]
+					raw := RawValue{src: doc.src[nv.span&0xFFFF : nv.span>>16]}
+					if s.ValueDict {
+						raw = s.valueRaw(i, nv.span&0xFFFF, raw)
+					}
+					dst = append(dst, raw)
+				} else {
+					e := &doc.entries[ord]
+					raw := RawValue{src: doc.src[e.start:e.end]}
+					if s.ValueDict {
+						raw = s.valueRaw(i, e.start, raw)
+					}
+					dst = append(dst, raw)
+				}
+				continue
+			}
+			var wide IndexEntry
+			var node Node
+			if r.narrow {
+				wide = s.narrow[r.off+uint32(ord)].widen()
+				node = Node{src: &doc.src[0], entry: &wide}
+			} else {
+				node = Node{src: &doc.src[0], entry: &doc.entries[ord]}
+			}
+			next, ok, err := node.pointerTokens(rest)
+			if err != nil {
+				return dst[:mark], err
+			}
+			if !ok {
+				dst = append(dst, RawValue{})
+				continue
+			}
+			raw := next.Raw()
+			if s.ValueDict {
+				raw = s.valueRaw(i, next.entry.start, raw)
+			}
+			dst = append(dst, raw)
+			continue
+		}
+		node, ok, err := s.docs[i].PointerCompiled(pointer)
+		if err != nil {
+			return dst[:mark], err
+		}
+		if !ok {
+			dst = append(dst, RawValue{})
+			continue
+		}
+		raw := node.Raw()
+		if s.ValueDict {
+			raw = s.valueRaw(i, node.entry.start, raw)
+		}
+		dst = append(dst, raw)
+	}
+	return dst, nil
+}

@@ -105,6 +105,69 @@ func (c *ShapeCache) AppendField(dst []RawValue, s *DocSet, name string) []RawVa
 	return dst
 }
 
+// AppendFieldRows is the sparse-gather form of [ShapeCache.AppendField]. It
+// resolves name only for the document ordinals in rows, in the order supplied,
+// and appends one value per ordinal to dst. Duplicate ordinals produce
+// duplicate values; an out-of-range ordinal panics like [DocSet.Doc]. The
+// value and lifetime semantics are otherwise exactly AppendField's, including
+// last-duplicate-key wins and a zero RawValue for an absent field.
+//
+// This is the selection-pushdown primitive for engines that already have a
+// selective posting list: work is O(len(rows)), not O(s.Len()). In particular,
+// shape-taped documents are read directly from their narrow or wide value
+// arrays and are never widened into classic tapes. Classic documents retain
+// AppendField's two-shape routing cache, so sorted or shape-clustered row lists
+// amortize lookup in the same way as a dense scan.
+//
+// AppendFieldRows grows c and follows its concurrency rule: one cache per
+// worker.
+func (c *ShapeCache) AppendFieldRows(dst []RawValue, s *DocSet, rows []int, name string) []RawValue {
+	fs := newFieldScan(name)
+	var th shapeTapeHint
+	for _, i := range rows {
+		if r := s.shapeTapeRefAt(i); r.rec != nil {
+			doc := &s.docs[i]
+			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
+				var start, end uint32
+				if r.narrow {
+					nv := s.narrow[r.off+uint32(ord)]
+					start, end = nv.span&0xFFFF, nv.span>>16
+				} else {
+					v := &doc.entries[ord]
+					start, end = v.start, v.end
+				}
+				raw := RawValue{src: doc.src[start:end]}
+				if s.ValueDict {
+					raw = s.valueRaw(i, start, raw)
+				}
+				dst = append(dst, raw)
+			} else {
+				dst = append(dst, RawValue{})
+			}
+			continue
+		}
+		root := s.docs[i].Root()
+		if root.entry == nil {
+			dst = append(dst, RawValue{})
+			continue
+		}
+		var raw RawValue
+		if value := fs.next(c, root); value != nil {
+			raw = RawValue{src: byteview.SliceRange(root.src, value.start, value.end)}
+			if s.ValueDict {
+				raw = s.valueRaw(i, value.start, raw)
+			}
+		} else if value, ok := root.GetCompiled(fs.key); ok {
+			raw = value.Raw()
+			if s.ValueDict {
+				raw = s.valueRaw(i, value.entry.start, raw)
+			}
+		}
+		dst = append(dst, raw)
+	}
+	return dst
+}
+
 // A fieldScan routes one query across a document batch: the state machine
 // behind [ShapeCache.AppendField] and the typed drivers of
 // shape_column_typed.go, holding the compiled query and the two hint slots

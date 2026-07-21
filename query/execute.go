@@ -34,11 +34,20 @@ type numColumn struct {
 
 // run executes the compiled plan over s.
 func (p *plan) run(s *simdjson.DocSet) (Result, error) {
+	candidates := p.candidateRows(s)
+	compact := preferSparseRows(len(candidates), s.Len(), candidates != nil)
+	var sourceRows []int
+	if compact {
+		sourceRows = candidates
+	}
 	ctx := &execCtx{s: s, rows: s.Len()}
-	if err := ctx.extract(p); err != nil {
+	if compact {
+		ctx.rows = len(sourceRows)
+	}
+	if err := ctx.extract(p, sourceRows); err != nil {
 		return Result{}, err
 	}
-	selected := p.selectRows(ctx)
+	selected := p.selectRows(ctx, candidates, compact)
 	switch {
 	case p.grouped:
 		return p.runGrouped(ctx, selected), nil
@@ -49,11 +58,25 @@ func (p *plan) run(s *simdjson.DocSet) (Result, error) {
 	}
 }
 
-// extract materializes every value and numeric column the plan reads.
-func (ctx *execCtx) extract(p *plan) error {
+// preferSparseRows chooses selection pushdown when a real posting bound visits
+// no more than half the corpus. Sparse gather has one random-access read per
+// selected row while a dense column scan streams every row; the half-corpus
+// crossover is deliberately conservative and is pinned by the selectivity
+// benchmarks. hasBound distinguishes a nil full-scan sentinel from an empty,
+// exact posting result.
+func preferSparseRows(candidates, total int, hasBound bool) bool {
+	return hasBound && candidates <= total/2
+}
+
+// extract materializes every value and numeric column the plan reads. When
+// sourceRows is non-nil, columns are compact and position j represents document
+// ordinal sourceRows[j]; otherwise columns remain dense and position j is
+// document j. The downstream executor always indexes positions, so the two
+// layouts share the same evaluation and reduction code.
+func (ctx *execCtx) extract(p *plan, sourceRows []int) error {
 	ctx.values = make([][]scalar, len(p.valuePaths))
 	for i, cp := range p.valuePaths {
-		raws, err := ctx.rawColumn(cp)
+		raws, err := ctx.rawColumn(cp, sourceRows)
 		if err != nil {
 			return err
 		}
@@ -65,7 +88,7 @@ func (ctx *execCtx) extract(p *plan) error {
 	}
 	ctx.nums = make([]numColumn, len(p.numPaths))
 	for i, cp := range p.numPaths {
-		nc, err := ctx.numericColumn(cp)
+		nc, err := ctx.numericColumn(cp, sourceRows)
 		if err != nil {
 			return err
 		}
@@ -76,7 +99,13 @@ func (ctx *execCtx) extract(p *plan) error {
 
 // rawColumn extracts a path as raw values: the fused field scan for a single
 // top-level field, the compiled pointer otherwise.
-func (ctx *execCtx) rawColumn(cp compiledPath) ([]simdjson.RawValue, error) {
+func (ctx *execCtx) rawColumn(cp compiledPath, sourceRows []int) ([]simdjson.RawValue, error) {
+	if sourceRows != nil {
+		if cp.single {
+			return ctx.cache.AppendFieldRows(nil, ctx.s, sourceRows, cp.name), nil
+		}
+		return ctx.s.AppendPointerRows(nil, sourceRows, cp.pointer)
+	}
 	if cp.single {
 		return ctx.cache.AppendField(nil, ctx.s, cp.name), nil
 	}
@@ -87,7 +116,21 @@ func (ctx *execCtx) rawColumn(cp compiledPath) ([]simdjson.RawValue, error) {
 // mask. A single top-level field takes the typed fused scan
 // (AppendFieldFloat64); a nested path resolves through the compiled pointer and
 // parses each cell with the same Float64 verdict.
-func (ctx *execCtx) numericColumn(cp compiledPath) (numColumn, error) {
+func (ctx *execCtx) numericColumn(cp compiledPath, sourceRows []int) (numColumn, error) {
+	if sourceRows != nil {
+		raws, err := ctx.rawColumn(cp, sourceRows)
+		if err != nil {
+			return numColumn{}, err
+		}
+		vals := make([]float64, len(raws))
+		valid := make([]bool, len(raws))
+		for i, r := range raws {
+			if f, ok := r.Float64(); ok {
+				vals[i], valid[i] = f, true
+			}
+		}
+		return numColumn{vals: vals, valid: valid}, nil
+	}
 	if cp.single {
 		vals, valid := ctx.cache.AppendFieldFloat64(nil, nil, ctx.s, cp.name)
 		return numColumn{vals: vals, valid: valid}, nil
@@ -106,13 +149,14 @@ func (ctx *execCtx) numericColumn(cp compiledPath) (numColumn, error) {
 	return numColumn{vals: vals, valid: valid}, nil
 }
 
-// selectRows returns the row ordinals the WHERE predicate accepts, in
-// ascending order. It tests each candidate the seam yields with the compiled
-// predicate; candidateRows decides which rows are candidates.
-func (p *plan) selectRows(ctx *execCtx) []int {
-	candidates := p.candidateRows(ctx)
+// selectRows returns the column positions the WHERE predicate accepts, in
+// source order. In compact mode the postings were pushed into extraction, so
+// every compact position is a candidate. In dense mode candidate ordinals are
+// also column positions and can be tested directly. Either way the compiled
+// predicate rechecks every posting result before it reaches execution.
+func (p *plan) selectRows(ctx *execCtx, candidates []int, compact bool) []int {
 	selected := make([]int, 0, ctx.rows)
-	if candidates == nil {
+	if compact || candidates == nil {
 		for row := 0; row < ctx.rows; row++ {
 			if p.where == nil || p.where.eval(ctx.values, row) {
 				selected = append(selected, row)
@@ -138,11 +182,11 @@ func (p *plan) selectRows(ctx *execCtx) []int {
 // eval — so the accepted-rows contract and everything downstream are unchanged,
 // only the candidate enumeration gets cheaper. Without postings, or for a
 // predicate no leaf can prune, it returns nil and the full scan stands.
-func (p *plan) candidateRows(ctx *execCtx) []int {
-	if p.where == nil || !ctx.s.Postings {
+func (p *plan) candidateRows(s *simdjson.DocSet) []int {
+	if p.where == nil || !s.Postings {
 		return nil
 	}
-	rows, ok := p.where.candidates(ctx.s)
+	rows, ok := p.where.candidates(s)
 	if !ok {
 		return nil // no postable leaf bounds the predicate: full scan
 	}

@@ -171,11 +171,7 @@ func TestPostingsSeamPrunes(t *testing.T) {
 	}
 
 	candidatesOf := func(set *simdjson.DocSet) []int {
-		ctx := &execCtx{s: set, rows: set.Len()}
-		if err := ctx.extract(p); err != nil {
-			t.Fatalf("extract: %v", err)
-		}
-		return p.candidateRows(ctx)
+		return p.candidateRows(set)
 	}
 
 	got := candidatesOf(on)
@@ -195,12 +191,55 @@ func TestPostingsSeamPrunes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compile range: %v", err)
 	}
-	ctx := &execCtx{s: on, rows: on.Len()}
-	if err := ctx.extract(pr); err != nil {
-		t.Fatalf("extract range: %v", err)
-	}
-	if c := pr.candidateRows(ctx); c != nil {
+	if c := pr.candidateRows(on); c != nil {
 		t.Fatalf("unpostable range with Postings on: candidateRows = %v, want nil (full scan)", c)
+	}
+}
+
+func TestSparseSelectionPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		candidates int
+		total      int
+		hasBound   bool
+		want       bool
+	}{
+		{"no bound", 0, 100, false, false},
+		{"empty bound", 0, 100, true, true},
+		{"half", 50, 100, true, true},
+		{"over half", 51, 100, true, false},
+		{"all", 100, 100, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := preferSparseRows(tc.candidates, tc.total, tc.hasBound); got != tc.want {
+				t.Fatalf("preferSparseRows(%d,%d,%v) = %v, want %v",
+					tc.candidates, tc.total, tc.hasBound, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPostingsQueryKeepsShapeTapesCompact guards the storage side of selection
+// pushdown: probing and rechecking a selective equality must read narrow shape
+// values directly, never cache the classic tapes Doc would synthesize.
+func TestPostingsQueryKeepsShapeTapesCompact(t *testing.T) {
+	docs := make([][]byte, 0, 256)
+	for i := 0; i < cap(docs); i++ {
+		docs = append(docs, []byte(`{"k":`+itoa(i%128)+`,"v":`+itoa(i)+`}`))
+	}
+	set := buildPostSet(t, docs, postConfig{"compact", true, true}, true)
+	before := set.Stats()
+	q := Select(Path("v")).Where(Cmp("k", Eq, 3))
+	got, err := q.Run(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RowCount != 2 {
+		t.Fatalf("RowCount = %d, want 2", got.RowCount)
+	}
+	after := set.Stats()
+	if after.Widened != before.Widened {
+		t.Fatalf("query widened %d compact tapes", after.Widened-before.Widened)
 	}
 }
 

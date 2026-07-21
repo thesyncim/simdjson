@@ -306,10 +306,10 @@ func (s *DocSet) whereExistsScan(path string) []int {
 // shadowed by a later duplicate key are filtered out and the returned set is
 // exactly the full scan's. A structured needle — an array or object, whose
 // containment the scalar buckets do not describe — and any query without
-// postings take the full scan directly. Verification widens a shape-taped
-// candidate through Doc, cached thereafter; a store that keeps its documents
-// classic verifies without materializing anything. The result is freshly
-// allocated and owned by the caller.
+// postings take the full scan directly. Verification reads a shape-taped
+// candidate's value entry in place, widening at most one narrow entry into
+// stack scratch; it never calls Doc or materializes a classic tape. The result
+// is freshly allocated and owned by the caller.
 func (s *DocSet) WhereContains(path string, needle []byte) ([]int, error) {
 	n, err := containsIndex(needle)
 	if err != nil {
@@ -322,8 +322,10 @@ func (s *DocSet) WhereContains(path string, needle []byte) ([]int, error) {
 	}
 	bucket := postBucket(hashKeyString(path), valueHash)
 	var res []int
+	key := CompileKey(path)
+	var wide IndexEntry
 	for _, ord := range s.postings.value[bucket] {
-		if v, ok := s.Doc(int(ord)).Root().Get(path); ok && v.Contains(root) {
+		if v, ok := s.fieldNodeAt(int(ord), key, &wide); ok && v.Contains(root) {
 			res = append(res, int(ord))
 		}
 	}
@@ -337,12 +339,36 @@ func (s *DocSet) WhereContains(path string, needle []byte) ([]int, error) {
 // needle with the same Node.Contains verifier. Ordinals are produced ascending.
 func (s *DocSet) whereContainsScan(path string, needle Node) []int {
 	var res []int
+	key := CompileKey(path)
+	var wide IndexEntry
 	for i := range s.docs {
-		if v, ok := s.Doc(i).Root().Get(path); ok && v.Contains(needle) {
+		if v, ok := s.fieldNodeAt(i, key, &wide); ok && v.Contains(needle) {
 			res = append(res, i)
 		}
 	}
 	return res
+}
+
+// fieldNodeAt resolves one top-level field without materializing a
+// shape-deduplicated document. A narrow value is widened into caller-owned
+// scratch, whose address stays valid for the immediate accessor or containment
+// check; a wide shape value and a classic lookup borrow their stored tapes.
+// The proven shape makes absence exact, and classic lookup preserves the
+// last-duplicate-key rule.
+func (s *DocSet) fieldNodeAt(doc int, key CompiledKey, wide *IndexEntry) (Node, bool) {
+	if r := s.shapeTapeRefAt(doc); r.rec != nil {
+		ord, ok := r.rec.fieldOrd(key.key, key.hash)
+		if !ok {
+			return Node{}, false
+		}
+		stored := &s.docs[doc]
+		if r.narrow {
+			*wide = s.narrow[int(r.off+ord)].widen()
+			return Node{src: &stored.src[0], entry: wide}, true
+		}
+		return Node{src: &stored.src[0], entry: &stored.entries[ord]}, true
+	}
+	return s.docs[doc].Root().GetCompiled(key)
 }
 
 // postKeyHash returns an object key's path hash — the content hash of its
