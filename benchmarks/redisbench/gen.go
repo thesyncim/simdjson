@@ -1,13 +1,13 @@
-// Package pgbaseline is the ADR 0002 phase-0 comparison harness: it
-// generates the shared corpus set, measures this library's side of the
-// baseline (space and single-core operation costs on a DocSet), parses the
-// PostgreSQL protocol logs produced by run-pg.sh, and emits the acceptance
-// report that later phases must regenerate.
+// Package redisbench is the ADR 0003 comparison harness: it generates the
+// shared corpus set, measures this library's side of the query surface
+// (space and single-core scenario costs on a DocSet), parses the
+// RedisJSON/RediSearch protocol logs produced by run-redis.sh, and emits the
+// scoreboard the query subpackage must keep green as it lands.
 //
 // Everything here is methodology: the corpus definitions, the byte
-// accounting rules, and the acceptance targets are code so that later
-// phases cannot move the goalposts. See METHODOLOGY.md in this directory.
-package pgbaseline
+// accounting rules, and the scenario matrix are code so that later work
+// cannot move the goalposts. See redis-methodology.md in this directory.
+package redisbench
 
 import (
 	"bufio"
@@ -24,11 +24,16 @@ import (
 	stdlibcorpus "github.com/thesyncim/simdjson/tests/stdlib"
 )
 
+// keyPrefix is the Redis key namespace every document is loaded under; it is
+// also the FT.CREATE ON JSON prefix, so the RediSearch index sees exactly the
+// corpus and nothing else.
+const keyPrefix = "doc:"
+
 // Manifest describes one generated corpus. It is written as manifest.json
-// (read by the Go tools) and manifest.env (read by run-pg.sh), and carries
-// the query parameters plus the expected result counts, so both sides of
-// the comparison run the same queries and can be cross-checked against the
-// same expectations.
+// (read by the Go tools) and manifest.env (read by run-redis.sh), and carries
+// the query parameters plus the expected result counts, so both sides of the
+// comparison run the same scenarios and can be cross-checked against the same
+// expectations.
 type Manifest struct {
 	Name  string `json:"name"`
 	Class string `json:"class"` // "clustered", "heterogeneous", or "real"
@@ -49,37 +54,60 @@ type Manifest struct {
 	ShapeCount int `json:"shape_count"`
 
 	// The query parameters. All keys and values are alphanumeric (plus
-	// underscore) by construction so they can be spliced into SQL literals
-	// verbatim; Generate fails otherwise. ContainKey may be empty, in which
-	// case the containment rows are skipped for this corpus.
+	// underscore) by construction so they can be spliced into RediSearch
+	// schema paths and TAG queries verbatim; Generate fails otherwise.
+	//
+	// ExtractField is the point-projection path. ContainKey/ContainValue is
+	// the equality predicate: the filtered-scan and group-by scenarios read
+	// ContainKey (a low-cardinality categorical), and containment matches the
+	// object {ContainKey: ContainValue}. ExistKey is a presence anchor kept
+	// for generator cross-checks. SumField, when non-empty, is the numeric
+	// path the scalar and grouped SUM aggregates reduce over.
 	ExtractField string `json:"extract_field"`
 	ExistKey     string `json:"exist_key"`
 	ContainKey   string `json:"contain_key,omitempty"`
 	ContainValue string `json:"contain_value,omitempty"`
+	SumField     string `json:"sum_field,omitempty"`
 
 	// Expected results, computed during generation. ExtractHits counts
-	// documents where ExtractField is present; ExistExpected counts
-	// documents containing ExistKey; ContainExpected counts documents whose
-	// ContainKey value equals the JSON string ContainValue.
-	ExtractHits     int `json:"extract_hits"`
-	ExistExpected   int `json:"exist_expected"`
-	ContainExpected int `json:"contain_expected"`
+	// documents where ExtractField is present; ExistExpected counts documents
+	// containing ExistKey; ContainExpected counts documents whose ContainKey
+	// value equals the JSON string ContainValue. SumExpected is the int64 sum
+	// of SumField over the documents that carry it, and GroupExpected is the
+	// number of distinct ContainKey values across the documents that carry
+	// it — the cardinality a GROUP BY ContainKey returns.
+	ExtractHits     int   `json:"extract_hits"`
+	ExistExpected   int   `json:"exist_expected"`
+	ContainExpected int   `json:"contain_expected"`
+	SumExpected     int64 `json:"sum_expected,omitempty"`
+	GroupExpected   int   `json:"group_expected,omitempty"`
 }
 
 // spliceSafe is the alphabet permitted in query keys and values; it is what
-// makes the literal splicing in run-pg.sh safe.
+// makes the RediSearch schema-path and TAG splicing in run-redis.sh safe.
 var spliceSafe = regexp.MustCompile(`^[A-Za-z0-9_]*$`)
 
+// groupCardinality is the GROUP BY result size under SQL semantics: the number
+// of distinct present group values, plus one NULL group when any of the total
+// documents lacks the group field — matching RediSearch, which collects every
+// document missing the TAG into a single empty-tag group.
+func groupCardinality(distinct, present, total int) int {
+	if present < total {
+		return distinct + 1
+	}
+	return distinct
+}
+
 // corpusWriter streams a corpus to docs.ndjson (one minified document per
-// line, our side's input) and docs.pgcopy (the same documents in COPY text
-// format, PostgreSQL's input), accumulating the manifest as it goes.
+// line, our side's input) and docs.resp (the same documents as JSON.SET
+// commands in the Redis RESP protocol, mass-loadable with redis-cli --pipe),
+// accumulating the manifest as it goes.
 type corpusWriter struct {
-	dir     string
-	ndjson  *bufio.Writer
-	pgcopy  *bufio.Writer
-	nf, pf  *os.File
-	m       Manifest
-	scratch []byte
+	dir    string
+	ndjson *bufio.Writer
+	resp   *bufio.Writer
+	nf, rf *os.File
+	m      Manifest
 }
 
 func newCorpusWriter(dir string, m Manifest) (*corpusWriter, error) {
@@ -90,7 +118,7 @@ func newCorpusWriter(dir string, m Manifest) (*corpusWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	pf, err := os.Create(filepath.Join(dir, "docs.pgcopy"))
+	rf, err := os.Create(filepath.Join(dir, "docs.resp"))
 	if err != nil {
 		nf.Close()
 		return nil, err
@@ -98,33 +126,28 @@ func newCorpusWriter(dir string, m Manifest) (*corpusWriter, error) {
 	return &corpusWriter{
 		dir:    dir,
 		ndjson: bufio.NewWriterSize(nf, 1<<20),
-		pgcopy: bufio.NewWriterSize(pf, 1<<20),
+		resp:   bufio.NewWriterSize(rf, 1<<20),
 		nf:     nf,
-		pf:     pf,
+		rf:     rf,
 		m:      m,
 	}, nil
 }
 
-// escapePGCopy appends doc in COPY text format: backslash, tab, newline,
-// and carriage return are the only metacharacters. Minified JSON contains
-// no raw control characters (they are escaped inside strings), so in
-// practice only backslash doubling fires, but all four are handled.
-func escapePGCopy(dst, doc []byte) []byte {
-	for _, c := range doc {
-		switch c {
-		case '\\':
-			dst = append(dst, '\\', '\\')
-		case '\t':
-			dst = append(dst, '\\', 't')
-		case '\n':
-			dst = append(dst, '\\', 'n')
-		case '\r':
-			dst = append(dst, '\\', 'r')
-		default:
-			dst = append(dst, c)
-		}
+// writeRESP appends one `JSON.SET doc:<n> $ <doc>` command in the Redis RESP
+// protocol. Bulk strings are length-prefixed and binary-safe, so the minified
+// document bytes need no escaping — this is the redis-cli --pipe mass-load
+// format, the RedisJSON analogue of a bulk COPY.
+func (w *corpusWriter) writeRESP(n int, doc []byte) error {
+	key := keyPrefix + strconv.Itoa(n)
+	// *4 command: "JSON.SET", key, "$", doc.
+	if _, err := fmt.Fprintf(w.resp, "*4\r\n$8\r\nJSON.SET\r\n$%d\r\n%s\r\n$1\r\n$\r\n$%d\r\n", len(key), key, len(doc)); err != nil {
+		return err
 	}
-	return dst
+	if _, err := w.resp.Write(doc); err != nil {
+		return err
+	}
+	_, err := w.resp.WriteString("\r\n")
+	return err
 }
 
 // add writes one minified document to both outputs and counts its bytes.
@@ -135,11 +158,7 @@ func (w *corpusWriter) add(doc []byte) error {
 	if err := w.ndjson.WriteByte('\n'); err != nil {
 		return err
 	}
-	w.scratch = escapePGCopy(w.scratch[:0], doc)
-	if _, err := w.pgcopy.Write(w.scratch); err != nil {
-		return err
-	}
-	if err := w.pgcopy.WriteByte('\n'); err != nil {
+	if err := w.writeRESP(w.m.Docs, doc); err != nil {
 		return err
 	}
 	w.m.Docs++
@@ -152,18 +171,18 @@ func (w *corpusWriter) close() (Manifest, error) {
 	if err := w.ndjson.Flush(); err != nil {
 		return Manifest{}, err
 	}
-	if err := w.pgcopy.Flush(); err != nil {
+	if err := w.resp.Flush(); err != nil {
 		return Manifest{}, err
 	}
 	if err := w.nf.Close(); err != nil {
 		return Manifest{}, err
 	}
-	if err := w.pf.Close(); err != nil {
+	if err := w.rf.Close(); err != nil {
 		return Manifest{}, err
 	}
-	for _, s := range []string{w.m.ExtractField, w.m.ExistKey, w.m.ContainKey, w.m.ContainValue} {
+	for _, s := range []string{w.m.ExtractField, w.m.ExistKey, w.m.ContainKey, w.m.ContainValue, w.m.SumField} {
 		if !spliceSafe.MatchString(s) {
-			return Manifest{}, fmt.Errorf("corpus %s: %q is not SQL-splice safe", w.m.Name, s)
+			return Manifest{}, fmt.Errorf("corpus %s: %q is not splice safe for a RediSearch schema", w.m.Name, s)
 		}
 	}
 	js, err := json.MarshalIndent(w.m, "", "\t")
@@ -173,20 +192,19 @@ func (w *corpusWriter) close() (Manifest, error) {
 	if err := os.WriteFile(filepath.Join(w.dir, "manifest.json"), append(js, '\n'), 0o644); err != nil {
 		return Manifest{}, err
 	}
-	env := fmt.Sprintf("NAME=%s\nDOCS=%d\nEXTRACT_FIELD=%s\nEXIST_KEY=%s\nCONTAIN_KEY=%s\nCONTAIN_VALUE=%s\n",
-		w.m.Name, w.m.Docs, w.m.ExtractField, w.m.ExistKey, w.m.ContainKey, w.m.ContainValue)
+	env := fmt.Sprintf("NAME=%s\nDOCS=%d\nKEY_PREFIX=%s\nEXTRACT_FIELD=%s\nCONTAIN_KEY=%s\nCONTAIN_VALUE=%s\nSUM_FIELD=%s\n",
+		w.m.Name, w.m.Docs, keyPrefix, w.m.ExtractField, w.m.ContainKey, w.m.ContainValue, w.m.SumField)
 	if err := os.WriteFile(filepath.Join(w.dir, "manifest.env"), []byte(env), 0o644); err != nil {
 		return Manifest{}, err
 	}
 	return w.m, nil
 }
 
-// SynthSpec configures one synthetic corpus. Documents are flat objects
-// with sixteen fields. In clustered mode there are Shapes distinct key
-// sets: document n has shape n%Shapes and its keys are named sSS_fFF, so
-// distinct shapes share no keys. In heterogeneous mode every document is
-// its own shape: keys are named dNNNNNNN_fFF with the document ordinal
-// baked in.
+// SynthSpec configures one synthetic corpus. Documents are flat objects with
+// sixteen fields. In clustered mode there are Shapes distinct key sets:
+// document n has shape n%Shapes and its keys are named sSS_fFF, so distinct
+// shapes share no keys. In heterogeneous mode every document is its own shape:
+// keys are named dNNNNNNN_fFF with the document ordinal baked in.
 type SynthSpec struct {
 	Name     string
 	Docs     int
@@ -197,7 +215,7 @@ type SynthSpec struct {
 }
 
 // The synthetic value alphabets. Everything is alphanumeric so containment
-// values are splice-safe and string comparison equals JSONB equality.
+// values are splice-safe and string comparison equals structural equality.
 const synthToken = "abcdefghijklmnopqrstuvwxyz0123456789"
 
 func appendToken(dst []byte, r *rand.Rand, n int) []byte {
@@ -207,14 +225,16 @@ func appendToken(dst []byte, r *rand.Rand, n int) []byte {
 	return dst
 }
 
-// synthDoc appends document n of the corpus. prefix is the shape's key
-// prefix ("s03" or "d0000042"). The categorical field f02 draws from 32
-// values, the existence anchor f11 from 4, and f15 is filler padding the
-// document to the target size.
-func synthDoc(dst []byte, prefix string, n int, r *rand.Rand, target int) (doc []byte, f02 string) {
+// synthDoc appends document n of the corpus. prefix is the shape's key prefix
+// ("s03" or "d0000042"). The categorical field f02 draws from 32 values (the
+// group/filter anchor), f01 is the numeric aggregate anchor, the existence
+// anchor f11 draws from 4, and f15 is filler padding the document to the
+// target size.
+func synthDoc(dst []byte, prefix string, n int, r *rand.Rand, target int) (doc []byte, f02 string, f01 int64) {
 	f02 = fmt.Sprintf("cat%02d", r.IntN(32))
+	f01 = int64(r.IntN(1000))
 	dst = fmt.Appendf(dst, `{"%s_f00":%d`, prefix, n)
-	dst = fmt.Appendf(dst, `,"%s_f01":%d`, prefix, r.IntN(1000))
+	dst = fmt.Appendf(dst, `,"%s_f01":%d`, prefix, f01)
 	dst = fmt.Appendf(dst, `,"%s_f02":"%s"`, prefix, f02)
 	dst = fmt.Appendf(dst, `,"%s_f03":%d.%02d`, prefix, r.IntN(10000), r.IntN(100))
 	dst = fmt.Appendf(dst, `,"%s_f04":%t`, prefix, r.IntN(2) == 0)
@@ -239,12 +259,12 @@ func synthDoc(dst []byte, prefix string, n int, r *rand.Rand, target int) (doc [
 	}
 	dst = appendToken(dst, r, fill)
 	dst = append(dst, '"', '}')
-	return dst, f02
+	return dst, f02, f01
 }
 
 // GenerateSynthetic writes a synthetic corpus into dir. The generator is
-// deterministic: math/rand/v2's PCG is seeded from spec.Seed only, so a
-// given spec reproduces byte-identical corpora on any platform.
+// deterministic: math/rand/v2's PCG is seeded from spec.Seed only, so a given
+// spec reproduces byte-identical corpora on any platform.
 func GenerateSynthetic(dir string, spec SynthSpec) (Manifest, error) {
 	shapes := spec.Shapes
 	if spec.Hetero {
@@ -259,10 +279,11 @@ func GenerateSynthetic(dir string, spec SynthSpec) (Manifest, error) {
 	}
 	m := Manifest{Name: spec.Name, Class: class, ShapeCount: shapes}
 
-	// Query anchors. The extraction field lives in shape 0, the existence
-	// key in a later shape (selectivity 1/Shapes; every document when
-	// Shapes==1), and containment matches one categorical value in shape
-	// existShape's neighbor. Heterogeneous corpora anchor on document 0's
+	// Query anchors. The extraction field lives in shape 0, the existence key
+	// in a later shape (selectivity 1/Shapes; every document when Shapes==1),
+	// and the categorical filter/group field plus the numeric aggregate field
+	// share the containment shape so a single shape carries the whole WHERE +
+	// GROUP BY + SUM story. Heterogeneous corpora anchor on document 0's
 	// shape: selectivity 1/Docs, the adversarial extreme.
 	prefixFor := func(n int) string {
 		if spec.Hetero {
@@ -276,16 +297,20 @@ func GenerateSynthetic(dir string, spec SynthSpec) (Manifest, error) {
 	m.ExistKey = prefixFor(existShape) + "_f11"
 	m.ContainKey = prefixFor(containShape) + "_f02"
 	m.ContainValue = "cat07"
+	m.SumField = prefixFor(containShape) + "_f01"
 
 	w, err := newCorpusWriter(dir, m)
 	if err != nil {
 		return Manifest{}, err
 	}
-	r := rand.New(rand.NewPCG(spec.Seed, 0x7067626173656c6e)) // "pgbaseln"
+	groups := map[string]bool{}
+	containDocs := 0
+	r := rand.New(rand.NewPCG(spec.Seed, 0x726564697362656e)) // "redisben"
 	var doc []byte
 	for n := range spec.Docs {
 		var f02 string
-		doc, f02 = synthDoc(doc[:0], prefixFor(n), n, r, spec.DocBytes)
+		var f01 int64
+		doc, f02, f01 = synthDoc(doc[:0], prefixFor(n), n, r, spec.DocBytes)
 		shape := n % shapes
 		if spec.Hetero {
 			shape = n
@@ -296,23 +321,31 @@ func GenerateSynthetic(dir string, spec SynthSpec) (Manifest, error) {
 		if shape == existShape {
 			w.m.ExistExpected++
 		}
-		if shape == containShape && f02 == w.m.ContainValue {
-			w.m.ContainExpected++
+		if shape == containShape {
+			containDocs++
+			w.m.SumExpected += f01
+			groups[f02] = true
+			if f02 == w.m.ContainValue {
+				w.m.ContainExpected++
+			}
 		}
 		if err := w.add(doc); err != nil {
 			return Manifest{}, err
 		}
 	}
+	// Grouping is SQL GROUP BY semantics: documents lacking the group field
+	// form one NULL group, exactly as RediSearch collects them into a single
+	// empty-tag group.
+	w.m.GroupExpected = groupCardinality(len(groups), containDocs, spec.Docs)
 	return w.close()
 }
 
 // RealSpec configures a corpus derived from one of the repository's real
-// corpora (tests/stdlib). When RecordsField is set, the top-level array
-// under that key is split into per-record documents — the natural document
-// unit — and the records are cycled in order until TargetBytes of minified
-// source have been written. When RecordsField is empty the whole corpus is
-// one document, replicated to TargetBytes; this exercises large-document
-// handling (and, on the PostgreSQL side, TOAST compression).
+// corpora (tests/stdlib). When RecordsField is set, the top-level array under
+// that key is split into per-record documents — the natural document unit —
+// and the records are cycled in order until TargetBytes of minified source
+// have been written. When RecordsField is empty the whole corpus is one
+// document, replicated to TargetBytes; this exercises large-document handling.
 type RealSpec struct {
 	Name         string
 	Corpus       string // stdlibcorpus name, e.g. "twitter_status.json.zst"
@@ -320,23 +353,27 @@ type RealSpec struct {
 	TargetBytes  int64
 	ExtractField string
 	ExistKey     string
-	ContainKey   string // empty skips containment for this corpus
+	ContainKey   string // empty skips the filter/group/containment scenarios
 	ContainValue string
+	SumField     string // empty skips the SUM scenarios
 }
 
-// realRecord is one distinct source record with its precomputed query
-// facts, so expectations scale exactly with replication.
+// realRecord is one distinct source record with its precomputed query facts,
+// so expectations scale exactly with replication.
 type realRecord struct {
 	doc          []byte
 	extract      bool
 	exist        bool
 	containMatch bool
+	groupValue   string
+	sum          int64
+	sumValid     bool
 }
 
 // GenerateReal writes a real-derived corpus into dir. Records are minified
 // with simdjson.Compact, so the byte accounting matches the "corpora are
-// measured minified" rule; the pretty-printed original's size is recorded
-// in the manifest for provenance.
+// measured minified" rule; the pretty-printed original's size is recorded in
+// the manifest for provenance.
 func GenerateReal(dir string, spec RealSpec) (Manifest, error) {
 	pretty, err := stdlibcorpus.Read(spec.Corpus)
 	if err != nil {
@@ -378,6 +415,18 @@ func GenerateReal(dir string, spec RealSpec) (Manifest, error) {
 				return Manifest{}, err
 			}
 			rec.containMatch = bytes.Equal(c, quoted)
+			// Only a non-empty string is a real group; anything else (absent,
+			// null, empty, or non-string) lands in RediSearch's empty-tag group.
+			var s string
+			if json.Unmarshal(v, &s) == nil {
+				rec.groupValue = s
+			}
+		}
+		if v, ok := fields[spec.SumField]; ok && spec.SumField != "" {
+			var n int64
+			if json.Unmarshal(v, &n) == nil {
+				rec.sum, rec.sumValid = n, true
+			}
 		}
 		records = append(records, rec)
 	}
@@ -390,13 +439,17 @@ func GenerateReal(dir string, spec RealSpec) (Manifest, error) {
 		ExistKey:     spec.ExistKey,
 		ContainKey:   spec.ContainKey,
 		ContainValue: spec.ContainValue,
+		SumField:     spec.SumField,
 	}
 	w, err := newCorpusWriter(dir, m)
 	if err != nil {
 		return Manifest{}, err
 	}
+	groups := map[string]bool{}
+	total, groupPresent := 0, 0
 	for i := 0; w.m.SourceBytes < spec.TargetBytes; i++ {
 		rec := records[i%len(records)]
+		total++
 		if rec.extract {
 			w.m.ExtractHits++
 		}
@@ -406,9 +459,19 @@ func GenerateReal(dir string, spec RealSpec) (Manifest, error) {
 		if rec.containMatch {
 			w.m.ContainExpected++
 		}
+		if spec.ContainKey != "" && rec.groupValue != "" {
+			groups[rec.groupValue] = true
+			groupPresent++
+		}
+		if rec.sumValid {
+			w.m.SumExpected += rec.sum
+		}
 		if err := w.add(rec.doc); err != nil {
 			return Manifest{}, err
 		}
+	}
+	if spec.ContainKey != "" {
+		w.m.GroupExpected = groupCardinality(len(groups), groupPresent, total)
 	}
 	return w.close()
 }
