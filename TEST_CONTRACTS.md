@@ -124,6 +124,7 @@ typed_hook_test.go
 
 ```text
 any_test.go
+contains_contract_test.go
 docset_test.go
 duplicate_keys_contract_test.go
 field_cursor_test.go
@@ -228,6 +229,7 @@ stream_decode_test.go
 ### `PERF`
 
 ```text
+contains_bench_test.go
 docset_stream_bench_test.go
 index_tapescan_bench_test.go
 multidoc_bench_test.go
@@ -315,6 +317,7 @@ same change.
 
 | Package | Target | Campaign |
 | --- | --- | ---: |
+| `./` | `FuzzContains` | 6 |
 | `./` | `FuzzDecodeTrust` | 2 |
 | `./` | `FuzzEncoderMatchesStdlib` | 3 |
 | `./` | `FuzzEncoderScratchOperationSequence` | 9 |

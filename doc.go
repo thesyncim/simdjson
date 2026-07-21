@@ -121,6 +121,8 @@
 // [FieldCursor] that resumes forward scans when several known fields are
 // read in roughly document order. [BuildObjectProbe] builds an [ObjectProbe]
 // — a constant-time member table over one wide object queried many times.
+// [Node.Contains] evaluates PostgreSQL-compatible jsonb containment over
+// two indexed documents, with [RawContains] as the one-shot spelling.
 //
 // For batches of documents, a [DocSet] indexes every appended document into
 // shared arena storage whose bytes never move, so handles stay valid as the
