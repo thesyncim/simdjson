@@ -146,6 +146,8 @@ shape_test.go
 value_accessors_contract_test.go
 value_iteration_contract_test.go
 value_spans_contract_test.go
+verify_exhaustive_test.go
+verify_invariants_test.go
 ```
 
 ### `STREAM`
