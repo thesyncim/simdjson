@@ -1,6 +1,10 @@
 package query
 
-import "strconv"
+import (
+	"strconv"
+
+	"github.com/thesyncim/simdjson/internal/byteview"
+)
 
 // A Result is the column-oriented output of a query: one ResultColumn per
 // selected column, in Select order, each holding one Cell per result row.
@@ -9,8 +13,10 @@ import "strconv"
 // and no GROUP BY yields exactly one row; a GROUP BY yields one row per group.
 //
 // Cells that project a document value borrow the DocSet's storage, exactly
-// like the RawValue they came from: they stay valid while the DocSet is alive
-// and unmodified. Copy through Cell.JSON if a cell must outlive the set.
+// like the RawValue they came from. RunInto may additionally place decoded
+// escaped text and computed aggregate JSON in its Workspace. Copy Cell.JSON
+// and, when needed, Cell.TextBytes before the DocSet, Result, or Workspace is
+// reused if a cell must outlive that borrowing boundary.
 type Result struct {
 	Columns  []ResultColumn
 	RowCount int
@@ -150,6 +156,16 @@ func (c Cell) Text() (string, bool) {
 		return "", false
 	}
 	return c.text, true
+}
+
+// TextBytes returns decoded string content without allocating. The slice is a
+// read-only borrowed view with the same lifetime as the Cell and must not be
+// modified. For a non-string it returns nil and false.
+func (c Cell) TextBytes() ([]byte, bool) {
+	if c.kind != KindString {
+		return nil, false
+	}
+	return byteview.Bytes(c.text), true
 }
 
 // JSON returns the cell as JSON bytes: the exact source bytes for a projected

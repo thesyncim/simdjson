@@ -1,94 +1,152 @@
 package query
 
 import (
-	"sort"
+	"bytes"
+	"slices"
+	"strconv"
 
 	"github.com/thesyncim/simdjson"
+	"github.com/thesyncim/simdjson/document"
 )
 
-// The executor. run extracts each needed path as a column off the DocSet's
-// tape, filters rows with a full columnar scan of the compiled predicate,
-// reduces aggregates over the typed columns, groups by interning group keys,
-// and sorts and truncates the small result. Every step is one pass; the result
-// materializes row-oriented and transposes to the column-oriented Result once,
-// because result sets are small next to the corpus.
+// Workspace owns all transient query execution storage. Its zero value is
+// ready to use. Reusing one Workspace with RunInto turns a warmed execution
+// whose row, posting-frontier, decoded-text, and group high-water marks fit the
+// retained capacity into a zero-allocation operation. That contract includes
+// posting merges, escaped-string classification, containment indexing, stable
+// ordering, aggregation, grouping, and result materialization.
+//
+// A Workspace is single-consumer and not safe for concurrent use. A compiled
+// Query remains safe for concurrent use when each goroutine supplies a distinct
+// Workspace and Result. Storage borrowed by a Result written by RunInto is
+// valid only until the next RunInto using the same Workspace or Result.
+type Workspace struct {
+	ctx execCtx
 
-// execCtx holds one Run's transient state: the extracted columns and a
-// per-Run ShapeCache (the cache is single-consumer, so a fresh one keeps
-// concurrent Runs of one compiled query independent).
+	raws           [][]simdjson.RawValue
+	numRaws        []simdjson.RawValue
+	selected       []int
+	candidates     [][]int
+	candidateUsed  int
+	emptyCandidate [1]int
+
+	containsEntries []simdjson.IndexEntry
+	text            []byte
+	numbers         []byte
+
+	accs       []aggAcc
+	interner   simdjson.KeyInterner
+	groups     []group
+	groupKey   []byte
+	groupOrder []int
+}
+
+// execCtx is the columnar state for one execution. Its inner column slices
+// persist inside Workspace and are overwritten on the next call.
 type execCtx struct {
 	s      *simdjson.DocSet
 	cache  simdjson.ShapeCache
 	rows   int
-	values [][]scalar  // one classified column per plan.valuePaths entry
-	nums   []numColumn // one numeric column per plan.numPaths entry
+	values [][]scalar
+	nums   []numColumn
 }
 
-// A numColumn is an aggregate argument extracted as dense float64 cells with a
-// validity mask: valid[i] is false for an absent, null, non-numeric, or
-// out-of-range value, exactly the cells SUM/AVG/MIN/MAX skip.
 type numColumn struct {
 	vals  []float64
 	valid []bool
 }
 
-// run executes the compiled plan over s.
-func (p *plan) run(s *simdjson.DocSet) (Result, error) {
-	candidates := p.candidateRows(s)
+// nextCandidates returns an independent empty posting buffer. Candidate-tree
+// evaluation never aliases its inputs with a merge output, so AND/OR can be
+// assembled in linear passes without allocations after the buffers warm.
+func (w *Workspace) nextCandidates() []int {
+	if w.candidateUsed == len(w.candidates) {
+		w.candidates = append(w.candidates, nil)
+	}
+	i := w.candidateUsed
+	w.candidateUsed++
+	return w.candidates[i][:0]
+}
+
+func (w *Workspace) keepCandidates(rows []int) {
+	w.candidates[w.candidateUsed-1] = rows
+}
+
+// runInto executes p, overwriting dst while retaining its column and cell
+// capacity. Callers must not reuse dst or w concurrently.
+func (p *plan) runInto(dst *Result, s *simdjson.DocSet, w *Workspace) error {
+	w.candidateUsed = 0
+	w.text = w.text[:0]
+	w.numbers = w.numbers[:0]
+	w.groupKey = w.groupKey[:0]
+	w.groupOrder = w.groupOrder[:0]
+	w.interner.Reset()
+
+	candidates := p.candidateRows(s, w)
 	compact := preferSparseRows(len(candidates), s.Len(), candidates != nil)
 	var sourceRows []int
 	if compact {
 		sourceRows = candidates
 	}
-	ctx := &execCtx{s: s, rows: s.Len()}
+
+	ctx := &w.ctx
+	ctx.s, ctx.rows = s, s.Len()
 	if compact {
 		ctx.rows = len(sourceRows)
 	}
-	if err := ctx.extract(p, sourceRows); err != nil {
-		return Result{}, err
+	if err := ctx.extract(p, sourceRows, w); err != nil {
+		return err
 	}
-	selected := p.selectRows(ctx, candidates, compact)
+	selected := p.selectRows(ctx, candidates, compact, w)
 	switch {
 	case p.grouped:
-		return p.runGrouped(ctx, selected), nil
+		p.runGroupedInto(dst, ctx, selected, w)
 	case p.singleRow:
-		return p.runAggregate(ctx, selected), nil
+		p.runAggregateInto(dst, ctx, selected, w)
 	default:
-		return p.runProjection(ctx, selected), nil
+		p.runProjectionInto(dst, ctx, selected)
 	}
+	return nil
 }
 
-// preferSparseRows chooses selection pushdown when a real posting bound visits
-// no more than half the corpus. Sparse gather has one random-access read per
-// selected row while a dense column scan streams every row; the half-corpus
-// crossover is deliberately conservative and is pinned by the selectivity
-// benchmarks. hasBound distinguishes a nil full-scan sentinel from an empty,
-// exact posting result.
 func preferSparseRows(candidates, total int, hasBound bool) bool {
 	return hasBound && candidates <= total/2
 }
 
-// extract materializes every value and numeric column the plan reads. When
-// sourceRows is non-nil, columns are compact and position j represents document
-// ordinal sourceRows[j]; otherwise columns remain dense and position j is
-// document j. The downstream executor always indexes positions, so the two
-// layouts share the same evaluation and reduction code.
-func (ctx *execCtx) extract(p *plan, sourceRows []int) error {
-	ctx.values = make([][]scalar, len(p.valuePaths))
+// extract gathers each raw value column before classifying any strings. That
+// permits one exact pre-growth of the decoded-text arena, so escaped strings
+// can append without moving views produced for earlier columns.
+func (ctx *execCtx) extract(p *plan, sourceRows []int, w *Workspace) error {
+	w.raws = resize(w.raws, len(p.valuePaths))
+	textNeed := 0
 	for i, cp := range p.valuePaths {
-		raws, err := ctx.rawColumn(cp, sourceRows)
+		raws, err := ctx.rawColumn(w.raws[i][:0], cp, sourceRows)
 		if err != nil {
 			return err
 		}
-		col := make([]scalar, len(raws))
+		w.raws[i] = raws
+		for _, r := range raws {
+			b := r.Bytes()
+			if r.Kind() == document.String && bytes.IndexByte(b, '\\') >= 0 {
+				textNeed += len(b)
+			}
+		}
+	}
+	if cap(w.text) < textNeed {
+		w.text = make([]byte, 0, growCap(cap(w.text), textNeed))
+	}
+	ctx.values = resize(ctx.values, len(p.valuePaths))
+	for i, raws := range w.raws {
+		col := resize(ctx.values[i], len(raws))
 		for j, r := range raws {
-			col[j] = classifyRaw(r)
+			col[j] = classifyRawInto(r, &w.text)
 		}
 		ctx.values[i] = col
 	}
-	ctx.nums = make([]numColumn, len(p.numPaths))
+
+	ctx.nums = resize(ctx.nums, len(p.numPaths))
 	for i, cp := range p.numPaths {
-		nc, err := ctx.numericColumn(cp, sourceRows)
+		nc, err := ctx.numericColumn(ctx.nums[i], cp, sourceRows, w)
 		if err != nil {
 			return err
 		}
@@ -97,50 +155,32 @@ func (ctx *execCtx) extract(p *plan, sourceRows []int) error {
 	return nil
 }
 
-// rawColumn extracts a path as raw values: the fused field scan for a single
-// top-level field, the compiled pointer otherwise.
-func (ctx *execCtx) rawColumn(cp compiledPath, sourceRows []int) ([]simdjson.RawValue, error) {
+func (ctx *execCtx) rawColumn(dst []simdjson.RawValue, cp compiledPath, sourceRows []int) ([]simdjson.RawValue, error) {
 	if sourceRows != nil {
 		if cp.single {
-			return ctx.cache.AppendFieldRows(nil, ctx.s, sourceRows, cp.name), nil
+			return ctx.cache.AppendFieldRows(dst, ctx.s, sourceRows, cp.name), nil
 		}
-		return ctx.s.AppendPointerRows(nil, sourceRows, cp.pointer)
+		return ctx.s.AppendPointerRows(dst, sourceRows, cp.pointer)
 	}
 	if cp.single {
-		return ctx.cache.AppendField(nil, ctx.s, cp.name), nil
+		return ctx.cache.AppendField(dst, ctx.s, cp.name), nil
 	}
-	return ctx.s.AppendPointer(nil, cp.pointer)
+	return ctx.s.AppendPointer(dst, cp.pointer)
 }
 
-// numericColumn extracts an aggregate argument as float64 cells with a validity
-// mask. A single top-level field takes the typed fused scan
-// (AppendFieldFloat64); a nested path resolves through the compiled pointer and
-// parses each cell with the same Float64 verdict.
-func (ctx *execCtx) numericColumn(cp compiledPath, sourceRows []int) (numColumn, error) {
-	if sourceRows != nil {
-		raws, err := ctx.rawColumn(cp, sourceRows)
-		if err != nil {
-			return numColumn{}, err
-		}
-		vals := make([]float64, len(raws))
-		valid := make([]bool, len(raws))
-		for i, r := range raws {
-			if f, ok := r.Float64(); ok {
-				vals[i], valid[i] = f, true
-			}
-		}
+func (ctx *execCtx) numericColumn(dst numColumn, cp compiledPath, sourceRows []int, w *Workspace) (numColumn, error) {
+	if sourceRows == nil && cp.single {
+		vals, valid := ctx.cache.AppendFieldFloat64(dst.vals[:0], dst.valid[:0], ctx.s, cp.name)
 		return numColumn{vals: vals, valid: valid}, nil
 	}
-	if cp.single {
-		vals, valid := ctx.cache.AppendFieldFloat64(nil, nil, ctx.s, cp.name)
-		return numColumn{vals: vals, valid: valid}, nil
-	}
-	raws, err := ctx.s.AppendPointer(nil, cp.pointer)
+	raws, err := ctx.rawColumn(w.numRaws[:0], cp, sourceRows)
 	if err != nil {
 		return numColumn{}, err
 	}
-	vals := make([]float64, len(raws))
-	valid := make([]bool, len(raws))
+	w.numRaws = raws
+	vals := resize(dst.vals, len(raws))
+	valid := resize(dst.valid, len(raws))
+	clear(valid)
 	for i, r := range raws {
 		if f, ok := r.Float64(); ok {
 			vals[i], valid[i] = f, true
@@ -149,124 +189,138 @@ func (ctx *execCtx) numericColumn(cp compiledPath, sourceRows []int) (numColumn,
 	return numColumn{vals: vals, valid: valid}, nil
 }
 
-// selectRows returns the column positions the WHERE predicate accepts, in
-// source order. In compact mode the postings were pushed into extraction, so
-// every compact position is a candidate. In dense mode candidate ordinals are
-// also column positions and can be tested directly. Either way the compiled
-// predicate rechecks every posting result before it reaches execution.
-func (p *plan) selectRows(ctx *execCtx, candidates []int, compact bool) []int {
-	selected := make([]int, 0, ctx.rows)
+func (p *plan) selectRows(ctx *execCtx, candidates []int, compact bool, w *Workspace) []int {
+	selected := w.selected[:0]
 	if compact || candidates == nil {
 		for row := 0; row < ctx.rows; row++ {
-			if p.where == nil || p.where.eval(ctx.values, row) {
+			if p.where == nil || p.where.eval(ctx.values, row, &w.containsEntries) {
 				selected = append(selected, row)
 			}
 		}
-		return selected
-	}
-	for _, row := range candidates {
-		if p.where == nil || p.where.eval(ctx.values, row) {
-			selected = append(selected, row)
+	} else {
+		for _, row := range candidates {
+			if p.where == nil || p.where.eval(ctx.values, row, &w.containsEntries) {
+				selected = append(selected, row)
+			}
 		}
 	}
+	w.selected = selected
 	return selected
 }
 
-// candidateRows is the selective seam. It returns the rows the WHERE predicate
-// must be tested against, or nil meaning "every row" — the full columnar scan.
-//
-// When the DocSet opted into the inverted posting layer (DocSet.Postings) and
-// the predicate has a leaf the postings can answer, candidateRows returns a
-// narrowed candidate slice built from the predicate's postable leaves (see
-// candidates.go), and selectRows verifies each candidate with the same per-row
-// eval — so the accepted-rows contract and everything downstream are unchanged,
-// only the candidate enumeration gets cheaper. Without postings, or for a
-// predicate no leaf can prune, it returns nil and the full scan stands.
-func (p *plan) candidateRows(s *simdjson.DocSet) []int {
+func (p *plan) candidateRows(s *simdjson.DocSet, w *Workspace) []int {
 	if p.where == nil || !s.Postings {
 		return nil
 	}
-	rows, ok := p.where.candidates(s)
+	rows, ok := p.where.candidates(s, w)
 	if !ok {
-		return nil // no postable leaf bounds the predicate: full scan
+		return nil
 	}
 	if rows == nil {
-		// A postable predicate that matches no row: an empty candidate set, not
-		// "every row". Hand back a non-nil empty slice so selectRows selects
-		// nothing rather than falling into the full scan.
-		return []int{}
+		return w.emptyCandidate[:0]
 	}
 	return rows
 }
 
-// runProjection builds one result row per selected document. A projection can
-// be as large as the corpus, so the unordered case — the common one — fills the
-// result columns directly, without a per-row intermediate; only ORDER BY needs
-// the row materialization the sort works over.
-func (p *plan) runProjection(ctx *execCtx, selected []int) Result {
-	if len(p.order) == 0 {
-		if p.hasLimit && len(selected) > p.limit {
-			selected = selected[:p.limit]
-		}
-		columns := make([]ResultColumn, len(p.columns))
-		for c := range p.columns {
-			columns[c] = ResultColumn{Header: p.columns[c].header, Cells: make([]Cell, len(selected))}
-		}
-		for r, row := range selected {
-			for c, col := range p.columns {
-				columns[c].Cells[r] = cellFromScalar(ctx.values[col.value][row])
-			}
-		}
-		return Result{Columns: columns, RowCount: len(selected)}
-	}
-	rows := make([]resultRow, 0, len(selected))
-	for _, row := range selected {
-		r := resultRow{cells: make([]Cell, len(p.columns))}
-		for c, col := range p.columns {
-			r.cells[c] = cellFromScalar(ctx.values[col.value][row])
-		}
-		r.order = p.orderKeysPerRow(ctx, row)
-		rows = append(rows, r)
-	}
-	return p.finish(rows)
-}
-
-// runAggregate builds the single result row of an aggregate query with no
-// GROUP BY.
-func (p *plan) runAggregate(ctx *execCtx, selected []int) Result {
-	accs := make([]aggAcc, len(p.columns))
-	for _, row := range selected {
-		p.accumulate(accs, ctx, row)
-	}
-	r := resultRow{cells: p.aggregateCells(accs, nil)}
-	return p.finish([]resultRow{r})
-}
-
-// runGrouped builds one result row per group, interning group keys to route
-// each selected row to its accumulators in a single pass.
-func (p *plan) runGrouped(ctx *execCtx, selected []int) Result {
-	var interner simdjson.KeyInterner
-	var groups []*group
-	var key []byte
-	for _, row := range selected {
-		key = p.groupKey(key[:0], ctx, row)
-		id := interner.Intern(key)
-		if int(id) == len(groups) {
-			groups = append(groups, p.newGroup(ctx, row))
-		}
-		p.accumulate(groups[id].accs, ctx, row)
-	}
-	rows := make([]resultRow, 0, len(groups))
-	for _, g := range groups {
-		rows = append(rows, resultRow{
-			cells: p.aggregateCells(g.accs, g),
-			order: p.orderKeysPerGroup(g),
+func (p *plan) runProjectionInto(dst *Result, ctx *execCtx, selected []int) {
+	if len(p.order) != 0 {
+		slices.SortStableFunc(selected, func(a, b int) int {
+			return p.compareRows(ctx, a, b)
 		})
 	}
-	return p.finish(rows)
+	if p.hasLimit && len(selected) > p.limit {
+		selected = selected[:p.limit]
+	}
+	prepareResult(dst, p, len(selected))
+	for r, row := range selected {
+		for c, col := range p.columns {
+			dst.Columns[c].Cells[r] = cellFromScalar(ctx.values[col.value][row])
+		}
+	}
 }
 
-// groupKey encodes a row's group-by values into a single interner key.
+func (p *plan) compareRows(ctx *execCtx, a, b int) int {
+	for _, o := range p.order {
+		c := compareScalar(ctx.values[o.value][a], ctx.values[o.value][b])
+		if o.dir == Desc {
+			c = -c
+		}
+		if c != 0 {
+			return c
+		}
+	}
+	return 0
+}
+
+func (p *plan) runAggregateInto(dst *Result, ctx *execCtx, selected []int, w *Workspace) {
+	w.accs = resize(w.accs, len(p.columns))
+	clear(w.accs)
+	for _, row := range selected {
+		p.accumulate(w.accs, ctx, row)
+	}
+	rows := 1
+	if p.hasLimit && p.limit == 0 {
+		rows = 0
+	}
+	prepareResult(dst, p, rows)
+	w.prepareNumbers(rows * len(p.columns) * 32)
+	if rows != 0 {
+		p.fillAggregateCells(dst, 0, w.accs, nil, w)
+	}
+}
+
+func (p *plan) runGroupedInto(dst *Result, ctx *execCtx, selected []int, w *Workspace) {
+	groupCount := 0
+	for _, row := range selected {
+		w.groupKey = p.groupKey(w.groupKey[:0], ctx, row)
+		id := int(w.interner.Intern(w.groupKey))
+		if id == groupCount {
+			w.groups = resize(w.groups, groupCount+1)
+			g := &w.groups[id]
+			g.scalars = resize(g.scalars, len(p.groupCols))
+			g.accs = resize(g.accs, len(p.columns))
+			clear(g.accs)
+			for i, gc := range p.groupCols {
+				g.scalars[i] = ctx.values[gc][row]
+			}
+			groupCount++
+		}
+		p.accumulate(w.groups[id].accs, ctx, row)
+	}
+	w.groups = w.groups[:groupCount]
+	w.groupOrder = resize(w.groupOrder[:0], groupCount)
+	for i := range w.groupOrder {
+		w.groupOrder[i] = i
+	}
+	if len(p.order) != 0 {
+		slices.SortStableFunc(w.groupOrder, func(a, b int) int {
+			return p.compareGroups(&w.groups[a], &w.groups[b])
+		})
+	}
+	if p.hasLimit && len(w.groupOrder) > p.limit {
+		w.groupOrder = w.groupOrder[:p.limit]
+	}
+	prepareResult(dst, p, len(w.groupOrder))
+	w.prepareNumbers(len(w.groupOrder) * len(p.columns) * 32)
+	for row, id := range w.groupOrder {
+		g := &w.groups[id]
+		p.fillAggregateCells(dst, row, g.accs, g, w)
+	}
+}
+
+func (p *plan) compareGroups(a, b *group) int {
+	for _, o := range p.order {
+		c := compareScalar(a.scalars[o.slot], b.scalars[o.slot])
+		if o.dir == Desc {
+			c = -c
+		}
+		if c != 0 {
+			return c
+		}
+	}
+	return 0
+}
+
 func (p *plan) groupKey(dst []byte, ctx *execCtx, row int) []byte {
 	for _, gc := range p.groupCols {
 		dst = appendGroupKey(dst, ctx.values[gc][row])
@@ -274,36 +328,19 @@ func (p *plan) groupKey(dst []byte, ctx *execCtx, row int) []byte {
 	return dst
 }
 
-// newGroup captures a fresh group's grouped-path values at first sighting; all
-// later rows of the group share them by construction.
-func (p *plan) newGroup(ctx *execCtx, row int) *group {
-	g := &group{
-		scalars: make([]scalar, len(p.groupCols)),
-		accs:    make([]aggAcc, len(p.columns)),
-	}
-	for i, gc := range p.groupCols {
-		g.scalars[i] = ctx.values[gc][row]
-	}
-	return g
-}
-
-// A group is one GROUP BY partition: its grouped-path values and its per-column
-// accumulators.
 type group struct {
 	scalars []scalar
 	accs    []aggAcc
 }
 
-// An aggAcc accumulates one aggregate column over the rows routed to it.
 type aggAcc struct {
-	count int     // COUNT contributions (rows, or present values)
-	n     int     // numeric contributions to SUM/AVG/MIN/MAX
-	sum   float64 // running total
+	count int
+	n     int
+	sum   float64
 	min   float64
 	max   float64
 }
 
-// accumulate folds one row into a column's accumulators.
 func (p *plan) accumulate(accs []aggAcc, ctx *execCtx, row int) {
 	for c, col := range p.columns {
 		switch col.agg {
@@ -334,108 +371,95 @@ func (p *plan) accumulate(accs []aggAcc, ctx *execCtx, row int) {
 	}
 }
 
-// aggregateCells materializes one output row from accumulators; g supplies the
-// grouped-path values for projection columns and is nil for a single-row
-// aggregate.
-func (p *plan) aggregateCells(accs []aggAcc, g *group) []Cell {
-	cells := make([]Cell, len(p.columns))
+func (p *plan) fillAggregateCells(dst *Result, row int, accs []aggAcc, g *group, w *Workspace) {
 	for c, col := range p.columns {
+		var cell Cell
 		switch col.agg {
 		case aggNone:
-			cells[c] = cellFromScalar(g.scalars[col.slot])
+			cell = cellFromScalar(g.scalars[col.slot])
 		case aggCount:
-			cells[c] = countCell(accs[c].count)
+			cell = w.countCell(accs[c].count)
 		case aggSum:
-			cells[c] = numericOrNull(accs[c].n, accs[c].sum)
+			cell = w.numericOrNull(accs[c].n, accs[c].sum)
 		case aggAvg:
 			if accs[c].n == 0 {
-				cells[c] = nullCell()
+				cell = nullCell()
 			} else {
-				cells[c] = floatCell(accs[c].sum / float64(accs[c].n))
+				cell = w.floatCell(accs[c].sum / float64(accs[c].n))
 			}
 		case aggMin:
-			cells[c] = numericOrNull(accs[c].n, accs[c].min)
+			cell = w.numericOrNull(accs[c].n, accs[c].min)
 		case aggMax:
-			cells[c] = numericOrNull(accs[c].n, accs[c].max)
+			cell = w.numericOrNull(accs[c].n, accs[c].max)
 		}
+		dst.Columns[c].Cells[row] = cell
 	}
-	return cells
 }
 
-// numericOrNull returns a numeric cell, or null when no row contributed.
-func numericOrNull(n int, v float64) Cell {
+func (w *Workspace) prepareNumbers(need int) {
+	if cap(w.numbers) < need {
+		w.numbers = make([]byte, 0, growCap(cap(w.numbers), need))
+	} else {
+		w.numbers = w.numbers[:0]
+	}
+}
+
+func (w *Workspace) floatCell(f float64) Cell {
+	mark := len(w.numbers)
+	w.numbers = strconv.AppendFloat(w.numbers, f, 'g', -1, 64)
+	return Cell{kind: KindNumber, fval: f, raw: w.numbers[mark:]}
+}
+
+func (w *Workspace) countCell(n int) Cell {
+	mark := len(w.numbers)
+	w.numbers = strconv.AppendInt(w.numbers, int64(n), 10)
+	return Cell{kind: KindNumber, fval: float64(n), ival: int64(n), isInt: true, raw: w.numbers[mark:]}
+}
+
+func (w *Workspace) numericOrNull(n int, v float64) Cell {
 	if n == 0 {
 		return nullCell()
 	}
-	return floatCell(v)
+	return w.floatCell(v)
 }
 
-// orderKeysPerRow captures a projected row's ORDER BY keys.
-func (p *plan) orderKeysPerRow(ctx *execCtx, row int) []scalar {
-	if len(p.order) == 0 {
-		return nil
-	}
-	keys := make([]scalar, len(p.order))
-	for i, o := range p.order {
-		keys[i] = ctx.values[o.value][row]
-	}
-	return keys
-}
-
-// orderKeysPerGroup captures a group's ORDER BY keys from its grouped values.
-func (p *plan) orderKeysPerGroup(g *group) []scalar {
-	if len(p.order) == 0 {
-		return nil
-	}
-	keys := make([]scalar, len(p.order))
-	for i, o := range p.order {
-		keys[i] = g.scalars[o.slot]
-	}
-	return keys
-}
-
-// A resultRow is one materialized output row before transposition, carrying its
-// cells and its ORDER BY keys.
-type resultRow struct {
-	cells []Cell
-	order []scalar
-}
-
-// finish sorts, limits, and transposes the materialized rows into the
-// column-oriented Result.
-func (p *plan) finish(rows []resultRow) Result {
-	p.sortRows(rows)
-	if p.hasLimit && len(rows) > p.limit {
-		rows = rows[:p.limit]
-	}
-	columns := make([]ResultColumn, len(p.columns))
-	for c := range p.columns {
-		columns[c] = ResultColumn{Header: p.columns[c].header, Cells: make([]Cell, len(rows))}
-	}
-	for r := range rows {
-		for c := range p.columns {
-			columns[c].Cells[r] = rows[r].cells[c]
+func prepareResult(dst *Result, p *plan, rows int) {
+	if cap(dst.Columns) < len(p.columns) {
+		dst.Columns = make([]ResultColumn, len(p.columns))
+	} else {
+		for i := len(p.columns); i < len(dst.Columns); i++ {
+			clear(dst.Columns[i].Cells)
 		}
+		dst.Columns = dst.Columns[:len(p.columns)]
 	}
-	return Result{Columns: columns, RowCount: len(rows)}
+	for i, pc := range p.columns {
+		cells := dst.Columns[i].Cells
+		if rows < len(cells) {
+			clear(cells[rows:])
+		}
+		cells = resize(cells, rows)
+		dst.Columns[i].Header = pc.header
+		dst.Columns[i].Cells = cells
+	}
+	dst.RowCount = rows
 }
 
-// sortRows applies the ORDER BY keys with a stable sort, so rows or groups that
-// tie keep their scan (first-appearance) order.
-func (p *plan) sortRows(rows []resultRow) {
-	if len(p.order) == 0 {
-		return
+func resize[T any](s []T, n int) []T {
+	if cap(s) < n {
+		out := make([]T, n, growCap(cap(s), n))
+		copy(out, s)
+		return out
 	}
-	sort.SliceStable(rows, func(i, j int) bool {
-		for k, o := range p.order {
-			c := compareScalar(rows[i].order[k], rows[j].order[k])
-			if o.dir == Desc {
-				c = -c
-			}
-			if c != 0 {
-				return c < 0
-			}
-		}
-		return false
-	})
+	return s[:n]
+}
+
+func growCap(old, need int) int {
+	n := old * 2
+	if n < 8 {
+		n = 8
+	}
+	if n < need {
+		n = need
+	}
+	return n
 }

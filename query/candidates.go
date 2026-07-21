@@ -17,19 +17,19 @@ import "github.com/thesyncim/simdjson"
 // A leaf is POSTABLE when it maps onto an execution primitive of the posting
 // layer over a single top-level field:
 //
-//   - EXISTS(path)        -> DocSet.WhereExists(path)
-//   - path @> scalarJSON  -> DocSet.WhereContains(path, needle)   (scalar needle)
-//   - path = scalarLit    -> DocSet.WhereContains(path, needle)   (equality)
+//   - EXISTS(path)        -> DocSet.AppendWhereExists
+//   - path @> scalarJSON  -> DocSet.AppendWhereContainsIndex (scalar needle)
+//   - path = scalarLit    -> DocSet.AppendWhereContainsIndex (equality)
 //
 // Equality rides the containment primitive because a scalar value contains an
-// equal scalar, so WhereContains(path, v) is a superset of the rows whose value
+// equal scalar, so the containment posting is a superset of rows whose value
 // at path equals v (it also admits arrays that hold v and, by hash coarseness,
 // collisions) — every one of which the per-row evalCmp re-checks and keeps only
 // on an exact, in-kind, exact-decimal match. IS NULL, inequalities other than
 // =, containment against a structured needle (the buckets index scalars only),
 // negation, and any nested or pointer path are NOT postable and fall through to
-// the full scan. WhereExists and WhereContains are themselves exact — equal to
-// their own full scan — so a postable leaf's candidate set is a sound superset
+// the full scan. The posting primitives are themselves exact — equal to their
+// own full scan — so a postable leaf's candidate set is a sound superset
 // (in fact the exact set) of the rows it accepts, the property the re-check and
 // the set combinators below rely on.
 //
@@ -45,7 +45,9 @@ import "github.com/thesyncim/simdjson"
 //   - NOT is never postable (the complement of a selective set is not selective).
 //
 // The set merges are linear O(a+b) passes over the ascending, deduplicated
-// ordinal slices WhereExists and WhereContains return.
+// ordinal slices the posting primitives return. Every leaf and merge writes
+// into a distinct reusable Workspace buffer, so the whole tree can be warmed
+// to zero allocations without aliasing an input with its output.
 
 // postKind classifies a leaf predicate's posting probe, or postNone when the
 // leaf cannot be answered from the postings.
@@ -65,7 +67,7 @@ const (
 type postProbe struct {
 	kind   postKind
 	path   string
-	needle []byte
+	needle simdjson.Index
 }
 
 // candidates returns a superset of the rows this predicate accepts, and ok
@@ -74,14 +76,19 @@ type postProbe struct {
 // that matches no row — an empty candidate set, distinct from the unbounded
 // ok-false case. The caller (candidateRows) normalizes the nil-but-ok slice so
 // selectRows never mistakes an empty candidate set for a full scan.
-func (p *compiledPredicate) candidates(s *simdjson.DocSet) (rows []int, ok bool) {
+func (p *compiledPredicate) candidates(s *simdjson.DocSet, w *Workspace) (rows []int, ok bool) {
 	switch p.kind {
 	case predCmp, predContains, predExists:
-		return p.probe.run(s)
+		if p.probe.kind == postNone {
+			return nil, false
+		}
+		rows, ok := p.probe.run(s, w.nextCandidates())
+		w.keepCandidates(rows)
+		return rows, ok
 	case predAnd:
-		return andCandidates(p.kids, s)
+		return andCandidates(p.kids, s, w)
 	case predOr:
-		return orCandidates(p.kids, s)
+		return orCandidates(p.kids, s, w)
 	default: // predIsNull, predNot: not postable
 		return nil, false
 	}
@@ -89,19 +96,12 @@ func (p *compiledPredicate) candidates(s *simdjson.DocSet) (rows []int, ok bool)
 
 // run executes a leaf probe, returning the primitive's ascending ordinal set.
 // postNone reports "not postable" so the caller keeps the full scan.
-func (pp postProbe) run(s *simdjson.DocSet) ([]int, bool) {
+func (pp postProbe) run(s *simdjson.DocSet, dst []int) ([]int, bool) {
 	switch pp.kind {
 	case postExists:
-		return s.WhereExists(pp.path), true
+		return s.AppendWhereExists(dst, pp.path), true
 	case postContains, postEq:
-		res, err := s.WhereContains(pp.path, pp.needle)
-		if err != nil {
-			// The needle was validated at compile, so an error here is not
-			// expected; treat it as unpostable and fall back to the full scan,
-			// which is always correct.
-			return nil, false
-		}
-		return res, true
+		return s.AppendWhereContainsIndex(dst, pp.path, pp.needle), true
 	default:
 		return nil, false
 	}
@@ -110,11 +110,11 @@ func (pp postProbe) run(s *simdjson.DocSet) ([]int, bool) {
 // andCandidates intersects the candidate sets of the postable conjuncts. An
 // unpostable conjunct is "every row" and is skipped; with no postable conjunct
 // the conjunction cannot be bounded and reports ok false (full scan).
-func andCandidates(kids []*compiledPredicate, s *simdjson.DocSet) ([]int, bool) {
+func andCandidates(kids []*compiledPredicate, s *simdjson.DocSet, w *Workspace) ([]int, bool) {
 	var acc []int
 	have := false
 	for _, kid := range kids {
-		rows, ok := kid.candidates(s)
+		rows, ok := kid.candidates(s, w)
 		if !ok {
 			continue
 		}
@@ -122,7 +122,8 @@ func andCandidates(kids []*compiledPredicate, s *simdjson.DocSet) ([]int, bool) 
 			acc, have = rows, true
 			continue
 		}
-		acc = intersectSorted(acc, rows)
+		acc = intersectSortedInto(w.nextCandidates(), acc, rows)
+		w.keepCandidates(acc)
 	}
 	if !have {
 		return nil, false
@@ -133,10 +134,10 @@ func andCandidates(kids []*compiledPredicate, s *simdjson.DocSet) ([]int, bool) 
 // orCandidates unions the candidate sets of the disjuncts. Every disjunct must
 // be postable; one unpostable disjunct forces the whole disjunction to the full
 // scan, since it could otherwise accept a row no union would cover.
-func orCandidates(kids []*compiledPredicate, s *simdjson.DocSet) ([]int, bool) {
+func orCandidates(kids []*compiledPredicate, s *simdjson.DocSet, w *Workspace) ([]int, bool) {
 	var acc []int
 	for i, kid := range kids {
-		rows, ok := kid.candidates(s)
+		rows, ok := kid.candidates(s, w)
 		if !ok {
 			return nil, false
 		}
@@ -144,15 +145,15 @@ func orCandidates(kids []*compiledPredicate, s *simdjson.DocSet) ([]int, bool) {
 			acc = rows
 			continue
 		}
-		acc = unionSorted(acc, rows)
+		acc = unionSortedInto(w.nextCandidates(), acc, rows)
+		w.keepCandidates(acc)
 	}
 	return acc, true
 }
 
 // intersectSorted returns the sorted intersection of two ascending,
 // deduplicated ordinal slices in one linear pass.
-func intersectSorted(a, b []int) []int {
-	out := make([]int, 0, min(len(a), len(b)))
+func intersectSortedInto(out, a, b []int) []int {
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
 		switch {
@@ -171,8 +172,7 @@ func intersectSorted(a, b []int) []int {
 
 // unionSorted returns the sorted union of two ascending, deduplicated ordinal
 // slices in one linear pass.
-func unionSorted(a, b []int) []int {
-	out := make([]int, 0, len(a)+len(b))
+func unionSortedInto(out, a, b []int) []int {
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
 		switch {

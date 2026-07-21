@@ -165,7 +165,7 @@ type compiledPredicate struct {
 	col    int
 	op     Op
 	lit    scalar
-	needle []byte
+	needle simdjson.Index
 	probe  postProbe
 	kids   []*compiledPredicate
 }
@@ -189,7 +189,11 @@ func compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error
 		// answer, and a nested path is not indexed.
 		if p.op == Eq && reg.paths[col].single {
 			if needle, ok := eqNeedle(cp.lit); ok {
-				cp.probe = postProbe{kind: postEq, path: reg.paths[col].name, needle: needle}
+				idx, err := buildNeedleIndex(needle)
+				if err != nil {
+					return nil, err
+				}
+				cp.probe = postProbe{kind: postEq, path: reg.paths[col].name, needle: idx}
 			}
 		}
 		return cp, nil
@@ -198,17 +202,17 @@ func compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error
 		if err != nil {
 			return nil, err
 		}
-		scalarNeedle, err := containsNeedleScalar(p.json)
+		needle, scalarNeedle, err := containsNeedleIndex(p.json)
 		if err != nil {
 			return nil, fmt.Errorf("query: Contains literal: %w", err)
 		}
-		cp := &compiledPredicate{kind: predContains, col: col, needle: []byte(p.json)}
+		cp := &compiledPredicate{kind: predContains, col: col, needle: needle}
 		// Only a scalar needle over a single top-level field prunes: the value
 		// buckets index scalars, and a structured needle would fall to a full
 		// scan inside WhereContains anyway, so leaving it unpostable avoids
 		// scanning twice.
 		if scalarNeedle && reg.paths[col].single {
-			cp.probe = postProbe{kind: postContains, path: reg.paths[col].name, needle: cp.needle}
+			cp.probe = postProbe{kind: postContains, path: reg.paths[col].name, needle: needle}
 		}
 		return cp, nil
 	case predExists:
@@ -247,25 +251,34 @@ func compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error
 // that document is a scalar (as opposed to an array or object). It reuses the
 // core validator by building the needle's index once; the root kind then tells
 // the compiler whether the value postings can prune the leaf.
-func containsNeedleScalar(s string) (bool, error) {
-	entries, err := simdjson.RequiredIndexEntries([]byte(s))
+func containsNeedleIndex(s string) (simdjson.Index, bool, error) {
+	src := []byte(s)
+	entries, err := simdjson.RequiredIndexEntries(src)
 	if err != nil {
-		return false, err
+		return simdjson.Index{}, false, err
 	}
-	idx, err := simdjson.BuildIndex([]byte(s), make([]simdjson.IndexEntry, entries))
+	idx, err := simdjson.BuildIndex(src, make([]simdjson.IndexEntry, entries))
 	if err != nil {
-		return false, err
+		return simdjson.Index{}, false, err
 	}
 	switch idx.Root().Kind() {
 	case document.Array, document.Object:
-		return false, nil
+		return idx, false, nil
 	default:
-		return true, nil
+		return idx, true, nil
 	}
 }
 
+func buildNeedleIndex(src []byte) (simdjson.Index, error) {
+	entries, err := simdjson.RequiredIndexEntries(src)
+	if err != nil {
+		return simdjson.Index{}, err
+	}
+	return simdjson.BuildIndex(src, make([]simdjson.IndexEntry, entries))
+}
+
 // eval evaluates the predicate for one row against the extracted columns.
-func (p *compiledPredicate) eval(cols [][]scalar, row int) bool {
+func (p *compiledPredicate) eval(cols [][]scalar, row int, entries *[]simdjson.IndexEntry) bool {
 	switch p.kind {
 	case predCmp:
 		return evalCmp(cols[p.col][row], p.op, p.lit)
@@ -274,28 +287,35 @@ func (p *compiledPredicate) eval(cols [][]scalar, row int) bool {
 		if len(cell.raw) == 0 {
 			return false // absent haystack contains nothing
 		}
-		ok, err := simdjson.RawContains(cell.raw, p.needle)
-		return ok && err == nil
+		need, err := simdjson.RequiredIndexEntries(cell.raw)
+		if err != nil {
+			return false
+		}
+		if cap(*entries) < need {
+			*entries = make([]simdjson.IndexEntry, need)
+		}
+		haystack, err := simdjson.BuildIndex(cell.raw, (*entries)[:need])
+		return err == nil && haystack.Root().Contains(p.needle.Root())
 	case predExists:
 		return present(cols[p.col][row])
 	case predIsNull:
 		return cols[p.col][row].kind == kindNull
 	case predAnd:
 		for _, kid := range p.kids {
-			if !kid.eval(cols, row) {
+			if !kid.eval(cols, row, entries) {
 				return false
 			}
 		}
 		return true
 	case predOr:
 		for _, kid := range p.kids {
-			if kid.eval(cols, row) {
+			if kid.eval(cols, row, entries) {
 				return true
 			}
 		}
 		return false
 	default: // predNot
-		return !p.kids[0].eval(cols, row)
+		return !p.kids[0].eval(cols, row, entries)
 	}
 }
 

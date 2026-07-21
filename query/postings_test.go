@@ -171,7 +171,8 @@ func TestPostingsSeamPrunes(t *testing.T) {
 	}
 
 	candidatesOf := func(set *simdjson.DocSet) []int {
-		return p.candidateRows(set)
+		var w Workspace
+		return p.candidateRows(set, &w)
 	}
 
 	got := candidatesOf(on)
@@ -191,7 +192,8 @@ func TestPostingsSeamPrunes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compile range: %v", err)
 	}
-	if c := pr.candidateRows(on); c != nil {
+	var w Workspace
+	if c := pr.candidateRows(on, &w); c != nil {
 		t.Fatalf("unpostable range with Postings on: candidateRows = %v, want nil (full scan)", c)
 	}
 }

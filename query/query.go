@@ -19,14 +19,21 @@
 //		Limit(10)
 //	result, err := q.Run(&docs)
 //
+// Hot paths retain their destination and scratch storage:
+//
+//	var result query.Result
+//	var workspace query.Workspace
+//	err := q.RunInto(&result, &docs, &workspace)
+//
 // The executor is column-oriented. Without an applicable posting bound it
 // extracts each needed path as a dense column and evaluates WHERE in one full
 // scan. With a selective bound it pushes the posting ordinals into extraction:
 // [simdjson.ShapeCache.AppendFieldRows] and
 // [simdjson.DocSet.AppendPointerRows] gather only candidate cells, then the
 // same compiled predicate rechecks them exactly before reduction, grouping,
-// ordering, and limiting. A compiled query is immutable and safe to Run
-// concurrently; each Run owns its transient scan state.
+// ordering, and limiting. A compiled query is immutable and safe to run
+// concurrently; Run owns its transient scan state, while concurrent RunInto
+// calls use one independent Result and Workspace pair per goroutine.
 //
 // # Value semantics
 //
@@ -317,9 +324,30 @@ func (q *Query) compileOrder(p *plan, values *pathRegistry, groupSet map[string]
 // compiles the query on first use. Run does not modify s and may be called
 // concurrently on a compiled query, each call using its own scan state.
 func (q *Query) Run(s *simdjson.DocSet) (Result, error) {
+	var result Result
+	var workspace Workspace
+	err := q.RunInto(&result, s, &workspace)
+	return result, err
+}
+
+// RunInto executes the query into caller-owned result and workspace storage.
+// The zero values of Result and Workspace are ready to use. After one warm-up,
+// executions whose row count, posting frontier, decoded text, and group count
+// fit the retained high-water marks allocate no heap memory, including stable
+// ordering, grouping, containment indexing, aggregate formatting, and escaped
+// string decoding.
+//
+// RunInto overwrites dst. Result cells may borrow both s and w; they remain
+// valid until s is modified, dst is reused, or the next RunInto using w. A
+// Workspace and Result are single-consumer. The Query itself remains safe for
+// concurrent execution with a distinct pair per goroutine.
+func (q *Query) RunInto(dst *Result, s *simdjson.DocSet, w *Workspace) error {
+	if dst == nil || s == nil || w == nil {
+		return fmt.Errorf("query: RunInto requires non-nil result, DocSet, and Workspace")
+	}
 	p, err := q.compiled()
 	if err != nil {
-		return Result{}, err
+		return err
 	}
-	return p.run(s)
+	return p.runInto(dst, s, w)
 }

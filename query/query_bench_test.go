@@ -62,6 +62,27 @@ func runQueryBench(b *testing.B, q *Query) {
 	b.ReportMetric(b.Elapsed().Seconds()*1e9/rows, "ns/doc")
 }
 
+func runQueryIntoBench(b *testing.B, q *Query) {
+	set := benchDocSet(b)
+	var dst Result
+	var w Workspace
+	if err := q.RunInto(&dst, set, &w); err != nil {
+		b.Fatalf("RunInto: %v", err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := q.RunInto(&dst, set, &w); err != nil {
+			b.Fatalf("RunInto: %v", err)
+		}
+	}
+	benchSink = dst
+	b.StopTimer()
+	rows := float64(b.N) * float64(benchDocs)
+	b.ReportMetric(rows/b.Elapsed().Seconds(), "rows/sec")
+	b.ReportMetric(b.Elapsed().Seconds()*1e9/rows, "ns/doc")
+}
+
 // BenchmarkQueryProjection1 projects a single field.
 func BenchmarkQueryProjection1(b *testing.B) {
 	runQueryBench(b, Select(Path("f0")))
@@ -86,4 +107,17 @@ func BenchmarkQuerySumAggregate(b *testing.B) {
 // BenchmarkQueryGroupBySum groups by one field and sums another.
 func BenchmarkQueryGroupBySum(b *testing.B) {
 	runQueryBench(b, Select(Path("f0"), Sum("f3")).GroupBy("f0"))
+}
+
+func BenchmarkQueryRunInto(b *testing.B) {
+	benchmarks := map[string]*Query{
+		"projection-1": Select(Path("f0")),
+		"projection-4": Select(Path("f0"), Path("f1"), Path("f2"), Path("f3")),
+		"filtered":     Select(Path("f0"), Path("f1")).Where(Cmp("f0", Eq, 0)),
+		"sum":          Select(Sum("f3")),
+		"group-sum":    Select(Path("f0"), Sum("f3")).GroupBy("f0"),
+	}
+	for name, q := range benchmarks {
+		b.Run(name, func(b *testing.B) { runQueryIntoBench(b, q) })
+	}
 }

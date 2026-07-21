@@ -124,6 +124,11 @@ The layer around that core, one line each:
   caller's result storage. Build the needle index once; warmed lookups allocate
   nothing, including long escaped strings and exact verification over compact
   shape tapes.
+- **Reusable query execution** — `query.Compile` or the builder API produces an
+  immutable query. Keep one `query.Result` and `query.Workspace` per worker and
+  call `q.RunInto(&result, &set, &workspace)`; after the retained row, posting,
+  decoded-text, and group capacities warm, projection, containment, stable
+  ordering, aggregates, and grouping execute with zero heap allocations.
 
 Ownership is uniform: an `Index` and its nodes borrow the source and the entry
 storage; `DocSet` and the caches own their arenas, and nothing they hand out is
@@ -173,6 +178,7 @@ define the methodology, gates, comparison boundaries, and pinned toolchains.
 | Compact, indented, or canonical output | `Compact`, `Indent`, `Canonicalize` |
 | Borrowed selection or repeated document navigation | `RawValue`, `Index`/`Node`, or `Parse`/`Value` |
 | Batches of documents, columnar field extraction | `DocSet`, `ShapeCache`, `KeyInterner` |
+| SQL-shaped projection, filtering, grouping, and aggregation | `query.Query.RunInto`, `query.Result`, `query.Workspace` |
 
 The advanced document APIs are moving into `document` during the pre-v1
 migration. JSON kind values already use `document.Kind`; the remaining package

@@ -5,6 +5,7 @@ import (
 
 	"github.com/thesyncim/simdjson"
 	"github.com/thesyncim/simdjson/document"
+	"github.com/thesyncim/simdjson/internal/byteview"
 )
 
 // The scalar value model and the total order the executor compares, groups,
@@ -64,6 +65,14 @@ type scalar struct {
 // classify as kindNull, so absent and null paths are indistinguishable to
 // every downstream operation, as documented.
 func classifyRaw(r simdjson.RawValue) scalar {
+	var scratch []byte
+	return classifyRawInto(r, &scratch)
+}
+
+// classifyRawInto is classifyRaw with caller-owned decoded-string storage.
+// The caller must reserve enough capacity before the first call if previously
+// returned escaped-string views must survive later calls.
+func classifyRawInto(r simdjson.RawValue, scratch *[]byte) scalar {
 	b := r.Bytes()
 	if len(b) == 0 {
 		return scalar{kind: kindNull}
@@ -81,13 +90,18 @@ func classifyRaw(r simdjson.RawValue) scalar {
 		}
 		return s
 	case document.String:
-		// A cell from a validated document always decodes; a decode error
-		// (impossible for stored documents) degrades to the raw spelling so
-		// classification stays total.
-		if text, ok, err := r.Text(); ok && err == nil {
-			return scalar{kind: kindString, sval: text, raw: b}
+		if content, clean := r.StringBytes(); clean {
+			return scalar{kind: kindString, sval: byteview.String(content), raw: b}
 		}
-		return scalar{kind: kindString, sval: string(b), raw: b}
+		mark := len(*scratch)
+		decoded, ok, err := r.AppendText(*scratch)
+		if ok && err == nil {
+			*scratch = decoded
+			return scalar{kind: kindString, sval: byteview.String(decoded[mark:]), raw: b}
+		}
+		// Stored documents are validated, so this is defensive only. Preserve
+		// a total classification without retaining a transient error.
+		return scalar{kind: kindString, sval: byteview.String(b), raw: b}
 	default:
 		return scalar{kind: kindContainer, raw: b}
 	}
