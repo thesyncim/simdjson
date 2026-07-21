@@ -41,6 +41,13 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `decoder_structural.go` — `structuralBytesOf`
 - `decoder_structural.go` — `structuralPositionsOf`
 - `docset.go` — `(*DocSet).buildDoc`
+- `docset_persist.go` — `(*DocSet).openDocRecord`
+- `docset_persist.go` — `(*persistWriter).writeEntries`
+- `docset_persist.go` — `(*persistWriter).writeNarrow`
+- `docset_persist.go` — `Open`
+- `docset_persist.go` — `appendNarrow`
+- `docset_persist.go` — `openEntries`
+- `docset_persist.go` — `package scope`
 - `docset_stream.go` — `(*DocSet).buildDocPrefix`
 - `encoder_cycle_go127.go` — `package scope`
 - `encoder_cycle_pre_go127.go` — `package scope`

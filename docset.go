@@ -138,6 +138,14 @@ type DocSet struct {
 	valueSplices []valueSplice
 	valueSeen    map[uint64]struct{}
 	valueFloor   uint32
+
+	// source is the serialized image an Open'd set borrows its arenas from
+	// (docset_persist.go): a set reconstructed by Open holds the bytes here so
+	// the zero-copy document sources and entry tapes that view into them stay
+	// alive for the set's lifetime, and it is nil for a set built by Append.
+	// The field pins the mapping; the caller owns keeping an underlying mmap
+	// mapped, and every borrowed view is invalid once it is unmapped.
+	source []byte
 }
 
 // Arena chunks grow geometrically between fixed bounds, like the interner's:
