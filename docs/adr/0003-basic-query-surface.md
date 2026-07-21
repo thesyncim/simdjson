@@ -71,7 +71,7 @@ aggregation, and group-by aggregation, against `JSON.GET` / `FT.SEARCH` /
 `FT.AGGREGATE`. Acceptance: at or above parity on every scenario single-core,
 with the containment predicate as a capability RedisJSON lacks; space per ADR
 0002. Reproducible harness, misses reported with causes — the same honesty
-rules as the gjson/sonic and PostgreSQL scoreboards.
+rules as the gjson/sonic scoreboard.
 
 ## Reprioritization of ADR 0002
 
