@@ -63,6 +63,27 @@ Targets, to be validated by the phase-5 harness on shared corpora
 
 Misses are reported as measured; targets bind the design, not the report.
 
+## Phase 0 findings (measured 2026-07-21, PostgreSQL 18.4)
+
+The first baseline run (benchmarks/results/phase0-report.md) confirmed the
+model where it was right and corrected it where it was wrong. Ingest meets
+its bound with room (22.9-144x). Heterogeneous space is already met (0.88x)
+and clustered synthetics sit at 0.90-0.95x awaiting phase 1. Two corrections:
+
+- **Real-corpus space is a compression battle.** PostgreSQL's TOAST
+  compresses large jsonb values (citm: 128 MiB of minified source stored in a
+  43 MiB table), producing 3.2-9.3x losses that no tape reduction can close.
+  Phase 3's cold columnar mode is therefore load-bearing, not stretch, and
+  must include source-byte compression for at-rest documents.
+- **The extraction bound assumed a slower competitor.** PostgreSQL 18's
+  per-row sequential `->>` costs ~100 ns on this hardware, so small-document
+  corpora measure 3-8x rather than 50x. The bound stays as written — the
+  distance is the roadmap: part of it was our own fast path not engaging on
+  the baseline corpora (fixed in phase 1), the rest falls to phases 1-2.
+
+Existence and containment lose up to 100x to GIN postings, as predicted;
+those rows are the quantified mandate for phase 4.
+
 ## Phases
 
 **Phase 0 - baseline and methodology.** Corpus set, PostgreSQL measurement
