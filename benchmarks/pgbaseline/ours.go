@@ -155,9 +155,16 @@ func MeasureCorpus(dir string, m Manifest, hashKeys, shapeTapes bool, reps int) 
 	}
 	entrySize := int64(unsafe.Sizeof(simdjson.IndexEntry{}))
 	st := set.Stats()
-	v.Entries = st.TapeEntries + st.ValueEntries
+	// Entries counts every stored value entry across both widths; the modeled
+	// floor costs the wide ones (classic tapes and wide value arrays) at the
+	// full entry size and the narrow ones at half, plus one entry-sized header
+	// per shape-taped document.
+	v.Entries = st.TapeEntries + st.ValueEntries + st.NarrowValueEntries
 	v.ShapeTapedDocs = int64(st.ShapeTaped)
-	v.ModeledBytes = m.SourceBytes + v.Entries*entrySize + v.ShapeTapedDocs*entrySize
+	v.ModeledBytes = m.SourceBytes +
+		(st.TapeEntries+st.ValueEntries)*entrySize +
+		st.NarrowValueEntries*(entrySize/2) +
+		v.ShapeTapedDocs*entrySize
 
 	// Queries. Every predicate below is a full column scan via
 	// AppendPointer — the pre-postings baseline.
