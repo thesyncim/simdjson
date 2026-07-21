@@ -129,6 +129,43 @@ dependencies is quarantined in the separate benchmarks module. The v1 API
 boundary (ADR 0001) is the checkpoint for partitioning the exported surface,
 including a possible store subpackage once the layout freezes.
 
+## Gap closure designs (adopted 2026-07-21)
+
+Phase 0 left four measured gaps. Each closes with a specific mechanism:
+
+**Gap A — real-corpus space (3.2-9.3x, cause: TOAST compression).**
+PostgreSQL compresses byte-wise and pays whole-value decompression on every
+access. We compress structurally instead: a corpus-wide **value dictionary**
+(the KeyInterner discipline applied to value spans) deduplicates repeated
+values — the enum strings, names, and labels that make real corpora
+compressible — while every value stays directly addressable at tape speed.
+Shape-deduplicated tapes remove key redundancy; the value dictionary removes
+value redundancy; documents become shape ref + fixed-width value refs.
+Optional stdlib flate wraps only cold at-rest residuals where random access
+is explicitly surrendered. Lands with phase 3 persistence, measured against
+the citm row (the worst loss, 8.3x) as the acceptance driver.
+
+**Gap B — existence and containment (up to 100x, cause: no postings).**
+Two posting families, both opt-in at ingest: key existence resolves as
+interner ID -> set of shapes containing the key -> shape membership doc
+lists (already implicit in shape-deduplicated storage) plus a scan of the
+non-conforming remainder; value containment prunes through
+(path hash, value hash) -> document bitmap postings, the `jsonb_path_ops`
+analogue, with candidates verified by **RawContains**, a JSONB-compatible
+containment evaluator whose oracle is PostgreSQL's documented `@>`
+semantics. RawContains is independent of the posting layer and lands first.
+
+**Gap C — extraction distance (3-8x vs the 50x bound).** Decomposed by
+measurement: the baseline-corpus fast-path miss is fixed in phase 1
+(34 -> 5 ns/doc); dual-width tapes (phase 2) halve the remaining memory
+traffic; the bound is re-measured after both land before any further
+mechanism is considered.
+
+**Gap D — large-document ingest (7.8x of 10x; ~500 MB/s on 466 KiB
+documents vs 1.4-1.9 GB/s elsewhere).** Cause unknown; owned as a profiled
+investigation (window interaction, chunk roll, or enrichment pass), fixed
+or explained with numbers.
+
 ## Non-goals
 
 Durability, replication, MVCC, SQL/jsonpath planning, multi-core scheduling
