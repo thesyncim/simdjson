@@ -1,0 +1,362 @@
+STEP version
+                                            version                                            
+-----------------------------------------------------------------------------------------------
+ PostgreSQL 18.4 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+(1 row)
+
+Time: 0.247 ms
+STEP setting_shared_buffers
+ shared_buffers 
+----------------
+ 1GB
+(1 row)
+
+Time: 0.067 ms
+STEP setting_maintenance_work_mem
+ maintenance_work_mem 
+----------------------
+ 1GB
+(1 row)
+
+Time: 0.123 ms
+STEP setting_max_parallel_workers_per_gather
+ max_parallel_workers_per_gather 
+---------------------------------
+ 0
+(1 row)
+
+Time: 0.079 ms
+STEP setting_max_parallel_maintenance_workers
+ max_parallel_maintenance_workers 
+----------------------------------
+ 0
+(1 row)
+
+Time: 0.101 ms
+STEP setting_max_wal_size
+ max_wal_size 
+--------------
+ 4GB
+(1 row)
+
+Time: 0.074 ms
+STEP setting_autovacuum
+ autovacuum 
+------------
+ off
+(1 row)
+
+Time: 0.088 ms
+Time: 0.159 ms
+NOTICE:  table "t" does not exist, skipping
+Time: 1.254 ms
+STEP copy
+Time: 1668.493 ms (00:01.668)
+STEP vacuum
+Time: 4.061 ms
+STEP rowcount
+ count 
+-------
+   288
+(1 row)
+
+Time: 0.159 ms
+STEP size_table
+ pg_table_size 
+---------------
+      32292864
+(1 row)
+
+Time: 0.189 ms
+STEP size_total_unindexed
+ pg_total_relation_size 
+------------------------
+               32292864
+(1 row)
+
+Time: 0.105 ms
+STEP explain_q_extract_seq
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=6.32..6.33 rows=1 width=8) (actual time=63.913..63.913 rows=1.00 loops=1)
+   Buffers: shared hit=4610
+   ->  Seq Scan on t  (cost=0.00..4.88 rows=288 width=18) (actual time=0.002..0.031 rows=288.00 loops=1)
+         Buffers: shared hit=2
+ Planning:
+   Buffers: shared hit=6
+ Planning Time: 0.025 ms
+ Execution Time: 63.923 ms
+(8 rows)
+
+Time: 64.175 ms
+STEP q_extract_seq
+ count 
+-------
+   288
+(1 row)
+
+Time: 61.057 ms
+STEP q_extract_seq
+ count 
+-------
+   288
+(1 row)
+
+Time: 60.282 ms
+STEP q_extract_seq
+ count 
+-------
+   288
+(1 row)
+
+Time: 60.180 ms
+STEP explain_q_extract_ctid
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ Tid Scan on t  (cost=0.00..4.02 rows=1 width=32) (actual time=0.282..0.293 rows=1.00 loops=1)
+   TID Cond: (ctid = '(0,1)'::tid)
+   Buffers: shared hit=17
+ Planning:
+   Buffers: shared hit=7
+ Planning Time: 0.056 ms
+ Execution Time: 0.299 ms
+(7 rows)
+
+Time: 0.558 ms
+STEP q_extract_ctid
+                                                                                                                                                                ?column?                                                                                                                                                                
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"count": 100, "query": "%E4%B8%80", "max_id": 505874924095815700, "since_id": 0, "max_id_str": "505874924095815681", "refresh_url": "?since_id=505874924095815681&q=%E4%B8%80&include_entities=1", "completed_in": 0.087, "next_results": "?max_id=505874847260352512&q=%E4%B8%80&count=100&include_entities=1", "since_id_str": "0"}
+(1 row)
+
+Time: 0.313 ms
+STEP q_extract_ctid
+                                                                                                                                                                ?column?                                                                                                                                                                
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"count": 100, "query": "%E4%B8%80", "max_id": 505874924095815700, "since_id": 0, "max_id_str": "505874924095815681", "refresh_url": "?since_id=505874924095815681&q=%E4%B8%80&include_entities=1", "completed_in": 0.087, "next_results": "?max_id=505874847260352512&q=%E4%B8%80&count=100&include_entities=1", "since_id_str": "0"}
+(1 row)
+
+Time: 0.298 ms
+STEP q_extract_ctid
+                                                                                                                                                                ?column?                                                                                                                                                                
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"count": 100, "query": "%E4%B8%80", "max_id": 505874924095815700, "since_id": 0, "max_id_str": "505874924095815681", "refresh_url": "?since_id=505874924095815681&q=%E4%B8%80&include_entities=1", "completed_in": 0.087, "next_results": "?max_id=505874847260352512&q=%E4%B8%80&count=100&include_entities=1", "since_id_str": "0"}
+(1 row)
+
+Time: 0.292 ms
+STEP explain_q_exist_seq
+                                              QUERY PLAN                                               
+-------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=5.61..5.62 rows=1 width=8) (actual time=59.759..59.760 rows=1.00 loops=1)
+   Buffers: shared hit=4610
+   ->  Seq Scan on t  (cost=0.00..5.60 rows=3 width=0) (actual time=0.220..59.730 rows=288.00 loops=1)
+         Filter: (doc ? 'statuses'::text)
+         Buffers: shared hit=4610
+ Planning Time: 0.010 ms
+ Execution Time: 59.767 ms
+(7 rows)
+
+Time: 59.974 ms
+STEP q_exist_seq
+ count 
+-------
+   288
+(1 row)
+
+Time: 59.889 ms
+STEP q_exist_seq
+ count 
+-------
+   288
+(1 row)
+
+Time: 60.771 ms
+STEP q_exist_seq
+ count 
+-------
+   288
+(1 row)
+
+Time: 61.161 ms
+STEP explain_q_contain_seq
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=5.61..5.62 rows=1 width=8) (actual time=60.403..60.404 rows=1.00 loops=1)
+   Buffers: shared hit=4610
+   ->  Seq Scan on t  (cost=0.00..5.60 rows=3 width=0) (actual time=60.400..60.400 rows=0.00 loops=1)
+         Filter: (doc @> '{"": ""}'::jsonb)
+         Rows Removed by Filter: 288
+         Buffers: shared hit=4610
+ Planning Time: 0.027 ms
+ Execution Time: 60.415 ms
+(8 rows)
+
+Time: 60.663 ms
+STEP q_contain_seq
+ count 
+-------
+     0
+(1 row)
+
+Time: 60.416 ms
+STEP q_contain_seq
+ count 
+-------
+     0
+(1 row)
+
+Time: 61.041 ms
+STEP q_contain_seq
+ count 
+-------
+     0
+(1 row)
+
+Time: 60.414 ms
+STEP create_gin_ops_fastupdate_on
+Time: 1212.757 ms (00:01.213)
+STEP size_gin_ops
+ pg_relation_size 
+------------------
+          1474560
+(1 row)
+
+Time: 0.253 ms
+STEP explain_q_exist_gin_ops
+                                              QUERY PLAN                                               
+-------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=5.61..5.62 rows=1 width=8) (actual time=63.685..63.686 rows=1.00 loops=1)
+   Buffers: shared hit=4610
+   ->  Seq Scan on t  (cost=0.00..5.60 rows=3 width=0) (actual time=0.369..63.643 rows=288.00 loops=1)
+         Filter: (doc ? 'statuses'::text)
+         Buffers: shared hit=4610
+ Planning:
+   Buffers: shared hit=11
+ Planning Time: 0.072 ms
+ Execution Time: 63.696 ms
+(9 rows)
+
+Time: 63.966 ms
+STEP q_exist_gin_ops
+ count 
+-------
+   288
+(1 row)
+
+Time: 62.093 ms
+STEP q_exist_gin_ops
+ count 
+-------
+   288
+(1 row)
+
+Time: 61.536 ms
+STEP q_exist_gin_ops
+ count 
+-------
+   288
+(1 row)
+
+Time: 60.356 ms
+STEP explain_q_contain_gin_ops
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=5.61..5.62 rows=1 width=8) (actual time=60.684..60.684 rows=1.00 loops=1)
+   Buffers: shared hit=4610
+   ->  Seq Scan on t  (cost=0.00..5.60 rows=3 width=0) (actual time=60.681..60.681 rows=0.00 loops=1)
+         Filter: (doc @> '{"": ""}'::jsonb)
+         Rows Removed by Filter: 288
+         Buffers: shared hit=4610
+ Planning:
+   Buffers: shared hit=4
+ Planning Time: 0.061 ms
+ Execution Time: 60.696 ms
+(10 rows)
+
+Time: 60.998 ms
+STEP q_contain_gin_ops
+ count 
+-------
+     0
+(1 row)
+
+Time: 60.059 ms
+STEP q_contain_gin_ops
+ count 
+-------
+     0
+(1 row)
+
+Time: 61.601 ms
+STEP q_contain_gin_ops
+ count 
+-------
+     0
+(1 row)
+
+Time: 60.763 ms
+Time: 1.642 ms
+STEP create_gin_ops_fastupdate_off
+Time: 1244.951 ms (00:01.245)
+STEP size_gin_ops_fastupdate_off
+ pg_relation_size 
+------------------
+          1474560
+(1 row)
+
+Time: 0.228 ms
+Time: 0.646 ms
+STEP create_gin_path_ops
+Time: 442.330 ms
+STEP size_gin_path_ops
+ pg_relation_size 
+------------------
+          1581056
+(1 row)
+
+Time: 0.256 ms
+STEP explain_q_contain_gin_path_ops
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=5.61..5.62 rows=1 width=8) (actual time=66.601..66.602 rows=1.00 loops=1)
+   Buffers: shared hit=4610
+   ->  Seq Scan on t  (cost=0.00..5.60 rows=3 width=0) (actual time=66.597..66.597 rows=0.00 loops=1)
+         Filter: (doc @> '{"": ""}'::jsonb)
+         Rows Removed by Filter: 288
+         Buffers: shared hit=4610
+ Planning:
+   Buffers: shared hit=12
+ Planning Time: 0.116 ms
+ Execution Time: 66.613 ms
+(10 rows)
+
+Time: 66.973 ms
+STEP q_contain_gin_path_ops
+ count 
+-------
+     0
+(1 row)
+
+Time: 63.072 ms
+STEP q_contain_gin_path_ops
+ count 
+-------
+     0
+(1 row)
+
+Time: 64.479 ms
+STEP q_contain_gin_path_ops
+ count 
+-------
+     0
+(1 row)
+
+Time: 63.518 ms
+STEP size_total_with_path_ops
+ pg_total_relation_size 
+------------------------
+               33873920
+(1 row)
+
+Time: 0.183 ms
+Time: 4.532 ms

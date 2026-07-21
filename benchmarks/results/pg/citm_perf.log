@@ -1,0 +1,374 @@
+STEP version
+                                            version                                            
+-----------------------------------------------------------------------------------------------
+ PostgreSQL 18.4 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit
+(1 row)
+
+Time: 0.362 ms
+STEP setting_shared_buffers
+ shared_buffers 
+----------------
+ 1GB
+(1 row)
+
+Time: 0.096 ms
+STEP setting_maintenance_work_mem
+ maintenance_work_mem 
+----------------------
+ 1GB
+(1 row)
+
+Time: 0.068 ms
+STEP setting_max_parallel_workers_per_gather
+ max_parallel_workers_per_gather 
+---------------------------------
+ 0
+(1 row)
+
+Time: 0.072 ms
+STEP setting_max_parallel_maintenance_workers
+ max_parallel_maintenance_workers 
+----------------------------------
+ 0
+(1 row)
+
+Time: 0.098 ms
+STEP setting_max_wal_size
+ max_wal_size 
+--------------
+ 4GB
+(1 row)
+
+Time: 0.053 ms
+STEP setting_autovacuum
+ autovacuum 
+------------
+ off
+(1 row)
+
+Time: 0.107 ms
+NOTICE:  table "t" does not exist, skipping
+Time: 0.215 ms
+Time: 1.438 ms
+STEP copy
+Time: 1914.402 ms (00:01.914)
+STEP vacuum
+Time: 82.980 ms
+STEP rowcount
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 5.318 ms
+STEP size_table
+ pg_table_size 
+---------------
+      45400064
+(1 row)
+
+Time: 0.407 ms
+STEP size_total_unindexed
+ pg_total_relation_size 
+------------------------
+               45400064
+(1 row)
+
+Time: 0.165 ms
+STEP explain_q_extract_seq
+                                                   QUERY PLAN                                                    
+-----------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=6617.84..6617.85 rows=1 width=8) (actual time=43.052..43.053 rows=1.00 loops=1)
+   Buffers: shared hit=5536
+   ->  Seq Scan on t  (cost=0.00..6257.23 rows=72123 width=570) (actual time=0.002..2.889 rows=72123.00 loops=1)
+         Buffers: shared hit=5536
+ Planning:
+   Buffers: shared hit=6
+ Planning Time: 0.035 ms
+ Execution Time: 43.064 ms
+(8 rows)
+
+Time: 43.544 ms
+STEP q_extract_seq
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 40.621 ms
+STEP q_extract_seq
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 40.888 ms
+STEP q_extract_seq
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 41.881 ms
+STEP explain_q_extract_ctid
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ Tid Scan on t  (cost=0.00..4.02 rows=1 width=32) (actual time=0.005..0.005 rows=1.00 loops=1)
+   TID Cond: (ctid = '(0,1)'::tid)
+   Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=3 read=4
+ Planning Time: 0.065 ms
+ Execution Time: 0.017 ms
+(7 rows)
+
+Time: 0.329 ms
+STEP q_extract_ctid
+   ?column?    
+---------------
+ PLEYEL_PLEYEL
+(1 row)
+
+Time: 0.105 ms
+STEP q_extract_ctid
+   ?column?    
+---------------
+ PLEYEL_PLEYEL
+(1 row)
+
+Time: 0.139 ms
+STEP q_extract_ctid
+   ?column?    
+---------------
+ PLEYEL_PLEYEL
+(1 row)
+
+Time: 0.072 ms
+STEP explain_q_exist_seq
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=6468.71..6468.72 rows=1 width=8) (actual time=44.021..44.021 rows=1.00 loops=1)
+   Buffers: shared hit=5536
+   ->  Seq Scan on t  (cost=0.00..6437.54 rows=12469 width=0) (actual time=0.005..42.097 rows=72123.00 loops=1)
+         Filter: (doc ? 'name'::text)
+         Buffers: shared hit=5536
+ Planning Time: 0.018 ms
+ Execution Time: 44.031 ms
+(7 rows)
+
+Time: 44.535 ms
+STEP q_exist_seq
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 40.939 ms
+STEP q_exist_seq
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 41.708 ms
+STEP q_exist_seq
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 41.335 ms
+STEP explain_q_contain_seq
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=6468.71..6468.72 rows=1 width=8) (actual time=45.049..45.050 rows=1.00 loops=1)
+   Buffers: shared hit=5536
+   ->  Seq Scan on t  (cost=0.00..6437.54 rows=12469 width=0) (actual time=0.006..43.240 rows=72123.00 loops=1)
+         Filter: (doc @> '{"venueCode": "PLEYEL_PLEYEL"}'::jsonb)
+         Buffers: shared hit=5536
+ Planning Time: 0.042 ms
+ Execution Time: 45.061 ms
+(7 rows)
+
+Time: 45.364 ms
+STEP q_contain_seq
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 43.139 ms
+STEP q_contain_seq
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 43.159 ms
+STEP q_contain_seq
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 42.908 ms
+STEP create_gin_ops_fastupdate_on
+Time: 1467.163 ms (00:01.467)
+STEP size_gin_ops
+ pg_relation_size 
+------------------
+          5611520
+(1 row)
+
+Time: 0.320 ms
+STEP explain_q_exist_gin_ops
+                                                            QUERY PLAN                                                            
+----------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=5817.80..5817.81 rows=1 width=8) (actual time=46.973..46.974 rows=1.00 loops=1)
+   Buffers: shared hit=5502
+   ->  Bitmap Heap Scan on t  (cost=94.77..5786.63 rows=12469 width=0) (actual time=2.664..45.103 rows=72123.00 loops=1)
+         Recheck Cond: (doc ? 'name'::text)
+         Heap Blocks: exact=5488
+         Buffers: shared hit=5502
+         ->  Bitmap Index Scan on idx_ops  (cost=0.00..91.65 rows=12469 width=0) (actual time=2.266..2.267 rows=72123.00 loops=1)
+               Index Cond: (doc ? 'name'::text)
+               Index Searches: 1
+               Buffers: shared hit=14
+ Planning:
+   Buffers: shared hit=11
+ Planning Time: 0.083 ms
+ Execution Time: 47.026 ms
+(14 rows)
+
+Time: 47.328 ms
+STEP q_exist_gin_ops
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 43.871 ms
+STEP q_exist_gin_ops
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 44.257 ms
+STEP q_exist_gin_ops
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 43.318 ms
+STEP explain_q_contain_gin_ops
+                                                            QUERY PLAN                                                             
+-----------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=5826.48..5826.49 rows=1 width=8) (actual time=49.690..49.690 rows=1.00 loops=1)
+   Buffers: shared hit=5516
+   ->  Bitmap Heap Scan on t  (cost=103.44..5795.31 rows=12469 width=0) (actual time=2.949..47.634 rows=72123.00 loops=1)
+         Recheck Cond: (doc @> '{"venueCode": "PLEYEL_PLEYEL"}'::jsonb)
+         Heap Blocks: exact=5488
+         Buffers: shared hit=5516
+         ->  Bitmap Index Scan on idx_ops  (cost=0.00..100.33 rows=12469 width=0) (actual time=2.602..2.603 rows=72123.00 loops=1)
+               Index Cond: (doc @> '{"venueCode": "PLEYEL_PLEYEL"}'::jsonb)
+               Index Searches: 1
+               Buffers: shared hit=28
+ Planning:
+   Buffers: shared hit=4
+ Planning Time: 0.066 ms
+ Execution Time: 49.744 ms
+(14 rows)
+
+Time: 49.988 ms
+STEP q_contain_gin_ops
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 48.228 ms
+STEP q_contain_gin_ops
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 47.244 ms
+STEP q_contain_gin_ops
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 46.600 ms
+Time: 1.761 ms
+STEP create_gin_ops_fastupdate_off
+Time: 1455.873 ms (00:01.456)
+STEP size_gin_ops_fastupdate_off
+ pg_relation_size 
+------------------
+          5611520
+(1 row)
+
+Time: 0.221 ms
+Time: 0.833 ms
+STEP create_gin_path_ops
+Time: 477.473 ms
+STEP size_gin_path_ops
+ pg_relation_size 
+------------------
+          5136384
+(1 row)
+
+Time: 0.180 ms
+STEP explain_q_contain_gin_path_ops
+                                                            QUERY PLAN                                                             
+-----------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=5817.80..5817.81 rows=1 width=8) (actual time=49.135..49.136 rows=1.00 loops=1)
+   Buffers: shared hit=5502
+   ->  Bitmap Heap Scan on t  (cost=94.77..5786.63 rows=12469 width=0) (actual time=2.135..47.290 rows=72123.00 loops=1)
+         Recheck Cond: (doc @> '{"venueCode": "PLEYEL_PLEYEL"}'::jsonb)
+         Heap Blocks: exact=5488
+         Buffers: shared hit=5502
+         ->  Bitmap Index Scan on idx_path  (cost=0.00..91.65 rows=12469 width=0) (actual time=1.798..1.798 rows=72123.00 loops=1)
+               Index Cond: (doc @> '{"venueCode": "PLEYEL_PLEYEL"}'::jsonb)
+               Index Searches: 1
+               Buffers: shared hit=14
+ Planning:
+   Buffers: shared hit=14
+ Planning Time: 0.090 ms
+ Execution Time: 49.190 ms
+(14 rows)
+
+Time: 49.573 ms
+STEP q_contain_gin_path_ops
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 46.177 ms
+STEP q_contain_gin_path_ops
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 45.887 ms
+STEP q_contain_gin_path_ops
+ count 
+-------
+ 72123
+(1 row)
+
+Time: 46.436 ms
+STEP size_total_with_path_ops
+ pg_total_relation_size 
+------------------------
+               50536448
+(1 row)
+
+Time: 0.152 ms
+Time: 3.647 ms

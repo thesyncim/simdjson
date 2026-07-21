@@ -31,11 +31,12 @@
 #   KEEP       set to 1 to leave the container running afterwards
 set -euo pipefail
 
+args=(); for a in "$@"; do args+=("$(cd "$a" && pwd)"); done; set -- "${args[@]}"
 cd "$(dirname "$0")"
 
 PG_IMAGE=${PG_IMAGE:-postgres:18.4-alpine}
 REPS=${REPS:-3}
-RESULTS=${RESULTS:-results/pg}
+RESULTS=${RESULTS:-../results/pg}
 CONTAINER=simdjson-pgbaseline
 
 [ $# -ge 1 ] || { echo "usage: $0 corpus-dir..." >&2; exit 2; }
