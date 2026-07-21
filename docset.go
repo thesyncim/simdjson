@@ -106,6 +106,38 @@ type DocSet struct {
 	// WhereContains; a partial index (Postings enabled late) is detected and
 	// bypassed, so the pointer being non-nil never forces a stale answer.
 	postings *docPostings
+
+	// ValueDict opts the set into the corpus-wide value dictionary, read at
+	// each Append like ShapeTapes: a value span that recurs across the set —
+	// an enum string, a label, a repeated sub-object — is interned once into
+	// the shared arena, and each later occurrence records a compact reference
+	// in place of the bytes, from which a compacting store drops the repeated
+	// source while every value still resolves to a stable arena view in O(1)
+	// (no decompression). Shape tapes remove key redundancy; the dictionary
+	// removes value redundancy, and the two compose. Semantics never change:
+	// every read is byte-identical to classic storage, the arena holding bytes
+	// identical to the source they stand in for — so the mode is a space lever,
+	// off by default, and the classic paths are untouched when it is off. Set
+	// it before the first Append. See docset_valuedict.go for the
+	// representation, its read contract, and the read==source invariant.
+	ValueDict bool
+
+	// Value-dictionary state (docset_valuedict.go), populated only under
+	// ValueDict. values is the corpus-wide interner arena, never-moving like
+	// the ShapeCache; valueSplices is the set-wide slab holding one record per
+	// dictionary-backed occurrence, in per-document source order; valueRefs is
+	// empty or docs-aligned and windows each document's records within the
+	// slab; valueSeen gates interning on a value's second sighting, so a
+	// singleton never costs an entry it cannot amortize. valueFloor is the
+	// interning length floor (zero selects valueDictMinSpan) — a test seam the
+	// exhaustive suite lowers to one so every repeated span is dictionary-
+	// backed and the arena read path is exercised on every value shape; nothing
+	// outside tests sets it.
+	values       ValueInterner
+	valueRefs    []valueDictRef
+	valueSplices []valueSplice
+	valueSeen    map[uint64]struct{}
+	valueFloor   uint32
 }
 
 // Arena chunks grow geometrically between fixed bounds, like the interner's:
@@ -277,13 +309,23 @@ func (s *DocSet) AppendPointer(dst []RawValue, pointer CompiledPointer) ([]RawVa
 			if len(rest) == 0 {
 				// The common single-token pointer names the value itself: its
 				// span is already in hand at both entry widths, so the raw
-				// slice is taken with no node to reconstitute or escape.
+				// slice is taken with no node to reconstitute or escape. Under
+				// ValueDict a dictionary-backed value reads its interned span
+				// from the shared arena instead — byte-identical.
 				if r.narrow {
 					nv := s.narrow[r.off+uint32(ord)]
-					dst = append(dst, RawValue{src: doc.src[nv.span&0xFFFF : nv.span>>16]})
+					raw := RawValue{src: doc.src[nv.span&0xFFFF : nv.span>>16]}
+					if s.ValueDict {
+						raw = s.valueRaw(i, nv.span&0xFFFF, raw)
+					}
+					dst = append(dst, raw)
 				} else {
 					e := &doc.entries[ord]
-					dst = append(dst, RawValue{src: doc.src[e.start:e.end]})
+					raw := RawValue{src: doc.src[e.start:e.end]}
+					if s.ValueDict {
+						raw = s.valueRaw(i, e.start, raw)
+					}
+					dst = append(dst, raw)
 				}
 				continue
 			}
@@ -308,7 +350,11 @@ func (s *DocSet) AppendPointer(dst []RawValue, pointer CompiledPointer) ([]RawVa
 				dst = append(dst, RawValue{})
 				continue
 			}
-			dst = append(dst, next.Raw())
+			raw := next.Raw()
+			if s.ValueDict {
+				raw = s.valueRaw(i, next.entry.start, raw)
+			}
+			dst = append(dst, raw)
 			continue
 		}
 		node, ok, err := s.docs[i].PointerCompiled(pointer)
@@ -319,7 +365,11 @@ func (s *DocSet) AppendPointer(dst []RawValue, pointer CompiledPointer) ([]RawVa
 			dst = append(dst, RawValue{})
 			continue
 		}
-		dst = append(dst, node.Raw())
+		raw := node.Raw()
+		if s.ValueDict {
+			raw = s.valueRaw(i, node.entry.start, raw)
+		}
+		dst = append(dst, raw)
 	}
 	return dst, nil
 }

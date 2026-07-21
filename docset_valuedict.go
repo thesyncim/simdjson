@@ -5,45 +5,53 @@ import (
 	"github.com/thesyncim/simdjson/internal/byteview"
 )
 
-// Corpus-wide value dictionary: structural deduplication of repeated value
-// spans across a document set.
+// Corpus-wide value dictionary: the DocSet storage lever behind DocSet.ValueDict.
 //
 // Real corpora repeat their values as hard as they repeat their keys: a
 // ticketing feed names the same handful of venues, seat categories, and area
 // sub-objects across every performance; a social feed repeats the same language
-// tags, source strings, and boilerplate across every post. A general-purpose
-// compressor removes this byte-wise and pays whole-value decompression on every
-// read. A ValueDictionary removes it structurally, once, without surrendering
-// random access: it interns each distinct value span into a ValueInterner
-// (value_dict.go) and records, per document, a compact reference in place of
-// each repeated occurrence, from which a compacting store can drop the repeated
-// source bytes while every value still resolves to a stable arena view in O(1).
+// tags, source strings, and boilerplate across every post. Shape-deduplicated
+// tapes (docset_shape.go) stop paying for the repeated *keys* by moving them
+// into a compiled shape; the value dictionary stops paying for the repeated
+// *values*. A general-purpose compressor removes this byte-wise and pays
+// whole-value decompression on every read. The dictionary removes it
+// structurally, once, without surrendering random access: it interns each
+// distinct value span into the set-wide ValueInterner arena (value_dict.go) and
+// records, per document, a compact reference in place of each repeated
+// occurrence, from which a compacting store drops the repeated source bytes
+// while every value still resolves to a stable arena view in O(1) — no
+// decompression.
 //
 //	doc i: [ ... "PLEYEL_PLEYEL" ... {"areaId":205705999,"blockIds":[]} ... ]
 //	doc j: [ ... "PLEYEL_PLEYEL" ... {"areaId":205705999,"blockIds":[]} ... ]
 //	dictionary: id7 -> "PLEYEL_PLEYEL"   id9 -> {"areaId":205705999,"blockIds":[]}
 //	doc i splices: (off,id7) (off,id9)   doc j splices: (off,id7) (off,id9)
 //
-// A building block, not a storage mode. A ValueDictionary indexes a DocSet
-// through its public Doc accessor and the tape's own coordinates; it never
-// modifies the set. That keeps it orthogonal to the storage modes it overlays —
-// it composes with ShapeTapes for free, because Doc yields a conforming
-// document's classic tape on demand, so the shape removes key redundancy and
-// the dictionary removes value redundancy over the same documents. The value
-// contract is unchanged: a document still reads through its Index exactly as
-// before; the dictionary is the parallel structure from which the repeated
-// bytes could be dropped.
+// A space lever, and it composes. The dictionary indexes each document's
+// classic tape at ingest and never changes its semantics: a document still
+// reads through its Index exactly as before, the dictionary being the parallel
+// structure a compacting store drops the repeated bytes into. That keeps it
+// orthogonal to shape tapes — the shape removes key redundancy and the
+// dictionary removes value redundancy over the same documents. When both modes
+// are on, a shape-taped document's classic tape is synthesized transiently for
+// the ingest walk (never cached, so the shape tape keeps its at-rest space
+// win), so the two levers stack rather than trade.
 //
 // What is interned. A value span is any complete value the tape carries — a
 // scalar or a whole container subtree — identified by its raw bytes. Interning
 // by raw bytes keeps the value exact: a spliced value reads back byte-identical,
-// number spellings included, and a container subtree reinstates verbatim. The
-// lever that closes the real-corpus gap is the container span: one four-byte
-// reference replaces a recurring sub-object's bytes and its whole entry subtree,
-// where a scalar reference would replace only bytes comparable in size to the
-// reference itself. The walk is therefore greedy and top-down — a repeated span
-// is taken whole, its members never separately considered — and gates on a
-// length floor so a span too short to out-save its reference stays inline.
+// number spellings included, and a container subtree reinstates verbatim. This
+// is the KeyInterner discipline (intern.go) applied to value content, with one
+// deliberate difference documented at ValueInterner: values intern by their raw
+// span, verbatim, because RawValue.Bytes, NumberText, and every round trip
+// return the original bytes and a number's spelling ("1e3" versus "1000") is
+// significant. The lever that closes the real-corpus gap is the container span:
+// one reference replaces a recurring sub-object's bytes and its whole entry
+// subtree, where a scalar reference would replace only bytes comparable in size
+// to the reference itself. The walk is therefore greedy and top-down — a
+// repeated span is taken whole, its members never separately considered — and
+// gates on a length floor so a span too short to out-save its reference stays
+// inline.
 //
 // Sighting economics. Interning a value seen once costs a dictionary entry with
 // no saving, so — as the shape cache gates compilation behind a repeat sighting
@@ -52,28 +60,43 @@ import (
 // therefore pays only a hash-set probe per candidate, never a dictionary entry
 // it cannot amortize.
 //
-// Read contract. A spliced value resolves through ValueInterner.Value in O(1) to
-// a stable arena view — no decompression. The dictionary's invariant
-// (value_dict.go) is that Value(id) is byte-identical to the span interned for
-// id, so a spliced reference reads back exactly the source bytes it replaced;
-// the bounded-exhaustive differential test checks this against classic reads for
-// the whole small-scope domain. The one thing given up is reconstructing a
-// document's exact original byte layout cheaply — the bytes are split between the
-// shared dictionary and each document's residual — so Reconstruct splices them
-// back, the cold operation the space win is traded for; every value stays
-// directly addressed.
+// Read contract. A dictionary-backed value resolves — through DocSet.DocValue
+// for a node handle, DocSet.AppendPointer for a batch column, or the RawValue a
+// splice yields — to a view over the interned span in the shared arena, in O(1),
+// with no decompression. The invariant that makes a dictionary read identical to
+// a source read is ValueInterner's: Value(id) is byte-identical to the span
+// interned for id, and stays so for the set's lifetime because the arena never
+// moves an interned span. A resolved node carries the source entry's info word
+// verbatim (kind and flags), so every scalar accessor — a pure function of the
+// bytes and that word — returns exactly what the source-backed node would; the
+// bounded-exhaustive differential (docset_valuedict_test.go) checks this against
+// classic reads across the whole small-scope domain. A resolved node is a
+// whole-value materialization handle, not a navigable subtree: a container's
+// members are not entries in the arena, so structural navigation stays on the
+// source tape the node came from, which the dictionary never alters.
 //
 // Everything here is safe Go: the interning walk, the splice records, and the
-// reconstruction use ordinary slice indexing bounded by the tape's own next
-// links.
+// arena reads use ordinary slice indexing and the same tape accessors that read
+// padding-free document slices, whose word kernels anchor every load inside the
+// value's own bytes (number_digits.go), so an interned span needs no trailing
+// padding.
 
-// valueDictMinSpan is the default length floor for interning. A splice costs
-// eight bytes (a source offset and a dictionary id); a span must exceed that to
-// save once its reference is charged, and the tape entries a container span also
-// collapses make the effective floor lower still. Sixteen bytes keeps short
-// scalars — the numbers whose spelling is no longer than their reference —
-// inline, where they cost no dictionary entry and no splice record.
+// valueDictMinSpan is the default length floor for interning. A splice record
+// costs eight bytes in memory (a source offset and a dictionary id) and its
+// modeled at-rest reference four (the id alone; the offset is implicit in a
+// compacting store's residual stream); a span must exceed that to save once its
+// reference is charged, and the tape entries a container span also collapses
+// make the effective floor lower still. Sixteen bytes keeps short scalars — the
+// numbers whose spelling is no longer than their reference — inline, where they
+// cost no dictionary entry and no splice record.
 const valueDictMinSpan = 16
+
+// valueDictRefBytes is the modeled at-rest cost of one dictionary reference: the
+// four-byte identifier a compacting store keeps where it drops a spliced span.
+// It is the reference charge in the DocSetStats space model; the live in-memory
+// splice record (valueSplice) is wider because it also carries the offset that
+// makes a read O(1) without reconstructing the document.
+const valueDictRefBytes = 4
 
 // A valueSplice records one dictionary-backed value occurrence in a document:
 // the value's start offset in the document's source and the dictionary id whose
@@ -86,79 +109,77 @@ type valueSplice struct {
 	id    uint32
 }
 
-// A valueDictRef is one document's splice header: its references occupy
-// splices[off : off+n], in ascending start order. The zero ref (n == 0) marks a
-// document with no dictionary-backed values — every value inline, first-sighted
-// or below the length floor.
+// A valueDictRef is one document's splice header: its records occupy
+// DocSet.valueSplices[off : off+n], in ascending start order. The zero ref
+// (n == 0) marks a document with no dictionary-backed values — every value
+// inline, first-sighted or below the length floor.
 type valueDictRef struct {
 	off uint32
 	n   uint32
 }
 
-// A ValueDictionary is a corpus-wide value dictionary built over the documents
-// of a DocSet. It owns its storage under the never-moving arena discipline of
-// the rest of the layer; a slice returned by Value stays valid for the
-// dictionary's lifetime. The zero ValueDictionary is not ready — use
-// NewValueDictionary. A ValueDictionary is not safe for concurrent use.
-type ValueDictionary struct {
-	values  ValueInterner
-	refs    []valueDictRef // one per document added, in add order
-	splices []valueSplice
-	seen    map[uint64]struct{}
-	floor   uint32
-}
-
-// NewValueDictionary returns an empty dictionary whose interning length floor is
-// floor bytes; a floor of zero selects the default (valueDictMinSpan). The
-// differential and bounded-exhaustive suites lower the floor to one so every
-// repeated value, however short, is dictionary-backed and the arena read path is
-// exercised on every value shape.
-func NewValueDictionary(floor int) *ValueDictionary {
-	f := uint32(valueDictMinSpan)
-	if floor > 0 {
-		f = uint32(floor)
+// valueDictAppend interns document i's repeated value spans and appends its
+// splice header, aligning valueRefs with the documents they window. It is the
+// ingest hook commitDoc calls under ValueDict, once the document is stored, so
+// it walks the document's classic tape: a classic document's entries directly,
+// a shape-taped document's synthesized transiently (uncached, so the shape
+// tape's at-rest space win is preserved). Only the walk's source offsets are
+// recorded, which are stable across both storage forms, so a later read
+// resolves through them whichever form the document is held in.
+func (s *DocSet) valueDictAppend(i int, ref shapeTapeRef) {
+	if s.valueSeen == nil {
+		s.valueSeen = make(map[uint64]struct{})
 	}
-	return &ValueDictionary{seen: make(map[uint64]struct{}), floor: f}
-}
-
-// Build indexes every document of s into the dictionary in ordinal order and
-// returns the dictionary, so BuildValueDictionary(s) is one call. Under
-// ShapeTapes each document's classic tape is materialized through Doc, so the
-// mode composes with shape deduplication without special handling.
-func BuildValueDictionary(s *DocSet, floor int) *ValueDictionary {
-	d := NewValueDictionary(floor)
-	for i := 0; i < s.Len(); i++ {
-		d.AddDoc(s.Doc(i))
+	idx := s.docs[i]
+	if ref.rec != nil {
+		// A shape-taped document's classic tape no longer exists; synthesize it
+		// for the walk and drop it — never through Doc, which would cache it and
+		// re-buy the storage the shape tape dropped.
+		idx = Index{src: s.docs[i].src, entries: s.synthShapeTape(i, ref)}
 	}
-	return d
+	vref := s.valueDictScan(idx)
+	for len(s.valueRefs) < i {
+		// A classic-only prefix before ValueDict first produced a ref keeps the
+		// slice docs-aligned, exactly as commitDoc pads tapeRefs; under the
+		// documented "set before the first Append" contract the padding never
+		// binds, every document contributing a ref.
+		s.valueRefs = append(s.valueRefs, valueDictRef{})
+	}
+	s.valueRefs = append(s.valueRefs, vref)
 }
 
-// AddDoc interns one document's repeated value spans and appends its splice
-// header, aligning refs with the order documents are added. idx is the
-// document's classic tape (Index): scalars and whole recurring sub-objects are
-// interned, keys never — that redundancy belongs to the shape layer.
-func (d *ValueDictionary) AddDoc(idx Index) {
-	off := uint32(len(d.splices))
+// valueDictScan is the greedy top-down interning walk over one classic tape. At
+// each value a repeated span at or above the floor is taken whole and its
+// subtree skipped, so a recurring sub-object is one reference rather than a
+// reference per scalar inside it; only a value not taken is descended, and only
+// into a container's member values, keys never — that redundancy belongs to the
+// shape layer. The root is descended, never interned: a whole-document repeat is
+// a corpus artifact of a tiled benchmark, not a property to harvest. It appends
+// the document's splices to the set-wide slab in ascending source order and
+// returns the header windowing them.
+func (s *DocSet) valueDictScan(idx Index) valueDictRef {
+	off := uint32(len(s.valueSplices))
 	ent := idx.entries
+	if len(ent) == 0 {
+		return valueDictRef{off: off}
+	}
 	src := idx.src
-	// Greedy top-down: at each value, a repeated span at or above the floor is
-	// taken whole and its subtree skipped, so a recurring sub-object is one
-	// reference rather than a reference per scalar inside it; only a value not
-	// taken is descended, and only into a container's member values. The root is
-	// descended, never interned: a whole-document repeat is a corpus artifact of
-	// a tiled benchmark, not a property to harvest.
+	floor := s.valueFloor
+	if floor == 0 {
+		floor = valueDictMinSpan
+	}
 	var walk func(i int, mayIntern bool) int
 	walk = func(i int, mayIntern bool) int {
 		e := &ent[i]
-		if mayIntern && e.end-e.start >= d.floor {
+		if mayIntern && e.end-e.start >= floor {
 			span := byteview.SliceRange(&src[0], e.start, e.end)
 			h := valueDictHash(span)
-			if _, sighted := d.seen[h]; sighted {
-				id := d.values.Intern(span)
-				d.splices = append(d.splices, valueSplice{start: e.start, id: id})
+			if _, sighted := s.valueSeen[h]; sighted {
+				id := s.values.Intern(span)
+				s.valueSplices = append(s.valueSplices, valueSplice{start: e.start, id: id})
 				return i + int(e.next)
 			}
-			d.seen[h] = struct{}{}
+			s.valueSeen[h] = struct{}{}
 		}
 		if k := e.Kind(); k != document.Object && k != document.Array {
 			return i + 1
@@ -174,16 +195,14 @@ func (d *ValueDictionary) AddDoc(idx Index) {
 		}
 		return end
 	}
-	if len(ent) > 0 {
-		walk(0, false)
-	}
-	d.refs = append(d.refs, valueDictRef{off: off, n: uint32(len(d.splices)) - off})
+	walk(0, false)
+	return valueDictRef{off: off, n: uint32(len(s.valueSplices)) - off}
 }
 
 // valueDictHash is the 64-bit sighting hash: it gates the second-sighting
 // interning decision only, so it never needs to be collision-resistant — a
 // collision merely admits an unrelated singleton to interning, where the
-// dictionary's own byte-verified Intern keeps it a distinct, correct entry. A
+// interner's own byte-verified Intern keeps it a distinct, correct entry. A
 // 64-bit fold makes even that waste vanishingly rare. FNV-1a over the raw span.
 func valueDictHash(b []byte) uint64 {
 	h := uint64(1469598103934665603)
@@ -194,27 +213,19 @@ func valueDictHash(b []byte) uint64 {
 	return h
 }
 
-// Len returns the number of documents indexed.
-func (d *ValueDictionary) Len() int { return len(d.refs) }
-
-// Value returns the raw span of an interned value, borrowing the dictionary's
-// arena. See ValueInterner.Value for the lifetime contract.
-func (d *ValueDictionary) Value(id uint32) []byte { return d.values.Value(id) }
-
-// spliceAt returns the dictionary id for the value at source offset start in the
-// document at ordinal doc, or false when that value is stored inline. It
-// binary-searches the document's ascending splice records — the walk appends
-// them in source order — so a value-dict read resolves a candidate in
-// O(log splices).
-func (d *ValueDictionary) spliceAt(doc int, start uint32) (uint32, bool) {
-	if uint(doc) >= uint(len(d.refs)) {
+// valueSpliceAt returns the dictionary id for the value at source offset start
+// in document doc, or false when that value is stored inline. It binary-searches
+// the document's ascending splice records — the walk appends them in source
+// order — so a value-dictionary read resolves a candidate in O(log splices).
+func (s *DocSet) valueSpliceAt(doc int, start uint32) (uint32, bool) {
+	if uint(doc) >= uint(len(s.valueRefs)) {
 		return 0, false
 	}
-	r := d.refs[doc]
+	r := s.valueRefs[doc]
 	lo, hi := r.off, r.off+r.n
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		switch sp := d.splices[mid]; {
+		switch sp := s.valueSplices[mid]; {
 		case sp.start == start:
 			return sp.id, true
 		case sp.start < start:
@@ -226,77 +237,70 @@ func (d *ValueDictionary) spliceAt(doc int, start uint32) (uint32, bool) {
 	return 0, false
 }
 
-// Raw returns node v's bytes for the document at ordinal doc, resolved through
-// the dictionary when v is a dictionary-backed value: its span was interned, so
-// the bytes come from the shared arena in O(1) rather than the document's
-// source. A value stored inline reads from source as usual. The two are
-// byte-identical by the dictionary invariant, so the result never changes; the
-// routing is what lets a compacting store drop the backed span and still read it
-// directly. v must be a node of the same document, obtained from the Index this
-// ordinal was added from.
-func (d *ValueDictionary) Raw(doc int, v Node) RawValue {
-	if v.entry != nil {
-		if id, ok := d.spliceAt(doc, v.entry.start); ok {
-			return RawValue{src: d.values.Value(id)}
+// valueNode returns a materialization handle over interned value id: a Node
+// whose source addresses the value's bytes in the shared arena and whose single
+// entry spans them entirely, [0, len), carrying the source entry's info word so
+// the handle reports the same kind and flags as the value it stands for. The
+// entry escapes to the heap, so the handle outlives this call; the arena bytes
+// never move, so it stays valid for the set's lifetime. Every scalar accessor
+// and Raw read it directly — no dictionary knowledge on the read path — which is
+// exactly what makes a dictionary read byte-identical to a source read.
+func (s *DocSet) valueNode(id uint32, info uint32) Node {
+	b := s.values.Value(id)
+	return Node{src: &b[0], entry: &IndexEntry{start: 0, end: uint32(len(b)), next: 1, info: info}}
+}
+
+// DocValue resolves the value at node v of document doc to a handle over its
+// bytes. When v is a dictionary-backed occurrence — its span was interned under
+// ValueDict — the returned Node addresses the value's interned bytes in the
+// shared arena, reading them with no dictionary knowledge on the read path: same
+// kind, same flags, byte-identical content, valid for the set's lifetime. When v
+// is stored inline, or ValueDict is off, v is returned unchanged. The result is
+// invariant to the routing — the arena holds bytes identical to the source it
+// stands in for — so DocValue changes where a value's bytes are read, never what
+// they are; that is what lets a compacting store drop the backed span and still
+// read it directly at tape speed.
+//
+// v must be a node obtained from Doc(doc). The handle is for value
+// materialization — Raw and the scalar accessors (StringBytes, NumberBytes,
+// Int64, Uint64, Float64, Bool, AppendText); structural navigation stays on the
+// source tape v came from, because a container's members are not entries in the
+// arena.
+func (s *DocSet) DocValue(doc int, v Node) Node {
+	if s.ValueDict && v.entry != nil {
+		if id, ok := s.valueSpliceAt(doc, v.entry.start); ok {
+			return s.valueNode(id, v.entry.info)
 		}
 	}
-	return v.Raw()
+	return v
 }
 
-// Reconstruct assembles the document's exact original source bytes into dst,
-// splicing each dictionary reference back inline from the arena. It is the cold
-// operation the space win is traded for — the only read that materializes a
-// whole document rather than addressing a value directly — and its output is
-// byte-identical to the source idx was built from, the property the
-// bounded-exhaustive differential test checks across the small-scope domain. idx
-// must be the Index the document at ordinal doc was added from. dst is grown as
-// needed and returned.
-func (d *ValueDictionary) Reconstruct(dst []byte, idx Index, doc int) []byte {
-	if uint(doc) >= uint(len(d.refs)) {
-		return append(dst, idx.src...)
+// valueRaw returns the RawValue for the dictionary-backed value at source offset
+// start in document doc, or fallback when the value is stored inline. It is the
+// columnar read path's dictionary hook: consulted only under ValueDict, it swaps
+// a spliced occurrence's source slice for its interned arena span — byte-
+// identical, borrowing the set-lifetime arena — so DocSet.AppendPointer reads
+// dictionary-backed values transparently.
+func (s *DocSet) valueRaw(doc int, start uint32, fallback RawValue) RawValue {
+	if id, ok := s.valueSpliceAt(doc, start); ok {
+		return RawValue{src: s.values.Value(id)}
 	}
-	r := d.refs[doc]
-	prev := uint32(0)
-	for k := r.off; k < r.off+r.n; k++ {
-		sp := d.splices[k]
-		dst = append(dst, idx.src[prev:sp.start]...)
-		dst = append(dst, d.values.Value(sp.id)...)
-		prev = sp.start + uint32(len(d.values.Value(sp.id)))
+	return fallback
+}
+
+// fillValueDictStats records the dictionary's storage composition into st. It
+// costs one pass over the splice slab and materializes no document, so Stats
+// stays safe for accounting at any point between appends.
+func (s *DocSet) fillValueDictStats(st *DocSetStats) {
+	st.DictValues = s.values.Len()
+	st.DictBytes = s.values.Bytes()
+	st.DictSplices = int64(len(s.valueSplices))
+	for _, sp := range s.valueSplices {
+		st.DictSplicedBytes += int64(len(s.values.Value(sp.id)))
 	}
-	return append(dst, idx.src[prev:]...)
-}
-
-// ValueDictStats reports the dictionary's storage composition, the accounting
-// behind the space model: distinct value spans held once, the occurrences they
-// stand in for, and the source bytes those occurrences repeat.
-type ValueDictStats struct {
-	// Entries distinct value spans held once cost DictBytes.
-	Entries   int
-	DictBytes int64
-	// Splices dictionary-backed occurrences reference the entries, removing
-	// SplicedBytes of source (sum of the referenced spans' lengths) — the
-	// redundancy the dictionary removed.
-	Splices      int64
-	SplicedBytes int64
-}
-
-// Stats summarizes the dictionary. It costs one pass over the splice slab and
-// materializes no document, so it is safe for accounting at any point.
-func (d *ValueDictionary) Stats() ValueDictStats {
-	st := ValueDictStats{Entries: d.values.Len(), DictBytes: d.values.Bytes(), Splices: int64(len(d.splices))}
-	for _, sp := range d.splices {
-		st.SplicedBytes += int64(len(d.values.Value(sp.id)))
-	}
-	return st
-}
-
-// ModeledBytes returns the source bytes a compacting store would hold if it
-// dropped every dictionary-backed span and kept a reference in its place:
-// sourceBytes - SplicedBytes + Splices*8 + DictBytes. It is the value
-// dictionary's warm at-rest floor — the tape and residual source stay, so every
-// value remains directly addressable — expressed against the caller's measured
-// source total.
-func (d *ValueDictionary) ModeledBytes(sourceBytes int64) int64 {
-	st := d.Stats()
-	return sourceBytes - st.SplicedBytes + st.Splices*8 + st.DictBytes
+	// The modeled at-rest saving of a compacting store: the spliced source it
+	// drops, less the references it keeps and the arena it adds. The live set
+	// retains the source, so this is the space model the dictionary enables, not
+	// a reduction already realized in memory.
+	st.DictSavedBytes = st.DictSplicedBytes - st.DictSplices*valueDictRefBytes - st.DictBytes
 }

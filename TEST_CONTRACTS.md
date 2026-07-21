@@ -127,6 +127,7 @@ any_test.go
 contains_contract_test.go
 docset_postings_test.go
 docset_test.go
+docset_valuedict_test.go
 duplicate_keys_contract_test.go
 field_cursor_test.go
 index_bitmap_test.go
@@ -237,6 +238,7 @@ contains_bench_test.go
 docset_postings_bench_test.go
 docset_shape_bench_test.go
 docset_stream_bench_test.go
+docset_valuedict_bench_test.go
 index_tapescan_bench_test.go
 multidoc_bench_test.go
 parser_bench_test.go

@@ -151,6 +151,17 @@ func (s *DocSet) commitDoc(index Index, ref shapeTapeRef) int {
 		// values are already in s.narrow, so the postings read the stored form.
 		s.indexPostings(ord, index, ref)
 	}
+	if s.ValueDict {
+		// The value dictionary's ingest hook, alongside shape compaction and the
+		// postings: it interns the just-committed document's repeated value spans
+		// and records its splice header (docset_valuedict.go). It runs after the
+		// document is stored so it can walk the document's classic tape —
+		// synthesized transiently for a shape-taped document, so shape and value
+		// dedup compose without either re-buying the other's storage. It records
+		// separate splice entries and does not mutate the committed tape, so the
+		// postings above read the same value content either way.
+		s.valueDictAppend(ord, ref)
+	}
 	return ord
 }
 
@@ -358,6 +369,20 @@ type DocSetStats struct {
 	// re-materialized on demand.
 	Shapes  int
 	Widened int
+	// Under ValueDict, the value dictionary's composition (docset_valuedict.go):
+	// DictValues distinct value spans held once cost DictBytes in the shared
+	// arena; DictSplices later occurrences reference them, standing in for
+	// DictSplicedBytes of repeated source. DictSavedBytes is the modeled net
+	// space a compacting store recovers — the spliced source it drops, less the
+	// four-byte references it keeps and the arena it adds. The live set retains
+	// the source (every value stays directly addressable), so DictSavedBytes is
+	// the at-rest space model the dictionary enables, not a live reduction.
+	// Every field is zero when ValueDict is off.
+	DictValues       int
+	DictSplices      int64
+	DictBytes        int64
+	DictSplicedBytes int64
+	DictSavedBytes   int64
 }
 
 // Stats summarizes the set's tape storage. It costs one pass over the
@@ -381,5 +406,8 @@ func (s *DocSet) Stats() DocSetStats {
 	s.widenMu.Lock()
 	st.Widened = len(s.widened)
 	s.widenMu.Unlock()
+	if s.ValueDict {
+		s.fillValueDictStats(&st)
+	}
 	return st
 }
