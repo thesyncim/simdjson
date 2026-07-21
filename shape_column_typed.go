@@ -74,8 +74,19 @@ func (c *ShapeCache) AppendFieldInt64(dst []int64, valid []bool, s *DocSet, name
 			var ok bool
 			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
 				doc := &s.docs[i]
-				e := &doc.entries[ord]
-				if e.info&infoIntNumberMask == infoIntNumberBits {
+				if r.narrow {
+					// The verbatim info word keeps the integer probe
+					// identical; only the span unpacks, and only the rare
+					// non-integer spelling widens into a stack entry for
+					// the accessor.
+					nv := s.narrow[r.off+uint32(ord)]
+					if nv.info&infoIntNumberMask == infoIntNumberBits {
+						n, ok = tapeInt64(&doc.src[0], nv.span&0xFFFF, nv.span>>16)
+					} else {
+						c.wide = nv.widen()
+						n, ok = (Node{src: &doc.src[0], entry: &c.wide}).Int64()
+					}
+				} else if e := &doc.entries[ord]; e.info&infoIntNumberMask == infoIntNumberBits {
 					n, ok = tapeInt64(&doc.src[0], e.start, e.end)
 				} else {
 					n, ok = (Node{src: &doc.src[0], entry: e}).Int64()
@@ -139,7 +150,12 @@ func (c *ShapeCache) AppendFieldFloat64(dst []float64, valid []bool, s *DocSet, 
 			var ok bool
 			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
 				doc := &s.docs[i]
-				f, ok = (Node{src: &doc.src[0], entry: &doc.entries[ord]}).Float64()
+				if r.narrow {
+					c.wide = s.narrow[r.off+uint32(ord)].widen()
+					f, ok = (Node{src: &doc.src[0], entry: &c.wide}).Float64()
+				} else {
+					f, ok = (Node{src: &doc.src[0], entry: &doc.entries[ord]}).Float64()
+				}
 				if !ok {
 					f = 0
 				}
@@ -188,7 +204,12 @@ func (c *ShapeCache) AppendFieldBool(dst []bool, valid []bool, s *DocSet, name s
 			var ok bool
 			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
 				doc := &s.docs[i]
-				b, ok = (Node{src: &doc.src[0], entry: &doc.entries[ord]}).Bool()
+				if r.narrow {
+					c.wide = s.narrow[r.off+uint32(ord)].widen()
+					b, ok = (Node{src: &doc.src[0], entry: &c.wide}).Bool()
+				} else {
+					b, ok = (Node{src: &doc.src[0], entry: &doc.entries[ord]}).Bool()
+				}
 			}
 			dst = append(dst, b)
 			valid = append(valid, ok)

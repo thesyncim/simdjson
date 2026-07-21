@@ -145,6 +145,14 @@ type ShapeCache struct {
 	recChunk   []shapeRecord
 	fieldChunk []shapeField
 	slotChunk  []uint32
+	// wide is scratch storage for a narrow value entry a typed accessor must
+	// read through a Node. A narrow document keeps no arena-backed IndexEntry
+	// to point at, and materializing one as a loop local escapes into the
+	// non-inlinable number accessors, one allocation per document. Widening
+	// into this receiver field instead — the cache is heap-resident and, by
+	// its one-per-worker contract, single-consumer — keeps the typed column
+	// scans allocation-free at both entry widths.
+	wide IndexEntry
 }
 
 // The arena grows geometrically between the interner's chunk bounds; the

@@ -51,7 +51,10 @@ type DocSet struct {
 	// byte-matching a compiled shape of the set's internal cache stores one
 	// entry per member value instead of the classic tape, roughly halving
 	// tape storage on shape-clustered corpora and letting the batch
-	// extractors index value arrays directly. Semantics never change — every
+	// extractors index value arrays directly. Value entries are themselves
+	// dual-width: a document whose root span fits 16-bit offsets (under
+	// 64 KiB) stores 8-byte entries, halving the value array again; wider
+	// documents keep 16-byte entries. Semantics never change — every
 	// lookup, extractor, and Doc result is identical to classic storage —
 	// but Doc's cost does: its first call on a shape-taped document
 	// materializes and permanently caches the classic tape (see Doc). Set it
@@ -66,14 +69,22 @@ type DocSet struct {
 	scratch    []IndexEntry // spill tape for documents the entry chunk cannot hold
 
 	// Shape-tape state (docset_shape.go): tapeRefs is empty or docs-aligned
-	// and holds each document's dedup header; shapes is the internal cache
-	// the ingest conformance gate resolves against; widened caches the
-	// classic tapes Doc has re-materialized, under widenMu so concurrent
-	// reads stay safe once appending stops.
-	tapeRefs []shapeTapeRef
-	shapes   ShapeCache
-	widened  map[int][]IndexEntry
-	widenMu  sync.Mutex
+	// and holds each document's dedup header; narrow is the slab of 8-byte
+	// value entries for narrow-width documents, addressed by each ref's
+	// offset (it relocates freely as it grows: no pointer into it ever
+	// leaves a call); shapes is the internal cache the ingest conformance
+	// gate resolves against; widened caches the classic tapes Doc has
+	// re-materialized, under widenMu so concurrent reads stay safe once
+	// appending stops. wideValueTapes is the width test seam: it forces
+	// 16-byte value entries for narrow-eligible documents so the
+	// differential and benchmark suites can hold the two widths against
+	// each other on identical documents; nothing outside tests sets it.
+	tapeRefs       []shapeTapeRef
+	narrow         []shapeNarrowValue
+	shapes         ShapeCache
+	widened        map[int][]IndexEntry
+	widenMu        sync.Mutex
+	wideValueTapes bool
 }
 
 // Arena chunks grow geometrically between fixed bounds, like the interner's:
@@ -241,19 +252,42 @@ func (s *DocSet) AppendPointer(dst []RawValue, pointer CompiledPointer) ([]RawVa
 				dst = append(dst, RawValue{})
 				continue
 			}
-			node := Node{src: &doc.src[0], entry: &doc.entries[ord]}
-			if rest := pointer.tokens[1:]; len(rest) > 0 {
-				next, ok, err := node.pointerTokens(rest)
-				if err != nil {
-					return dst[:mark], err
+			rest := pointer.tokens[1:]
+			if len(rest) == 0 {
+				// The common single-token pointer names the value itself: its
+				// span is already in hand at both entry widths, so the raw
+				// slice is taken with no node to reconstitute or escape.
+				if r.narrow {
+					nv := s.narrow[r.off+uint32(ord)]
+					dst = append(dst, RawValue{src: doc.src[nv.span&0xFFFF : nv.span>>16]})
+				} else {
+					e := &doc.entries[ord]
+					dst = append(dst, RawValue{src: doc.src[e.start:e.end]})
 				}
-				if !ok {
-					dst = append(dst, RawValue{})
-					continue
-				}
-				node = next
+				continue
 			}
-			dst = append(dst, node.Raw())
+			// Deeper tokens descend into the value. A flat value has no
+			// children, so the descent resolves to absence except for an
+			// array-index token error on an empty-array value; only this
+			// uncommon path reconstitutes a narrow entry, which the descent
+			// never lets outlive the iteration.
+			var wide IndexEntry
+			var node Node
+			if r.narrow {
+				wide = s.narrow[r.off+uint32(ord)].widen()
+				node = Node{src: &doc.src[0], entry: &wide}
+			} else {
+				node = Node{src: &doc.src[0], entry: &doc.entries[ord]}
+			}
+			next, ok, err := node.pointerTokens(rest)
+			if err != nil {
+				return dst[:mark], err
+			}
+			if !ok {
+				dst = append(dst, RawValue{})
+				continue
+			}
+			dst = append(dst, next.Raw())
 			continue
 		}
 		node, ok, err := s.docs[i].PointerCompiled(pointer)

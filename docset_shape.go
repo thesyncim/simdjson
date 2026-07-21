@@ -27,6 +27,23 @@ import (
 // touch, which on corpora larger than cache is the difference between
 // streaming one tape line per document and faulting scattered source lines.
 //
+// Dual widths: the value array itself comes in two entry widths, chosen per
+// document at ingest. The flatness identity the conformance gate already
+// proves (root.next == 2*count+1) forces every member value to exactly one
+// entry, so a dedup value entry never carries structure: its next is
+// provably 1 (the root's span identity holds only if every member subtree is
+// one entry, and a one-entry value's next is its subtree size) and its count
+// bits are zero (scalars and empty containers alike). Position is ordinal.
+// What remains is the span and the kind/flag bits, and for a document whose
+// root ends within the first 64 KiB of its source those pack into eight
+// bytes — shapeNarrowValue, half the classic width. Documents with a wider
+// root span keep 16-byte value entries; the width is recorded per document
+// in its header ref, and both widths reconstitute the identical classic
+// entry on widening, so the choice is invisible to every read. Narrow
+// arrays live in one set-wide slab (DocSet.narrow) rather than the pinned
+// entry arena: no caller ever holds a pointer into them — hot paths copy
+// eight bytes out, cold paths widen — so the slab may relocate as it grows.
+//
 // The trust boundary shifts, deliberately, from read time to ingest time.
 // The classic shape paths never trust the fingerprint for reads: every
 // positional read re-verifies key bytes because a fingerprint collision must
@@ -63,14 +80,46 @@ import (
 // shape's field count.
 
 // A shapeTapeRef is the per-document header of a shape-deduplicated tape:
-// the proven shape, the root object's source span, and whether the original
-// build enriched key hashes (so widening reproduces the exact classic tape).
-// The zero ref (nil rec) marks a classic document.
+// the proven shape, the root object's source span, the entry width with the
+// narrow array's slab position, and whether the original build enriched key
+// hashes (so widening reproduces the exact classic tape). The zero ref (nil
+// rec) marks a classic document.
 type shapeTapeRef struct {
 	rec      *shapeRecord
 	start    uint32 // root object's first source byte, per-document coordinates
 	end      uint32 // one past the root's closing brace
+	off      uint32 // narrow only: first value entry in the set's narrow slab
+	narrow   bool   // value entries are 8-byte shapeNarrowValues in the slab
 	enriched bool   // the classic tape carried key-hash enrichment
+}
+
+// shapeNarrowMaxEnd is the widest root span the narrow width can address:
+// every stored offset is bounded by the root's end, so one comparison against
+// it decides a document's entry width. The boundary is exact — a root ending
+// at offset 65535 packs, one ending at 65536 does not.
+const shapeNarrowMaxEnd = 1<<16 - 1
+
+// A shapeNarrowValue is one 8-byte value entry of a narrow shape tape: the
+// value's document-coordinate span packed into one word and the classic
+// entry's info word verbatim. The info word is stored whole rather than just
+// its live top six bits (kind and flags; the count bits are zero by the
+// flatness proof) so kind tests written against classic entries — the typed
+// extractors' masked integer probe — run on it unchanged, and widening is
+// two shifts and a constant.
+type shapeNarrowValue struct {
+	span uint32 // start | end<<16, offsets within the document's source
+	info uint32 // the classic value entry's packed info word, verbatim
+}
+
+// start and end unpack the span's document coordinates.
+func (n shapeNarrowValue) start() uint32 { return n.span & 0xFFFF }
+func (n shapeNarrowValue) end() uint32   { return n.span >> 16 }
+
+// widen reconstitutes the classic 16-byte entry this value was packed from,
+// bit-identical by the dedup invariants: next is 1 for every single-entry
+// value and the info word was stored verbatim.
+func (n shapeNarrowValue) widen() IndexEntry {
+	return IndexEntry{start: n.span & 0xFFFF, end: n.span >> 16, next: 1, info: n.info}
 }
 
 // shapeTapeRefAt returns document i's dedup header, or the zero ref for a
@@ -148,6 +197,21 @@ func (s *DocSet) shapeTapeCompact(index Index) (Index, shapeTapeRef) {
 		end:      root.end,
 		enriched: root.keysHashed(),
 	}
+	if root.end <= shapeNarrowMaxEnd && !s.wideValueTapes &&
+		uint64(len(s.narrow))+uint64(count) <= uint64(^uint32(0)) {
+		// Narrow width: every member offset is bounded by root.end, so the
+		// spans pack into 16 bits each. The entries move to the narrow slab
+		// and the document keeps no entry-arena storage at all. The slab
+		// bound keeps ref.off exact; a set past four billion narrow entries
+		// falls back to the wide form rather than overflowing it.
+		ref.narrow, ref.off = true, uint32(len(s.narrow))
+		for m := 0; m < count; m++ {
+			v := &entries[2*m+2]
+			s.narrow = append(s.narrow, shapeNarrowValue{span: v.start | v.end<<16, info: v.info})
+		}
+		index.entries = entries[:0:0]
+		return index, ref
+	}
 	for m := 0; m < count; m++ {
 		entries[m] = entries[2*m+2]
 	}
@@ -178,26 +242,32 @@ func (s *DocSet) widenShapeTape(i int, r shapeTapeRef) Index {
 }
 
 // synthShapeTape rebuilds document i's classic entries from its value array
-// and shape. Value entries copy verbatim; each key entry's span is recovered
-// by scanning backward from its value's first byte across the colon and any
-// whitespace to the closing quote — the spelling's length is compiled in the
-// shape, and ingest proved the document's bytes match it, so the recovered
-// span is exact, escapes included. The result is bit-identical to the tape
-// classic mode would have stored (enrichment, applied by the caller,
-// included), which the differential suite pins.
+// and shape. Value entries copy verbatim — a narrow document's are widened
+// first, which the packing's invariants make exact — and each key entry's
+// span is recovered by scanning backward from its value's first byte across
+// the colon and any whitespace to the closing quote: the spelling's length
+// is compiled in the shape, and ingest proved the document's bytes match it,
+// so the recovered span is exact, escapes included. The result is
+// bit-identical to the tape classic mode would have stored (enrichment,
+// applied by the caller, included), which the differential suite pins.
 func (s *DocSet) synthShapeTape(i int, r shapeTapeRef) []IndexEntry {
 	values := s.docs[i].entries
 	src := s.docs[i].src
 	fields := r.rec.fields
-	entries := make([]IndexEntry, 2*len(values)+1)
+	entries := make([]IndexEntry, 2*len(fields)+1)
 	entries[0] = IndexEntry{
 		start: r.start,
 		end:   r.end,
 		next:  uint32(len(entries)),
-		info:  packInfo(uint32(len(values)), document.Object, 0),
+		info:  packInfo(uint32(len(fields)), document.Object, 0),
 	}
-	for m := range values {
-		j := int(values[m].start) - 1
+	for m := range fields {
+		if r.narrow {
+			entries[2*m+2] = s.narrow[int(r.off)+m].widen()
+		} else {
+			entries[2*m+2] = values[m]
+		}
+		j := int(entries[2*m+2].start) - 1
 		for isJSONWhitespace(src[j]) {
 			j-- // back over any space between the colon and the value
 		}
@@ -213,7 +283,6 @@ func (s *DocSet) synthShapeTape(i int, r shapeTapeRef) []IndexEntry {
 			next:  1,
 			info:  f.info,
 		}
-		entries[2*m+2] = values[m]
 	}
 	return entries
 }
@@ -258,21 +327,26 @@ func (h *shapeTapeHint) lookup(rec *shapeRecord, key CompiledKey) int32 {
 
 // DocSetStats reports the set's tape storage composition, the accounting
 // behind the space model: a classic document holds 2N+1 sixteen-byte tape
-// entries for N members, a shape-taped one holds N value entries plus one
-// header ref, and each distinct shape stores its key spellings once. Stats
-// never widens a document (unlike summing Doc(i).Len()), so measuring a
-// set's storage does not change it.
+// entries for N members, a shape-taped one holds N value entries — sixteen
+// bytes each in the wide form, eight in the narrow — plus one header ref,
+// and each distinct shape stores its key spellings once. Stats never widens
+// a document (unlike summing Doc(i).Len()), so measuring a set's storage
+// does not change it.
 type DocSetStats struct {
 	// Docs is the number of stored documents; ShapeTaped of them are held
-	// in shape-deduplicated form.
-	Docs       int
-	ShapeTaped int
+	// in shape-deduplicated form, and NarrowTaped of those in the narrow
+	// (8-byte-entry) width — documents whose root span fits 16-bit offsets.
+	Docs        int
+	ShapeTaped  int
+	NarrowTaped int
 	// TapeEntries counts the 16-byte entries of classic tapes, ValueEntries
-	// those of shape-taped value arrays. Their sum is the set's entry
+	// those of wide shape-taped value arrays, and NarrowValueEntries the
+	// 8-byte entries of narrow ones. Together they are the set's entry
 	// storage; the classic equivalent of a shape-taped document would have
-	// cost 2N+1 entries against its N.
-	TapeEntries  int64
-	ValueEntries int64
+	// cost 2N+1 sixteen-byte entries against its N of either width.
+	TapeEntries        int64
+	ValueEntries       int64
+	NarrowValueEntries int64
 	// Shapes is the number of layouts the set's internal cache has
 	// compiled. Widened counts documents whose classic tape Doc
 	// re-materialized on demand.
@@ -286,11 +360,16 @@ type DocSetStats struct {
 func (s *DocSet) Stats() DocSetStats {
 	st := DocSetStats{Docs: len(s.docs), Shapes: len(s.shapes.shapes)}
 	for i := range s.docs {
-		if s.shapeTapeRefAt(i).rec != nil {
+		switch r := s.shapeTapeRefAt(i); {
+		case r.rec == nil:
+			st.TapeEntries += int64(len(s.docs[i].entries))
+		case r.narrow:
+			st.ShapeTaped++
+			st.NarrowTaped++
+			st.NarrowValueEntries += int64(len(r.rec.fields))
+		default:
 			st.ShapeTaped++
 			st.ValueEntries += int64(len(s.docs[i].entries))
-		} else {
-			st.TapeEntries += int64(len(s.docs[i].entries))
 		}
 	}
 	s.widenMu.Lock()

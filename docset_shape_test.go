@@ -144,7 +144,49 @@ func shapeTapeCorpora() map[string][]string {
 	}
 	corpora["rootdup"] = dups
 
+	// One shape whose root span straddles the narrow bound exactly: the
+	// same key sequence stored at both entry widths within one set, with
+	// adversarial spans at 65535 (the last narrow root) and 65536 (the
+	// first wide one).
+	var boundary []string
+	for i := 0; i < 3; i++ {
+		for _, end := range []int{64, 1 << 10, shapeNarrowMaxEnd - 1, shapeNarrowMaxEnd,
+			shapeNarrowMaxEnd + 1, shapeNarrowMaxEnd + 2} {
+			boundary = append(boundary, shapeTapeBoundaryDoc(end, 0, i))
+		}
+	}
+	corpora["boundary"] = boundary
+
+	// A width-mixed stream of one recurring shape alternating small and
+	// huge documents, with escaped string values and empty containers in
+	// both widths, so narrow packing must preserve the escaped flag and the
+	// empty-container kinds and the extractors must switch widths per
+	// document.
+	var widthmix []string
+	for i := 0; i < 12; i++ {
+		pad := 40
+		if i%2 == 1 {
+			pad = 70_000
+		}
+		widthmix = append(widthmix, fmt.Sprintf(
+			`{"esc":"a\tb-%02d","num":%d,"pad":"%s","mt":[],"obj":{}}`,
+			i, i*7, strings.Repeat("x", pad)))
+	}
+	corpora["widthmix"] = widthmix
+
 	return corpora
+}
+
+// shapeTapeBoundaryDoc returns a conforming two-member document whose root
+// object ends exactly at source offset rootEnd, after lead spaces of leading
+// whitespace: a filler string sized to hit the offset and a fixed-width
+// integer (kept in [1000, 9999] so no spelling grows a leading zero), so one
+// key sequence recurs at every width the boundary battery needs.
+// rootEnd - lead must cover the 19 fixed syntax bytes.
+func shapeTapeBoundaryDoc(rootEnd, lead, v int) string {
+	const fixed = len(`{"pad":"","v":1000}`)
+	return strings.Repeat(" ", lead) +
+		fmt.Sprintf(`{"pad":"%s","v":%d}`, strings.Repeat("p", rootEnd-lead-fixed), 1000+v%9000)
 }
 
 // shapeTapePointers returns the compiled-pointer battery: the root pointer,
@@ -334,8 +376,8 @@ func TestDocSetShapeTapesDocContract(t *testing.T) {
 
 // TestDocSetShapeTapesStats pins the conformance gate's accounting: under
 // the sighting economics exactly one document per recurring shape stays
-// classic, and the duplicate, empty, and non-flat rules keep their documents
-// classic entirely.
+// classic, small conformers take the narrow width, and the duplicate, empty,
+// and non-flat rules keep their documents classic entirely.
 func TestDocSetShapeTapesStats(t *testing.T) {
 	const count, shapes, width = 60, 3, 9
 	set := shapeTapeDocSet(t, shapeTapeClusteredDocs(count, shapes, width), true)
@@ -346,14 +388,37 @@ func TestDocSetShapeTapesStats(t *testing.T) {
 	if want := count - shapes; st.ShapeTaped != want {
 		t.Fatalf("ShapeTaped = %d, want %d (one classic first sighting per shape)", st.ShapeTaped, want)
 	}
-	if want := int64(st.ShapeTaped) * int64(width); st.ValueEntries != want {
-		t.Fatalf("ValueEntries = %d, want %d", st.ValueEntries, want)
+	// Every clustered document is far under the narrow bound, so all dedup
+	// storage is 8-byte entries and none is wide.
+	if st.NarrowTaped != st.ShapeTaped || st.ValueEntries != 0 {
+		t.Fatalf("Stats = %+v, want every shape-taped document narrow", st)
+	}
+	if want := int64(st.ShapeTaped) * int64(width); st.NarrowValueEntries != want {
+		t.Fatalf("NarrowValueEntries = %d, want %d", st.NarrowValueEntries, want)
 	}
 	if want := int64(shapes) * int64(2*width+1); st.TapeEntries != want {
 		t.Fatalf("TapeEntries = %d, want %d", st.TapeEntries, want)
 	}
 	if st.Widened != 0 {
 		t.Fatalf("Widened = %d before any Doc call", st.Widened)
+	}
+
+	// The width seam forces the wide form on the same documents: the seam is
+	// what the width benchmarks and differentials stand on, so its effect is
+	// pinned here.
+	wide := &DocSet{
+		Options:        document.IndexOptions{HashKeys: true},
+		ShapeTapes:     true,
+		wideValueTapes: true,
+	}
+	for _, doc := range shapeTapeClusteredDocs(count, shapes, width) {
+		if _, err := wide.Append([]byte(doc)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ws := wide.Stats(); ws.NarrowTaped != 0 || ws.NarrowValueEntries != 0 ||
+		ws.ShapeTaped != st.ShapeTaped || ws.ValueEntries != st.NarrowValueEntries {
+		t.Fatalf("wide-seam Stats = %+v, want the narrow accounting (%+v) moved to ValueEntries", ws, st)
 	}
 
 	for label, docs := range map[string][]string{
@@ -369,6 +434,50 @@ func TestDocSetShapeTapesStats(t *testing.T) {
 	}
 }
 
+// TestDocSetShapeTapesWidthBoundary pins the narrow-width gate byte by byte:
+// the width follows the root object's end offset in document coordinates, so
+// 65535 is the last narrow root and 65536 the first wide one, leading
+// whitespace that shifts a small object past the bound forces wide, and
+// trailing whitespace after the root changes nothing. Each classified
+// document must still widen to the classic twin's exact tape.
+func TestDocSetShapeTapesWidthBoundary(t *testing.T) {
+	docs := []string{
+		shapeTapeBoundaryDoc(64, 0, 0), // first sighting: stays classic
+		shapeTapeBoundaryDoc(64, 0, 1), // second sighting compiles and dedups
+		shapeTapeBoundaryDoc(shapeNarrowMaxEnd, 0, 2),
+		shapeTapeBoundaryDoc(shapeNarrowMaxEnd+1, 0, 3),
+		shapeTapeBoundaryDoc(shapeNarrowMaxEnd+1, 40, 4),                           // lead pushes a fitting object wide
+		shapeTapeBoundaryDoc(shapeNarrowMaxEnd, 40, 5),                             // lead absorbed inside the bound
+		shapeTapeBoundaryDoc(1<<10, 0, 6) + strings.Repeat(" ", shapeNarrowMaxEnd), // trailing space is past the root
+	}
+	wantNarrow := []bool{false, true, true, false, false, true, true}
+	for _, hashKeys := range []bool{false, true} {
+		classic := shapeColumnDocSet(t, docs, hashKeys)
+		taped := shapeTapeDocSet(t, docs, hashKeys)
+		for i, want := range wantNarrow {
+			r := taped.shapeTapeRefAt(i)
+			if i == 0 {
+				if r.rec != nil {
+					t.Fatalf("hashKeys=%v: first sighting was shape-taped", hashKeys)
+				}
+				continue
+			}
+			if r.rec == nil || r.narrow != want {
+				t.Fatalf("hashKeys=%v: doc %d (root end %d) narrow=%v, want %v",
+					hashKeys, i, r.end, r.narrow, want)
+			}
+		}
+		checkShapeTapeTwin(t, classic, taped, []string{"pad", "v", "absent"},
+			fmt.Sprintf("boundary hashKeys=%v", hashKeys))
+		for i := range docs {
+			want, got := classic.Doc(i), taped.Doc(i)
+			if !reflect.DeepEqual(got.entries, want.entries) {
+				t.Fatalf("hashKeys=%v: Doc(%d) diverges from the classic tape", hashKeys, i)
+			}
+		}
+	}
+}
+
 // TestDocSetShapeTapesReadFrom holds the stream ingest to Append parity in
 // this mode: an NDJSON ReadFrom — including documents large enough for the
 // framing slow path and the spill copy — produces the same storage
@@ -378,6 +487,12 @@ func TestDocSetShapeTapesReadFrom(t *testing.T) {
 	docs := shapeTapeClusteredDocs(48, 3, 9)
 	wide := keyHashWideDoc(1200, "")
 	docs = append(docs, wide, wide, wide, `{"a":1,"a":2}`, `[7]`)
+	// Wide-width conformers: past the narrow bound, large enough for the
+	// framing slow path, and recurring so the stream must classify both
+	// entry widths exactly as Append does.
+	for i := 0; i < 3; i++ {
+		docs = append(docs, shapeTapeBoundaryDoc(shapeNarrowMaxEnd+2, 0, i))
+	}
 	var stream strings.Builder
 	for _, doc := range docs {
 		stream.WriteString(doc)
@@ -397,7 +512,8 @@ func TestDocSetShapeTapesReadFrom(t *testing.T) {
 				hashKeys, streamed.Len(), appended.Len())
 		}
 		sa, sb := appended.Stats(), streamed.Stats()
-		if sa.ShapeTaped != sb.ShapeTaped || sa.TapeEntries != sb.TapeEntries || sa.ValueEntries != sb.ValueEntries {
+		sa.Widened, sb.Widened = 0, 0 // storage classification only
+		if sa != sb {
 			t.Fatalf("hashKeys=%v: stream stats %+v, append stats %+v", hashKeys, sb, sa)
 		}
 		for i := 0; i < appended.Len(); i++ {
@@ -477,23 +593,49 @@ func TestDocSetShapeTapesConcurrentDoc(t *testing.T) {
 	}
 }
 
-// TestDocSetShapeTapesSteadyAllocs proves the fused single-field pass over a
-// shape-taped set allocates nothing once dst has capacity.
+// TestDocSetShapeTapesSteadyAllocs proves every fused pass over a
+// shape-taped set allocates nothing once dst has capacity. The corpus mixes
+// both entry widths so the narrow paths' stack-widened entries are proven
+// not to escape — the accessor fallbacks (a fractional number for the int
+// driver, the float and bool accessors, the pointer descent) all take a
+// pointer to the reconstituted entry.
 func TestDocSetShapeTapesSteadyAllocs(t *testing.T) {
-	set := shapeTapeDocSet(t, shapeTapeClusteredDocs(64, 2, 8), true)
+	docs := shapeTapeClusteredDocs(64, 2, 8)
+	for i := 0; i < 3; i++ {
+		docs = append(docs, shapeTapeBoundaryDoc(shapeNarrowMaxEnd+2, 0, i))
+	}
+	set := shapeTapeDocSet(t, docs, true)
 	var cache ShapeCache
+	pointer := MustCompilePointer("/s00_f01")
 	dst := cache.AppendField(nil, set, "s00_f02")
-	if allocs := testing.AllocsPerRun(32, func() {
-		dst = cache.AppendField(dst[:0], set, "s00_f02")
-	}); allocs != 0 {
-		t.Fatalf("AppendField on a shape-taped set allocates %v per run", allocs)
+	ints, iok := cache.AppendFieldInt64(nil, nil, set, "s00_f01") // fractional: accessor path
+	floats, fok := cache.AppendFieldFloat64(nil, nil, set, "s00_f01")
+	bools, bok := cache.AppendFieldBool(nil, nil, set, "s00_f03")
+	ptrs, err := set.AppendPointer(nil, pointer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// AppendFields is absent by contract: it allocates its per-name state
+	// (compiled keys and inline-cache slots) on every call, independent of
+	// the storage form.
+	for name, fn := range map[string]func(){
+		"AppendField":        func() { dst = cache.AppendField(dst[:0], set, "s00_f02") },
+		"AppendFieldInt64":   func() { ints, iok = cache.AppendFieldInt64(ints[:0], iok[:0], set, "s00_f01") },
+		"AppendFieldFloat64": func() { floats, fok = cache.AppendFieldFloat64(floats[:0], fok[:0], set, "s00_f01") },
+		"AppendFieldBool":    func() { bools, bok = cache.AppendFieldBool(bools[:0], bok[:0], set, "s00_f03") },
+		"AppendPointer":      func() { ptrs, _ = set.AppendPointer(ptrs[:0], pointer) },
+	} {
+		if allocs := testing.AllocsPerRun(32, fn); allocs != 0 {
+			t.Fatalf("%s on a shape-taped set allocates %v per run", name, allocs)
+		}
 	}
 }
 
 // TestGCCorruptionShapeTapes is the standing corruption gate for the mode's
-// borrowed reads: value-array extraction and the widening scan both walk
-// arena-backed entries and source bytes while the collector may move stacks.
-// Concurrent workers rebuild shape-taped sets whose entry arenas end in
+// borrowed reads: value-array extraction at both entry widths and the
+// widening scan walk arena-backed entries, the narrow slab, and source bytes
+// while the collector may move stacks. Concurrent workers rebuild
+// shape-taped sets whose entry arenas and narrow slabs end in
 // sentinel-poisoned free tails, extract raw and typed columns, widen
 // documents under forced stack movement and GC, verify everything against
 // the classic reference, and prove the sentinels stay untouched. Stress:
@@ -501,7 +643,10 @@ func TestDocSetShapeTapesSteadyAllocs(t *testing.T) {
 //	GOGC=1 GOEXPERIMENT=simd gotip test -run TestGCCorruptionShapeTapes -count=5 -cpu=1,4,8 ./
 func TestGCCorruptionShapeTapes(t *testing.T) {
 	docs := shapeTapeClusteredDocs(36, 3, 9)
-	names := []string{"s00_f00", "s01_f01", "s02_f02", "s00_f03", "absent"}
+	for i := 0; i < 3; i++ { // wide-width conformers among the narrow ones
+		docs = append(docs, shapeTapeBoundaryDoc(shapeNarrowMaxEnd+2, 0, i))
+	}
+	names := []string{"s00_f00", "s01_f01", "s02_f02", "s00_f03", "pad", "absent"}
 	type wantCol struct {
 		raws  [][]byte
 		ints  []int64
@@ -548,6 +693,11 @@ func TestGCCorruptionShapeTapes(t *testing.T) {
 				for i := range tail {
 					tail[i] = sentinel
 				}
+				narrowSentinel := shapeNarrowValue{span: ^uint32(0), info: ^uint32(0)}
+				narrowTail := set.narrow[len(set.narrow):cap(set.narrow)]
+				for i := range narrowTail {
+					narrowTail[i] = narrowSentinel
+				}
 				for _, name := range names {
 					want := reference[name]
 					for i, rv := range cache.AppendField(nil, set, name) {
@@ -583,6 +733,12 @@ func TestGCCorruptionShapeTapes(t *testing.T) {
 				for i := range tail {
 					if tail[i] != sentinel {
 						errs <- fmt.Errorf("worker %d iter %d: sentinel %d overwritten", id, it, i)
+						return
+					}
+				}
+				for i := range narrowTail {
+					if narrowTail[i] != narrowSentinel {
+						errs <- fmt.Errorf("worker %d iter %d: narrow sentinel %d overwritten", id, it, i)
 						return
 					}
 				}

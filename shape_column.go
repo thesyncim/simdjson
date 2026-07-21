@@ -75,8 +75,17 @@ func (c *ShapeCache) AppendField(dst []RawValue, s *DocSet, name string) []RawVa
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
 			doc := &s.docs[i]
 			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
-				v := &doc.entries[ord]
-				dst = append(dst, RawValue{src: doc.src[v.start:v.end]})
+				// Both widths are one array index; the narrow read unpacks
+				// its two 16-bit offsets from half the memory traffic.
+				var start, end uint32
+				if r.narrow {
+					nv := s.narrow[r.off+uint32(ord)]
+					start, end = nv.span&0xFFFF, nv.span>>16
+				} else {
+					v := &doc.entries[ord]
+					start, end = v.start, v.end
+				}
+				dst = append(dst, RawValue{src: doc.src[start:end]})
 			} else {
 				dst = append(dst, RawValue{})
 			}
@@ -383,8 +392,15 @@ func (c *ShapeCache) AppendFields(dst [][]RawValue, s *DocSet, names ...string) 
 			}
 			for j, ord := range tapeOrds {
 				if ord >= 0 {
-					v := &doc.entries[ord]
-					dst[j] = append(dst[j], RawValue{src: doc.src[v.start:v.end]})
+					var start, end uint32
+					if r.narrow {
+						nv := s.narrow[r.off+uint32(ord)]
+						start, end = nv.span&0xFFFF, nv.span>>16
+					} else {
+						v := &doc.entries[ord]
+						start, end = v.start, v.end
+					}
+					dst[j] = append(dst[j], RawValue{src: doc.src[start:end]})
 				} else {
 					dst[j] = append(dst[j], RawValue{})
 				}
