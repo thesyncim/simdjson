@@ -40,6 +40,20 @@ type docSetStream struct {
 	// with or before it have been consumed; io.Reader delivers data and
 	// error together and the data comes first.
 	readErr error
+
+	// Commit statistics for this call steer the two adaptive policies below:
+	// srcChunkMax sizes chunk rolls from the mean committed document, and
+	// extendWalk judges entry headroom from the mean entry count.
+	docs       int64 // documents committed by this call
+	docBytes   int64 // their total source bytes
+	docEntries int64 // their total index entries
+}
+
+// record notes one committed document in the call's running statistics.
+func (d *docSetStream) record(bytes, entries int) {
+	d.docs++
+	d.docBytes += int64(bytes)
+	d.docEntries += int64(entries)
 }
 
 // offset translates a chunk position into this call's input offset.
@@ -53,7 +67,8 @@ func (d *docSetStream) offset(p int) int64 {
 // committed documents never move; *keep is rewritten to the bytes' new
 // position. The partial's length doubles into the new capacity, so a
 // document larger than the chunk bound still ingests with amortized-linear
-// copying. fill reports false when no new bytes will ever arrive.
+// copying; the bound itself adapts to the stream's document sizes
+// (srcChunkMax). fill reports false when no new bytes will ever arrive.
 func (d *docSetStream) fill(keep *int) bool {
 	if d.eof {
 		return false
@@ -61,7 +76,7 @@ func (d *docSetStream) fill(keep *int) bool {
 	s := d.s
 	if d.bufEnd == cap(s.srcChunk) {
 		partial := d.bufEnd - *keep
-		chunk := make([]byte, 0, docSetChunkCap(cap(s.srcChunk), 2*partial, docSetMinSrcChunk, docSetMaxSrcChunk))
+		chunk := make([]byte, 0, docSetChunkCap(cap(s.srcChunk), 2*partial, docSetMinSrcChunk, d.srcChunkMax()))
 		chunk = append(chunk, s.srcChunk[*keep:d.bufEnd]...)
 		s.srcChunk = chunk[:0]
 		d.bufEnd = partial
@@ -121,25 +136,73 @@ func (s *DocSet) ReadFrom(r io.Reader) (int64, error) {
 	}
 }
 
-// docSetPrefixWindow bounds the one-pass walk to documents below the stage-1
-// bitmap threshold. A document that outgrows the window declines to the
-// framing slow path, whose exact-extent buildDoc routes through the same
-// bitmap engine Append uses for large documents; the cap also bounds the
-// walk work wasted on a document that turns out to be truncated.
+// docSetPrefixWindow bounds the one-pass walk while more input can still
+// land in the current chunk. A document that outgrows the window has an
+// unknown extent: walking on risks doing full-document work only to find
+// truncation at the buffered edge, so the walk stops and the document
+// declines to the framing slow path, whose exact-extent buildDoc routes
+// through the stage-1 bitmap engine Append uses for large documents. Once
+// the buffer cannot grow in place, that risk is bounded and the walk runs
+// over every buffered byte instead (extendWalk), keeping large fully
+// buffered documents on the one-pass hot path.
 const docSetPrefixWindow = validBitmapMinBytes
+
+// docSetMaxStreamSrcChunk caps srcChunkMax's adaptive raise. It bounds both
+// the retention granularity of a stream's source arena and the copying a
+// single roll can perform, while keeping the roll's abandoned tail — at most
+// one mean-sized document per chunk — a small fraction of the whole.
+const docSetMaxStreamSrcChunk = 8 << 20
+
+// srcChunkMax returns the size bound for the next source-chunk roll. The
+// static bound serves mixed and small-document streams unchanged; a stream
+// of large documents raises it toward eight times its mean committed
+// document, so one chunk holds several documents and each roll abandons at
+// most one document's worth of tail instead of nearly a whole chunk.
+func (d *docSetStream) srcChunkMax() int {
+	bound := int64(docSetMaxSrcChunk)
+	if d.docs > 0 {
+		if t := 8 * (d.docBytes / d.docs); t > bound {
+			bound = min(t, docSetMaxStreamSrcChunk)
+		}
+	}
+	return int(bound)
+}
+
+// extendWalk reports whether readDoc's one-pass walk may run past
+// docSetPrefixWindow, over every buffered byte. Extension pays off exactly
+// when the buffered bytes plausibly hold the whole document: once the chunk
+// is full or the input has ended, no more bytes can land in place, so a
+// document that will ever complete in this buffer already has, and walking
+// it in one pass saves the slow lane's separate framing scan. While the
+// buffer can still grow, the window stays capped — the walk would routinely
+// reach the buffered edge mid-document and the work to that edge is thrown
+// away. The entry-headroom test keeps streams of entry-dense documents off
+// the extension for the same reason, using twice the stream's mean entry
+// count as the bar for the entry chunk's free tail.
+func (d *docSetStream) extendWalk() bool {
+	if !d.eof && d.bufEnd < cap(d.s.srcChunk) {
+		return false
+	}
+	if d.docs == 0 {
+		return true
+	}
+	free := cap(d.s.entryChunk) - len(d.s.entryChunk)
+	return int64(free) >= 2*(d.docEntries/d.docs)
+}
 
 // readDoc ingests the document whose first significant byte is at *pos,
 // advancing *pos past it on success. The hot path is one pass: the fast tape
 // walker validates, indexes, and locates the document's end directly in the
 // buffered arena bytes, and the commit extends the source and entry chunks
 // over that storage. The walker declining — truncation, a syntax error,
-// exhausted entry storage, deep nesting, or a document past the prefix
-// window — falls to readDocSlow, which settles every such case.
+// exhausted entry storage, deep nesting, or a document past the walk window
+// (docSetPrefixWindow, extendWalk) — falls to readDocSlow, which settles
+// every such case.
 func (s *DocSet) readDoc(d *docSetStream, pos *int) error {
 	start := *pos
 	for {
 		windowEnd := d.bufEnd
-		if windowEnd-start > docSetPrefixWindow {
+		if windowEnd-start > docSetPrefixWindow && !d.extendWalk() {
 			windowEnd = start + docSetPrefixWindow
 		}
 		index, end, ok := s.buildDocPrefix(start, windowEnd)
@@ -167,6 +230,7 @@ func (s *DocSet) readDoc(d *docSetStream, pos *int) error {
 		s.entryChunk = s.entryChunk[:len(s.entryChunk)+len(index.entries)]
 		s.srcChunk = s.srcChunk[:end]
 		s.docs = append(s.docs, index)
+		d.record(end-start, len(index.entries))
 		*pos = end
 		return nil
 	}
@@ -204,6 +268,7 @@ func (s *DocSet) readDocSlow(d *docSetStream, start int, pos *int) error {
 	}
 	s.srcChunk = s.srcChunk[:end]
 	s.docs = append(s.docs, index)
+	d.record(end-start, len(index.entries))
 	*pos = end
 	return nil
 }
@@ -218,6 +283,12 @@ func (s *DocSet) readDocSlow(d *docSetStream, start int, pos *int) error {
 // size, stopped at the root value's end instead of demanding end of input,
 // so accepted documents index byte-identically to Append.
 func (s *DocSet) buildDocPrefix(start, windowEnd int) (Index, int, bool) {
+	if uint64(windowEnd-start) > uint64(^uint32(0)) {
+		// Entry offsets are uint32, exactly as buildIndexOptions enforces; a
+		// window past their reach cannot be walked. The slow lane frames the
+		// document's true extent and reports its own error.
+		return Index{}, 0, false
+	}
 	if cap(s.entryChunk) == 0 {
 		s.entryChunk = make([]IndexEntry, 0, docSetMinEntryChunk)
 	}
