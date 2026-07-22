@@ -72,8 +72,12 @@ digest or byte-count mismatch.
 
 ## Physical state under test
 
-Store receives one `Put(key, json)` per row and then creates/backfills one exact
-index on the configured JSON pointer.
+Store bulk-loads through `StoreBuilder`, which copies every key and document,
+then compacts its immutable key directory before publication. It subsequently
+creates/backfills one exact index on the configured JSON pointer; completion
+folds the transient posting tree into packed pointer-free posting pages. This
+keeps load and index construction separately timed while exercising the same
+mutable Store returned to applications.
 
 DuckDB bulk-loads this table:
 
@@ -167,22 +171,35 @@ After load and both indexes, the runner executes `CHECKPOINT` and records:
 - WAL bytes after the mutation smoke.
 
 Store records settled `runtime.MemStats.HeapAlloc` delta with input and caller
-keys released. It includes exact JSON, structural representation, key lookup,
-chunks, snapshots, and the exact index. The index model is also reported as a
-diagnostic subset.
+keys released, plus `Store.Stats` external key, document-directory, and index
+blocks. The report shows heap, external blocks, and their sum separately. That
+sum includes exact JSON, structural representation, key lookup, chunks,
+snapshots, and the exact index, but remains an engine-accounted resident view
+rather than process RSS. The index model is also reported as a diagnostic
+subset.
+
+After the checkpoint, DuckDB runs the representative point, filter, aggregate,
+group, and containment working set in one process and records the current
+`duckdb_memory()` total plus its `ART_INDEX` subset. This is shown separately
+from the maximum `system_peak_buffer_memory` observed across profiled stages.
 
 These categories answer different questions:
 
-- `Store heap / logical payload` estimates current resident Go-heap expansion;
+- `Store accounted resident / logical payload` estimates current Store-owned
+  heap plus pointer-free external expansion;
 - `DuckDB file / logical payload` estimates durable compressed storage;
+- DuckDB warm buffers estimate current engine-managed memory after the common
+  working set;
 - DuckDB buffer peak estimates engine-managed working memory for this run; and
 - WAL bytes show uncheckpointed durable state.
 
-Dividing Store heap by DuckDB file bytes would mix resident memory with durable
-compressed storage and is therefore forbidden by the report generator. A
-resident-memory comparison needs process RSS or equivalent on both sides under
-the same cache state; a durable-storage comparison needs Store's completed page
-format and retained-generation policy.
+Dividing Store resident bytes by DuckDB file bytes would mix resident memory
+with durable compressed storage and is therefore forbidden by the report
+generator. A resident-memory comparison needs process RSS or equivalent on
+both sides under the same cache state; `duckdb_memory()` and Store's accounted
+bytes are useful diagnostics but do not include identical runtime/process
+overhead. A durable storage comparison needs Store's completed page format and
+retained-generation policy.
 
 ## Timing boundaries
 
@@ -190,7 +207,7 @@ format and retained-generation policy.
 - DuckDB `latency` includes parsing, binding, planning, optimization, and
   execution inside the engine; it excludes container startup and CLI output.
 - Both sides use one CPU execution lane.
-- Load consumes the same NDJSON but uses each engine's intended bulk path.
+- Load consumes the same NDJSON through each engine's intended bulk path.
 - Index build is separate from load.
 - Read ratios are `DuckDB / Store`; greater than 1 means Store took less time.
 - Storage ratios are each engine's bytes divided by logical key+JSON, never an
@@ -220,17 +237,23 @@ go run ./duckdbbench/cmd/duckdbbench report \
   -out "$root/report.md"
 ```
 
-The 5M run is intentionally not an ordinary test: it can consume many
-gigabytes with the current Store heap representation. Record machine model,
-available RAM, operating system, image digest, Go version, and a clean working
-tree alongside any published run. A killed or swapping run is a capacity
-result, not a latency result.
+The 5M run is intentionally not an ordinary test: 400-byte JSON rows plus both
+engines' indexes, durable state, working buffers, and retained artifacts can
+consume several gigabytes. Record machine model, available RAM, operating
+system, image digest, Go version, and a clean working tree alongside any
+published run. A killed or swapping run is a capacity result, not a latency
+result.
 
 Ordinary plumbing validation is fast:
 
 ```bash
 go test ./duckdbbench/...
 ```
+
+For retained-heap attribution of one Store corpus, set
+`DUCKDBBENCH_HEAP_PROFILE=/absolute/path/heap.pprof` on the `ours` command and
+inspect it with `go tool pprof`. Profiling forces an additional GC and is a
+diagnostic run, not timing evidence.
 
 The pinned container smoke is opt-in:
 

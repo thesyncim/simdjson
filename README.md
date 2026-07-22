@@ -6,8 +6,8 @@ Strict JSON processing for Go, written entirely in Go. It provides
 `encoding/json`-style `Marshal` and `Unmarshal` for supported values, reusable
 typed plans, a structural document index with multi-document batch primitives,
 and optional Go-native SIMD.
-The root module has no third-party module dependencies, assembly, C,
-`go:linkname`, or private runtime-layout assumptions.
+The root module uses only `golang.org/x/sys` for scoped Linux file/ring calls;
+it has no assembly, C, `go:linkname`, or private runtime-layout assumptions.
 
 This project is pre-v1: APIs may change while the accepted
 [v1 boundary](docs/adr/0001-v1-api.md) is implemented. It is an independent Go
@@ -124,11 +124,13 @@ The layer around that core, one line each:
   caller's result storage. Build the needle index once; warmed lookups allocate
   nothing, including long escaped strings and exact verification over compact
   shape tapes.
-- **Reusable query execution** — `query.Compile` or the builder API produces an
-  immutable query. Keep one `query.Result` and `query.Workspace` per worker and
-  call `q.RunInto(&result, &set, &workspace)`; after the retained row, posting,
-  decoded-text, and group capacities warm, projection, containment, stable
-  ordering, aggregates, and grouping execute with zero heap allocations.
+- **Reusable typed query execution** — the builder's `Prepare` method and
+  `query.PrepareSQL` produce the same immutable `query.Plan`; SQL is never the
+  executor's representation. Keep one `query.Result` and `query.Workspace` per
+  worker and call `plan.RunInto(&result, &set, &workspace)`; after retained
+  capacities warm, execution allocates nothing. Output schema uses stable
+  ordinals, and typed cells append JSON directly to caller storage, leaving a
+  future wire encoder independent of SQL and header lookup.
 
 Ownership is uniform: an `Index` and its nodes borrow the source and the entry
 storage; `DocSet` and the caches own their arenas, and nothing they hand out is
@@ -187,7 +189,11 @@ store, err := builder.Build()
 The builder is single-goroutine and accepts each key once. It owns both key and
 JSON bytes after `Append`; declared nested or compound indexes are returned
 `Ready`, and the Store immediately supports ordinary mutation, snapshots, TTL,
-and online index changes.
+and online index changes. `Build` folds keys, exact JSON, row descriptors,
+structural tapes, and exact-index postings into pointer-free external blocks.
+The common power-of-two layout uses eight bytes per key reference and 16 bytes
+per row reference; scalar and nested-template tapes select compact widths per
+row instead of widening the whole Store for an exceptional document.
 
 `Store.WriteTo` checkpoints one generation into a Store-native container of the
 same bounded `DocSet` page images. `OpenStore` can borrow a caller-owned
@@ -217,12 +223,62 @@ post-open mutations do not update the image. The measured limit and automatic
 append-only 100x-RAM design are in
 [Mutable Store operations](docs/store.md).
 
-The separate attached-file substrate now has crash-safe double roots, a common
-checksummed page envelope, a pointer-free state root, packed 64-way chunk
-directories, and eight-byte-per-live-row document directories with
-variable-size extents. It remains internal until mutation batches and the
-key/index/TTL page schemas are connected end to end; these codecs do not make
-ordinary `Put` durable yet.
+The separate page-file surface is now an end-to-end bounded-residency read
+tier. `Store.WritePageFile` writes an immutable generation to an empty file,
+publishing its double-superblock only after document, packed 64-way chunk,
+sorted key, and state-root pages are checksummed and synced.
+`OpenStorePageReader` recovers that root and admits pages through a fixed
+external frame arena instead of mapping or validating the corpus eagerly:
+
+```go
+file, err := os.OpenFile("store.next", os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+if err != nil {
+	return err
+}
+_, err = store.WritePageFile(file, simdjson.StorePageWriteOptions{})
+closeErr := file.Close()
+if err != nil || closeErr != nil {
+	return errors.Join(err, closeErr)
+}
+
+reader, err := simdjson.OpenStorePageReader("store.next", simdjson.StorePageOpenOptions{
+	ResidentBytes: 64 << 20,
+	DirectIO:      simdjson.StoreDirectTry,
+})
+if err != nil {
+	return err
+}
+defer reader.Close()
+
+key, ok, err := reader.PrepareKey("session:42")
+if err != nil {
+	return err
+}
+if !ok {
+	return os.ErrNotExist
+}
+dst, ok, err := reader.AppendRawKey(buf[:0], key)
+if err != nil {
+	return err
+}
+if !ok {
+	return os.ErrNotExist
+}
+```
+
+Admission verifies CRC32C, Store identity, page identity, and the complete
+kind-specific schema once; resident hits use epoch-protected views. CLOCK
+eviction cannot reuse a leased frame, concurrent misses for the same page
+coalesce, and a full set of pinned frames returns explicit backpressure instead
+of growing. `RangeRaw` scans in logical chunk/slot order with callback-scoped
+bytes. Linux direct I/O is explicit and observable; `StoreDirectRequire` never
+silently falls back.
+
+This surface is intentionally read-only. It currently rejects Store
+generations with TTL or secondary indexes rather than dropping their
+semantics, and it does not make later `Put` calls durable. Online copy-on-write
+mutation, persistent index/TTL roots, overflow values, reclamation, and
+asynchronous scan batches remain the attached-database boundary.
 
 An update parses only its replacement. Unchanged source and structural-tape
 storage stays immutable and is shared into the next bounded chunk; deletes copy
@@ -291,12 +347,12 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Lookup primitives (probe hit, hashed `Get`) | 3.8–6.4 ns |
 | Extract one field across a document set | 8.1 ns/doc |
 | Extract a typed `int64` column | 12 ns/doc |
-| Immutable `Store.GetRaw` point read | 21.9-23.9 ns, 0 allocations |
-| Compiled stable-slot `Store.GetRawKey` | 8.0-8.5 ns, 0 allocations |
-| Bulk `StoreBuilder` vs repeated `Put` | about 7.7x throughput, 93.7% fewer transient bytes |
+| Immutable `Store.GetRaw` point read | 25.7-26.3 ns, 0 allocations |
+| Compiled stable-slot `Store.GetRawKey` | 3.99-4.04 ns, 0 allocations |
+| Bulk `StoreBuilder` vs repeated `Put` | about 7.5x throughput, 94.7% fewer transient bytes; final source/tapes are pointer-free external blocks |
 | Mapped `OpenStore`, 16,384 keys / 5.40 MB image | 1.04-1.05 ms, 234.7 KB Go heap, 1.21 MB pointer-free external metadata |
-| Mapped `OpenStore`, one compound exact index | 2.64-2.67 ms, 450.6 KB Go heap, 1.21 MB pointer-free external metadata |
-| Mapped keyed read, ordinary / compiled stable slot | 9.22-9.29 ns / 4.63-4.66 ns, 0 allocations |
+| Mapped `OpenStore`, one compound exact index | 2.65-2.68 ms, 423.6 KB transient Go allocation, 1.21 MB external key/document metadata plus 45,056 external index bytes |
+| Mapped keyed read, ordinary / compiled stable slot | 10.23-10.32 ns / 4.47-4.51 ns, 0 allocations |
 | Mapped compound query, 32 rows in 2/256 pages | 2.55-2.61 us, 0 allocations |
 | `Store.WriteTo`, 5.40 MB / 16,384 documents | 1.07-1.09 ms, 4.96-5.04 GB/s, 3 allocations |
 | Default-chunk Store replace | 2.24 us median, 9.8 KiB/op |
@@ -308,7 +364,7 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Dense bitmap Boolean pass on M4 Max | 75-80 GB/s, 0 allocations; NEON did not beat scalar and is not dispatched |
 | Packed resident document page, JSON-only / full string-key verify | 2.566-2.576 ns / 4.034-4.092 ns, 0 allocations |
 | Packed 64-way chunk-directory hit | 7.17-7.26 ns, 0 allocations |
-| 5M-row indexed Store scale smoke | 0.98M build docs/s, 55 ns point read, 521.1 live-heap B/doc, 0.251 objects/doc, 4.16 packed-index B/doc |
+| 5M-row indexed Store scale smoke | 0.95M build docs/s, 49 ns point read, 14.4 heap B/doc, 0.016 objects/doc, 163.1 accounted B/doc, 4.16 packed-index B/doc |
 
 On the hosted AMD EPYC 7763 runner, AVX2 reduced the fused dense Store
 three-predicate kernel from 815-823 ns to 174-175 ns (about 4.7x). The complete
@@ -345,8 +401,9 @@ define the methodology, gates, comparison boundaries, and pinned toolchains.
 | Compact, indented, or canonical output | `Compact`, `Indent`, `Canonicalize` |
 | Borrowed selection or repeated document navigation | `RawValue`, `Index`/`Node`, or `Parse`/`Value` |
 | Keyed datasets, including bulk construction | `StoreBuilder`, `Store`, `Snapshot` |
+| Immutable datasets larger than a fixed frame budget | `Store.WritePageFile`, `OpenStorePageReader`, `StorePageReader` |
 | Low-level immutable arenas and column extraction | `DocSet`, `ShapeCache`, `KeyInterner` |
-| SQL-shaped projection, filtering, grouping, and aggregation | `query.Query.RunInto`, `query.Result`, `query.Workspace` |
+| Typed projection, filtering, grouping, and aggregation; optional SQL front end | `query.Plan`, `query.PrepareSQL`, `query.Result`, `query.Workspace` |
 | Keyed updates, deletes, TTL, snapshots, exact indexes, and wildcard postings | `Store`, `Snapshot`, `StoreIndexDefinition`, `StoreStats` |
 
 The advanced document APIs are moving into `document` during the pre-v1
@@ -378,6 +435,13 @@ Compiled encoders, decoders, keys, and pointers are immutable and safe for
 concurrent use. Destinations and source buffers remain caller-owned; each
 `Reader` or `Writer` belongs to one goroutine. The complete rules are in the
 [architecture and safety record](docs/architecture.md).
+
+`StorePageReader` is safe for concurrent reads; `Close` waits for live page
+values, and new calls observe `ErrStorePageClosed`. `StorePageValue` and
+`RangeRaw` callback bytes borrow fixed cache
+frames. Close each value, never retain callback bytes, and use `AppendRaw` when
+the result must outlive a lease. Prepared page keys retain only value metadata,
+not frame pointers, and are safe to copy and share.
 
 ## Support and project records
 

@@ -96,9 +96,13 @@ type storeState struct {
 	generation uint64
 	count      int
 	chunkCount uint32
-	seed       maphash.Seed
-	options    StoreOptions
-	keys       *storeKeyNode
+	// mappedDocChunks counts current chunks that still borrow mappedDocs. A
+	// rebuilt chunk becomes ordinary owned Go state; the last detach drops the
+	// state-level owner while retained snapshots keep their own chunk owners.
+	mappedDocChunks uint32
+	seed            maphash.Seed
+	options         StoreOptions
+	keys            *storeKeyNode
 	// baseKeys is the compact immutable directory created by StoreBuilder or
 	// OpenStore. keys is then only the path-copied overlay for later insertions
 	// and moved keys.
@@ -204,9 +208,14 @@ func prepareStoreDocSet(docs *DocSet, options StoreOptions, postings bool, old *
 		return
 	}
 	narrowCap := 0
+	entryCap := 0
 	for bitsLeft := live; bitsLeft != 0; bitsLeft &= bitsLeft - 1 {
 		slot := bits.TrailingZeros64(bitsLeft)
 		if slot == replaceSlot || old.live&(uint64(1)<<uint(slot)) == 0 {
+			continue
+		}
+		if template, ok := old.docs.storeTemplateAt(int(old.ord[slot])); ok {
+			entryCap += len(template.index.entries)
 			continue
 		}
 		ref := old.docs.shapeTapeRefAt(int(old.ord[slot]))
@@ -217,9 +226,14 @@ func prepareStoreDocSet(docs *DocSet, options StoreOptions, postings bool, old *
 	}
 	if replaceSlot >= 0 {
 		if old.live&(uint64(1)<<uint(replaceSlot)) != 0 {
-			ref := old.docs.shapeTapeRefAt(int(old.ord[replaceSlot]))
-			if ref.narrow {
-				narrowCap += len(ref.rec.fields)
+			oldOrd := int(old.ord[replaceSlot])
+			if template, ok := old.docs.storeTemplateAt(oldOrd); ok {
+				entryCap += len(template.index.entries)
+			} else {
+				ref := old.docs.shapeTapeRefAt(oldOrd)
+				if ref.narrow {
+					narrowCap += len(ref.rec.fields)
+				}
 			}
 		} else if old.count != 0 {
 			// An insertion has no old row to size from. Reserve the current
@@ -231,6 +245,9 @@ func prepareStoreDocSet(docs *DocSet, options StoreOptions, postings bool, old *
 	if narrowCap != 0 {
 		docs.narrow = make([]shapeNarrowValue, 0, narrowCap)
 	}
+	if entryCap != 0 {
+		docs.entryChunk = make([]IndexEntry, 0, entryCap)
+	}
 }
 
 // appendStoreDoc carries one validated immutable document into a new dense
@@ -239,6 +256,12 @@ func prepareStoreDocSet(docs *DocSet, options StoreOptions, postings bool, old *
 // and rewrite the private offset before commit. commitDoc then rebuilds any
 // enabled chunk-local postings or value dictionary against the new ordinal.
 func appendStoreDoc(dst *DocSet, old *DocSet, oldOrd int) int {
+	if template, ok := old.storeTemplateAt(oldOrd); ok {
+		used := len(dst.entryChunk)
+		dst.entryChunk = old.synthStoreTemplate(oldOrd, template, dst.entryChunk)
+		index := Index{src: old.docAt(oldOrd).src, entries: dst.entryChunk[used:]}
+		return dst.commitDoc(index, shapeTapeRef{})
+	}
 	index := old.docAt(oldOrd)
 	ref := old.shapeTapeRefAt(oldOrd)
 	promoted := false
@@ -368,10 +391,6 @@ func cloneStoreChunk(options StoreOptions, postings bool, old *storeChunk) (*sto
 	return buildStoreChunk(options, postings, old, old.live, -1, "", nil)
 }
 
-func (c *storeChunk) rawSlot(slot int) []byte {
-	return c.docs.rawAt(int(c.ord[slot]))
-}
-
 func (c *storeChunk) key(slot int) string {
 	if c.keys != nil {
 		return c.keys[slot]
@@ -416,6 +435,7 @@ func (s *Store) Put(key string, src []byte) (created bool, err error) {
 		}
 		next := *state
 		next.generation++
+		next.detachMappedDocuments(old)
 		next.chunks = state.chunks.set(loc.chunk, chunk)
 		s.noteChunkPostingsLocked(loc.chunk, old, chunk)
 		catalogChanged, secondaryChanged := s.noteIndexesForChunkLocked(loc.chunk, old, chunk, uint64(1)<<loc.slot)
@@ -441,6 +461,7 @@ func (s *Store) Put(key string, src []byte) (created bool, err error) {
 	next := *state
 	next.generation++
 	next.count++
+	next.detachMappedDocuments(old)
 	loc = storeLocation{chunk: chunkID, slot: uint8(slot)}
 	next.keys = storeKeyInsert(state.keys, hash, key, loc)
 	if chunkID == state.chunks.count {
@@ -495,6 +516,7 @@ func (s *Store) deleteLocked(key string) bool {
 	next := *state
 	next.generation++
 	next.count--
+	next.detachMappedDocuments(old)
 	next.keys = storeKeyDelete(state.keys, hash, key)
 	next.chunks = state.chunks.set(loc.chunk, chunk)
 	if chunk == nil {
@@ -514,6 +536,26 @@ func (s *Store) deleteLocked(key string) bool {
 	}
 	s.state.Store(&next)
 	return true
+}
+
+func (s *storeState) detachMappedDocuments(chunk *storeChunk) {
+	if s.mappedDocs == nil || chunk == nil || chunk.docs.mappedDocs != s.mappedDocs {
+		return
+	}
+	s.detachMappedDocumentChunks(1)
+}
+
+func (s *storeState) detachMappedDocumentChunks(count uint32) {
+	if count == 0 {
+		return
+	}
+	if count > s.mappedDocChunks {
+		panic("simdjson: mapped Store document count invariant")
+	}
+	s.mappedDocChunks -= count
+	if s.mappedDocChunks == 0 {
+		s.mappedDocs = nil
+	}
 }
 
 func (s *Store) allocateSlotLocked(state *storeState) (uint32, int, *storeChunk) {
@@ -625,13 +667,13 @@ func (s Snapshot) GetRaw(key string) (RawValue, bool) {
 		if chunk == nil || chunk.live&(uint64(1)<<loc.slot) == 0 {
 			return RawValue{}, false
 		}
-		return RawValue{src: chunk.rawSlot(int(loc.slot))}, true
+		return RawValue{src: chunk.docs.rawAt(int(chunk.ord[loc.slot]))}, true
 	}
 	chunk, loc, ok := storeStateKeyLookupChunk(s.state, hash, key)
 	if !ok {
 		return RawValue{}, false
 	}
-	return RawValue{src: chunk.rawSlot(int(loc.slot))}, true
+	return RawValue{src: chunk.docs.rawAt(int(chunk.ord[loc.slot]))}, true
 }
 
 // Get returns key's navigable Index. Shape-taped chunks may take their widening
@@ -670,7 +712,7 @@ func (s Snapshot) Range(fn func(key string, value RawValue) bool) {
 	s.state.chunks.each(func(_ uint32, chunk *storeChunk) bool {
 		for live := chunk.live; live != 0; live &= live - 1 {
 			slot := bits.TrailingZeros64(live)
-			if !fn(chunk.key(slot), RawValue{src: chunk.rawSlot(slot)}) {
+			if !fn(chunk.key(slot), RawValue{src: chunk.docs.rawAt(int(chunk.ord[slot]))}) {
 				return false
 			}
 		}

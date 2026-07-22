@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"time"
 
@@ -19,10 +20,13 @@ import (
 // is measured before the destructive mutation smoke so the storage row and
 // read timings describe the same state.
 type OursStore struct {
-	LoadNS       int64  `json:"load_ns"`
-	IndexBuildNS int64  `json:"index_build_ns,omitempty"`
-	HeapBytes    int64  `json:"heap_bytes"`
-	IndexBytes   uint64 `json:"index_bytes,omitempty"`
+	LoadNS                int64  `json:"load_ns"`
+	IndexBuildNS          int64  `json:"index_build_ns,omitempty"`
+	HeapBytes             int64  `json:"heap_bytes"`
+	ExternalKeyBytes      uint64 `json:"external_key_bytes,omitempty"`
+	ExternalDocumentBytes uint64 `json:"external_document_bytes,omitempty"`
+	ExternalIndexBytes    uint64 `json:"external_index_bytes,omitempty"`
+	IndexBytes            uint64 `json:"index_bytes,omitempty"`
 
 	PointNS   int64 `json:"point_ns"`
 	FilterNS  int64 `json:"filter_ns,omitempty"`
@@ -41,6 +45,26 @@ type OursStore struct {
 	SumObserved  int64 `json:"sum_observed,omitempty"`
 	GroupCount   int   `json:"group_count,omitempty"`
 	ContainCount int   `json:"contain_count,omitempty"`
+}
+
+// AccountedResidentBytes combines settled live Go heap with Store-owned
+// pointer-free blocks that are outside HeapAlloc but remain resident process
+// memory. It deliberately excludes the caller's released NDJSON input.
+func (v OursStore) AccountedResidentBytes() int64 {
+	const maxInt64 = int64(^uint64(0) >> 1)
+	external := v.ExternalKeyBytes
+	if external > uint64(maxInt64) || v.ExternalDocumentBytes > uint64(maxInt64)-external {
+		return 0
+	}
+	external += v.ExternalDocumentBytes
+	if v.ExternalIndexBytes > uint64(maxInt64)-external {
+		return 0
+	}
+	external += v.ExternalIndexBytes
+	if v.HeapBytes < 0 || v.HeapBytes > maxInt64-int64(external) {
+		return 0
+	}
+	return v.HeapBytes + int64(external)
 }
 
 // OursCorpus binds one Store measurement to the exact generated manifest.
@@ -94,10 +118,14 @@ func countValue(r query.Result) int64 {
 
 const duckDBBenchStoreIndex = "duckdbbench_filter"
 
-// buildMeasuredStore consumes NDJSON from memory. Keys are prepared before
-// timing on both sides; Put still copies every key and document into Store.
+// buildMeasuredStore consumes NDJSON through StoreBuilder so both engines use
+// their intended bulk-load path. Append still copies every key and document;
+// Build compacts immutable keys before returning the mutable Store.
 func buildMeasuredStore(buf []byte, keys []string) (*simdjson.Store, error) {
-	store := simdjson.NewStore(simdjson.StoreOptions{ShapeTapes: true})
+	builder, err := simdjson.NewStoreBuilder(simdjson.StoreOptions{ShapeTapes: true})
+	if err != nil {
+		return nil, err
+	}
 	row := 0
 	for len(buf) != 0 {
 		end := bytes.IndexByte(buf, '\n')
@@ -108,7 +136,7 @@ func buildMeasuredStore(buf []byte, keys []string) (*simdjson.Store, error) {
 			if row >= len(keys) {
 				return nil, fmt.Errorf("NDJSON has more than %d documents", len(keys))
 			}
-			if _, err := store.Put(keys[row], buf[:end]); err != nil {
+			if err := builder.Append(keys[row], buf[:end]); err != nil {
 				return nil, fmt.Errorf("document %d: %w", row, err)
 			}
 			row++
@@ -121,7 +149,7 @@ func buildMeasuredStore(buf []byte, keys []string) (*simdjson.Store, error) {
 	if row != len(keys) {
 		return nil, fmt.Errorf("NDJSON has %d documents, manifest says %d", row, len(keys))
 	}
-	return store, nil
+	return builder.Build()
 }
 
 func buildMeasuredStoreIndex(store *simdjson.Store, m Manifest) error {
@@ -201,6 +229,24 @@ func MeasureStoreCorpus(dir string, m Manifest, reps int) (OursStore, error) {
 	keys = nil
 	if retained := int64(heapAlloc()) - int64(base); retained > 0 {
 		v.HeapBytes = retained
+	}
+	storeStats := store.Stats()
+	v.ExternalKeyBytes = storeStats.ExternalKeyBytes
+	v.ExternalDocumentBytes = storeStats.ExternalDocumentBytes
+	v.ExternalIndexBytes = storeStats.ExternalIndexBytes
+	if profilePath := os.Getenv("DUCKDBBENCH_HEAP_PROFILE"); profilePath != "" {
+		profile, profileErr := os.Create(profilePath)
+		if profileErr != nil {
+			return v, profileErr
+		}
+		profileErr = pprof.WriteHeapProfile(profile)
+		closeErr := profile.Close()
+		if profileErr != nil {
+			return v, profileErr
+		}
+		if closeErr != nil {
+			return v, closeErr
+		}
 	}
 	if m.ContainKey != "" {
 		stats, err := store.IndexStats(duckDBBenchStoreIndex)

@@ -75,14 +75,14 @@ func (s Snapshot) GetRawKey(key StoreKey) (RawValue, bool) {
 		chunk := state.chunks.get(loc.chunk)
 		if chunk != nil && chunk.live&(uint64(1)<<loc.slot) != 0 &&
 			(key.generation == state.generation || chunk.key(int(loc.slot)) == key.key) {
-			return RawValue{src: chunk.rawSlot(int(loc.slot))}, true
+			return RawValue{src: chunk.docs.rawAt(int(chunk.ord[loc.slot]))}, true
 		}
 	}
 	chunk, loc, ok := storeKeyCompiledFallback(state, key)
 	if !ok {
 		return RawValue{}, false
 	}
-	return RawValue{src: chunk.rawSlot(int(loc.slot))}, true
+	return RawValue{src: chunk.docs.rawAt(int(chunk.ord[loc.slot]))}, true
 }
 
 // GetKey returns key's navigable Index through a compiled Store lookup. Shape-

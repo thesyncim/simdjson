@@ -130,6 +130,25 @@ func OpenChunkDirectoryPage(src []byte, fileEnd, nextLogicalID uint64) (ChunkDir
 	return ChunkDirectoryView{header: header, payload: payload}, nil
 }
 
+// AdmittedChunkDirectoryPage reconstructs a view of a page already validated
+// by PageCache admission. Calling it on arbitrary bytes is invalid. It avoids
+// repeating CRC and whole-node validation on every resident lookup.
+func AdmittedChunkDirectoryPage(src []byte) ChunkDirectoryView {
+	pageHeader, _ := decodePageHeader(src)
+	payloadEnd := PageHeaderSize + int(pageHeader.PayloadLength)
+	payload := src[PageHeaderSize:payloadEnd:payloadEnd]
+	return ChunkDirectoryView{
+		header: ChunkDirectoryHeader{
+			StoreID: pageHeader.StoreID, Generation: pageHeader.Generation,
+			LogicalID: pageHeader.LogicalID, PageSize: pageHeader.PageSize,
+			Prefix: binary.LittleEndian.Uint32(payload[4:8]),
+			Bitmap: binary.LittleEndian.Uint64(payload[8:16]), Shift: payload[16],
+			Flags: binary.LittleEndian.Uint16(payload[18:20]),
+		},
+		payload: payload,
+	}
+}
+
 // Header returns the value-only identity and radix metadata of the view.
 func (v ChunkDirectoryView) Header() ChunkDirectoryHeader { return v.header }
 
@@ -143,6 +162,21 @@ func (v ChunkDirectoryView) RefAt(rank int) (PageRef, bool) {
 		return PageRef{}, false
 	}
 	return chunkDirectoryRefAt(v.payload, rank)
+}
+
+// ChunkIDAt returns the logical chunk id represented by a leaf rank. It is
+// false for branch nodes. Rank follows the increasing set-bit order used by
+// RefAt, so callers can enumerate a sparse leaf without scanning empty ids.
+func (v ChunkDirectoryView) ChunkIDAt(rank int) (uint32, bool) {
+	if v.header.Shift != 0 || rank < 0 || rank >= v.Len() {
+		return 0, false
+	}
+	bitmap := v.header.Bitmap
+	for range rank {
+		bitmap &= bitmap - 1
+	}
+	lane := uint32(bits.TrailingZeros64(bitmap))
+	return v.header.Prefix | lane, true
 }
 
 // Lookup resolves one logical chunk id with a prefix check, bitmap probe, and

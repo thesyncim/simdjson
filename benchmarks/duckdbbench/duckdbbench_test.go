@@ -58,7 +58,7 @@ func writeDuckDBRun(t *testing.T, dir string, m Manifest) {
 	}
 	facts := "IMAGE duckdb/duckdb:1.5.4@sha256:test\n" +
 		"VERSION v1.5.4 test\nPLATFORM linux/arm64\nCORPUS_SHA256 " + m.NDJSONSHA256 + "\n" +
-		"THREADS 1\nDOCS 10\nSOURCE_BYTES " + strconv.FormatInt(m.SourceBytes, 10) + "\nKEY_BYTES " + strconv.FormatInt(m.KeyBytes, 10) + "\nDATABASE_BYTES 8192\nWAL_BYTES 0\n" +
+		"THREADS 1\nDOCS 10\nSOURCE_BYTES " + strconv.FormatInt(m.SourceBytes, 10) + "\nKEY_BYTES " + strconv.FormatInt(m.KeyBytes, 10) + "\nDATABASE_BYTES 8192\nWAL_BYTES 0\nCURRENT_BUFFER_BYTES 6144\nCURRENT_ART_BYTES 1024\nCURRENT_TEMP_BYTES 0\n" +
 		"MUTATION_OPS 2\nWAL_BYTES_AFTER_MUTATIONS 1024\n" +
 		"RESULT docs 10\nRESULT extract_hits 10\nRESULT filter 2\n" +
 		"RESULT group 3\nRESULT contain 2\nRESULT sum 55\nRESULT after_deletes 8\n"
@@ -137,7 +137,8 @@ func TestBuildReportKeepsAccountingDomainsSeparate(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := OursStore{
-		LoadNS: 100_000, IndexBuildNS: 200_000, HeapBytes: 4000, IndexBytes: 256,
+		LoadNS: 100_000, IndexBuildNS: 200_000, HeapBytes: 4000,
+		ExternalKeyBytes: 1000, ExternalIndexBytes: 256, IndexBytes: 256,
 		PointNS: 100, FilterNS: 1000, SumNS: 2000, GroupNS: 3000, ContainNS: 4000,
 		MutationOps: 2, UpdateNSOp: 500, DeleteNSOp: 300, AfterDeletes: 8,
 		DocsObserved: 10, ExtractHits: 10, FilterCount: 2, SumObserved: 55,
@@ -146,11 +147,20 @@ func TestBuildReportKeepsAccountingDomainsSeparate(t *testing.T) {
 	report := BuildReport(OursResults{GoVersion: "go-test", GOARCH: "test", Corpora: []OursCorpus{{Manifest: m, Store: store}}}, map[string]DuckDBLog{"tiny": log})
 	for _, want := range []string{
 		"Store and DuckDB comparison", "Correctness gate", "Store live heap",
-		"DuckDB file", "there is no heap/disk cross-ratio", "Per-key mutations", "verified",
+		"Store accounted resident", "warm buffers", "DuckDB file", "there is no heap/disk cross-ratio", "Per-key mutations", "verified",
 	} {
 		if !strings.Contains(report, want) {
 			t.Fatalf("report missing %q:\n%s", want, report)
 		}
+	}
+}
+
+func TestAccountedResidentBytesRejectsOverflow(t *testing.T) {
+	if got := (OursStore{HeapBytes: 7, ExternalKeyBytes: 11, ExternalDocumentBytes: 13, ExternalIndexBytes: 17}).AccountedResidentBytes(); got != 48 {
+		t.Fatalf("AccountedResidentBytes = %d, want 48", got)
+	}
+	if got := (OursStore{HeapBytes: 1, ExternalKeyBytes: ^uint64(0), ExternalDocumentBytes: 1}).AccountedResidentBytes(); got != 0 {
+		t.Fatalf("overflowed AccountedResidentBytes = %d, want 0", got)
 	}
 }
 
@@ -165,9 +175,9 @@ func TestMeasureStoreCorpusSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	if bad := result.Verify(m); len(bad) != 0 {
-		t.Fatalf("verification: %v", bad)
+		t.Fatalf("verification: %v; result: %+v", bad, result)
 	}
-	if result.HeapBytes <= 0 || result.PointNS <= 0 || result.UpdateNSOp <= 0 || result.DeleteNSOp <= 0 {
+	if result.HeapBytes <= 0 || result.AccountedResidentBytes() <= result.HeapBytes || result.PointNS <= 0 || result.UpdateNSOp <= 0 || result.DeleteNSOp <= 0 {
 		t.Fatalf("missing measurements: %+v", result)
 	}
 }

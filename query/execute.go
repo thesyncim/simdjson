@@ -2,9 +2,9 @@ package query
 
 import (
 	"bytes"
+	"math"
 	"math/bits"
 	"slices"
-	"strconv"
 
 	"github.com/thesyncim/simdjson"
 	"github.com/thesyncim/simdjson/document"
@@ -38,13 +38,16 @@ type Workspace struct {
 
 	containsEntries []simdjson.IndexEntry
 	text            []byte
-	numbers         []byte
 
 	accs       []aggAcc
+	reductions []simdjson.Float64Aggregate
+	reduced    []bool
 	interner   simdjson.KeyInterner
 	groups     []group
 	groupKey   []byte
 	groupOrder []int
+	stringHash []uint32
+	stringSlot []uint32
 }
 
 func (w *Workspace) nextStoreMasks() []simdjson.StoreMask {
@@ -96,7 +99,6 @@ func (w *Workspace) keepCandidates(rows []int) {
 func (p *plan) runInto(dst *Result, s *simdjson.DocSet, w *Workspace) error {
 	w.candidateUsed = 0
 	w.text = w.text[:0]
-	w.numbers = w.numbers[:0]
 	w.groupKey = w.groupKey[:0]
 	w.groupOrder = w.groupOrder[:0]
 	w.interner.Reset()
@@ -132,11 +134,17 @@ func (p *plan) runSnapshotInto(dst *Result, snapshot simdjson.Snapshot, w *Works
 	w.candidateUsed = 0
 	w.storeMaskUsed = 0
 	w.text = w.text[:0]
-	w.numbers = w.numbers[:0]
 	w.groupKey = w.groupKey[:0]
 	w.groupOrder = w.groupOrder[:0]
 	w.interner.Reset()
-
+	if p.runDirectSnapshotAggregate(dst, snapshot, w) {
+		return nil
+	}
+	if handled, err := p.runDirectSnapshotStringCountGroups(dst, snapshot, w); err != nil {
+		return err
+	} else if handled {
+		return nil
+	}
 	masks := p.storeCandidateMasks(snapshot, w)
 	candidateCount := 0
 	for _, mask := range masks {
@@ -251,6 +259,13 @@ func (ctx *execCtx) extractSnapshot(p *plan, snapshot simdjson.Snapshot, sourceR
 
 	ctx.nums = resize(ctx.nums, len(p.numPaths))
 	for i, cp := range p.numPaths {
+		if !compact && cp.single {
+			vals, valid := snapshot.AppendFieldFloat64(
+				ctx.nums[i].vals[:0], ctx.nums[i].valid[:0], cp.name, &ctx.cache,
+			)
+			ctx.nums[i] = numColumn{vals: vals, valid: valid}
+			continue
+		}
 		var raws []simdjson.RawValue
 		var err error
 		if compact {
@@ -379,7 +394,6 @@ func (p *plan) runAggregateInto(dst *Result, ctx *execCtx, selected []int, w *Wo
 		rows = 0
 	}
 	prepareResult(dst, p, rows)
-	w.prepareNumbers(rows * len(p.columns) * 32)
 	if rows != 0 {
 		p.fillAggregateCells(dst, 0, w.accs, nil, w)
 	}
@@ -417,7 +431,6 @@ func (p *plan) runGroupedInto(dst *Result, ctx *execCtx, selected []int, w *Work
 		w.groupOrder = w.groupOrder[:p.limit]
 	}
 	prepareResult(dst, p, len(w.groupOrder))
-	w.prepareNumbers(len(w.groupOrder) * len(p.columns) * 32)
 	for row, id := range w.groupOrder {
 		g := &w.groups[id]
 		p.fillAggregateCells(dst, row, g.accs, g, w)
@@ -512,24 +525,12 @@ func (p *plan) fillAggregateCells(dst *Result, row int, accs []aggAcc, g *group,
 	}
 }
 
-func (w *Workspace) prepareNumbers(need int) {
-	if cap(w.numbers) < need {
-		w.numbers = make([]byte, 0, growCap(cap(w.numbers), need))
-	} else {
-		w.numbers = w.numbers[:0]
-	}
-}
-
 func (w *Workspace) floatCell(f float64) Cell {
-	mark := len(w.numbers)
-	w.numbers = strconv.AppendFloat(w.numbers, f, 'g', -1, 64)
-	return Cell{kind: KindNumber, fval: f, raw: w.numbers[mark:]}
+	return Cell{kind: KindNumber, word: math.Float64bits(f)}
 }
 
 func (w *Workspace) countCell(n int) Cell {
-	mark := len(w.numbers)
-	w.numbers = strconv.AppendInt(w.numbers, int64(n), 10)
-	return Cell{kind: KindNumber, fval: float64(n), ival: int64(n), isInt: true, raw: w.numbers[mark:]}
+	return Cell{kind: KindNumber, flag: cellInteger, word: uint64(n)}
 }
 
 func (w *Workspace) numericOrNull(n int, v float64) Cell {
@@ -548,13 +549,13 @@ func prepareResult(dst *Result, p *plan, rows int) {
 		}
 		dst.Columns = dst.Columns[:len(p.columns)]
 	}
-	for i, pc := range p.columns {
+	for i := range p.columns {
 		cells := dst.Columns[i].Cells
 		if rows < len(cells) {
 			clear(cells[rows:])
 		}
 		cells = resize(cells, rows)
-		dst.Columns[i].Header = pc.header
+		dst.Columns[i].Header = p.headers[i]
 		dst.Columns[i].Cells = cells
 	}
 	dst.RowCount = rows

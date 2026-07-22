@@ -11,7 +11,7 @@ import (
 
 // Given a battery of SQL queries paired with the builder query each is meant to
 // denote, when both run over a set of corpora, then their column-oriented
-// Results are identical — the parser emits the builder IR and nothing else. A
+// Results are identical — SQL and builder syntax lower to one typed plan. A
 // second battery of malformed inputs asserts each yields a *ParseError with a
 // position and never a panic. Together these are a differential (parser vs the
 // builder it must match) plus a rejection suite over a bounded input domain.

@@ -4,9 +4,10 @@ Status: accepted in stages. Transient construction, the caller-owned
 Store-image boundary with pointer-free base metadata, dense stable-slot Boolean
 workspaces, the scoped pure-Go Linux ring substrate, the bounded internal page
 committer, checksummed double-superblock recovery, the common page envelope,
-the state-root schema, packed chunk directories, and compact document pages are
-implemented. Mutation attachment, key/index/TTL and large-value overflow page
-schemas, the swizzled read-page manager, and bounded residency remain proposed.
+the state-root schema, packed chunk and key directories, compact document
+pages, and the read-only bounded-residency page manager are implemented.
+Mutation attachment, durable index/TTL and large-value overflow schemas,
+asynchronous read batches, and reclamation remain proposed.
 Extends ADR 0004 without changing its borrowed-value lifetime contract.
 
 ## Decision
@@ -63,6 +64,40 @@ in that first reader-visible generation. On the 16,384-document microbenchmark
 without a declared index, construction is about 7.7x faster than repeated
 `Put` and reduces transient allocation bytes from 143 MiB to 8.9 MiB. Adding a
 ready 16-value exact index costs about 1 ms and 0.2 MiB on that fixture.
+
+Before publication, the builder replaces its transient pointer graph with a
+small set of pointer-free owned blocks. Power-of-two chunk sizes derive
+`(chunk, slot)` from key ordinal, so the common key reference is eight bytes;
+non-power-of-two layouts retain an explicit 12-byte reference. The common row
+descriptor is 16 bytes and falls back to 24 or 32 bytes only when document,
+classic-tape, or shape-catalog bounds require it. Flat scalar tapes select three, four,
+or five bytes per value. Repeated nested layouts share one exactly verified
+structural template and store two, three, or four span bytes per non-key entry.
+All choices are per publication or per row and have exact wider fallbacks.
+Updates, deletes, expiry batches, and posting maintenance detach each rebuilt
+chunk from that base. A constant-time remaining-chunk count drops the current
+generation's document owner after the last detach; retained snapshots continue
+to pin their original chunks and therefore preserve borrowing safety.
+
+## Implementation boundaries
+
+The Store representation is split by responsibility:
+
+- `store_builder.go` owns append, chunk finalization, and one-shot publication;
+- `store_owned_documents.go` sizes and writes the pointer-free document arena;
+- `store_document_template.go` admits exact repeated layouts and chooses row
+  encodings;
+- `store_document_template_read.go` decodes templates and contains the cold
+  widening path;
+- `store_mapped_keys.go` owns mapped, compact, and ordinal-derived key tables;
+- `store_index_packed.go` owns immutable packed posting bases; and
+- `query/execute_snapshot_fast.go` contains complete Store-only execution lanes,
+  with the generic query executor as the semantic fallback.
+
+Store-specific policy does not live in the `simd` subpackage. That package
+contains only reusable architecture kernels. Representation code may call a
+measured kernel, but key, TTL, persistence, index, and query semantics remain in
+their owning modules.
 
 ## Key-directory choice and CHAMP
 
@@ -125,13 +160,13 @@ takes 1.04-1.05 ms and allocates 234,688-234,689 Go-heap bytes in 273
 allocations, plus 688,136 pointer-free external key bytes and 524,288 external
 row bytes. Against the earlier per-key HAMT/per-row reopen, this is about 93%
 less Go heap, 98.6% fewer allocations, and 40% lower open latency. One compound
-exact index raises open to 2.64-2.67 ms and about 450.6 KB Go heap because its
-root is not mapped yet. This is a useful off-heap payload/startup boundary, but
-the remaining eager validation and root reconstruction are explicit evidence
-that it is not the final greater-than-memory representation.
+exact index raises open to 2.65-2.68 ms and about 423.6 KB of transient Go
+allocation while producing a 45,056-byte external packed base. This is a
+useful off-heap payload/startup boundary, but the remaining eager validation is
+explicit evidence that it is not the final greater-than-memory representation.
 
-After open, the same mapping measured 9.22-9.29 ns for ordinary keyed reads,
-4.63-4.66 ns for compiled generation-pinned stable-slot reads, and 2.55-2.61 us
+After open, the same mapping measured 10.23-10.32 ns for ordinary keyed reads,
+4.47-4.51 ns for compiled generation-pinned stable-slot reads, and 2.55-2.61 us
 for a zero-allocation compound query selecting 32 rows from two of 256
 micro-pages. These are hot-mapping measurements, not promises for storage
 faults.
@@ -144,22 +179,48 @@ stream every nested page without per-row or per-page heap objects.
 
 ## Greater-than-memory mode
 
-The current Store image can be larger than physical memory as a virtual
-mapping, but `OpenStore` still validates every key and row, allocates external
-metadata proportional to both, and rebuilds distinct shapes and exact roots
-from documents. It therefore cannot promise a bounded resident working set or
-a 100x-RAM corpus yet. The mapping is bounded by virtual address space, Go's
-`int` slice length, the image format, and existing per-document 32-bit
-coordinate limits.
+The caller-owned `OpenStore` image can be larger than physical memory as a
+virtual mapping, but it still validates every key and row, allocates external
+metadata proportional to both, and rebuilds distinct shapes and exact roots.
+It is not the bounded-residency surface.
 
-The engineering target for mapped Store is a data image at least 100 times the
-configured resident budget, provided the workload's hot key/index/page working
-set fits that budget. The multiplier is not a latency guarantee: a cold random
-read must pay a storage fault. Selective indexed queries can nevertheless beat
-a heap engine that scans more data by proving non-candidate pages from compact
-resident summaries and never faulting their JSON bytes.
+`Store.WritePageFile` and `OpenStorePageReader` implement the first explicit
+greater-than-memory tier for immutable generations. The writer emits packed
+document extents first, a sparse 64-way chunk radix, a sorted keyed B+tree,
+then the state root and finally one alternating superblock. The reader keeps
+only the recovered value root plus a fixed frame arena and O(frame-count)
+control words. Page bytes live outside Go `HeapAlloc` on supported Unix
+systems. The cache rounds the configured byte budget down to equal maximum-
+extent frames and never grows beyond it.
 
-Keep residency controllable by separating four temperature classes:
+On admission, a frame verifies the common checksum and full physical identity,
+then validates its document or directory schema. Only then does an even epoch
+publish it to lock-free ready probes. Eviction atomically claims exactly an
+unpinned frame, uses CLOCK second chances, and cannot cross a live lease.
+Concurrent misses for one physical reference wait for the first read. Failed
+pages stay failed until explicitly invalidated; corruption is never converted
+to a miss. Closing prevents new admissions, waits for loads and leases, then
+unmaps the arena. A prepared key stores only Store id, exact spelling, stable
+slot, and physical reference—never a frame pointer—so it survives eviction and
+still rechecks the complete key after admission.
+
+The bounded smoke uses a 1,155,072-byte file with an 8,192-byte frame budget:
+141.0x more file than cache. Every lookup and a complete ordered scan remain
+correct under continuous eviction. This ratio covers the explicit frame arena,
+not process baseline, goroutine stacks, kernel memory, or the small
+O(frame-count) Go control table. It is a residency proof, not an equal-latency
+claim: cold direct reads pay storage latency.
+
+On Apple M4 Max, admitted ordinary point reads measured 150.7-153.9 ns and a
+prepared immutable location 49.3-49.8 ns, both at zero allocations. Under the
+141x pressure fixture, random point reads perform five 4 KiB reads and measured
+7.06-7.14 us through the host buffer cache. A full 4,096-row ordered scan reads
+264 pages/1,081,344 bytes and measured 371-378 us, about 91 ns per row. In a
+Linux/arm64 Docker VM with `O_DIRECT` required, the same random point measured
+168-174 us and the scan 9.53-9.93 ms. Those direct numbers describe that VM and
+its storage path; they do not estimate NVMe hardware.
+
+The complete mutable design continues to separate four temperature classes:
 
 1. a very small pinned superblock and upper key/index directory;
 2. bounded swizzled frames for directory, posting, and document pages;
@@ -167,13 +228,10 @@ Keep residency controllable by separating four temperature classes:
    reads and bounded prefetch; and
 4. append-only replacement pages plus reclaimable free extents.
 
-The Store page manager, rather than virtual mapping size, owns the resident byte
-budget and replacement policy. A resident logical-page reference is pointer-
-swizzled so its hot path is one predictable state check and a direct frame
-pointer, not a hash-table lookup. Cold references retain their physical page
-id and enter the I/O scheduler. The implementation must expose resident bytes,
-page reads, prefetch hits, dirty bytes, evictions, and queue depth. A 100x corpus
-is accepted only when steady hot-set RSS remains within the configured budget.
+The page reader already exposes capacity, logical resident bytes, frame states,
+pins, hits, misses, coalescing, reads, bytes, evictions, failures, file bytes,
+and whether direct I/O is actually active. Dirty bytes, prefetch depth, and
+queue depth belong to the not-yet-attached mutable/asynchronous tier.
 
 `OpenStore` may continue to mmap a read-only checkpoint for simple restart and
 hot, read-mostly workloads. It is not the primary 100x transactional backend.
@@ -457,6 +515,7 @@ The mapped Store is not complete until it passes:
 - working sets below, near, and above physical RAM; and
 - bounded reclamation under a deliberately long-lived snapshot.
 
-Until those gates pass, `OpenStore` is a caller-owned off-heap payload boundary,
-not a bounded-residency or durable mapped database. `Open` remains the
-lower-level `DocSet` image mechanism used inside it.
+Until those gates pass, `OpenStore` remains a caller-owned off-heap payload
+boundary and `OpenStorePageReader` remains an immutable bounded-residency tier,
+not a durable mutable database. `Open` remains the lower-level `DocSet` image
+mechanism used inside `OpenStore`.

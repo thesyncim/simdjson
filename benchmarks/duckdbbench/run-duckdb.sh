@@ -167,6 +167,34 @@ SQL
 	if [[ -f $db.wal ]]; then
 		wal_bytes=$(wc -c <"$db.wal" | tr -d ' ')
 	fi
+
+	# Measure current engine-managed memory in one process after touching the
+	# representative warm working set. This is closer to resident state than a
+	# checkpointed file size, but remains a DuckDB buffer-manager counter rather
+	# than process RSS.
+	cat >"$out/memory.sql" <<SQL
+SET threads=1;
+SELECT json_extract_string(doc, '\$.${EXTRACT_FIELD}') FROM docs WHERE key='doc:0';
+SQL
+	if [[ -n $CONTAIN_KEY ]]; then
+		cat >>"$out/memory.sql" <<SQL
+SELECT count(*) FROM docs WHERE filter_value='${CONTAIN_VALUE}';
+SELECT count(*) FROM (SELECT filter_value FROM docs GROUP BY filter_value);
+SELECT count(*) FROM docs WHERE json_contains(doc, '{"${CONTAIN_KEY}":"${CONTAIN_VALUE}"}'::JSON);
+SQL
+	fi
+	if [[ -n $SUM_FIELD ]]; then
+		echo 'SELECT coalesce(sum(metric), 0) FROM docs;' >>"$out/memory.sql"
+	fi
+	echo "SELECT coalesce(sum(memory_usage_bytes), 0), coalesce(sum(memory_usage_bytes) FILTER (tag='ART_INDEX'), 0), coalesce(sum(temporary_storage_bytes), 0) FROM duckdb_memory();" >>"$out/memory.sql"
+	memory_line=$(duckdb -csv -noheader /out/store.duckdb <"$out/memory.sql" | tail -n 1)
+	IFS=, read -r current_buffer_bytes current_art_bytes current_temp_bytes <<<"$memory_line"
+	for value in "$current_buffer_bytes" "$current_art_bytes" "$current_temp_bytes"; do
+		if ! [[ $value =~ ^[0-9]+$ ]]; then
+			echo "$corpus: invalid duckdb_memory() result $memory_line" >&2
+			exit 1
+		fi
+	done
 	mutation_ops=$DOCS
 	if ((mutation_ops > 256)); then mutation_ops=256; fi
 
@@ -206,6 +234,9 @@ SOURCE_BYTES $SOURCE_BYTES
 KEY_BYTES $KEY_BYTES
 DATABASE_BYTES $database_bytes
 WAL_BYTES $wal_bytes
+CURRENT_BUFFER_BYTES $current_buffer_bytes
+CURRENT_ART_BYTES $current_art_bytes
+CURRENT_TEMP_BYTES $current_temp_bytes
 MUTATION_OPS $mutation_ops
 WAL_BYTES_AFTER_MUTATIONS $wal_after_mutations
 RESULT docs $result_docs

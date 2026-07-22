@@ -36,7 +36,7 @@ func TestStoreMappedKeysPointerFreeBaseAndOverlay(t *testing.T) {
 	if base.keys != nil {
 		t.Fatal("OpenStore rebuilt a per-key pointer HAMT")
 	}
-	if base.baseKeys == nil || base.baseKeys.count != 17 || len(base.baseKeys.refs) != 17 {
+	if base.baseKeys == nil || base.baseKeys.count != 17 || base.baseKeys.keyRefCount() != 17 {
 		t.Fatalf("mapped base = %+v", base.baseKeys)
 	}
 	base.chunks.each(func(_ uint32, chunk *storeChunk) bool {
@@ -146,7 +146,7 @@ func TestStoreMappedBaseConcurrentReadersAndWriter(t *testing.T) {
 func TestStoreMappedKeysGroupProbeCollisionDifferential(t *testing.T) {
 	const count = 257
 	source := make([]byte, 0, count*12)
-	mapped, err := newStoreMappedKeys(nil, count)
+	mapped, err := newStoreMappedKeys(nil, count, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,8 @@ func TestStoreMappedKeysGroupProbeCollisionDifferential(t *testing.T) {
 		off := len(source)
 		source = append(source, key...)
 		loc := storeLocation{chunk: uint32(i / 64), slot: uint8(i % 64)}
-		mapped.refs[i] = storeMappedKeyRef{off: uint64(off), length: uint32(len(key)), loc: loc}
+		mapped.refs[i] = storeMappedKeyRef{off: uint64(off), length: uint32(len(key))}
+		mapped.setLocation(uint64(i), loc)
 		want[key] = loc
 	}
 	mapped.source = source

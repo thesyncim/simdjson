@@ -19,6 +19,7 @@ const (
 	superblockCopies        = 2
 	superblockKnownFlags    = uint32(0)
 	maxSuperblockFileOffset = uint64(^uint64(0) >> 1)
+	physicalPageQuantum     = uint32(4096)
 )
 
 var (
@@ -371,7 +372,7 @@ func validRootExtent(offset uint64, length uint32, fileEnd uint64, pageSize uint
 }
 
 func validPhysicalPageSize(pageSize uint32) bool {
-	return pageSize >= 4096 && pageSize&(pageSize-1) == 0
+	return pageSize >= physicalPageQuantum && pageSize&(pageSize-1) == 0
 }
 
 func allZero(src []byte) bool {

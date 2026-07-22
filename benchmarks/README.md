@@ -98,8 +98,9 @@ repository by default.
 defines the embedded JSON-store comparison. It generates one shared NDJSON
 corpus, measures keyed Store operations, runs the pinned official DuckDB image,
 retains DuckDB's raw JSON profiles, verifies both engines against generator
-truth, and renders storage categories without mixing live heap with durable
-file bytes. The frozen 10K clustered smoke is
+truth, and renders Store heap/external blocks, DuckDB warm/peak buffers, and
+durable file bytes without mixing their accounting domains. The frozen 10K
+clustered smoke is
 [`results/duckdb-synth-s4.md`](results/duckdb-synth-s4.md); the methodology also
 provides identical 100K and 5M commands.
 

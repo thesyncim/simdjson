@@ -170,27 +170,30 @@ func BuildReport(res OursResults, logs map[string]DuckDBLog) string {
 	w("\n")
 
 	w("## Storage and memory\n\n")
-	w("These are deliberately separate accounting domains. Store is settled live Go heap. DuckDB file bytes are measured after `CHECKPOINT`; WAL is listed separately. DuckDB buffer and temporary peaks come from the engine's JSON profiler. Ratios in the two `payload` columns are each engine's own bytes divided by logical key+JSON bytes; there is no heap/disk cross-ratio.\n\n")
-	w("| corpus | Store live heap | Store/payload | exact index model | DuckDB file | DuckDB/payload | WAL | peak buffers | peak temp |\n")
-	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	w("These are deliberately separate accounting domains. Store reports settled live Go heap plus Store-owned external blocks; their sum is the accounted resident state, not process RSS. DuckDB file bytes are measured after `CHECKPOINT`; WAL is listed separately. `warm buffers` is current engine-managed memory after one representative warm query sequence, while peak buffers and temporary bytes come from the profiler. Ratios in the two `payload` columns are each engine's own storage bytes divided by logical key+JSON bytes; there is no heap/disk cross-ratio.\n\n")
+	w("| corpus | Store live heap | Store external | Store accounted resident | Store/payload | exact index model | DuckDB file | DuckDB/payload | WAL | warm buffers | peak buffers | peak temp |\n")
+	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, corpus := range corpora {
 		m, store := corpus.Manifest, corpus.Store
-		duckFile, wal, buffer, temp := int64(-1), int64(-1), int64(-1), int64(-1)
+		duckFile, wal, current, buffer, temp := int64(-1), int64(-1), int64(-1), int64(-1), int64(-1)
 		if log := logFor(m.Name); log != nil {
 			duckFile = log.Values["database_bytes"]
 			wal = log.Values["wal_bytes"]
+			current = log.Values["current_buffer_bytes"]
 			buffer = log.PeakBufferBytes()
 			temp = log.PeakTempBytes()
 		}
-		w("| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
-			m.Name, fmtBytes(store.HeapBytes), fmtPayloadRatio(store.HeapBytes, m.LogicalBytes()),
+		external := int64(store.ExternalKeyBytes + store.ExternalDocumentBytes + store.ExternalIndexBytes)
+		resident := store.AccountedResidentBytes()
+		w("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
+			m.Name, fmtBytes(store.HeapBytes), fmtMeasuredBytes(external), fmtBytes(resident), fmtPayloadRatio(resident, m.LogicalBytes()),
 			fmtBytes(int64(store.IndexBytes)), fmtMeasuredBytes(duckFile), fmtPayloadRatio(duckFile, m.LogicalBytes()),
-			fmtMeasuredBytes(wal), fmtMeasuredBytes(buffer), fmtMeasuredBytes(temp))
+			fmtMeasuredBytes(wal), fmtMeasuredBytes(current), fmtMeasuredBytes(buffer), fmtMeasuredBytes(temp))
 	}
 	w("\n")
 
 	w("## Load and index build\n\n")
-	w("Both start from the same NDJSON. Store uses `Put`; DuckDB uses `read_ndjson_objects` into a `JSON` column plus materialized scalar columns. Index build is separate: Store backfills one exact path index; DuckDB builds single-column ART indexes for key and the comparable scalar path. Ratio is DuckDB/Store latency, so greater than 1 means Store completed sooner.\n\n")
+	w("Both start from the same NDJSON and use their bulk-load path. StoreBuilder compacts immutable keys before publication; DuckDB uses `read_ndjson_objects` into a `JSON` column plus materialized scalar columns. Index build is separate: Store backfills and folds one exact path index into packed posting pages; DuckDB builds single-column ART indexes for key and the comparable scalar path. Ratio is DuckDB/Store latency, so greater than 1 means Store completed sooner.\n\n")
 	w("| corpus | Store load | Store rate | DuckDB load | DuckDB rate | load ratio | Store index | DuckDB indexes | index ratio |\n")
 	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, corpus := range corpora {
@@ -262,7 +265,7 @@ func BuildReport(res OursResults, logs map[string]DuckDBLog) string {
 	w("- DuckDB's ART index scan is eligible only for a single plain column and is intended for point or very selective predicates. A low-cardinality filter can remain a vectorized scan; the report exposes rows scanned instead of pretending the ART served it.\n")
 	w("- DuckDB's compound and expression indexes are valid storage objects but are not eligible for ART index scans today, so this harness does not create a decorative compound index.\n")
 	w("- DuckDB is an embedded analytical database with ACID transactions, checkpoint/WAL persistence, vectorized SQL, and snapshot isolation. Store has a narrower embedded JSON API and different durability/concurrency semantics. Results apply only to the listed operations.\n")
-	w("- A checkpointed database file is not resident memory, and settled Go heap is not durable storage. Use each payload ratio for capacity planning in its own domain; do not divide one by the other.\n")
+	w("- A checkpointed database file is not resident memory, and settled Store memory is not durable storage. Store accounted resident bytes and DuckDB warm buffer bytes are useful engine-level views but still are not process RSS; do not turn them into a universal capacity ratio.\n")
 
 	return b.String()
 }

@@ -242,8 +242,9 @@ func (s *DocSet) writeToPersistWriter(pw *persistWriter, base int64) {
 	// Shape records are addressed by their compiled id — their position in the
 	// cache's shape list, which is stable — so a record names its shape by that
 	// index and the shape table is written in the same order.
-	shapeID := make(map[*shapeRecord]uint32, len(s.shapes.shapes))
-	for id, rec := range s.shapes.shapes {
+	shapeRecords := s.persistShapeRecords()
+	shapeID := make(map[*shapeRecord]uint32, len(shapeRecords))
+	for id, rec := range shapeRecords {
 		shapeID[rec] = uint32(id)
 	}
 
@@ -262,7 +263,7 @@ func (s *DocSet) writeToPersistWriter(pw *persistWriter, base int64) {
 
 	pw.pad8()
 	shapeTableOffset := uint64(pw.off - base)
-	pw.writeShapeTable(s)
+	pw.writeShapeTable(shapeRecords)
 	shapeTableLength := uint64(pw.off-base) - shapeTableOffset
 
 	pw.pad8()
@@ -299,6 +300,10 @@ func (pw *persistWriter) writeDocRecord(s *DocSet, i int, shapeID map[*shapeReco
 
 	idx := s.docAt(i)
 	ref := s.shapeTapeRefAt(i)
+	template, templateOK := s.storeTemplateAt(i)
+	if ref.rec != nil {
+		ref.start, ref.end = s.shapeTapeRootSpan(idx, ref)
+	}
 
 	var (
 		kind    uint8
@@ -306,6 +311,9 @@ func (pw *persistWriter) writeDocRecord(s *DocSet, i int, shapeID map[*shapeReco
 		sid     = persistNoShape
 	)
 	switch {
+	case templateOK:
+		kind = persistDocClassic
+		entries = uint32(len(template.index.entries))
 	case ref.rec == nil:
 		kind = persistDocClassic
 		entries = uint32(len(idx.entries))
@@ -333,12 +341,38 @@ func (pw *persistWriter) writeDocRecord(s *DocSet, i int, shapeID map[*shapeReco
 	pw.writeSmall(header[:])
 	pw.write(idx.src)
 	pw.pad8()
-	if kind == persistDocNarrow {
+	if templateOK {
+		pw.writeTemplateDoc(s, i, template)
+	} else if kind == persistDocNarrow {
 		pw.writeNarrowDoc(s, i, ref, entries)
 	} else {
 		pw.writeEntries(idx.entries)
 	}
 	return offset
+}
+
+// writeTemplateDoc expands a builder-only repeated-layout template directly
+// into the stable checkpoint format. It uses fixed scratch and never creates
+// a second in-memory tape, so checkpointing a compact Store remains bounded.
+func (pw *persistWriter) writeTemplateDoc(s *DocSet, doc int, template *storeDocumentTemplate) {
+	var raw [16]byte
+	for ordinal := range template.index.entries {
+		entry := template.index.entries[ordinal]
+		if ordinal == 0 {
+			span := s.storeTemplateSpan(doc, template, ordinal)
+			entry.start, entry.end = span&0xffff, span>>16
+		} else if template.spanIndex[ordinal] == ^uint16(0) {
+			entry.start, entry.end = s.storeTemplateKeySpan(doc, template, ordinal)
+		} else {
+			span := s.storeTemplateSpan(doc, template, ordinal)
+			entry.start, entry.end = span&0xffff, span>>16
+		}
+		binary.LittleEndian.PutUint32(raw[0:4], entry.start)
+		binary.LittleEndian.PutUint32(raw[4:8], entry.end)
+		binary.LittleEndian.PutUint32(raw[8:12], entry.next)
+		binary.LittleEndian.PutUint32(raw[12:16], entry.info)
+		pw.writeSmall(raw[:])
+	}
 }
 
 // writeNarrowDoc streams one compact tape from either the ordinary Go slab or
@@ -360,11 +394,18 @@ func (pw *persistWriter) writeNarrowDoc(s *DocSet, doc int, ref shapeTapeRef, en
 // decoded names, the info words, the name table, and the fingerprint by
 // resolving each shape back through a fresh ShapeCache, so the table is the
 // interned key store and nothing about a shape is duplicated on disk.
-func (pw *persistWriter) writeShapeTable(s *DocSet) {
+func (s *DocSet) persistShapeRecords() []*shapeRecord {
+	if len(s.mappedShapes) != 0 {
+		return s.mappedShapes
+	}
+	return s.shapes.shapes
+}
+
+func (pw *persistWriter) writeShapeTable(shapes []*shapeRecord) {
 	var scratch [4]byte
-	binary.LittleEndian.PutUint32(scratch[:], uint32(len(s.shapes.shapes)))
+	binary.LittleEndian.PutUint32(scratch[:], uint32(len(shapes)))
 	pw.writeSmall(scratch[:])
-	for _, rec := range s.shapes.shapes {
+	for _, rec := range shapes {
 		binary.LittleEndian.PutUint32(scratch[:], uint32(len(rec.fields)))
 		pw.writeSmall(scratch[:])
 		for f := range rec.fields {
@@ -701,7 +742,7 @@ func (set *DocSet) openDocRecord(data []byte, recOff, recLimit uint64, shapeRecs
 	case persistDocClassic:
 		if compact {
 			set.mappedDocs.refs[set.mappedBase+uint64(i)] = storeMappedDocRef{
-				recordOff: recOff, srcLen: uint32(srcLen),
+				sourceOff: srcOff, srcLen: uint32(srcLen),
 				entryCount: uint32(entryCount), shapeID: storeMappedNoShape, kind: kind,
 			}
 			return shapeTapeRef{}, nil
@@ -718,7 +759,7 @@ func (set *DocSet) openDocRecord(data []byte, recOff, recLimit uint64, shapeRecs
 		}
 		if compact {
 			set.mappedDocs.refs[set.mappedBase+uint64(i)] = storeMappedDocRef{
-				recordOff: recOff, srcLen: uint32(srcLen),
+				sourceOff: srcOff, srcLen: uint32(srcLen),
 				entryCount: uint32(entryCount), start: start, end: end, shapeID: sid,
 				kind: kind, enriched: enriched,
 			}
@@ -736,7 +777,7 @@ func (set *DocSet) openDocRecord(data []byte, recOff, recLimit uint64, shapeRecs
 		}
 		if compact {
 			set.mappedDocs.refs[set.mappedBase+uint64(i)] = storeMappedDocRef{
-				recordOff: recOff, srcLen: uint32(srcLen),
+				sourceOff: srcOff, srcLen: uint32(srcLen),
 				entryCount: uint32(entryCount), start: start, end: end, shapeID: sid,
 				kind: kind, enriched: enriched,
 			}

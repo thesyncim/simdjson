@@ -130,14 +130,37 @@ func (n shapeNarrowValue) widen() IndexEntry {
 // single bounds test covers both.
 func (s *DocSet) shapeTapeRefAt(i int) shapeTapeRef {
 	if s.mappedDocs != nil {
-		r := &s.mappedDocs.refs[s.mappedBase+uint64(i)]
-		if r.shapeID == storeMappedNoShape {
+		index := s.mappedBase + uint64(i)
+		var shapeID uint32
+		var start, end uint32
+		var kind uint8
+		var enriched bool
+		if s.mappedDocs.compactRefs != nil {
+			r := &s.mappedDocs.compactRefs[index]
+			shapeID = uint32(r.meta)
+			kind, enriched = r.kind, r.flags&1 != 0
+			if kind == persistDocClassic {
+				shapeID = storeMappedNoShape
+			}
+		} else if s.mappedDocs.ownedRefs != nil {
+			r := &s.mappedDocs.ownedRefs[index]
+			shapeID, start, end = uint32(r.shapeID), uint32(r.start), uint32(r.end)
+			kind, enriched = r.kind, r.flags&1 != 0
+			if r.shapeID == storeOwnedNoShape {
+				shapeID = storeMappedNoShape
+			}
+		} else {
+			r := &s.mappedDocs.refs[index]
+			shapeID, start, end = r.shapeID, r.start, r.end
+			kind, enriched = r.kind, r.enriched
+		}
+		if shapeID == storeMappedNoShape || storeOwnedDocIsTemplate(kind) {
 			runtime.KeepAlive(s.mappedDocs)
 			return shapeTapeRef{}
 		}
 		ref := shapeTapeRef{
-			rec: s.mappedShapes[r.shapeID], start: r.start, end: r.end,
-			narrow: r.kind == persistDocNarrow, enriched: r.enriched,
+			rec: s.mappedShapes[shapeID], start: start, end: end,
+			narrow: kind == persistDocNarrow || storeOwnedDocIsNarrow(kind), enriched: enriched,
 		}
 		runtime.KeepAlive(s.mappedDocs)
 		return ref
@@ -146,6 +169,17 @@ func (s *DocSet) shapeTapeRefAt(i int) shapeTapeRef {
 		return s.tapeRefs[i]
 	}
 	return shapeTapeRef{}
+}
+
+// shapeTapeRootSpan supplies the cold root coordinates omitted by compact
+// StoreBuilder row refs. Ordinary field scans never call it; empty-pointer
+// gathers, classic-tape widening, and checkpoint expansion recover the exact
+// trimmed parser span from validated source when needed.
+func (s *DocSet) shapeTapeRootSpan(doc Index, ref shapeTapeRef) (uint32, uint32) {
+	if ref.end == 0 && s.mappedDocs != nil && s.mappedDocs.compactRefs != nil {
+		return storeRootSpan(doc.src)
+	}
+	return ref.start, ref.end
 }
 
 // commitDoc appends one successfully built document and its dedup header,
@@ -315,6 +349,7 @@ func (s *DocSet) widenShapeTape(i int, r shapeTapeRef) Index {
 // applied by the caller, included), which the differential suite pins.
 func (s *DocSet) synthShapeTape(i int, r shapeTapeRef) []IndexEntry {
 	doc := s.docAt(i)
+	r.start, r.end = s.shapeTapeRootSpan(doc, r)
 	values := doc.entries
 	src := doc.src
 	fields := r.rec.fields

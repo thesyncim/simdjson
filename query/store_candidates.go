@@ -42,6 +42,23 @@ func (p *compiledPredicate) storeCandidates(snapshot simdjson.Snapshot, paths []
 			return out, true, true
 		}
 		return nil, false, false
+	case predContains:
+		if p.containIndexPath == "" {
+			return nil, false, false
+		}
+		for _, index := range indexes {
+			if index.Kind != simdjson.StoreIndexExact || index.State != simdjson.StoreIndexReady || index.ColumnCount != 1 || index.Columns[0] != p.containIndexPath {
+				continue
+			}
+			out := w.nextStoreMasks()
+			out, err := snapshot.AppendIndexMasks(out, index.Name, p.containIndexNeedle)
+			if err != nil {
+				return nil, false, false
+			}
+			w.keepStoreMasks(out)
+			return out, true, true
+		}
+		return nil, false, false
 	case predAnd:
 		return p.storeAndCandidates(snapshot, paths, indexes, w)
 	case predOr:

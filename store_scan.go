@@ -5,6 +5,27 @@ package simdjson
 // so shape tapes, compiled keys, value dictionaries, and duplicate-key
 // semantics stay centralized in the existing column primitives.
 
+// AppendField appends the top-level object member named name for every live
+// row in Store order. An absent member appends a zero RawValue. It is the
+// Store-wide form of [ShapeCache.AppendField]: shape and structural-template
+// routing are reused independently in every immutable chunk, and values
+// borrow s. cache belongs to the calling worker; nil uses an invocation-local
+// cache. With sufficient dst capacity the operation allocates nothing.
+func (s Snapshot) AppendField(dst []RawValue, name string, cache *ShapeCache) []RawValue {
+	if s.state == nil {
+		return dst
+	}
+	var local ShapeCache
+	if cache == nil {
+		cache = &local
+	}
+	s.state.chunks.each(func(_ uint32, chunk *storeChunk) bool {
+		dst = cache.AppendField(dst, &chunk.docs, name)
+		return true
+	})
+	return dst
+}
+
 // AppendPointer appends one value per live Snapshot row in chunk/slot order.
 // An absent path appends a zero RawValue. Values borrow s. With sufficient dst
 // capacity the operation allocates nothing.
@@ -27,6 +48,60 @@ func (s Snapshot) AppendPointer(dst []RawValue, pointer CompiledPointer) ([]RawV
 		return dst[:mark], scanErr
 	}
 	return dst, nil
+}
+
+// AppendFieldFloat64 appends one typed numeric cell and validity bit per live
+// row for a top-level object field. It is the fused Store scan counterpart of
+// [ShapeCache.AppendFieldFloat64]: shape routing, span lookup, and number
+// parsing happen in one pass without a []RawValue intermediate. cache belongs
+// to the calling worker; nil uses an invocation-local cache. With sufficient
+// output capacity the operation allocates nothing.
+func (s Snapshot) AppendFieldFloat64(dst []float64, valid []bool, name string, cache *ShapeCache) ([]float64, []bool) {
+	if s.state == nil {
+		return dst, valid
+	}
+	var local ShapeCache
+	if cache == nil {
+		cache = &local
+	}
+	s.state.chunks.each(func(_ uint32, chunk *storeChunk) bool {
+		dst, valid = cache.AppendFieldFloat64(dst, valid, &chunk.docs, name)
+		return true
+	})
+	return dst, valid
+}
+
+// ReduceFieldFloat64 fuses one top-level numeric field scan into aggregate
+// state without materializing a RawValue, float, validity, or row column.
+// cache has the same ownership contract as AppendFieldFloat64.
+func (s Snapshot) ReduceFieldFloat64(name string, cache *ShapeCache) Float64Aggregate {
+	var total Float64Aggregate
+	if s.state == nil {
+		return total
+	}
+	var local ShapeCache
+	if cache == nil {
+		cache = &local
+	}
+	s.state.chunks.each(func(_ uint32, chunk *storeChunk) bool {
+		part := cache.ReduceFieldFloat64(&chunk.docs, name)
+		if part.Count != 0 {
+			if total.Count == 0 {
+				total.Min, total.Max = part.Min, part.Max
+			} else {
+				if part.Min < total.Min {
+					total.Min = part.Min
+				}
+				if part.Max > total.Max {
+					total.Max = part.Max
+				}
+			}
+			total.Count += part.Count
+			total.Sum += part.Sum
+		}
+		return true
+	})
+	return total
 }
 
 // AppendPointerRows is the sparse-gather form of [Snapshot.AppendPointer].

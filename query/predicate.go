@@ -161,13 +161,15 @@ func floatLiteral(f float64) literal {
 // carries its posting probe (postNone when unpostable), the descriptor
 // candidates.go uses to prune candidate rows through DocSet.Postings.
 type compiledPredicate struct {
-	kind   predKind
-	col    int
-	op     Op
-	lit    scalar
-	needle simdjson.Index
-	probe  postProbe
-	kids   []*compiledPredicate
+	kind               predKind
+	col                int
+	op                 Op
+	lit                scalar
+	needle             simdjson.Index
+	probe              postProbe
+	containIndexPath   string
+	containIndexNeedle simdjson.Index
+	kids               []*compiledPredicate
 }
 
 // compilePredicate resolves a predicate tree, registering every path it reads
@@ -218,6 +220,20 @@ func compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error
 		if scalarNeedle && reg.paths[col].single {
 			cp.probe = postProbe{kind: postContains, path: reg.paths[col].name, needle: needle}
 		}
+		if key, value, ok, probeErr := singleScalarObjectContainmentProbe(needle); probeErr != nil {
+			return nil, probeErr
+		} else if ok {
+			base := reg.paths[col].indexPath()
+			cp.containIndexPath = base + "/" + escapePointerSegment(key)
+			cp.containIndexNeedle = value
+			// DocSet postings address one top-level field. A root-object
+			// containment predicate can therefore use the same derived scalar
+			// equality as a sound candidate bound; nested forms are handled by
+			// declared Store indexes below.
+			if base == "" {
+				cp.probe = postProbe{kind: postEq, path: key, needle: value}
+			}
+		}
 		return cp, nil
 	case predExists:
 		col, err := reg.add(p.path)
@@ -248,6 +264,35 @@ func compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error
 	default:
 		return nil, fmt.Errorf("query: invalid predicate")
 	}
+}
+
+// singleScalarObjectContainmentProbe recognizes the exact implication
+//
+//	container @> {key: scalar}  =>  container/key = scalar
+//
+// for a one-member object needle. The derived equality is safe as a candidate
+// bound because JSON object containment resolves that member through the same
+// last-key and exact-scalar semantics as an exact index. Containers and wider
+// objects remain on the general structural path. Compilation may allocate for
+// an escaped key or the tiny scalar tape; execution does not.
+func singleScalarObjectContainmentProbe(needle simdjson.Index) (string, simdjson.Index, bool, error) {
+	root := needle.Root()
+	count, ok := root.ObjectLen()
+	if !ok || count != 1 {
+		return "", simdjson.Index{}, false, nil
+	}
+	it, _ := root.ObjectIter()
+	key, value, _ := it.Next()
+	switch value.Kind() {
+	case document.Array, document.Object, document.Invalid:
+		return "", simdjson.Index{}, false, nil
+	}
+	decoded, _ := key.AppendText(nil)
+	valueNeedle, err := buildNeedleIndex(value.Raw().Bytes())
+	if err != nil {
+		return "", simdjson.Index{}, false, err
+	}
+	return string(decoded), valueNeedle, true, nil
 }
 
 // containsNeedleScalar validates that s is exactly one JSON document — the

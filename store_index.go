@@ -192,6 +192,7 @@ func (s *Store) BackfillIndex(name string, maxChunks int) (StoreIndexInfo, error
 	}
 	nextChunks := state.chunks
 	examined := 0
+	detachedMapped := uint32(0)
 	changed := false
 	bulkRoot := b.root
 	var pending map[uint64][]storeIndexChunkMask
@@ -223,6 +224,9 @@ func (s *Store) BackfillIndex(name string, maxChunks int) (StoreIndexInfo, error
 				return b.info, err
 			}
 			nextChunks = nextChunks.set(id, rebuilt)
+			if state.mappedDocs != nil && chunk.docs.mappedDocs == state.mappedDocs {
+				detachedMapped++
+			}
 			s.noteChunkPostingsLocked(id, chunk, rebuilt)
 		}
 		if b.exact != nil {
@@ -239,10 +243,23 @@ func (s *Store) BackfillIndex(name string, maxChunks int) (StoreIndexInfo, error
 			b.root = storeIndexApplyBulk(bulkRoot, pending)
 		}
 	}
+	if b.exact != nil && b.base == nil && b.info.CoveredChunks == b.info.TotalChunks {
+		base, err := newStorePackedIndex(storeIndexPending(b.root))
+		if err != nil {
+			// Keep the complete heap root and Building state retryable. A later
+			// BackfillIndex call can retry only the fold without rescanning rows.
+			return b.info, err
+		}
+		b.base = base
+		b.root = nil
+		b.dirty = storeIndexMaskVector{}
+		changed = true
+	}
 	b.updateState()
 	if changed {
 		next := *state
 		next.generation++
+		next.detachMappedDocumentChunks(detachedMapped)
 		next.chunks = nextChunks
 		next.indexes = s.indexInfosLocked()
 		next.secondary = s.indexSnapshotsLocked()
@@ -299,6 +316,7 @@ func (s *Store) ReclaimIndexes(maxChunks int) (rebuilt int, done bool) {
 		limit = int(state.chunks.count)
 	}
 	nextChunks := state.chunks
+	detachedMapped := uint32(0)
 	for len(s.postingChunks.ids) != 0 && rebuilt < limit {
 		id := s.postingChunks.ids[len(s.postingChunks.ids)-1]
 		chunk := state.chunks.get(id)
@@ -311,6 +329,9 @@ func (s *Store) ReclaimIndexes(maxChunks int) (rebuilt int, done bool) {
 			panic("simdjson: rebuilding validated Store chunk: " + err.Error())
 		}
 		nextChunks = nextChunks.set(id, plain)
+		if state.mappedDocs != nil && chunk.docs.mappedDocs == state.mappedDocs {
+			detachedMapped++
+		}
 		s.noteChunkPostingsLocked(id, chunk, plain)
 		rebuilt++
 	}
@@ -318,6 +339,7 @@ func (s *Store) ReclaimIndexes(maxChunks int) (rebuilt int, done bool) {
 	if rebuilt != 0 {
 		next := *state
 		next.generation++
+		next.detachMappedDocumentChunks(detachedMapped)
 		next.chunks = nextChunks
 		s.state.Store(&next)
 	}

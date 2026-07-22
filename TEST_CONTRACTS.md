@@ -135,7 +135,9 @@ internal/storeio/chunk_directory_test.go
 internal/storeio/device_test.go
 internal/storeio/document_page_test.go
 internal/storeio/index_pool_test.go
+internal/storeio/key_directory_test.go
 internal/storeio/page_test.go
+internal/storeio/page_cache_test.go
 internal/storeio/posting_page_test.go
 internal/storeio/state_root_test.go
 internal/storeio/superblock_test.go
@@ -152,6 +154,7 @@ lazy_scalar_contract_test.go
 lazy_test.go
 pointer_rfc6901_test.go
 query/parse_test.go
+query/plan_test.go
 query/postings_test.go
 query/query_test.go
 query/store_test.go
@@ -165,6 +168,7 @@ store_bitmap_test.go
 store_index_exact_test.go
 store_index_packed_test.go
 store_persist_test.go
+store_page_file_test.go
 internal/storeio/ring_linux_test.go
 value_accessors_contract_test.go
 value_iteration_contract_test.go
@@ -207,6 +211,7 @@ internal/byteview/byteview_test.go
 internal/storemem/block_test.go
 ownership_lifetime_test.go
 store_mapped_keys_test.go
+store_owned_documents_test.go
 typed_slice_words_test.go
 ```
 

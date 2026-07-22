@@ -28,7 +28,7 @@ raw, ok := view.GetRaw("user:42")
 
 | Operation | Result | Complexity |
 | --- | --- | --- |
-| `NewStoreBuilder` + `Append` + `Build` | bulk-validates unique keys into final pages; publishes one Store | O(total input + transient key-radix construction) |
+| `NewStoreBuilder` + `Append` + `Build` | bulk-validates unique keys, then packs keys/source/tapes outside the Go heap; publishes one Store | O(total input + transient construction) |
 | `Put(key, json)` | `created=true` on insert; validates and copies input | O(replacement bytes + one chunk's metadata + radix height) |
 | `Delete(key)` | true when the key existed | O(one chunk's metadata + radix height) |
 | `Snapshot()` | immutable current view | O(1) |
@@ -74,7 +74,10 @@ capacity.
 Deletes remove the row instead of recording a tombstone. Surviving document
 storage is shared unchanged, freed slots and empty chunk ids are reused, and
 deleting a chunk's final row removes the leaf without building an empty chunk.
-There is no compaction command or compaction threshold.
+There is no compaction command or compaction threshold. A rebuilt bulk/mapped
+chunk detaches from the immutable document base. The current generation drops
+the base owner when its last such chunk detaches; older snapshots retain it
+only for as long as their borrowed rows remain reachable.
 
 `ChunkDocuments` bounds the row metadata touched by one ordinary mutation:
 
@@ -112,7 +115,7 @@ for next() {
 store, err := builder.Build()
 ```
 
-`Append` validates and copies the JSON and clones the key; caller buffers may
+`Append` validates and copies the JSON and key; caller buffers may
 be reused as soon as it returns. Keys must be unique. An invalid document or
 duplicate changes no committed row. The builder belongs to one goroutine and
 closes after `Build`; the returned Store is safe for concurrent use and has the
@@ -122,13 +125,23 @@ compound paths are extracted at `Build`; the returned index is `Ready` in the
 first reader-visible generation, with no scan fallback window.
 
 The builder fills final micro-pages and mutates only unpublished key/chunk
-radix nodes. `Build` freezes that graph and performs one publication instead of
-path-copying it once per row. On the 16,384-document benchmark fixture it
-measured 4.57-4.76 ms (206-214 MB/s) versus 35.8-37.1 ms (26.4-27.3 MB/s) for
-repeated `Put`: about 7.7x the throughput, with 8.9 MiB rather than 143 MiB of
-transient allocation bytes. Including a ready 16-value exact index measured
-5.70-5.86 ms (167-172 MB/s) and 9.2 MiB. Run `BenchmarkStoreBulkBuild` for the
-exact local result.
+radix nodes. Repeated layouts reuse immutable shape records across pages, and
+each bounded source arena is sized once instead of retaining geometric growth
+generations. `Build` then folds keys, row descriptors, exact source bytes,
+structural tapes, and exact-index postings into Store-owned pointer-free blocks
+before one publication. The default power-of-two chunk layout derives stable
+locations from ordinal key references, reducing them to eight bytes. Common
+row descriptors are 16 bytes. Flat scalar tapes select three, four, or five
+bytes per value; repeated nested layouts keep one exact structural template and
+two, three, or four span bytes per non-key entry. Width is selected per row, so
+an exceptional document does not widen the whole Store. Value dictionaries
+compose with templates; the optional wildcard-posting mode currently keeps
+classic nested tapes for its remainder verifier. On the 16,384-document
+benchmark fixture it measured 5.09-6.29 ms (156-192 MB/s) versus 43.7-45.2 ms
+(21.6-22.4 MB/s) for repeated `Put`: about 7.5x median throughput, with 7.65
+MiB rather than 144.6 MiB of transient allocation bytes. Including a ready
+16-value exact index measured 5.99-6.31 ms and 7.85 MiB. Run
+`BenchmarkStoreBulkBuild` for the exact local result.
 
 Index construction reuses the same per-page tuple extraction, fingerprinting,
 exact-recheck contract, stable-slot masks, and immutable bulk radix builders as
@@ -198,13 +211,14 @@ therefore fall back safely. A handle stores no chunk pointer, so keeping it does
 not pin an obsolete document page. Both ordinary and compiled reads allocate
 zero bytes.
 
-## Store images and mapped source bytes
+## Store images and external source bytes
 
-Heap-built Store source arenas are `[]byte` objects. They contain no pointers,
-so the GC does not scan each JSON byte, but they still count as live heap and
-therefore affect the pacer and heap target. A mapped image lowers Go
-`HeapAlloc`; it does not make those bytes disappear from RSS or the Store's
-total memory footprint.
+`StoreBuilder.Build` moves its immutable key spellings, exact JSON, row
+descriptors, compact structural tapes, and packed index bases into Store-owned
+pointer-free blocks. On supported Unix systems those blocks are anonymous
+mappings outside Go `HeapAlloc`. The GC sees a bounded owner graph rather than
+one pointer-bearing object per row. These bytes still occupy address space and
+RSS; external is a GC accounting boundary, not free memory.
 
 `Store.WriteTo` emits a Store-native container of the existing bounded `DocSet`
 page images plus a checksummed tail manifest. It records effective options,
@@ -258,8 +272,8 @@ reports `mapped-B`, all three external metadata classes, `B/op`, and
 number.
 
 Once open, mapped source bytes add no steady allocation or ownership wrapper:
-ordinary keyed reads measured 9.22-9.29 ns and generation-pinned compiled reads
-4.63-4.66 ns. A nested two-column exact query selecting 32 documents from two
+ordinary keyed reads measured 10.23-10.32 ns and generation-pinned compiled reads
+4.47-4.51 ns. A nested two-column exact query selecting 32 documents from two
 of 256 micro-pages measured 2.55-2.61 us, also at zero allocations. These rows
 measure a hot mapping after eager open; they are not cold-storage latency.
 
@@ -304,54 +318,119 @@ writer-owned fixed storage; only the top-level reference list, Store manifest,
 and writer object allocate. The manifest must be buffered to checksum before a
 generic `io.Writer` receives it.
 
-Supporting a corpus around 100 times larger than RAM while keeping a bounded
-hot set needs the next four changes:
+### Bounded page files
 
-1. address immutable chunks by logical page id and pointer-swizzle resident
-   frames, reducing a hot hit to one predictable state check and a direct
-   pointer;
-2. store packed key, exact-index, posting, and TTL nodes in the same page
-   space, keeping only measured hot upper paths resident;
-3. issue explicit asynchronous page reads and physically ordered prefetch under
-   a Store-owned byte budget, exposing reads, bytes, hits, queue depth, dirty
-   bytes, and evictions; and
-4. publish replacement pages and roots through append-only copy-on-write with
-   snapshot-aware extent reclamation and checksummed root selection.
+`Store.WritePageFile` and `OpenStorePageReader` are the immutable,
+explicit-I/O path for a corpus larger than its configured frame budget. This
+is separate from `WriteTo`/`OpenStore`: the latter is a mutable, eagerly opened
+checkpoint image; the page reader never maps or validates the complete corpus.
 
-Read-only mapping remains useful for the implemented checkpoint and a hot,
-read-mostly corpus. It is not the automatic 100x transactional scheduler:
-demand faults can block arbitrary goroutines and do not provide Store-level
-admission, eviction, prefetch, or error control. ADR 0005 records the primary
-research basis and the explicit-I/O, swizzled-buffer-manager decision.
+Write a temporary empty file, close it, and atomically rename it into place at
+the application boundary:
 
-The intended attached-file mode is automatic without taxing readers. The
-serialized Store writer is already single-threaded, so it can enqueue a
-generation into a preallocated single-producer ring without another lock or a
-heap allocation. A background writer appends changed pages and copied
-directory/index/TTL paths, group-commits their root, and advances a durable
-generation counter. `Flush`/`Close` fence a requested generation. A synchronous
-option waits on each mutation and necessarily pays storage latency. An async
-`Put` is reader-visible before it is crash-durable; hiding that distinction
-would be an incorrect safety contract.
+```go
+next, err := os.OpenFile("accounts.next", os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+if err != nil {
+	return err
+}
+_, writeErr := store.WritePageFile(next, simdjson.StorePageWriteOptions{
+	MaxDocumentPageBytes: 64 << 10,
+})
+closeErr := next.Close()
+if err := errors.Join(writeErr, closeErr); err != nil {
+	return err
+}
+if err := os.Rename("accounts.next", "accounts.pages"); err != nil {
+	return err
+}
+```
 
-The internal I/O half of that contract is implemented. It has a lock-free SPSC
-generation ring, ABA-resistant lock-free buffer/descriptor recycling, bounded
-backpressure, sticky failures, natural group commit, and a zero-allocation
-`Begin`/fill/`Publish`/`Wait` test. Linux uses a scoped pure-Go `io_uring`
-backend with registered off-heap buffers and files; other systems, unsupported
-kernels, and blocked sandboxes use positional writes and data-integrity
-barriers. The root is submitted only after every data page succeeds. This is
-not yet a public Store persistence mode. The internal double-superblock codec
-now enforces generation-slot parity, Store identity, CRC32C/complement checks,
-page-aligned bounds, file high-water bounds, and referenced-state verification;
-recovery validates both state and free-tree roots and falls back when the
-newest root or either referenced page is torn. Mutation attachment, key/TTL
-payload schemas, large-value overflow, and extent reclamation are the remaining
-correctness boundary. The common page envelope binds a 64-byte
-pointer-free header and full-page CRC32C trailer to Store id, kind, stable
-logical id, and generation. Its fixed 256-byte state root separates chunk, key,
-exact-index, and TTL directory references, and recovery verifies each
-referenced top-level page before generation selection.
+`WritePageFile` refuses a non-empty target. It writes document extents, the
+packed chunk radix, the sorted key B+tree, and the state page before syncing;
+only then does it publish and sync the alternating checksummed superblock. A
+partial file without that root is not recoverable. The caller owns directory
+sync after rename when crash-safe name replacement matters.
+
+Open with a complete frame budget and an explicit direct-I/O policy:
+
+```go
+reader, err := simdjson.OpenStorePageReader("accounts.pages", simdjson.StorePageOpenOptions{
+	ResidentBytes:        64 << 20,
+	MaxDocumentPageBytes: 64 << 10,
+	DirectIO:             simdjson.StoreDirectTry,
+})
+if err != nil {
+	return err
+}
+defer reader.Close()
+
+key, ok, err := reader.PrepareKey("account:42")
+if err != nil {
+	return err
+}
+if !ok {
+	return os.ErrNotExist
+}
+dst := make([]byte, 0, 4096)
+dst, ok, err = reader.AppendRawKey(dst, key)
+```
+
+The budget is rounded down to equal maximum-extent frames and must hold at
+least two. Frame bytes use anonymous external memory on supported Unix systems;
+the Go heap retains O(frame-count) atomic control words, not one object per key
+or database page. Metadata pages use 4 KiB physical extents but occupy one
+cache frame, an intentional simple bound for format version one.
+
+Admission performs CRC32C, Store/page identity, and complete kind-specific
+schema validation before publishing an even frame epoch. Resident probes pin
+through one atomic gate; eviction can atomically claim only exactly zero pins,
+uses CLOCK second chances, and never reuses leased bytes. Identical concurrent
+misses coalesce. A cache with no evictable frame returns explicit backpressure
+as `ErrStorePageCacheFull` instead of allocating. Failed/corrupt pages remain
+failed and report `ErrStorePageCorrupt` rather than a missing key. `Close`
+rejects new reads with `ErrStorePageClosed` and waits for in-flight loads and
+values before releasing the arena.
+
+`ViewRaw` returns a `StorePageValue` that must be closed; its bytes become
+invalid at close. `AppendRaw` copies into caller capacity and holds no frame on
+return. `PrepareKey` performs the durable directory lookup once and records a
+Store-bound physical reference plus stable slot, never a frame pointer. It
+therefore survives eviction and reduces a repeat read to one document-page
+probe while still comparing the complete key. `RangeRaw` visits callback-
+scoped key/JSON bytes in logical chunk/slot order and pins the active directory
+leaf while walking its documents. Do not retain or modify callback bytes.
+
+`Stats` reports file bytes, configured capacity, logical resident bytes, frame
+states, current pins, hits, misses, coalescing, physical reads/bytes, evictions,
+failures, and whether direct I/O is actually active.
+`StoreDirectTry` falls back only when the platform or filesystem rejects direct
+I/O; `StoreDirectRequire` never silently changes semantics and reports
+`ErrStoreDirectIOUnsupported` when the request cannot be honored.
+
+The bounded smoke writes 1,155,072 bytes and opens it with 8,192 bytes of
+frames: a 141.0x file/cache ratio. This proves bounded correctness, not equal
+latency. Apple M4 Max measurements:
+
+| path | result | physical reads | allocation |
+| --- | ---: | ---: | ---: |
+| admitted ordinary point | 150.7-153.9 ns | 0 | 0 |
+| admitted prepared point | 49.3-49.8 ns | 0 | 0 |
+| random point, 141x pressure, host buffer cache | 7.06-7.14 us | 5 × 4 KiB | 0 |
+| ordered 4,096-row scan, 141x pressure | 371-378 us | 264 / 1,081,344 B | 0 |
+
+In a Linux/arm64 Docker VM with `O_DIRECT` required, the pressure point
+measured 168-174 us and the complete scan 9.53-9.93 ms. Those numbers measure
+that VM storage stack, not NVMe. A cold read cannot match DRAM latency; the
+useful guarantee is that a hot set stays resident and a cold set cannot force
+unbounded Go heap or RSS growth.
+
+This page-file surface is read-only and currently rejects TTL or secondary-
+index state rather than silently dropping it. Online copy-on-write mutation,
+durable index/TTL roots, overflow values, asynchronous scan batches, and
+snapshot-aware extent reclamation remain the attached-database boundary. The
+internal root-last committer and pure-Go Linux ring writer already provide the
+bounded durability substrate, but ordinary `Put`, `Delete`, and TTL calls are
+not falsely described as updating this file yet.
 
 Chunk placement now uses 64-way packed CHAMP nodes: one occupancy word plus
 densely ranked 32-byte physical references, with no empty child array or Go
@@ -432,52 +511,50 @@ STORE_SCALE_SMOKE=10000,100000,5000000 \
 It bulk-loads identical-shape documents with one nested single-column index and
 one nested compound index, forces GC before measuring live heap, then measures
 random keyed reads, a 1/256 compound query, updates, delete/reinsert churn, and
-TTL changes. Apple M4 Max, stable Go, one run:
+TTL changes. Apple M4 Max, pinned Go development toolchain, one run per scale:
 
-| Records | Build docs/s | Source B/doc | Live heap B/doc | Heap objects/doc | Packed document extents B/doc | Packed exact indexes B/doc | Point read | Compound query |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | 1.42M | 92.9 | 520.5 | 0.256 | 128.2 | 7.27 | 19 ns | 4.15 us / 39 masks |
-| 100,000 | 1.48M | 94.9 | 521.0 | 0.251 | 128.0 | 4.45 | 30 ns | 48.18 us / 390 masks |
-| 5,000,000 | 0.98M | 98.7 | 521.1 | 0.251 | 128.0 | 4.16 | 55 ns | 9.20 ms / 19,531 masks |
+| Records | Build docs/s | Source B/doc | Heap B/doc | Heap objects/doc | External B/doc | Accounted B/doc | Raw extent projection B/doc | Packed exact index B/doc | Point read | Compound query |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 1.33M | 92.9 | 16.0 | 0.022 | 147.2 | 163.3 | 128.2 | 7.27 | 19 ns | 3.56 us / 39 masks |
+| 100,000 | 1.41M | 94.9 | 14.5 | 0.016 | 150.4 | 164.9 | 128.0 | 4.45 | 28 ns | 37.75 us / 390 masks |
+| 5,000,000 | 0.95M | 98.7 | 14.4 | 0.016 | 148.7 | 163.1 | 128.0 | 4.16 | 49 ns | 7.77 ms / 19,531 masks |
 
-At 5M rows, keys plus JSON are 493,480,886 bytes. Packed owned keys and the two
-exact-index bases reduce the current heap from the earlier 3,995,694,760 bytes
-and 13,246,371 objects to 2,605,486,408 bytes and 1,252,619 objects: 65.2% of
-the original heap remains, 90.5% of the objects are gone, and point lookup is
-faster. Actual packed index storage
-is 20,798,476 bytes (4.16 B/doc), within 0.04% of the independent 20,791,296
-byte page projection. The still-unattached variable document extents project
-to 640,000,000 bytes (1.30x source); document plus posting extents are about
-1.34x source before key/value directories, TTL/free-space metadata, roots,
-allocator slack, and retained generations.
+At 5M rows, exact keys plus JSON are 493,480,886 bytes. Live Go heap is
+71,759,480 bytes and 80,753 objects: 14.4 B/doc and 0.016 objects/doc. The
+pointer-free key, document, and exact-index blocks total 743,629,378 bytes.
+Honest heap-plus-external storage is therefore 815,388,858 bytes, 163.1 B/doc,
+or 1.65x the logical input. Against the earlier 3,995,694,760-byte heap-only
+representation, total accounted storage fell about 4.9x while GC-visible bytes
+fell 98.2% and objects fell 99.4%.
 
-The remaining 0.251 objects/doc is not accepted as the endpoint. A diagnostic
-reopen through the existing pointer-free checkpoint reached 0.016 objects/doc
-at 100k rows—more than 100x below the original 2.665—but its legacy tape image
-was 5.45x source and made point/index operations slower. That path is evidence
-that the GC target is feasible, not the selected format. Acceptance requires
-at most 0.027 objects/doc with the new packed extents and no hot-path
-regression; attaching compact document/tape frames is the remaining dominant
-work.
+The document block is 567,000,000 bytes. It includes exact JSON, compact row
+descriptors, per-row adaptive scalar spans, and shared nested structural
+templates. The key block is 155,831,938 bytes. The two packed exact indexes are
+20,798,476 estimated bytes (4.16 B/doc), within 0.04% of the independent
+20,791,296-byte posting-page projection. The separate 640,000,000-byte raw-page
+projection is no longer a lower total for this corpus; it omits the key
+directory and structural lookup state that the measured Store includes.
 
-Across the same 5M run, indexed update averaged 4.17 us, delete plus reinsert
-7.95 us, and changing an existing TTL 42 ns. The point-read rise from 19 ns to
-55 ns is a cache-footprint result, not an algorithmic complexity change. Query
-time scales with the number of exact result masks because this smoke
-materializes them; a Boolean consumer can combine those stable-slot words
-without decoding rejected documents.
+Across the isolated 5M run, indexed update averaged 5.34 us, delete plus
+reinsert 11.19 us, and changing an existing TTL 46 ns. The point-read rise from
+19 ns to 49 ns is a cache-footprint result, not an algorithmic complexity
+change. Query time scales with the number of exact result masks because this
+smoke materializes them; a Boolean consumer can combine those stable-slot
+words without decoding rejected documents.
 
 ### Capacity planning for 1 TiB
 
-There are two different answers until the paged mode is complete. The current
-heap Store measured 62.4 MiB for 25.0 MiB of clustered source JSON with one
-low-cardinality exact index: 2.50 live heap bytes per source byte. A linear
-1 TiB extrapolation would therefore require about 2.50 TiB of live heap. That
-is workload evidence, not a universal multiplier, but it makes clear that the
-current implementation is not a 1 TiB-on-64-GiB database.
+There are different answers for the mutable heap Store and immutable page
+reader. The current 5M-row builder Store uses 0.15 live heap bytes and 1.65
+heap-plus-external bytes per source byte. A linear 1 TiB extrapolation of this
+exact indexed workload would therefore require about 1.65 TiB of resident
+addressable storage even though the Go GC scans only a small fraction. That is
+workload evidence, not a universal multiplier: external ownership solves GC
+cost, while a 1 TiB corpus on 64 GiB needs the bounded page-file representation.
 
-The bounded paged target sizes RAM from the hot working set rather than total
-JSON. The following directory estimates extrapolate the measured 65,536-key
+The immutable page reader sizes its frame arena from the hot working set rather
+than total JSON. The following estimates also describe what a future mutable
+attached mode must budget. They extrapolate the measured 65,536-key
 fixed and packed-CHAMP prototypes; the per-index column extrapolates the
 measured 4.2 bytes/document 16-value exact index. They exclude key spelling,
 TTL entries, high-cardinality value directories, allocator rounding, and the
@@ -490,14 +567,15 @@ resident JSON-page cache.
 | 16 KiB | 67.1 million | 9.17 GiB | 3.77 GiB | 0.26 GiB |
 
 For the 4 KiB example, a literal 100x page-cache ratio contributes another
-10.24 GiB. About 32 GiB is therefore only a lower-bound configuration with a
-paged cold directory and a few compact indexes; 64 GiB is a practical starting
-point, and 128 GiB buys a materially larger hot set. One-kilobyte documents or
-many unique/high-cardinality and compound indexes can require 128–256 GiB even
-though JSON pages remain bounded. Disk must additionally hold page headers,
-index/value dictionaries, copy-on-write generations awaiting reclamation, and
-free-space headroom; no fixed disk multiplier is claimed until the durable page
-format and churn benchmark exist.
+10.24 GiB. About 32 GiB is therefore only a lower-bound mutable configuration
+with a paged cold directory and a few compact indexes; 64 GiB is a practical
+starting point, and 128 GiB buys a materially larger hot set. One-kilobyte
+documents or many unique/high-cardinality and compound indexes can require
+128–256 GiB even though JSON pages remain bounded. The current read-only file
+adds common headers, compact key entries, radix references, and extent
+rounding. A mutable file must additionally reserve copy-on-write generations,
+persistent index/TTL dictionaries, reclamation lag, and free-space headroom;
+no mutable disk multiplier is claimed before that churn benchmark exists.
 
 ## TTL
 
@@ -589,17 +667,26 @@ The query engine binds indexes at execution time, so a compiled query can
 outlive create, backfill, and drop:
 
 ```go
-q := query.Select(query.Path("id"), query.Path("profile.geo.country")).Where(
+plan, err := query.Select(query.Path("id"), query.Path("profile.geo.country")).Where(
 	query.And(
 		query.Cmp("tenant", query.Eq, "acme"),
 		query.Cmp("profile.geo.country", query.Eq, "PT"),
 	),
-)
+).Prepare()
+if err != nil {
+	return err
+}
 
 var result query.Result
 var workspace query.Workspace
-err = q.RunSnapshotInto(&result, store.Snapshot(), &workspace)
+err = plan.RunSnapshotInto(&result, store.Snapshot(), &workspace)
 ```
+
+The builder and `query.PrepareSQL` lower into this same typed `Plan`. SQL text,
+lexer tokens, and builder nodes are absent from execution; paths and constants
+are compiled once, and result columns are addressed by stable ordinals. This is
+also the wire boundary: a future decoder can lower path/schema bytes and typed
+constants into the plan without making SQL strings an intermediate format.
 
 The planner prefers the widest matching compound index, intersects indexed
 `AND` branches, unions `OR` only when every branch is bounded, and complements
@@ -700,8 +787,9 @@ allocation-free operational snapshot:
 - `ReusableChunks`: partial or empty ids available to writes;
 - `ExpiringKeys`: exact heap-node count;
 - `Indexes`, `IndexedChunks`, and `IndexReclaiming`.
-- `MappedImageBytes`, `ExternalKeyBytes`, and `ExternalDocumentBytes`; mapped
-  bytes remain RSS even when they do not contribute to Go `HeapAlloc`.
+- `MappedImageBytes`, `ExternalKeyBytes`, `ExternalDocumentBytes`, and
+  `ExternalIndexBytes`; mapped blocks remain RSS even when they do not
+  contribute to Go `HeapAlloc`.
 
 `Snapshot.AppendIndexes` returns reader-visible index name, kind, ordered paths,
 state, covered chunks, and total chunks. `Snapshot.IndexStats` adds the physical
@@ -714,18 +802,31 @@ snapshots, or an event loop that leaves expired deadlines unpublished.
 `ErrStoreTooLarge` before wraparound. Detailed source, tape, depth, retention,
 and maintenance limits are in [`contracts/limits.md`](contracts/limits.md).
 
-The current Store remains an in-memory API; the internal page format is not yet
-the public automatic-durability path. The DuckDB harness compares two embedded
+The mutable `Store` remains an in-memory API. `StorePageReader` is a public
+immutable bounded-residency surface, not the automatic-durability path for
+later mutations. The DuckDB harness compares two embedded
 engines over identical key+JSON input, one execution lane, matching scalar
-materialization, and verified results. It reports Store live heap, DuckDB's
-checkpointed file, WAL, and profiled buffer peak separately. A live heap/file
-ratio would mix resident parsed state with compressed durable storage and is
-therefore intentionally absent.
+materialization, and verified results. It reports Store live heap and external
+blocks, DuckDB's checkpointed file and WAL, and DuckDB's current warm and peak
+buffer-manager bytes separately. A resident/file ratio would mix parsed state
+with compressed durable storage and is therefore intentionally absent.
 
-The frozen 10,000-row clustered smoke measured Store at 2.38x logical key+JSON
-in settled live heap and DuckDB at 1.29x in its checkpointed database file.
-These numbers answer different capacity questions and are workload-dependent;
-neither is a resident-memory comparison. The same run includes warmed point,
-filter, aggregate, containment, update, and delete timings with a differential
-correctness gate. See the [frozen run](../benchmarks/results/duckdb-synth-s4.md)
-and [methodology](../benchmarks/duckdbbench/duckdb-methodology.md).
+The frozen 10,000-row clustered smoke measures Store at 1.25x logical key+JSON
+in settled heap plus owned external blocks. DuckDB records 5.75 MiB in its warm
+buffer manager, 1.29x in its checkpointed database file, and a 98.35 MiB peak
+during the run. Store's 4.85 MiB accounted state is 3% smaller than DuckDB's
+5.01 MiB file and 15% smaller than its warm buffers on this corpus, but those
+remain different accounting domains and neither is process RSS.
+
+Store wins the frozen direct-operation timings because its surface is narrower:
+an in-process key probe returns a stable-slot row without SQL parsing or plan
+construction; exact filters and one-member containment start from 64-row
+bitmap postings and recheck only candidates; numeric reduction and categorical
+grouping fuse directly over compact structural tapes. DuckDB executes a general
+vectorized SQL pipeline, and its low-cardinality ART may correctly choose a
+scan. Store update/delete publish in-memory copy-on-write generations, whereas
+DuckDB's per-key measurements include an ACID transaction and durability work.
+That mutation ratio is not a durability-equivalent claim. DuckDB remains the
+broader engine for durable SQL, joins, and general analytical plans. See the
+[frozen run](../benchmarks/results/duckdb-synth-s4.md) and
+[methodology](../benchmarks/duckdbbench/duckdb-methodology.md).

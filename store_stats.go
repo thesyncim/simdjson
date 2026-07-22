@@ -35,8 +35,9 @@ type StoreStats struct {
 	// ExternalKeyBytes is pointer-free mapped key-directory metadata outside
 	// Go HeapAlloc on supported Unix platforms. It remains process RSS.
 	ExternalKeyBytes uint64
-	// ExternalDocumentBytes is pointer-free mapped document-descriptor
-	// metadata outside Go HeapAlloc on supported Unix platforms.
+	// ExternalDocumentBytes is pointer-free document descriptors plus any
+	// Store-owned packed source/tape blocks outside Go HeapAlloc on supported
+	// Unix platforms. Caller-owned mapped image bytes remain separate.
 	ExternalDocumentBytes uint64
 	// ExternalIndexBytes is immutable exact-index page/directory storage
 	// outside Go HeapAlloc on supported Unix platforms. Mutation deltas remain

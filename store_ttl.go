@@ -314,6 +314,7 @@ func (s *Store) ExpireDue(now time.Time, limit int) int {
 		if err != nil {
 			panic("simdjson: rebuilding validated Store chunk: " + err.Error())
 		}
+		next.detachMappedDocuments(old)
 		next.chunks = next.chunks.set(chunkID, chunk)
 		if chunk == nil {
 			next.chunkCount--
