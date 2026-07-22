@@ -12,7 +12,7 @@ func Accelerated() bool { return true }
 
 func andWords(dst, a, b []uint64) {
 	if len(dst) < 8 {
-		andWordsScalar(dst, a, b)
+		andWordsSmall(dst, a, b)
 		return
 	}
 	andWordsAVX2(dst, a, b)
@@ -20,7 +20,7 @@ func andWords(dst, a, b []uint64) {
 
 func and3Words(dst, a, b, c []uint64) {
 	if len(dst) < 8 {
-		and3WordsScalar(dst, a, b, c)
+		and3WordsSmall(dst, a, b, c)
 		return
 	}
 	and3WordsAVX2(dst, a, b, c)
@@ -28,7 +28,7 @@ func and3Words(dst, a, b, c []uint64) {
 
 func orWords(dst, a, b []uint64) {
 	if len(dst) < 8 {
-		orWordsScalar(dst, a, b)
+		orWordsSmall(dst, a, b)
 		return
 	}
 	orWordsAVX2(dst, a, b)
@@ -36,7 +36,7 @@ func orWords(dst, a, b []uint64) {
 
 func andNotWords(dst, a, b []uint64) {
 	if len(dst) < 8 {
-		andNotWordsScalar(dst, a, b)
+		andNotWordsSmall(dst, a, b)
 		return
 	}
 	andNotWordsAVX2(dst, a, b)

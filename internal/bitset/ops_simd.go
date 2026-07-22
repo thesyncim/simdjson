@@ -12,6 +12,33 @@ import (
 // stack ABI, and array-pointer loads remove loop bounds checks. The scalar
 // tails are shared only after every vector is stored.
 
+// The dispatch wrappers inline these compact loops below the first complete
+// two-vector block. Keeping them separate from the unrolled scalar fallback
+// avoids a second call on tiny bitmaps without bloating every wrapper.
+func andWordsSmall(dst, a, b []uint64) {
+	for i := range dst {
+		dst[i] = a[i] & b[i]
+	}
+}
+
+func and3WordsSmall(dst, a, b, c []uint64) {
+	for i := range dst {
+		dst[i] = a[i] & b[i] & c[i]
+	}
+}
+
+func orWordsSmall(dst, a, b []uint64) {
+	for i := range dst {
+		dst[i] = a[i] | b[i]
+	}
+}
+
+func andNotWordsSmall(dst, a, b []uint64) {
+	for i := range dst {
+		dst[i] = a[i] &^ b[i]
+	}
+}
+
 func andWordsAVX2(dst, a, b []uint64) {
 	i := 0
 	dp := unsafe.Pointer(unsafe.SliceData(dst))

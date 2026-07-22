@@ -17,7 +17,11 @@ var bitsetAVX2Available = archsimd.X86.AVX2()
 func Accelerated() bool { return bitsetAVX2Available }
 
 func andWords(dst, a, b []uint64) {
-	if len(dst) >= 8 && bitsetAVX2Available {
+	if len(dst) < 8 {
+		andWordsSmall(dst, a, b)
+		return
+	}
+	if bitsetAVX2Available {
 		andWordsAVX2(dst, a, b)
 		return
 	}
@@ -25,7 +29,11 @@ func andWords(dst, a, b []uint64) {
 }
 
 func and3Words(dst, a, b, c []uint64) {
-	if len(dst) >= 8 && bitsetAVX2Available {
+	if len(dst) < 8 {
+		and3WordsSmall(dst, a, b, c)
+		return
+	}
+	if bitsetAVX2Available {
 		and3WordsAVX2(dst, a, b, c)
 		return
 	}
@@ -33,7 +41,11 @@ func and3Words(dst, a, b, c []uint64) {
 }
 
 func orWords(dst, a, b []uint64) {
-	if len(dst) >= 8 && bitsetAVX2Available {
+	if len(dst) < 8 {
+		orWordsSmall(dst, a, b)
+		return
+	}
+	if bitsetAVX2Available {
 		orWordsAVX2(dst, a, b)
 		return
 	}
@@ -41,7 +53,11 @@ func orWords(dst, a, b []uint64) {
 }
 
 func andNotWords(dst, a, b []uint64) {
-	if len(dst) >= 8 && bitsetAVX2Available {
+	if len(dst) < 8 {
+		andNotWordsSmall(dst, a, b)
+		return
+	}
+	if bitsetAVX2Available {
 		andNotWordsAVX2(dst, a, b)
 		return
 	}

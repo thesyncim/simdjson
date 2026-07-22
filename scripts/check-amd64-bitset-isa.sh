@@ -58,14 +58,20 @@ for level in v1 v2 v3; do
 			echo "GOAMD64=$level $operation omitted the eight-word crossover" >&2
 			exit 1
 		fi
-		for target in "${operation}AVX2" "${operation}Scalar"; do
-			if ! grep -q "$target" "$dispatch_assembly"; then
-				echo "GOAMD64=$level $operation dispatch omitted $target" >&2
-				exit 1
-			fi
-		done
+		if grep -q "${operation}Small" "$dispatch_assembly"; then
+			echo "GOAMD64=$level $operation did not inline its small scalar loop" >&2
+			exit 1
+		fi
+		if ! grep -q "${operation}AVX2" "$dispatch_assembly"; then
+			echo "GOAMD64=$level $operation dispatch omitted its AVX2 body" >&2
+			exit 1
+		fi
 		case $level in
 		v1 | v2)
+			if ! grep -q "${operation}Scalar" "$dispatch_assembly"; then
+				echo "GOAMD64=$level $operation omitted its large scalar fallback" >&2
+				exit 1
+			fi
 			if ! grep -q bitsetAVX2Available "$dispatch_assembly"; then
 				echo "GOAMD64=$level $operation omitted runtime AVX2 gating" >&2
 				exit 1
