@@ -137,14 +137,17 @@
 // documents.
 //
 // A [Store] adds keyed insert, replace, delete, TTL, immutable [Snapshot]
-// publication, and online posting lifecycle. Snapshot GetRaw reads are
-// lock-free, clock-free, and allocation-free. Updates parse only their
-// replacement and share unchanged immutable source/tape storage; deletes
-// rebuild bounded dense row metadata without tombstones or later compaction.
-// [Store.ExpireDue] groups expiry deletes by chunk; [Store.BackfillIndex] and
-// [Store.ReclaimIndexes] let an event loop bound maintenance work. Buffered
-// snapshot probes append matching keys into caller storage. See docs/store.md
-// for ownership, expiry semantics, operational counters, and tuning.
+// publication, declared single/compound exact indexes, and wildcard postings.
+// Snapshot GetRaw reads are lock-free, clock-free, and allocation-free.
+// Updates parse only their replacement and share unchanged immutable
+// source/tape storage; deletes rebuild bounded dense row metadata without
+// tombstones or later compaction. [Store.CreateIndex] accepts nested RFC 6901
+// paths. [Snapshot.AppendIndexMasks] exposes stable-slot Boolean words, while
+// [Snapshot.AppendIndexRows] and [Snapshot.AppendPointerRows] support sparse
+// late materialization. [Store.ExpireDue] groups expiry deletes by chunk;
+// [Store.BackfillIndex] and [Store.ReclaimIndexes] let an event loop bound
+// maintenance work. See docs/store.md for ownership, expiry semantics,
+// operational counters, and tuning.
 //
 // [ShapeCache] compiles the layouts of recurring flat objects: Resolve
 // fingerprints an object's key sequence, [Shape.Field] resolves a field

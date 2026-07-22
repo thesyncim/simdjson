@@ -10,7 +10,7 @@ immutable snapshots. Reader-visible state contains:
 - a per-Store-keyed persistent 32-way HAMT from complete key to chunk/slot;
 - a persistent 32-way radix vector of immutable chunks;
 - at most 64 stable slots per chunk and one dense `DocSet` row table; and
-- the logical online-index watermark.
+- the logical online-index watermark plus immutable exact-index roots.
 
 Writer-only state contains reusable and indexed chunk-id sets, TTL metadata,
 online-index build cursors, and reclamation progress. Readers never consult it.
@@ -29,6 +29,9 @@ online-index build cursors, and reclamation progress. Readers never consult it.
    generations.
 7. Index construction and reclamation are caller-budgeted and observable.
 8. Hash collisions may widen work but never change an answer.
+9. Declared indexes support nested RFC 6901 paths and ordered compound keys.
+10. Buffered exact probes and indexed snapshot queries allocate zero bytes
+    after their caller-owned storage reaches its high-water mark.
 
 ## Publication and ownership
 
@@ -116,11 +119,71 @@ consumer disappears, `ReclaimIndexes(k)` rebuilds at most `k` ids taken from an
 O(1) writer set; it never scans the Store merely to discover completion. Old
 snapshots continue to own their physical index version through normal GC.
 
+## Declared exact indexes
+
+`CreateIndex` publishes one to four compiled RFC 6901 paths. The definition may
+name a top-level column, a nested object field, or an array position. Multiple
+paths form one ordered compound key. Missing paths, incompatible traversal
+steps, and containers contribute no entry; the four JSON scalar families do.
+Compiled pointers share the Store-owned
+path spelling and reuse the existing shape/classic `AppendPointerRows` engines,
+so index maintenance does not introduce a second JSON traversal implementation.
+
+The chunk is also the index micro-page. Its stable slots are a native `uint64`
+posting word; the chunk's dense document ordinal may change after a delete, but
+the slot bit does not. This separates scan density from index identity:
+
+- delete rebuilds dense row metadata and clears the old stable bit;
+- insert reuses the free bit without a tombstone or remap table;
+- update moves only changed slots between tuple postings; and
+- an unchanged tuple reuses the complete old index root and catalog slices.
+
+Each tuple fingerprint maps to an adaptive posting. Up to four chunk words live
+inside the posting leaf. Wider values promote to a sparse persistent radix
+vector. Removal demotes a four-word result back inline and contracts redundant
+top radix levels immediately; there is no background bitmap compaction phase.
+The fingerprint directory and word vector path-copy only changed routes, so old
+Snapshots retain their exact version through ordinary reachability.
+
+Strings use the Store's keyed collision-resistant hash over decoded content;
+the tuple fold receives a final low-bit avalanche before HAMT routing. Numbers
+use an equality-compatible candidate bucket. Neither is authoritative: lookup
+re-resolves every path and applies exact Boolean, decimal, decoded-string, or
+null equality before returning a row. A collision therefore costs work but
+cannot forge an answer.
+
+Backfill traverses the captured chunk vector in caller-bounded batches and
+adds stable words to the persistent root without rebuilding document chunks.
+Writes touching an uncovered chunk index its complete next image and mark that
+chunk covered before publication. `Building` probes scan the immutable
+snapshot exactly; `Ready` probes visit only candidate masks. Dropping a declared
+index detaches its root in one publication, and old roots need no explicit
+reclamation command because they contain no chunk-local physical layer.
+
+## Snapshot query planning
+
+`query.RunSnapshotInto` binds against the Snapshot's catalog on every run. A
+compiled query can therefore precede index creation and survive backfill or
+drop without invalidation. Equality leaves bind to matching single-column
+definitions. An `AND` first chooses the widest usable compound definition and
+then intersects any further indexed conjuncts. An `OR` unions only when every
+branch has a sound bound. Exact `NOT` complements against live stable-slot
+words. Every mask operation is ordered by chunk and evaluates 64 rows per
+machine-word Boolean operation.
+
+Candidate count decides late materialization: at or below half the snapshot,
+set bits decode to `(chunk, slot)` rows and existing sparse column gathers touch
+only survivors; above half, the engine keeps the dense column scan. The original
+predicate remains the semantic authority after candidate pruning. Projection,
+aggregation, grouping, stable ordering, and limiting reuse the same execution
+code as `DocSet` queries.
+
 ## Allocation contract
 
 After caller-owned capacity is warm, snapshots, `GetRaw`, `Range`, buffered
-posting probes, compiled `query.RunInto`, warmed TTL changes, and native dense
-Boolean operations allocate zero bytes.
+exact/posting probes, sparse Snapshot gathers, compiled `query.RunInto` and
+`query.RunSnapshotInto`, warmed TTL changes, and native dense Boolean operations
+allocate zero bytes.
 
 Mutations allocate the next immutable state. A zero-allocation `Put` or
 `Delete` would require overwriting storage visible to an old snapshot or
@@ -144,6 +207,16 @@ faster for delete-plus-insert than rebuilding and reparsing every surviving
 row, with 82% and 80% less allocation respectively. `Store.GetRaw` remains
 19.6 ns with zero allocations. These are local regression fixtures, not
 universal Redis command claims.
+
+Declared-index regression fixtures on the same machine add no allocation when
+the indexed tuple is unchanged: a single or compound definition measures about
+2.64 us, 9.9 KiB, and 12 allocations. Moving the tuple costs about 3.1 us,
+11.9 KiB, and 18 allocations. A 65,536-document, 16-value enum definition is
+about 4.2 reachable index bytes/document. A warmed 10%-selective Snapshot query
+measures about 12.9 ns/input document versus 67.2 ns/document for the matching
+full scan; a compound point query measures about 3.01 ns/input document.
+Distribution changes posting density, so `Snapshot.IndexStats` is the
+production sizing authority.
 
 ## Validation
 

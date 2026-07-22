@@ -145,11 +145,13 @@ pointer_rfc6901_test.go
 query/parse_test.go
 query/postings_test.go
 query/query_test.go
+query/store_test.go
 raw_trusted_test.go
 shape_column_test.go
 shape_column_typed_test.go
 shape_test.go
 store_test.go
+store_index_exact_test.go
 value_accessors_contract_test.go
 value_iteration_contract_test.go
 value_spans_contract_test.go

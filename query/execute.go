@@ -2,6 +2,7 @@ package query
 
 import (
 	"bytes"
+	"math/bits"
 	"slices"
 	"strconv"
 
@@ -29,6 +30,11 @@ type Workspace struct {
 	candidates     [][]int
 	candidateUsed  int
 	emptyCandidate [1]int
+	storeMasks     [][]simdjson.StoreMask
+	storeMaskUsed  int
+	storeRows      []simdjson.StoreRow
+	storeIndexes   []simdjson.StoreIndexInfo
+	emptyStoreMask [1]simdjson.StoreMask
 
 	containsEntries []simdjson.IndexEntry
 	text            []byte
@@ -39,6 +45,19 @@ type Workspace struct {
 	groups     []group
 	groupKey   []byte
 	groupOrder []int
+}
+
+func (w *Workspace) nextStoreMasks() []simdjson.StoreMask {
+	if w.storeMaskUsed == len(w.storeMasks) {
+		w.storeMasks = append(w.storeMasks, nil)
+	}
+	i := w.storeMaskUsed
+	w.storeMaskUsed++
+	return w.storeMasks[i][:0]
+}
+
+func (w *Workspace) keepStoreMasks(masks []simdjson.StoreMask) {
+	w.storeMasks[w.storeMaskUsed-1] = masks
 }
 
 // execCtx is the columnar state for one execution. Its inner column slices
@@ -109,6 +128,53 @@ func (p *plan) runInto(dst *Result, s *simdjson.DocSet, w *Workspace) error {
 	return nil
 }
 
+func (p *plan) runSnapshotInto(dst *Result, snapshot simdjson.Snapshot, w *Workspace) error {
+	w.candidateUsed = 0
+	w.storeMaskUsed = 0
+	w.text = w.text[:0]
+	w.numbers = w.numbers[:0]
+	w.groupKey = w.groupKey[:0]
+	w.groupOrder = w.groupOrder[:0]
+	w.interner.Reset()
+
+	masks := p.storeCandidateMasks(snapshot, w)
+	candidateCount := 0
+	for _, mask := range masks {
+		candidateCount += bits.OnesCount64(mask.Bits)
+	}
+	compact := masks != nil && candidateCount <= snapshot.Len()/2
+	w.storeRows = w.storeRows[:0]
+	if compact {
+		for _, mask := range masks {
+			for word := mask.Bits; word != 0; word &= word - 1 {
+				w.storeRows = append(w.storeRows, simdjson.StoreRow{
+					Chunk: mask.Chunk,
+					Slot:  uint8(bits.TrailingZeros64(word)),
+				})
+			}
+		}
+	}
+
+	ctx := &w.ctx
+	ctx.s, ctx.rows = nil, snapshot.Len()
+	if compact {
+		ctx.rows = len(w.storeRows)
+	}
+	if err := ctx.extractSnapshot(p, snapshot, w.storeRows, compact, w); err != nil {
+		return err
+	}
+	selected := p.selectRows(ctx, nil, compact, w)
+	switch {
+	case p.grouped:
+		p.runGroupedInto(dst, ctx, selected, w)
+	case p.singleRow:
+		p.runAggregateInto(dst, ctx, selected, w)
+	default:
+		p.runProjectionInto(dst, ctx, selected)
+	}
+	return nil
+}
+
 func preferSparseRows(candidates, total int, hasBound bool) bool {
 	return hasBound && candidates <= total/2
 }
@@ -132,6 +198,20 @@ func (ctx *execCtx) extract(p *plan, sourceRows []int, w *Workspace) error {
 			}
 		}
 	}
+	ctx.classifyRawColumns(p, w, textNeed)
+
+	ctx.nums = resize(ctx.nums, len(p.numPaths))
+	for i, cp := range p.numPaths {
+		nc, err := ctx.numericColumn(ctx.nums[i], cp, sourceRows, w)
+		if err != nil {
+			return err
+		}
+		ctx.nums[i] = nc
+	}
+	return nil
+}
+
+func (ctx *execCtx) classifyRawColumns(p *plan, w *Workspace, textNeed int) {
 	if cap(w.text) < textNeed {
 		w.text = make([]byte, 0, growCap(cap(w.text), textNeed))
 	}
@@ -143,14 +223,46 @@ func (ctx *execCtx) extract(p *plan, sourceRows []int, w *Workspace) error {
 		}
 		ctx.values[i] = col
 	}
+}
 
-	ctx.nums = resize(ctx.nums, len(p.numPaths))
-	for i, cp := range p.numPaths {
-		nc, err := ctx.numericColumn(ctx.nums[i], cp, sourceRows, w)
+func (ctx *execCtx) extractSnapshot(p *plan, snapshot simdjson.Snapshot, sourceRows []simdjson.StoreRow, compact bool, w *Workspace) error {
+	w.raws = resize(w.raws, len(p.valuePaths))
+	textNeed := 0
+	for i, cp := range p.valuePaths {
+		var raws []simdjson.RawValue
+		var err error
+		if compact {
+			raws, err = snapshot.AppendPointerRows(w.raws[i][:0], sourceRows, cp.pointerForStore())
+		} else {
+			raws, err = snapshot.AppendPointer(w.raws[i][:0], cp.pointerForStore())
+		}
 		if err != nil {
 			return err
 		}
-		ctx.nums[i] = nc
+		w.raws[i] = raws
+		for _, r := range raws {
+			b := r.Bytes()
+			if r.Kind() == document.String && bytes.IndexByte(b, '\\') >= 0 {
+				textNeed += len(b)
+			}
+		}
+	}
+	ctx.classifyRawColumns(p, w, textNeed)
+
+	ctx.nums = resize(ctx.nums, len(p.numPaths))
+	for i, cp := range p.numPaths {
+		var raws []simdjson.RawValue
+		var err error
+		if compact {
+			raws, err = snapshot.AppendPointerRows(w.numRaws[:0], sourceRows, cp.pointerForStore())
+		} else {
+			raws, err = snapshot.AppendPointer(w.numRaws[:0], cp.pointerForStore())
+		}
+		if err != nil {
+			return err
+		}
+		w.numRaws = raws
+		ctx.nums[i] = numericRaws(ctx.nums[i], raws)
 	}
 	return nil
 }
@@ -178,6 +290,10 @@ func (ctx *execCtx) numericColumn(dst numColumn, cp compiledPath, sourceRows []i
 		return numColumn{}, err
 	}
 	w.numRaws = raws
+	return numericRaws(dst, raws), nil
+}
+
+func numericRaws(dst numColumn, raws []simdjson.RawValue) numColumn {
 	vals := resize(dst.vals, len(raws))
 	valid := resize(dst.valid, len(raws))
 	clear(valid)
@@ -186,7 +302,7 @@ func (ctx *execCtx) numericColumn(dst numColumn, cp compiledPath, sourceRows []i
 			vals[i], valid[i] = f, true
 		}
 	}
-	return numColumn{vals: vals, valid: valid}, nil
+	return numColumn{vals: vals, valid: valid}
 }
 
 func (p *plan) selectRows(ctx *execCtx, candidates []int, compact bool, w *Workspace) []int {

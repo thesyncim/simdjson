@@ -2,6 +2,7 @@ package simdjson
 
 import (
 	"errors"
+	"math/bits"
 	"slices"
 	"strings"
 )
@@ -14,6 +15,11 @@ const (
 	// layer in every Store chunk. It accelerates query equality, existence, and
 	// scalar containment while exact predicate rechecks preserve semantics.
 	StoreIndexPostings StoreIndexKind = iota + 1
+	// StoreIndexExact is a declared single-column or compound scalar index.
+	// Create it with [Store.CreateIndex]. Its physical directory maps one
+	// order-sensitive typed fingerprint to persistent stable-slot bitmaps;
+	// hashes only prune and every returned row is verified exactly.
+	StoreIndexExact
 )
 
 // StoreIndexState is an online index's publication state.
@@ -36,6 +42,10 @@ type StoreIndexInfo struct {
 	Name string
 	// Kind identifies the shared physical index family.
 	Kind StoreIndexKind
+	// Columns contains the indexed RFC 6901 paths in compound-key order.
+	// ColumnCount is zero for the legacy wildcard posting family.
+	Columns     [StoreIndexMaxColumns]string
+	ColumnCount uint8
 	// State is Building until CoveredChunks equals TotalChunks.
 	State StoreIndexState
 	// CoveredChunks is the count eligible for the physical accelerated path.
@@ -45,9 +55,9 @@ type StoreIndexInfo struct {
 }
 
 var (
-	// ErrStoreIndexExists reports an AddIndex name collision.
+	// ErrStoreIndexExists reports an AddIndex or CreateIndex name collision.
 	ErrStoreIndexExists = errors.New("simdjson: Store index already exists")
-	// ErrStoreIndexNotFound reports an unknown BackfillIndex or DropIndex name.
+	// ErrStoreIndexNotFound reports an unknown index name.
 	ErrStoreIndexNotFound = errors.New("simdjson: Store index not found")
 	// ErrStoreIndexKind reports a StoreIndexKind this build does not implement.
 	ErrStoreIndexKind = errors.New("simdjson: unsupported Store index kind")
@@ -59,6 +69,8 @@ type storeIndexBuild struct {
 	scan     storeChunkVector
 	cursor   uint64
 	all      bool
+	exact    *storeExactIndex
+	root     *storeIndexPostingNode
 }
 
 type storeIndexReclaim struct{}
@@ -113,6 +125,49 @@ func (s *Store) AddIndex(name string, kind StoreIndexKind) (StoreIndexInfo, erro
 	next := *state
 	next.generation++
 	next.indexes = s.indexInfosLocked()
+	next.secondary = s.indexSnapshotsLocked()
+	s.state.Store(&next)
+	return b.info, nil
+}
+
+// CreateIndex atomically publishes a path-specific exact scalar index. A
+// single path indexes one column; multiple paths form an order-sensitive
+// compound key. Existing chunks are processed by BackfillIndex while every
+// later write dual-maintains the definition before publication. Until Ready,
+// probes use an exact scan fallback.
+func (s *Store) CreateIndex(def StoreIndexDefinition) (StoreIndexInfo, error) {
+	exact, err := compileStoreExactIndex(def)
+	if err != nil {
+		return StoreIndexInfo{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.initLocked()
+	if err != nil {
+		return StoreIndexInfo{}, err
+	}
+	if s.indexes == nil {
+		s.indexes = make(map[string]*storeIndexBuild)
+	}
+	if _, exists := s.indexes[def.Name]; exists {
+		return StoreIndexInfo{}, ErrStoreIndexExists
+	}
+	name := strings.Clone(def.Name)
+	exact.seed = state.seed
+	b := &storeIndexBuild{exact: exact, info: StoreIndexInfo{
+		Name:        name,
+		Kind:        StoreIndexExact,
+		State:       StoreIndexBuilding,
+		TotalChunks: state.chunkCount,
+	}, scan: state.chunks}
+	b.info.ColumnCount = exact.n
+	copy(b.info.Columns[:], exact.specs[:exact.n])
+	b.updateState()
+	s.indexes[name] = b
+	next := *state
+	next.generation++
+	next.indexes = s.indexInfosLocked()
+	next.secondary = s.indexSnapshotsLocked()
 	s.state.Store(&next)
 	return b.info, nil
 }
@@ -136,6 +191,8 @@ func (s *Store) BackfillIndex(name string, maxChunks int) (StoreIndexInfo, error
 	nextChunks := state.chunks
 	examined := 0
 	changed := false
+	bulkRoot := b.root
+	var pending map[uint64][]storeIndexChunkMask
 	for maxChunks <= 0 || examined < maxChunks {
 		id, _, ok := b.scan.next(b.cursor)
 		if !ok {
@@ -150,7 +207,15 @@ func (s *Store) BackfillIndex(name string, maxChunks int) (StoreIndexInfo, error
 		if chunk == nil {
 			continue
 		}
-		if !chunk.docs.Postings {
+		if b.exact != nil {
+			var storage [storeMaxChunkDocuments]storeIndexHashMask
+			for _, entry := range storeIndexCollectChunk(storage[:0], b.exact, chunk) {
+				if pending == nil {
+					pending = make(map[uint64][]storeIndexChunkMask)
+				}
+				pending[entry.hash] = append(pending[entry.hash], storeIndexChunkMask{chunk: id, mask: entry.mask})
+			}
+		} else if !chunk.docs.Postings {
 			rebuilt, err := cloneStoreChunk(state.options, true, chunk)
 			if err != nil {
 				return b.info, err
@@ -158,8 +223,19 @@ func (s *Store) BackfillIndex(name string, maxChunks int) (StoreIndexInfo, error
 			nextChunks = nextChunks.set(id, rebuilt)
 			s.noteChunkPostingsLocked(id, chunk, rebuilt)
 		}
-		s.markIndexesCoveredLocked(id)
+		if b.exact != nil {
+			b.mark(id)
+		} else {
+			s.markIndexesCoveredLocked(id)
+		}
 		changed = true
+	}
+	if len(pending) != 0 {
+		if bulkRoot == nil {
+			b.root = storeIndexBuildBulk(pending)
+		} else {
+			b.root = storeIndexApplyBulk(bulkRoot, pending)
+		}
 	}
 	b.updateState()
 	if changed {
@@ -167,6 +243,7 @@ func (s *Store) BackfillIndex(name string, maxChunks int) (StoreIndexInfo, error
 		next.generation++
 		next.chunks = nextChunks
 		next.indexes = s.indexInfosLocked()
+		next.secondary = s.indexSnapshotsLocked()
 		s.state.Store(&next)
 	}
 	return b.info, nil
@@ -195,6 +272,7 @@ func (s *Store) DropIndex(name string) error {
 	next := *state
 	next.generation++
 	next.indexes = s.indexInfosLocked()
+	next.secondary = s.indexSnapshotsLocked()
 	s.state.Store(&next)
 	return nil
 }
@@ -314,24 +392,70 @@ func (s *Store) markIndexesCoveredLocked(id uint32) {
 // removing the last document removes that chunk from both total and covered
 // counts. Rewrites dual-maintain before publication and therefore mark the
 // chunk covered even while background backfill is still running elsewhere.
-func (s *Store) noteIndexesForChunkLocked(id uint32, old, next *storeChunk) {
+func (s *Store) noteIndexesForChunkLocked(id uint32, old, next *storeChunk, changed uint64) (catalogChanged, secondaryChanged bool) {
 	oldLive, nextLive := old != nil, next != nil
 	for _, b := range s.indexes {
-		if b.info.Kind != StoreIndexPostings {
-			continue
-		}
+		oldInfo, oldRoot := b.info, b.root
+		covered := b.has(id)
 		switch {
 		case !oldLive && nextLive:
 			b.info.TotalChunks++
+			if b.exact != nil {
+				b.root = storeIndexSetChunk(b.root, b.exact, id, next, true)
+			}
 			b.mark(id)
 		case oldLive && !nextLive:
+			if b.exact != nil && covered {
+				b.root = storeIndexSetChunk(b.root, b.exact, id, old, false)
+			}
 			b.info.TotalChunks--
 			b.unmark(id)
 		case nextLive:
+			if b.exact != nil {
+				if covered {
+					for slots := changed; slots != 0; slots &= slots - 1 {
+						slot := bits.TrailingZeros64(slots)
+						b.root = storeIndexUpdateSlot(b.root, b.exact, id, old, next, slot)
+					}
+				} else {
+					// A mutation of an uncovered chunk indexes its complete next
+					// image, so the chunk can join coverage immediately.
+					b.root = storeIndexSetChunk(b.root, b.exact, id, next, true)
+				}
+			}
 			b.mark(id)
 		}
 		b.updateState()
+		if b.info != oldInfo {
+			catalogChanged = true
+		}
+		if b.exact != nil && (b.root != oldRoot || b.info != oldInfo) {
+			secondaryChanged = true
+		}
 	}
+	return catalogChanged, secondaryChanged
+}
+
+func (s *Store) indexSnapshotsLocked() []storeIndexSnapshot {
+	if len(s.indexes) == 0 {
+		return nil
+	}
+	out := make([]storeIndexSnapshot, 0, len(s.indexes))
+	for _, b := range s.indexes {
+		if b.exact != nil {
+			out = append(out, storeIndexSnapshot{info: b.info, exact: b.exact, root: b.root})
+		}
+	}
+	slices.SortFunc(out, func(a, b storeIndexSnapshot) int {
+		if a.info.Name < b.info.Name {
+			return -1
+		}
+		if a.info.Name > b.info.Name {
+			return 1
+		}
+		return 0
+	})
+	return out
 }
 
 func (s *Store) indexInfosLocked() []StoreIndexInfo {

@@ -20,6 +20,18 @@ They complement the differential and oracle suites, which compare against
 ([`benchmarks/pgbaseline`](../../benchmarks/pgbaseline/METHODOLOGY.md)). The goal
 is correctness evidence, not performance.
 
+The mutable layer adds a separate stable-slot differential in
+`store_index_exact_test.go`: across chunk sizes 1, 3, 8, and 64 it interleaves
+inserts, replacements, deletes, slot reuse, partial backfill, complete
+backfill, and retained old snapshots, then compares every compound-index probe
+against an independent full `Snapshot.Range` plus compiled-pointer walk. Nested
+object fields, escaped pointer tokens, array positions, missing values, exact
+decimal aliases, decoded-string aliases, deliberately coarse wide-number
+buckets, and bitmap promotion/demotion are covered directly. Query-level tests
+compare `RunSnapshot` against `Run` for compound equality, nested equality,
+`AND`, `OR`, `NOT`, residual ranges, projections, grouping, aggregation, and
+ordering in both `Building` and `Ready` states.
+
 The two harnesses are `verify_exhaustive_test.go` and
 `verify_invariants_test.go`; both run under
 `go test -run 'Exhaustive|InfoWord|NarrowSpan|EncodingInvariants'`.

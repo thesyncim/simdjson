@@ -254,6 +254,7 @@ func (s *Store) ExpireDue(now time.Time, limit int) int {
 	next.generation++
 	next.keys = state.keys
 	next.chunks = state.chunks
+	catalogChanged, secondaryChanged := false, false
 	for first := 0; first < len(s.expireScratch); {
 		chunkID := s.expireScratch[first].loc.chunk
 		last := first
@@ -276,10 +277,17 @@ func (s *Store) ExpireDue(now time.Time, limit int) int {
 		}
 		s.noteChunkPostingsLocked(chunkID, old, chunk)
 		s.addFreeLocked(chunkID)
-		s.noteIndexesForChunkLocked(chunkID, old, chunk)
+		catalog, secondary := s.noteIndexesForChunkLocked(chunkID, old, chunk, remove)
+		catalogChanged = catalogChanged || catalog
+		secondaryChanged = secondaryChanged || secondary
 		first = last
 	}
-	next.indexes = s.indexInfosLocked()
+	if catalogChanged {
+		next.indexes = s.indexInfosLocked()
+	}
+	if secondaryChanged {
+		next.secondary = s.indexSnapshotsLocked()
+	}
 	s.state.Store(&next)
 	expired := len(s.expireScratch)
 	clear(s.expireScratch)

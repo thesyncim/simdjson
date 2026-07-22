@@ -184,16 +184,20 @@ func compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error
 			return nil, err
 		}
 		cp := &compiledPredicate{kind: predCmp, col: col, op: p.op, lit: classifyLiteral(lit)}
-		// Equality over a single top-level field prunes through the value
-		// postings; every other operator is a range the scalar buckets do not
-		// answer, and a nested path is not indexed.
-		if p.op == Eq && reg.paths[col].single {
+		// Every equality compiles its exact scalar needle for declared Store
+		// indexes, including nested paths. The older DocSet posting family is
+		// limited to one top-level field and receives the same needle only when
+		// that narrower contract applies.
+		if p.op == Eq {
 			if needle, ok := eqNeedle(cp.lit); ok {
 				idx, err := buildNeedleIndex(needle)
 				if err != nil {
 					return nil, err
 				}
-				cp.probe = postProbe{kind: postEq, path: reg.paths[col].name, needle: idx}
+				cp.needle = idx
+				if reg.paths[col].single {
+					cp.probe = postProbe{kind: postEq, path: reg.paths[col].name, needle: idx}
+				}
 			}
 		}
 		return cp, nil

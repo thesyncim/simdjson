@@ -35,11 +35,16 @@ func compilePath(spec string) (compiledPath, error) {
 	}
 	segments := strings.Split(spec, ".")
 	if len(segments) == 1 {
+		pointer, err := simdjson.CompilePointer("/" + escapePointerSegment(spec))
+		if err != nil {
+			return compiledPath{}, err
+		}
 		return compiledPath{
-			spec:   spec,
-			single: true,
-			name:   spec,
-			key:    simdjson.CompileKey(spec),
+			spec:    spec,
+			single:  true,
+			name:    spec,
+			key:     simdjson.CompileKey(spec),
+			pointer: pointer,
 		}, nil
 	}
 	pointer, err := simdjson.CompilePointer(pointerFromSegments(segments))
@@ -47,6 +52,18 @@ func compilePath(spec string) (compiledPath, error) {
 		return compiledPath{}, err
 	}
 	return compiledPath{spec: spec, pointer: pointer}, nil
+}
+
+func (p compiledPath) pointerForStore() simdjson.CompiledPointer { return p.pointer }
+
+// indexPath returns the canonical RFC 6901 spelling used by declared Store
+// indexes. Query's dotted syntax is a front-end convenience; index matching is
+// performed only on this exact compiled form.
+func (p compiledPath) indexPath() string {
+	if p.single {
+		return "/" + escapePointerSegment(p.name)
+	}
+	return p.pointer.String()
 }
 
 // pointerFromSegments renders dotted segments as an RFC 6901 pointer, escaping

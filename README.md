@@ -169,11 +169,37 @@ key, no stale deadline generations—and due keys are grouped by chunk and
 published in one delete batch. `RunExpiry` sleeps until the next deadline;
 ordinary reads pay literally no TTL branch or time lookup.
 
-Online posting indexes publish as `Building`, dual-maintain concurrent writes,
-backfill in caller-bounded chunk batches, and become `Ready` at complete
-coverage. Snapshot probes remain exact during build through per-chunk scan
-fallback. Dropping detaches the logical index immediately; physical reclamation
-is also caller-bounded and never performs a hidden full-store completion scan.
+Declared exact indexes accept one to four RFC 6901 paths, including nested
+object fields and array positions. Compound equality, `AND`, `OR`, and exact
+`NOT` plans combine stable-slot chunk masks before sparse column extraction:
+
+```go
+info, err := store.CreateIndex(simdjson.StoreIndexDefinition{
+	Name:  "tenant_country",
+	Paths: []string{"/tenant", "/profile/geo/country"},
+})
+for err == nil && info.State != simdjson.StoreIndexReady {
+	info, err = store.BackfillIndex(info.Name, 64)
+}
+if err != nil {
+	return err
+}
+
+q := query.Select(query.Path("id")).Where(query.And(
+	query.Cmp("tenant", query.Eq, "acme"),
+	query.Cmp("profile.geo.country", query.Eq, "PT"),
+))
+var result query.Result
+var workspace query.Workspace
+err = q.RunSnapshotInto(&result, store.Snapshot(), &workspace)
+```
+
+Online indexes publish as `Building`, dual-maintain concurrent writes, backfill
+in caller-bounded chunk batches, and become `Ready` at complete coverage.
+Snapshot probes remain exact during build through scan fallback. Dropping
+detaches the logical index immediately. Wildcard-posting reclamation is also
+caller-bounded and never performs a hidden full-store completion scan; declared
+roots are reclaimed automatically with their last snapshot.
 
 The complete API, ownership rules, expiration semantics, tuning table,
 complexity bounds, zero-allocation recipes, operational counters, and Redis
@@ -195,6 +221,9 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Extract a typed `int64` column | 12 ns/doc |
 | Immutable `Store.GetRaw` point read | 19-21 ns, 0 allocations |
 | Default-chunk Store replace | 2.36 us median, 9.8 KiB/op |
+| Exact-index replace, indexed tuple unchanged | 2.64 us, 9.9 KiB/op, no added allocations |
+| Indexed Snapshot equality at 10% selectivity | 12.9 ns/input doc, 0 allocations |
+| Indexed Snapshot compound point query | 3.01 ns/input doc, 0 allocations |
 | Change an existing TTL | 43 ns, 0 allocations |
 | Native-bitmap SIMD `AND` vs scalar | 2.1-2.6x six-run median, 0 allocations |
 
@@ -228,7 +257,7 @@ define the methodology, gates, comparison boundaries, and pinned toolchains.
 | Borrowed selection or repeated document navigation | `RawValue`, `Index`/`Node`, or `Parse`/`Value` |
 | Batches of documents, columnar field extraction | `DocSet`, `ShapeCache`, `KeyInterner` |
 | SQL-shaped projection, filtering, grouping, and aggregation | `query.Query.RunInto`, `query.Result`, `query.Workspace` |
-| Keyed updates, deletes, TTL, snapshots, and online postings | `Store`, `Snapshot`, `StoreStats` |
+| Keyed updates, deletes, TTL, snapshots, exact indexes, and wildcard postings | `Store`, `Snapshot`, `StoreIndexDefinition`, `StoreStats` |
 
 The advanced document APIs are moving into `document` during the pre-v1
 migration. JSON kind values already use `document.Kind`; the remaining package

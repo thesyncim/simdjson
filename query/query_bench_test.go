@@ -121,3 +121,54 @@ func BenchmarkQueryRunInto(b *testing.B) {
 		b.Run(name, func(b *testing.B) { runQueryIntoBench(b, q) })
 	}
 }
+
+func BenchmarkQueryRunSnapshotIndexed(b *testing.B) {
+	store := simdjson.NewStore(simdjson.StoreOptions{ChunkDocuments: 64, ShapeTapes: true})
+	for i := 0; i < benchDocs; i++ {
+		if _, err := store.Put(fmt.Sprintf("key-%05d", i), benchRecord(i)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	for _, def := range []simdjson.StoreIndexDefinition{
+		{Name: "f0", Paths: []string{"/f0"}},
+		{Name: "f0_f1", Paths: []string{"/f0", "/f1"}},
+	} {
+		info, err := store.CreateIndex(def)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if info, err = store.BackfillIndex(info.Name, 0); err != nil || info.State != simdjson.StoreIndexReady {
+			b.Fatalf("BackfillIndex(%s) = (%+v,%v)", def.Name, info, err)
+		}
+	}
+	snapshot := store.Snapshot()
+	for _, test := range []struct {
+		name string
+		q    *Query
+	}{
+		{"single-10pct", Select(Path("f0"), Path("f1")).Where(Cmp("f0", Eq, 0))},
+		{"compound-point", Select(Path("f0"), Path("f1")).Where(And(Cmp("f0", Eq, 0), Cmp("f1", Eq, 101)))},
+		{"or-20pct", Select(Path("f0"), Path("f1")).Where(Or(Cmp("f0", Eq, 0), Cmp("f0", Eq, 1)))},
+		{"not-90pct", Select(Count()).Where(Not(Cmp("f0", Eq, 0)))},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			var dst Result
+			var w Workspace
+			if err := test.q.RunSnapshotInto(&dst, snapshot, &w); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := test.q.RunSnapshotInto(&dst, snapshot, &w); err != nil {
+					b.Fatal(err)
+				}
+			}
+			benchSink = dst
+			b.StopTimer()
+			rows := float64(b.N) * float64(benchDocs)
+			b.ReportMetric(rows/b.Elapsed().Seconds(), "rows/sec")
+			b.ReportMetric(b.Elapsed().Seconds()*1e9/rows, "ns/doc")
+		})
+	}
+}

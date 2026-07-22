@@ -351,3 +351,29 @@ func (q *Query) RunInto(dst *Result, s *simdjson.DocSet, w *Workspace) error {
 	}
 	return p.runInto(dst, s, w)
 }
+
+// RunSnapshot executes q over an immutable Store snapshot. Declared exact
+// indexes are bound from that snapshot's catalog at execution time, so a Query
+// compiled before online index creation can use it once Ready without being
+// recompiled.
+func (q *Query) RunSnapshot(s simdjson.Snapshot) (Result, error) {
+	var result Result
+	var workspace Workspace
+	err := q.RunSnapshotInto(&result, s, &workspace)
+	return result, err
+}
+
+// RunSnapshotInto is the caller-owned, zero-steady-allocation form of
+// [Query.RunSnapshot]. Candidate predicates combine native stable-slot masks;
+// only surviving rows are decoded before exact predicate recheck and late
+// projection, grouping, aggregation, ordering, and limiting.
+func (q *Query) RunSnapshotInto(dst *Result, s simdjson.Snapshot, w *Workspace) error {
+	if dst == nil || w == nil {
+		return fmt.Errorf("query: RunSnapshotInto requires non-nil result and Workspace")
+	}
+	p, err := q.compiled()
+	if err != nil {
+		return err
+	}
+	return p.runSnapshotInto(dst, s, w)
+}

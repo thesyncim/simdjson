@@ -138,11 +138,23 @@ entry; changing a TTL does not add a generation. Each physical posting chunk
 appears exactly once in writer reclamation metadata, even when multiple logical
 posting index names share it.
 
-Snapshots pin every immutable node, chunk, source arena, tape, and physical
-index version reachable from their publication state. Holding old snapshots
-while updating hot keys intentionally retains old versions. The package cannot
-bound that memory without invalidating the snapshot contract; applications must
-bound snapshot age or count according to their workload.
+A declared exact index has one to four RFC 6901 paths. Missing paths,
+incompatible traversal steps, and JSON containers are not indexed. Each
+distinct composite fingerprint owns an
+adaptive stable-slot posting: up to four chunk words inline, then a sparse
+persistent radix vector. Each materialized word addresses 64 document slots;
+empty address ranges use no word. Fingerprint collisions can increase candidate
+bits but exact rechecks preserve answers. `Snapshot.IndexStats` reports the
+reachable footprint of a definition; no distribution-independent bytes/key
+bound exists because value cardinality and frequency determine the directory
+and word counts.
+
+Snapshots pin every immutable node, chunk, source arena, tape, declared-index
+root, and physical wildcard-index version reachable from their publication
+state. Holding old snapshots while updating hot keys intentionally retains old
+versions. The package cannot bound that memory without invalidating the
+snapshot contract; applications must bound snapshot age or count according to
+their workload.
 
 The current Store version may share unchanged source and structural-tape
 backing with an older publication, but it retains no parent chunk or historical
@@ -151,11 +163,11 @@ collectible as soon as no retained snapshot reaches it. Compact narrow-value
 slabs and dense row headers are publication-private.
 
 A building online index temporarily retains the immutable chunk-vector root
-captured by `AddIndex` so its bounded cursor cannot miss an original live
-chunk. Coverage is a sparse-paged bitmap: dense populated pages cost one bit per
-chunk, while empty historical address ranges retain no pages. Reaching `Ready`
-or dropping the definition releases the root; completion also collapses the
-coverage bitmap to an implicit all-live state.
+captured by `AddIndex` or `CreateIndex` so its bounded cursor cannot miss an
+original live chunk. Coverage is a sparse-paged bitmap: dense populated pages
+cost one bit per chunk, while empty historical address ranges retain no pages.
+Reaching `Ready` or dropping the definition releases the root; completion also
+collapses the coverage bitmap to an implicit all-live state.
 
 `BackfillIndex`, `ReclaimIndexes`, and `ExpireDue` accept caller work limits.
 A non-positive limit means all currently eligible work, which may be large.

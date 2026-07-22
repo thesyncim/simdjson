@@ -60,11 +60,11 @@ func (o StoreOptions) normalized() (StoreOptions, error) {
 // document: no tombstone enters a read path and no later compaction is required
 // to restore scan speed.
 //
-// The zero Store is ready to use. Set Options before the first Put or AddIndex,
-// or use NewStore. A Store is safe for concurrent use. Snapshot readers take
-// no writer lock; GetRaw and Range take no lock at all. Get may enter the
-// synchronized shape-tape widening cache described on [Snapshot.Get].
-// A Store must not be copied after first use.
+// The zero Store is ready to use. Set Options before the first Put, AddIndex,
+// or CreateIndex, or use NewStore. A Store is safe for concurrent use.
+// Snapshot readers take no writer lock; GetRaw and Range take no lock at all.
+// Get may enter the synchronized shape-tape widening cache described on
+// [Snapshot.Get]. A Store must not be copied after first use.
 type Store struct {
 	Options StoreOptions
 
@@ -101,6 +101,7 @@ type storeState struct {
 	keys       *storeKeyNode
 	chunks     storeChunkVector
 	indexes    []StoreIndexInfo
+	secondary  []storeIndexSnapshot
 }
 
 type storeChunk struct {
@@ -384,8 +385,13 @@ func (s *Store) Put(key string, src []byte) (created bool, err error) {
 		next.generation++
 		next.chunks = state.chunks.set(loc.chunk, chunk)
 		s.noteChunkPostingsLocked(loc.chunk, old, chunk)
-		s.noteIndexesForChunkLocked(loc.chunk, old, chunk)
-		next.indexes = s.indexInfosLocked()
+		catalogChanged, secondaryChanged := s.noteIndexesForChunkLocked(loc.chunk, old, chunk, uint64(1)<<loc.slot)
+		if catalogChanged {
+			next.indexes = s.indexInfosLocked()
+		}
+		if secondaryChanged {
+			next.secondary = s.indexSnapshotsLocked()
+		}
 		s.state.Store(&next)
 		return false, nil
 	}
@@ -418,8 +424,13 @@ func (s *Store) Put(key string, src []byte) (created bool, err error) {
 	} else {
 		s.addFreeLocked(chunkID)
 	}
-	s.noteIndexesForChunkLocked(chunkID, old, chunk)
-	next.indexes = s.indexInfosLocked()
+	catalogChanged, secondaryChanged := s.noteIndexesForChunkLocked(chunkID, old, chunk, uint64(1)<<uint(slot))
+	if catalogChanged {
+		next.indexes = s.indexInfosLocked()
+	}
+	if secondaryChanged {
+		next.secondary = s.indexSnapshotsLocked()
+	}
 	s.state.Store(&next)
 	return true, nil
 }
@@ -462,8 +473,13 @@ func (s *Store) deleteLocked(key string) bool {
 	if s.ttl.remove(key) {
 		s.notifyExpiryLocked()
 	}
-	s.noteIndexesForChunkLocked(loc.chunk, old, chunk)
-	next.indexes = s.indexInfosLocked()
+	catalogChanged, secondaryChanged := s.noteIndexesForChunkLocked(loc.chunk, old, chunk, uint64(1)<<loc.slot)
+	if catalogChanged {
+		next.indexes = s.indexInfosLocked()
+	}
+	if secondaryChanged {
+		next.secondary = s.indexSnapshotsLocked()
+	}
 	s.state.Store(&next)
 	return true
 }

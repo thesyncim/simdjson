@@ -84,11 +84,15 @@ tape storage; unchanged rows share their already-immutable source and classic
 tape backing into the new chunk. Dense row headers and the chunk-relative
 narrow-value slab are private copies. The new shape cache imports only records
 referenced by surviving rows, so sharing cannot accumulate dead layout history.
-TTL and index-lifecycle structures remain writer-only. `Snapshot.GetRaw`
-therefore never locks, reads a clock, checks a tombstone, or consults mutable
-metadata. `Snapshot.Get` retains the existing `DocSet.Doc` contract: the first
-access to a compact shape tape may enter a synchronized memoization cache and
-allocate its equivalent classic tape.
+TTL and index-lifecycle cursors remain writer-only. Reader state contains only
+immutable index metadata and declared-index roots. A declared posting addresses
+one bounded chunk through a stable-slot `uint64`; Boolean planning therefore
+combines 64 rows at a time before `ord[slot]` maps survivors into the dense
+`DocSet`. Nested keys reuse compiled-pointer/shape extraction instead of a
+parallel decoder. `Snapshot.GetRaw` never locks, reads a clock, checks a
+tombstone, or consults mutable metadata. `Snapshot.Get` retains the existing
+`DocSet.Doc` contract: the first access to a compact shape tape may enter a
+synchronized memoization cache and allocate its equivalent classic tape.
 
 Deleted rows are absent from the rebuilt dense row table; deleting a final row
 publishes a nil radix leaf without constructing an empty chunk. Tree traversal
