@@ -53,6 +53,30 @@ func TestDocumentPageSteadyAllocation(t *testing.T) {
 	}
 }
 
+func TestDocumentPageOverflowSteadyAllocation(t *testing.T) {
+	header := testDocumentPageHeader(1)
+	fileEnd := uint64(32 * testSuperblockPageSize)
+	rows := []DocumentRecord{{
+		Slot: 0, Key: []byte("large"), Overflow: testOverflowRef(10, 20, header.Generation), JSONLength: 1 << 20,
+	}}
+	page := make([]byte, testSuperblockPageSize)
+	if allocs := testing.AllocsPerRun(1000, func() {
+		if _, err := EncodeDocumentPageWithOverflow(page, header, rows, testDocumentNextLogicalID, fileEnd, testSuperblockPageSize); err != nil {
+			panic(err)
+		}
+		view, err := OpenDocumentPageWithOverflow(page, header.ChunkID+1, testDocumentNextLogicalID, fileEnd, testSuperblockPageSize)
+		if err != nil {
+			panic(err)
+		}
+		value, ok := view.LookupStringValue(0, "large")
+		if !ok || value.Overflow != rows[0].Overflow || value.Length != rows[0].JSONLength {
+			panic("overflow lookup")
+		}
+	}); allocs != 0 {
+		t.Fatalf("document overflow codec allocations = %g, want 0", allocs)
+	}
+}
+
 func BenchmarkDocumentPage(b *testing.B) {
 	header := testDocumentPageHeader(^uint64(0))
 	rows := testBenchmarkDocumentRows()

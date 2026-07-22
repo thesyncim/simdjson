@@ -165,6 +165,90 @@ func TestDocumentPageVariableExtent(t *testing.T) {
 	}
 }
 
+func TestDocumentPageOverflowReferenceRoundTrip(t *testing.T) {
+	const live = uint64(1)<<0 | uint64(1)<<5
+	header := testDocumentPageHeader(live)
+	fileEnd := uint64(32 * testSuperblockPageSize)
+	overflow := testOverflowRef(10, 20, header.Generation)
+	rows := []DocumentRecord{
+		{Slot: 0, Key: []byte("inline"), JSON: []byte(`{"ok":true}`)},
+		{Slot: 5, Key: []byte("large"), Overflow: overflow, JSONLength: 1 << 20},
+	}
+	page := make([]byte, testSuperblockPageSize)
+	encoded, err := EncodeDocumentPageWithOverflow(page, header, rows, testDocumentNextLogicalID, fileEnd, testSuperblockPageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenDocumentPage(encoded, header.ChunkID+1, testDocumentNextLogicalID); !errors.Is(err, ErrDocumentPageCorrupt) {
+		t.Fatalf("legacy OpenDocumentPage = %v, want %v", err, ErrDocumentPageCorrupt)
+	}
+	view, err := OpenDocumentPageWithOverflow(encoded, header.ChunkID+1, testDocumentNextLogicalID, fileEnd, testSuperblockPageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inline, ok := view.LookupValue(0)
+	if !ok || string(inline.Inline) != string(rows[0].JSON) || inline.Length != uint64(len(rows[0].JSON)) || inline.Overflow != (PageRef{}) {
+		t.Fatalf("inline value = (%+v,%v)", inline, ok)
+	}
+	large, ok := view.LookupValue(5)
+	if !ok || large.Inline != nil || large.Overflow != overflow || large.Length != rows[1].JSONLength {
+		t.Fatalf("overflow value = (%+v,%v)", large, ok)
+	}
+	record, ok := view.Lookup(5)
+	if !ok || string(record.Key) != "large" || record.JSON != nil || record.Overflow != overflow || record.JSONLength != rows[1].JSONLength {
+		t.Fatalf("overflow record = (%+v,%v)", record, ok)
+	}
+	if _, ok := view.LookupJSON(5); ok {
+		t.Fatal("LookupJSON returned an overflow descriptor as JSON")
+	}
+	if _, ok := view.LookupKey(5, []byte("large")); ok {
+		t.Fatal("LookupKey returned an overflow descriptor as JSON")
+	}
+	if got, ok := view.LookupStringValue(5, "large"); !ok || got.Inline != nil || got.Overflow != large.Overflow || got.Length != large.Length {
+		t.Fatalf("LookupStringValue = (%+v,%v), want (%+v,true)", got, ok, large)
+	}
+	if got, ok := view.LookupKeyValue(5, []byte("large")); !ok || got.Inline != nil || got.Overflow != large.Overflow || got.Length != large.Length {
+		t.Fatalf("LookupKeyValue = (%+v,%v), want (%+v,true)", got, ok, large)
+	}
+	if _, ok := view.LookupKeyValue(5, []byte("collision")); ok {
+		t.Fatal("LookupKeyValue accepted wrong key")
+	}
+	if _, err := EncodeDocumentPage(page, header, rows, testDocumentNextLogicalID); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("EncodeDocumentPage with overflow = %v, want %v", err, ErrInvalidWrite)
+	}
+}
+
+func TestDocumentPageRejectsCorruptOverflowDescriptor(t *testing.T) {
+	header := testDocumentPageHeader(1)
+	fileEnd := uint64(32 * testSuperblockPageSize)
+	rows := []DocumentRecord{{
+		Slot: 0, Key: []byte("large"), Overflow: testOverflowRef(10, 20, header.Generation), JSONLength: 1024,
+	}}
+	page := make([]byte, testSuperblockPageSize)
+	if _, err := EncodeDocumentPageWithOverflow(page, header, rows, testDocumentNextLogicalID, fileEnd, testSuperblockPageSize); err != nil {
+		t.Fatal(err)
+	}
+	descriptor := PageHeaderSize + DocumentPagePayloadHeaderSize
+	dataStart := PageHeaderSize + DocumentPagePayloadHeaderSize + DocumentPageRecordSize
+	keyEnd := int(binary.LittleEndian.Uint32(page[descriptor : descriptor+4]))
+	for _, mutate := range []func([]byte){
+		func(p []byte) {
+			binary.LittleEndian.PutUint32(p[descriptor+4:descriptor+8], uint32(keyEnd+DocumentOverflowDescriptorSize))
+		},
+		func(p []byte) { p[dataStart+keyEnd+29] = 1 },
+		func(p []byte) {
+			clear(p[dataStart+keyEnd+PageRefSize : dataStart+keyEnd+DocumentOverflowDescriptorSize])
+		},
+	} {
+		corrupt := append([]byte(nil), page...)
+		mutate(corrupt)
+		resealTestPage(corrupt)
+		if _, err := OpenDocumentPageWithOverflow(corrupt, header.ChunkID+1, testDocumentNextLogicalID, fileEnd, testSuperblockPageSize); !errors.Is(err, ErrDocumentPageCorrupt) {
+			t.Fatalf("OpenDocumentPageWithOverflow = %v, want %v", err, ErrDocumentPageCorrupt)
+		}
+	}
+}
+
 func TestDocumentPageRejectsInvalidWrites(t *testing.T) {
 	const live = uint64(1)<<0 | uint64(1)<<5 | uint64(1)<<63
 	valid := testDocumentPageHeader(live)

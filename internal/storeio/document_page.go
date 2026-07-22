@@ -9,10 +9,12 @@ import (
 )
 
 const (
-	DocumentPagePayloadHeaderSize = 32
-	DocumentPageRecordSize        = 8
-	documentPageVersion           = uint32(1)
-	documentPageKnownFlags        = uint8(0)
+	DocumentPagePayloadHeaderSize  = 32
+	DocumentPageRecordSize         = 8
+	DocumentOverflowDescriptorSize = PageRefSize + 8
+	documentPageVersion            = uint32(1)
+	documentPageKnownFlags         = uint8(0)
+	documentPageOverflowBit        = uint32(1 << 31)
 )
 
 // ErrDocumentPageCorrupt reports a checksum-valid common page whose document
@@ -35,9 +37,20 @@ type DocumentPageHeader struct {
 // JSON only for the call. Views returned by DocumentPageView alias the admitted
 // page and are invalid when its backing frame is reused.
 type DocumentRecord struct {
-	Key  []byte
-	JSON []byte
-	Slot uint8
+	Key        []byte
+	JSON       []byte
+	Overflow   PageRef
+	JSONLength uint64
+	Slot       uint8
+}
+
+// DocumentValue is either an inline JSON spelling or a reference to the first
+// separately checksummed overflow piece. Length is the complete JSON byte
+// length in both cases.
+type DocumentValue struct {
+	Inline   []byte
+	Overflow PageRef
+	Length   uint64
 }
 
 // DocumentPageView is an admitted, checksum-verified micro-page. One borrowed
@@ -57,7 +70,18 @@ type DocumentPageView struct {
 // deterministic page initialization clears dst before copying. No allocation
 // is performed when rows and dst are caller-owned.
 func EncodeDocumentPage(dst []byte, header DocumentPageHeader, rows []DocumentRecord, nextLogicalID uint64) ([]byte, error) {
-	dataLength, err := validateDocumentPageWrite(header, rows, nextLogicalID)
+	return encodeDocumentPage(dst, header, rows, nextLogicalID, 0, 0, false)
+}
+
+// EncodeDocumentPageWithOverflow writes a document page that may reference
+// overflow chains. Each overflow row has an empty JSON, a non-zero Overflow,
+// and its complete JSONLength. Inline rows leave those fields zero.
+func EncodeDocumentPageWithOverflow(dst []byte, header DocumentPageHeader, rows []DocumentRecord, nextLogicalID, fileEnd uint64, allocationQuantum uint32) ([]byte, error) {
+	return encodeDocumentPage(dst, header, rows, nextLogicalID, fileEnd, allocationQuantum, true)
+}
+
+func encodeDocumentPage(dst []byte, header DocumentPageHeader, rows []DocumentRecord, nextLogicalID, fileEnd uint64, allocationQuantum uint32, allowOverflow bool) ([]byte, error) {
+	dataLength, err := validateDocumentPageWrite(header, rows, nextLogicalID, fileEnd, allocationQuantum, allowOverflow)
 	if err != nil {
 		return nil, err
 	}
@@ -84,15 +108,26 @@ func EncodeDocumentPage(dst []byte, header DocumentPageHeader, rows []DocumentRe
 
 	dataStart := DocumentPagePayloadHeaderSize + count*DocumentPageRecordSize
 	dataEnd := 0
+	var overflowCount uint8
 	for rank, row := range rows {
 		copy(payload[dataStart+dataEnd:], row.Key)
 		dataEnd += len(row.Key)
 		descriptor := DocumentPagePayloadHeaderSize + rank*DocumentPageRecordSize
 		binary.LittleEndian.PutUint32(payload[descriptor:descriptor+4], uint32(dataEnd))
-		copy(payload[dataStart+dataEnd:], row.JSON)
-		dataEnd += len(row.JSON)
-		binary.LittleEndian.PutUint32(payload[descriptor+4:descriptor+8], uint32(dataEnd))
+		if row.Overflow == (PageRef{}) {
+			copy(payload[dataStart+dataEnd:], row.JSON)
+			dataEnd += len(row.JSON)
+			binary.LittleEndian.PutUint32(payload[descriptor+4:descriptor+8], uint32(dataEnd))
+		} else {
+			overflowCount++
+			encoded := payload[dataStart+dataEnd:]
+			encodePageRef(encoded[:PageRefSize], row.Overflow)
+			binary.LittleEndian.PutUint64(encoded[PageRefSize:DocumentOverflowDescriptorSize], row.JSONLength)
+			dataEnd += DocumentOverflowDescriptorSize
+			binary.LittleEndian.PutUint32(payload[descriptor+4:descriptor+8], documentPageOverflowBit|uint32(dataEnd))
+		}
 	}
+	payload[24] = overflowCount
 	page := dst[:int(header.PageSize)]
 	if _, err := sealInitializedPage(page); err != nil {
 		return nil, err
@@ -105,6 +140,16 @@ func EncodeDocumentPage(dst []byte, header DocumentPageHeader, rows []DocumentRe
 // state root and reject pages outside that graph. The returned view borrows src
 // and repeated lookups allocate nothing.
 func OpenDocumentPage(src []byte, chunkHighWater uint32, nextLogicalID uint64) (DocumentPageView, error) {
+	return openDocumentPage(src, chunkHighWater, nextLogicalID, 0, 0, false)
+}
+
+// OpenDocumentPageWithOverflow admits document pages containing overflow
+// references and validates each reference against the selected state root.
+func OpenDocumentPageWithOverflow(src []byte, chunkHighWater uint32, nextLogicalID, fileEnd uint64, allocationQuantum uint32) (DocumentPageView, error) {
+	return openDocumentPage(src, chunkHighWater, nextLogicalID, fileEnd, allocationQuantum, true)
+}
+
+func openDocumentPage(src []byte, chunkHighWater uint32, nextLogicalID, fileEnd uint64, allocationQuantum uint32, allowOverflow bool) (DocumentPageView, error) {
 	pageHeader, payload, err := OpenPage(src)
 	if err != nil {
 		return DocumentPageView{}, fmt.Errorf("%w: %w", ErrDocumentPageCorrupt, err)
@@ -112,7 +157,7 @@ func OpenDocumentPage(src []byte, chunkHighWater uint32, nextLogicalID uint64) (
 	if pageHeader.Kind != PageDocument || len(payload) < DocumentPagePayloadHeaderSize ||
 		binary.LittleEndian.Uint32(payload[0:4]) != documentPageVersion ||
 		binary.LittleEndian.Uint16(payload[22:24]) != DocumentPageRecordSize ||
-		!allZero(payload[24:DocumentPagePayloadHeaderSize]) {
+		!allZero(payload[25:DocumentPagePayloadHeaderSize]) {
 		return DocumentPageView{}, fmt.Errorf("%w: header, version, or reserved bytes", ErrDocumentPageCorrupt)
 	}
 	header := DocumentPageHeader{
@@ -134,16 +179,31 @@ func OpenDocumentPage(src []byte, chunkHighWater uint32, nextLogicalID uint64) (
 		return DocumentPageView{}, fmt.Errorf("%w: payload length", ErrDocumentPageCorrupt)
 	}
 	var previousEnd uint32
+	var overflowCount uint8
 	for rank := 0; rank < count; rank++ {
 		descriptor := DocumentPagePayloadHeaderSize + rank*DocumentPageRecordSize
 		keyEnd := binary.LittleEndian.Uint32(payload[descriptor : descriptor+4])
-		jsonEnd := binary.LittleEndian.Uint32(payload[descriptor+4 : descriptor+8])
-		if keyEnd < previousEnd || jsonEnd <= keyEnd || uint64(jsonEnd) > dataLength {
+		encodedEnd := binary.LittleEndian.Uint32(payload[descriptor+4 : descriptor+8])
+		overflow := encodedEnd&documentPageOverflowBit != 0
+		recordEnd := encodedEnd &^ documentPageOverflowBit
+		if keyEnd < previousEnd || recordEnd <= keyEnd || uint64(recordEnd) > dataLength ||
+			overflow && (!allowOverflow || recordEnd-keyEnd != DocumentOverflowDescriptorSize) {
 			return DocumentPageView{}, fmt.Errorf("%w: non-canonical record bounds", ErrDocumentPageCorrupt)
 		}
-		previousEnd = jsonEnd
+		if overflow {
+			overflowCount++
+			encoded := payload[int(dataStart)+int(keyEnd) : int(dataStart)+int(recordEnd)]
+			if !pageRefReservedZero(encoded[:PageRefSize]) || binary.LittleEndian.Uint64(encoded[PageRefSize:]) == 0 {
+				return DocumentPageView{}, fmt.Errorf("%w: overflow descriptor", ErrDocumentPageCorrupt)
+			}
+			ref := decodePageRef(encoded[:PageRefSize])
+			if !validDocumentOverflowRef(header, ref, fileEnd, nextLogicalID, allocationQuantum) {
+				return DocumentPageView{}, fmt.Errorf("%w: overflow reference", ErrDocumentPageCorrupt)
+			}
+		}
+		previousEnd = recordEnd
 	}
-	if uint64(previousEnd) != dataLength {
+	if uint64(previousEnd) != dataLength || overflowCount != payload[24] {
 		return DocumentPageView{}, fmt.Errorf("%w: unreferenced packed data", ErrDocumentPageCorrupt)
 	}
 	return DocumentPageView{
@@ -189,6 +249,9 @@ func (v DocumentPageView) LookupJSON(slot uint8) ([]byte, bool) {
 	descriptor := DocumentPagePayloadHeaderSize + rank*DocumentPageRecordSize
 	keyEnd := binary.LittleEndian.Uint32(v.payload[descriptor : descriptor+4])
 	jsonEnd := binary.LittleEndian.Uint32(v.payload[descriptor+4 : descriptor+8])
+	if jsonEnd&documentPageOverflowBit != 0 {
+		return nil, false
+	}
 	start := v.dataStart + int(keyEnd)
 	end := v.dataStart + int(jsonEnd)
 	if start >= end || end > len(v.payload) {
@@ -212,10 +275,13 @@ func (v DocumentPageView) LookupKey(slot uint8, key []byte) ([]byte, bool) {
 	descriptor := DocumentPagePayloadHeaderSize + rank*DocumentPageRecordSize
 	rowStart := uint32(0)
 	if rank != 0 {
-		rowStart = binary.LittleEndian.Uint32(v.payload[descriptor-4 : descriptor])
+		rowStart = binary.LittleEndian.Uint32(v.payload[descriptor-4:descriptor]) &^ documentPageOverflowBit
 	}
 	keyEnd := binary.LittleEndian.Uint32(v.payload[descriptor : descriptor+4])
 	jsonEnd := binary.LittleEndian.Uint32(v.payload[descriptor+4 : descriptor+8])
+	if jsonEnd&documentPageOverflowBit != 0 {
+		return nil, false
+	}
 	keyStart := v.dataStart + int(rowStart)
 	jsonStart := v.dataStart + int(keyEnd)
 	end := v.dataStart + int(jsonEnd)
@@ -241,10 +307,13 @@ func (v DocumentPageView) LookupString(slot uint8, key string) ([]byte, bool) {
 	descriptor := DocumentPagePayloadHeaderSize + rank*DocumentPageRecordSize
 	rowStart := uint32(0)
 	if rank != 0 {
-		rowStart = binary.LittleEndian.Uint32(v.payload[descriptor-4 : descriptor])
+		rowStart = binary.LittleEndian.Uint32(v.payload[descriptor-4:descriptor]) &^ documentPageOverflowBit
 	}
 	keyEnd := binary.LittleEndian.Uint32(v.payload[descriptor : descriptor+4])
 	jsonEnd := binary.LittleEndian.Uint32(v.payload[descriptor+4 : descriptor+8])
+	if jsonEnd&documentPageOverflowBit != 0 {
+		return nil, false
+	}
 	keyStart := v.dataStart + int(rowStart)
 	jsonStart := v.dataStart + int(keyEnd)
 	end := v.dataStart + int(jsonEnd)
@@ -267,6 +336,45 @@ func (v DocumentPageView) RecordAt(rank int) (DocumentRecord, bool) {
 	return v.recordAt(rank, uint8(bits.TrailingZeros64(live)))
 }
 
+// LookupValue returns either inline JSON or the first overflow reference for a
+// stable slot. The inline slice aliases the leased document page.
+func (v DocumentPageView) LookupValue(slot uint8) (DocumentValue, bool) {
+	if slot >= 64 {
+		return DocumentValue{}, false
+	}
+	bit := uint64(1) << slot
+	if v.header.Live&bit == 0 {
+		return DocumentValue{}, false
+	}
+	rank := bits.OnesCount64(v.header.Live & (bit - 1))
+	return v.valueAt(rank)
+}
+
+// LookupKeyValue verifies the complete key before returning an inline or
+// overflow value descriptor.
+func (v DocumentPageView) LookupKeyValue(slot uint8, key []byte) (DocumentValue, bool) {
+	record, ok := v.Lookup(slot)
+	if !ok || !bytes.Equal(record.Key, key) {
+		return DocumentValue{}, false
+	}
+	if record.Overflow != (PageRef{}) {
+		return DocumentValue{Overflow: record.Overflow, Length: record.JSONLength}, true
+	}
+	return DocumentValue{Inline: record.JSON, Length: uint64(len(record.JSON))}, true
+}
+
+// LookupStringValue is the string-key form of LookupKeyValue.
+func (v DocumentPageView) LookupStringValue(slot uint8, key string) (DocumentValue, bool) {
+	record, ok := v.Lookup(slot)
+	if !ok || string(record.Key) != key {
+		return DocumentValue{}, false
+	}
+	if record.Overflow != (PageRef{}) {
+		return DocumentValue{Overflow: record.Overflow, Length: record.JSONLength}, true
+	}
+	return DocumentValue{Inline: record.JSON, Length: uint64(len(record.JSON))}, true
+}
+
 func (v DocumentPageView) recordAt(rank int, slot uint8) (DocumentRecord, bool) {
 	descriptor := DocumentPagePayloadHeaderSize + rank*DocumentPageRecordSize
 	if rank < 0 || rank >= int(v.count) || descriptor+DocumentPageRecordSize > v.dataStart {
@@ -274,15 +382,26 @@ func (v DocumentPageView) recordAt(rank int, slot uint8) (DocumentRecord, bool) 
 	}
 	start := uint32(0)
 	if rank != 0 {
-		start = binary.LittleEndian.Uint32(v.payload[descriptor-4 : descriptor])
+		start = binary.LittleEndian.Uint32(v.payload[descriptor-4:descriptor]) &^ documentPageOverflowBit
 	}
 	keyEnd := binary.LittleEndian.Uint32(v.payload[descriptor : descriptor+4])
-	jsonEnd := binary.LittleEndian.Uint32(v.payload[descriptor+4 : descriptor+8])
+	encodedEnd := binary.LittleEndian.Uint32(v.payload[descriptor+4 : descriptor+8])
+	recordEnd := encodedEnd &^ documentPageOverflowBit
 	keyStart := v.dataStart + int(start)
 	jsonStart := v.dataStart + int(keyEnd)
-	end := v.dataStart + int(jsonEnd)
+	end := v.dataStart + int(recordEnd)
 	if keyStart > jsonStart || jsonStart >= end || end > len(v.payload) {
 		return DocumentRecord{}, false
+	}
+	if encodedEnd&documentPageOverflowBit != 0 {
+		encoded := v.payload[jsonStart:end]
+		if len(encoded) != DocumentOverflowDescriptorSize {
+			return DocumentRecord{}, false
+		}
+		return DocumentRecord{
+			Key: v.payload[keyStart:jsonStart:jsonStart], Overflow: decodePageRef(encoded[:PageRefSize]),
+			JSONLength: binary.LittleEndian.Uint64(encoded[PageRefSize:]), Slot: slot,
+		}, true
 	}
 	return DocumentRecord{
 		Key:  v.payload[keyStart:jsonStart:jsonStart],
@@ -291,7 +410,18 @@ func (v DocumentPageView) recordAt(rank int, slot uint8) (DocumentRecord, bool) 
 	}, true
 }
 
-func validateDocumentPageWrite(header DocumentPageHeader, rows []DocumentRecord, nextLogicalID uint64) (int, error) {
+func (v DocumentPageView) valueAt(rank int) (DocumentValue, bool) {
+	record, ok := v.recordAt(rank, 0)
+	if !ok {
+		return DocumentValue{}, false
+	}
+	if record.Overflow != (PageRef{}) {
+		return DocumentValue{Overflow: record.Overflow, Length: record.JSONLength}, true
+	}
+	return DocumentValue{Inline: record.JSON, Length: uint64(len(record.JSON))}, true
+}
+
+func validateDocumentPageWrite(header DocumentPageHeader, rows []DocumentRecord, nextLogicalID, fileEnd uint64, allocationQuantum uint32, allowOverflow bool) (int, error) {
 	if err := validateDocumentPageHeader(header, len(rows), header.ChunkID+1, nextLogicalID); err != nil {
 		return 0, err
 	}
@@ -299,11 +429,23 @@ func validateDocumentPageWrite(header DocumentPageHeader, rows []DocumentRecord,
 	dataLength := uint64(0)
 	for _, row := range rows {
 		slot := uint8(bits.TrailingZeros64(live))
-		if row.Slot != slot || len(row.JSON) == 0 {
+		if row.Slot != slot {
 			return 0, fmt.Errorf("%w: rows do not match stable slots", ErrInvalidWrite)
 		}
-		dataLength += uint64(len(row.Key)) + uint64(len(row.JSON))
-		if dataLength > uint64(^uint32(0)) {
+		rowLength := len(row.JSON)
+		if row.Overflow == (PageRef{}) {
+			if rowLength == 0 || row.JSONLength != 0 {
+				return 0, fmt.Errorf("%w: inline document value", ErrInvalidWrite)
+			}
+		} else {
+			if !allowOverflow || rowLength != 0 || row.JSONLength == 0 ||
+				!validDocumentOverflowRef(header, row.Overflow, fileEnd, nextLogicalID, allocationQuantum) {
+				return 0, fmt.Errorf("%w: overflow document value", ErrInvalidWrite)
+			}
+			rowLength = DocumentOverflowDescriptorSize
+		}
+		dataLength += uint64(len(row.Key)) + uint64(rowLength)
+		if dataLength >= uint64(documentPageOverflowBit) {
 			return 0, fmt.Errorf("%w: document data length", ErrInvalidWrite)
 		}
 		live &= live - 1
@@ -313,6 +455,17 @@ func validateDocumentPageWrite(header DocumentPageHeader, rows []DocumentRecord,
 		return 0, fmt.Errorf("%w: document payload does not fit", ErrInvalidWrite)
 	}
 	return int(dataLength), nil
+}
+
+func validDocumentOverflowRef(header DocumentPageHeader, ref PageRef, fileEnd, nextLogicalID uint64, allocationQuantum uint32) bool {
+	if !validPhysicalPageSize(allocationQuantum) || header.PageSize < allocationQuantum || header.PageSize%allocationQuantum != 0 {
+		return false
+	}
+	overflowHeader := OverflowPageHeader{
+		StoreID: header.StoreID, Generation: header.Generation, LogicalID: header.LogicalID,
+		PageSize: header.PageSize,
+	}
+	return pageRefWithinFile(ref, PageOverflow, overflowHeader, fileEnd, nextLogicalID, allocationQuantum)
 }
 
 func validateDocumentPageHeader(header DocumentPageHeader, count int, chunkHighWater uint32, nextLogicalID uint64) error {
