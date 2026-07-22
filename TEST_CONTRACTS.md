@@ -307,7 +307,7 @@ benchmarks/stdlib_corpus_jsonv2_bench_test.go
 benchmarks/typed_bench_test.go
 benchmarks/typed_jsonv2_bench_test.go
 internal/scanner/scan_backend_bench_test.go
-benchmarks/redisbench/redisbench_test.go
+benchmarks/duckdbbench/duckdbbench_test.go
 tests/stdlib/corpus_bench_test.go
 ```
 

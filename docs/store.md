@@ -147,7 +147,7 @@ documents, the median of six 500 ms samples:
 
 `BenchmarkStoreMutation` and `BenchmarkStoreMutationModes` reproduce the
 bounded-copy and full-rebuild control paths. These numbers are local regression
-evidence, not Redis command latency claims.
+evidence, not cross-engine SQL latency claims.
 
 ## Snapshot and borrowing rules
 
@@ -714,20 +714,18 @@ snapshots, or an event loop that leaves expired deadlines unpublished.
 `ErrStoreTooLarge` before wraparound. Detailed source, tape, depth, retention,
 and maintenance limits are in [`contracts/limits.md`](contracts/limits.md).
 
-The Store is in-memory. It has no WAL, crash recovery, replication, eviction,
-cluster protocol, or cross-process snapshot. The RedisJSON/RediSearch harness
-compares a keyed Store plus a matching declared exact index over identical
-corpora, while retaining DocSet-only rows as representation diagnostics. The
-latest local 65,536-document clustered run measured 62.4 MiB live Store heap
-including its 0.5 MiB exact index, versus 62.0 MiB RedisJSON keyspace plus a
-17.5 MiB RediSearch index: 0.79x as many accounted bytes. Store load was 1.89x
-faster, exact-index build about 415x faster, point projection 112x faster,
-indexed filter 1.92x faster, group-by 24.1x faster, and SUM 47.8x faster.
+The current Store remains an in-memory API; the internal page format is not yet
+the public automatic-durability path. The DuckDB harness compares two embedded
+engines over identical key+JSON input, one execution lane, matching scalar
+materialization, and verified results. It reports Store live heap, DuckDB's
+checkpointed file, WAL, and profiled buffer peak separately. A live heap/file
+ratio would mix resident parsed state with compressed durable storage and is
+therefore intentionally absent.
 
-Those are same-hardware single-core results, not a claim of server equivalence:
-Redis ran in a Linux container, Store ran natively, Redis scenario time came
-from SLOWLOG without client round-trip cost, and Store has none of the services
-listed above. Match durability, protocol/client time, document distribution,
-index definitions, and expiry semantics before applying the ratios. See
-the [frozen run](../benchmarks/results/redis-synth-s4.md) and
-[`benchmarks/redisbench/redis-methodology.md`](../benchmarks/redisbench/redis-methodology.md).
+The frozen 10,000-row clustered smoke measured Store at 2.38x logical key+JSON
+in settled live heap and DuckDB at 1.29x in its checkpointed database file.
+These numbers answer different capacity questions and are workload-dependent;
+neither is a resident-memory comparison. The same run includes warmed point,
+filter, aggregate, containment, update, and delete timings with a differential
+correctness gate. See the [frozen run](../benchmarks/results/duckdb-synth-s4.md)
+and [methodology](../benchmarks/duckdbbench/duckdb-methodology.md).

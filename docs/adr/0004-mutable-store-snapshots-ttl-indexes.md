@@ -237,9 +237,8 @@ small documents, the median of six 500 ms samples:
 
 `Store.GetRaw` is 21.92-23.88 ns with zero allocations. A compiled stable-slot
 `GetRawKey` is 7.99-8.50 ns with zero allocations and falls back to ordinary
-lookup when its cached location is no longer valid. These are local
-regression fixtures, not
-universal Redis command claims.
+lookup when its cached location is no longer valid. These are local regression
+fixtures, not universal cross-engine SQL claims.
 
 Declared-index regression fixtures on the same machine add no allocation when
 the indexed tuple is unchanged: a single or compound definition measures about

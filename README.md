@@ -274,7 +274,7 @@ caller-bounded and never performs a hidden full-store completion scan; declared
 roots are reclaimed automatically with their last snapshot.
 
 The complete API, ownership rules, expiration semantics, tuning table,
-complexity bounds, zero-allocation recipes, operational counters, and Redis
+complexity bounds, zero-allocation recipes, operational counters, and DuckDB
 comparison boundary are in [Mutable Store operations](docs/store.md).
 
 ## Performance

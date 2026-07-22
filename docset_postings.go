@@ -37,7 +37,7 @@ import (
 // remainder is the whole set, so existence stays correct but unaccelerated;
 // the two flags are designed to be enabled together.
 //
-// Value containment is the RediSearch/inverted analogue. Every scalar a
+// Value containment is the inverted-index analogue. Every scalar a
 // document carries under a top-level key — the key's own value, or a scalar
 // element of a top-level array value — is bucketed by (path hash, canonical
 // value hash). A query field @> needle hashes (path, needle) the same way,

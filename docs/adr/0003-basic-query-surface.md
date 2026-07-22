@@ -70,14 +70,15 @@ is intentionally rejected until a complete build/combine/decode benchmark wins.
 
 ## Competitive boundary
 
-The comparable Redis surface is RedisJSON with RediSearch projection,
-filtering, and aggregation on one shard and one connection. Containment is an
-additional capability because RediSearch has no equivalent exact JSON
-containment operator. Server round-trip time, durability, and replication are
-reported separately from in-process execution.
+The comparable DuckDB surface stores exact JSON, materializes the same scalar
+paths, and builds single-column ART indexes for key and exact filter lookup.
+Both sides use one execution lane and must reproduce generator-owned counts and
+aggregates. Store timing is a direct in-process call; DuckDB's profiled latency
+also includes SQL parse, bind, optimization, and execution. Durable file, WAL,
+buffer peak, and Store live heap remain separate accounting domains.
 
 The reproducible setup is
-[`benchmarks/redisbench/redis-methodology.md`](../../benchmarks/redisbench/redis-methodology.md).
+[`benchmarks/duckdbbench/duckdb-methodology.md`](../../benchmarks/duckdbbench/duckdb-methodology.md).
 Machine-specific ratios belong in generated benchmark reports, not as timeless
 API promises in this ADR.
 

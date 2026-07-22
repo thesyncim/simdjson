@@ -92,6 +92,25 @@ The direct runner requires `clang++`, `cargo`, `zstd`, and git. Publication uses
 the contract-only path, which does not require Cargo. Both refuse a dirty
 repository by default.
 
+## Mutable Store and DuckDB
+
+[`duckdbbench/duckdb-methodology.md`](duckdbbench/duckdb-methodology.md)
+defines the embedded JSON-store comparison. It generates one shared NDJSON
+corpus, measures keyed Store operations, runs the pinned official DuckDB image,
+retains DuckDB's raw JSON profiles, verifies both engines against generator
+truth, and renders storage categories without mixing live heap with durable
+file bytes. The frozen 10K clustered smoke is
+[`results/duckdb-synth-s4.md`](results/duckdb-synth-s4.md); the methodology also
+provides identical 100K and 5M commands.
+
+Ordinary tests validate generation, parsing, accounting, and the Store side.
+The container smoke is explicit:
+
+```sh
+cd benchmarks
+DUCKDBBENCH=1 go test ./duckdbbench -run TestPinnedDuckDBEndToEnd -count=1
+```
+
 ## Publish a record
 
 Build the pinned compiler, then run the clean-tree publication path:

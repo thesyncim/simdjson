@@ -10,9 +10,10 @@ predicates, and restart without reparsing. Building those features outside the
 repository would duplicate the tape, shape, interner, and containment logic and
 would lose the existing correctness and unsafe-code gates.
 
-The comparison target is the in-memory part of RedisJSON with RediSearch. This
-is a mechanism comparison, not a claim of protocol, durability, replication,
-or clustering parity.
+The comparison target is DuckDB's embedded JSON, projected-column, and ART
+index path. This is an operation-by-operation mechanism comparison, not a
+claim that an analytical SQL engine and this JSON API have identical storage,
+durability, or concurrency semantics.
 
 ## Decision
 
@@ -32,8 +33,8 @@ Keep the multi-document substrate in this repository:
 - versioned `DocSet` serialization stores sources, tapes, shapes, dictionaries,
   and postings in a reopenable image. Formats remain unstable before v1.
 
-The root module keeps no third-party dependency. Comparison servers and their
-clients remain in the nested benchmark module.
+The root module keeps no third-party dependency. The comparison runner remains
+in the nested benchmark module and uses a pinned official DuckDB image.
 
 ## Required invariants
 
@@ -83,8 +84,8 @@ in this decision record. The current commands and comparison boundary are in:
 
 - [`benchmarks/README.md`](../../benchmarks/README.md) for local benchmark
   methodology;
-- [`benchmarks/redisbench/redis-methodology.md`](../../benchmarks/redisbench/redis-methodology.md)
-  for RedisJSON/RediSearch; and
+- [`benchmarks/duckdbbench/duckdb-methodology.md`](../../benchmarks/duckdbbench/duckdb-methodology.md)
+  for the embedded DuckDB comparison; and
 - [`docs/store.md`](../store.md) for mutable Store behavior and measurements.
 
 ## Consequences
@@ -93,5 +94,5 @@ The substrate preserves key order, duplicate keys, and exact number spellings
 that a decoded-tree store normally discards, and lets a consuming engine shard
 by owning multiple sets or Stores. In exchange, options must be chosen before
 ingest, compact shape tapes may allocate once if widened through `Doc`, and the
-library deliberately does not promise Redis-compatible persistence or server
+library deliberately does not promise SQL-engine storage or transaction
 semantics.

@@ -36,9 +36,10 @@ making Store slower.
 
 The ordinary `Put` path is optimized for one online mutation: it validates one
 document, path-copies persistent metadata, and publishes one generation. The
-Redis harness measures about 155 MB/s when it intentionally loads 65,536 rows
-through that path. Dense construction avoids republishing and path-copying per
-row.
+frozen 10,000-row embedded-engine smoke measures about 78 MiB/s when it
+intentionally loads through that path. Dense construction avoids republishing
+and path-copying per row; the number is a local regression fixture, not a
+timeless throughput claim.
 
 Bulk construction must therefore be a separate transaction, not a loop hidden
 behind `Put`:

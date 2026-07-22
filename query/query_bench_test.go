@@ -8,7 +8,7 @@ import (
 	"github.com/thesyncim/simdjson/document"
 )
 
-// Benchmarks for the four query shapes that feed the RedisJSON scoreboard:
+// Benchmarks for the query shapes that feed the embedded-engine scoreboard:
 // path projection (one and four fields), a filtered scan at ~10% selectivity,
 // a scalar SUM, and a GROUP BY with SUM. Each runs over an inline fixture of
 // flat sixteen-field numeric records and reports ns/doc and rows/sec, the
