@@ -186,6 +186,69 @@ func TestPageCacheWarmAcquireSteadyAllocation(t *testing.T) {
 	}
 }
 
+func TestPageCacheVariableDocumentExtent(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "store-page-cache-variable-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	storeID := [16]byte{9, 7, 5, 3, 1, 2, 4, 6, 8, 10, 12, 14, 16, 15, 13, 11}
+	const extentSize = 2 * pageCacheTestPageSize
+	page := make([]byte, extentSize)
+	payload, err := InitPage(page, PageHeader{
+		StoreID: storeID, Generation: 3, LogicalID: 7,
+		PageSize: extentSize, PayloadLength: 17, Kind: PageDocument,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(payload, "variable document")
+	if _, err := SealPage(page); err != nil {
+		t.Fatal(err)
+	}
+	ref := PageRef{
+		Offset: 2 * pageCacheTestPageSize, LogicalID: 7, Generation: 3,
+		Length: extentSize, Kind: PageDocument,
+	}
+	if _, err := file.WriteAt(page, int64(ref.Offset)); err != nil {
+		t.Fatal(err)
+	}
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, MaxPageSize: extentSize,
+		ResidentBytes: extentSize, StoreID: storeID, ReadConcurrency: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := cache.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	lease, err := cache.Acquire(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(lease.Payload()); got != "variable document" {
+		t.Fatalf("Payload = %q", got)
+	}
+	if got := lease.Header().PageSize; got != extentSize {
+		t.Fatalf("PageSize = %d, want %d", got, extentSize)
+	}
+	lease.Release()
+
+	metadata := ref
+	metadata.Kind = PageKeyDirectory
+	if _, err := cache.Acquire(metadata); !errors.Is(err, ErrPageCacheReference) {
+		t.Fatalf("oversize metadata error = %v, want %v", err, ErrPageCacheReference)
+	}
+	stats := cache.Stats()
+	if stats.CapacityBytes != extentSize || stats.ResidentBytes != extentSize ||
+		stats.PageReads != 1 || stats.ReadBytes != extentSize {
+		t.Fatalf("unexpected variable-extent stats: %+v", stats)
+	}
+}
+
 func newPageCacheFixture(t testing.TB, count int) (*os.File, [16]byte, []PageRef) {
 	t.Helper()
 	file, err := os.CreateTemp(t.TempDir(), "store-page-cache-*")

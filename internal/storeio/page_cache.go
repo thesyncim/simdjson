@@ -10,6 +10,8 @@ import (
 
 const defaultPrefetchQueue = 64
 
+const defaultReadConcurrency = 4
+
 var (
 	// ErrPageCacheClosed reports use after Close has started.
 	ErrPageCacheClosed = errors.New("simdjson: Store page cache is closed")
@@ -22,13 +24,24 @@ var (
 )
 
 // PageCacheOptions fixes the complete resident and prefetch memory of a
-// PageCache. ResidentBytes is rounded down to an integral number of pages; it
-// must hold at least one page. StoreID binds every admitted page to one file.
+// PageCache. ResidentBytes is rounded down to an integral number of maximum-
+// size frames; it must hold at least one. StoreID binds every admitted page to
+// one file.
 type PageCacheOptions struct {
-	PageSize      int
+	// PageSize is the Store allocation quantum and the exact size of metadata
+	// pages. Document and overflow extents may be larger powers of two.
+	PageSize int
+	// MaxPageSize is the largest extent admitted into one frame. Zero selects
+	// PageSize. Fixed-size frames make the memory ceiling independent of the
+	// page-size distribution and avoid allocator work on cache misses.
+	MaxPageSize   int
 	ResidentBytes int64
 	StoreID       [16]byte
 	PrefetchQueue int
+	// ReadConcurrency is the fixed number of prefetch workers. Zero selects
+	// four. Demand misses remain synchronous to their caller, while concurrent
+	// misses and prefetches use positional reads safely in parallel.
+	ReadConcurrency int
 }
 
 func (o PageCacheOptions) normalized() (PageCacheOptions, int, error) {
@@ -39,13 +52,20 @@ func (o PageCacheOptions) normalized() (PageCacheOptions, int, error) {
 		uint64(o.PageSize) > uint64(^uint32(0)) || !validPhysicalPageSize(uint32(o.PageSize)) {
 		return PageCacheOptions{}, 0, fmt.Errorf("%w: Store id or page size", ErrPageCacheReference)
 	}
-	if o.ResidentBytes < int64(o.PageSize) {
-		return PageCacheOptions{}, 0, fmt.Errorf("%w: resident budget %d is smaller than one %d-byte page",
-			ErrPageCacheReference, o.ResidentBytes, o.PageSize)
+	if o.MaxPageSize == 0 {
+		o.MaxPageSize = o.PageSize
 	}
-	frames64 := o.ResidentBytes / int64(o.PageSize)
+	if o.MaxPageSize < o.PageSize || uint64(o.MaxPageSize) > uint64(^uint32(0)) ||
+		!validPhysicalPageSize(uint32(o.MaxPageSize)) || o.MaxPageSize%o.PageSize != 0 {
+		return PageCacheOptions{}, 0, fmt.Errorf("%w: maximum page size", ErrPageCacheReference)
+	}
+	if o.ResidentBytes < int64(o.MaxPageSize) {
+		return PageCacheOptions{}, 0, fmt.Errorf("%w: resident budget %d is smaller than one %d-byte page",
+			ErrPageCacheReference, o.ResidentBytes, o.MaxPageSize)
+	}
+	frames64 := o.ResidentBytes / int64(o.MaxPageSize)
 	maxInt := int64(^uint(0) >> 1)
-	if frames64 <= 0 || frames64 > maxInt/int64(o.PageSize) {
+	if frames64 <= 0 || frames64 > maxInt/int64(o.MaxPageSize) {
 		return PageCacheOptions{}, 0, fmt.Errorf("%w: resident budget overflows address space", ErrPageCacheReference)
 	}
 	if o.PrefetchQueue == 0 {
@@ -54,7 +74,13 @@ func (o PageCacheOptions) normalized() (PageCacheOptions, int, error) {
 	if o.PrefetchQueue < 1 || o.PrefetchQueue > maxDeviceQueueDepth {
 		return PageCacheOptions{}, 0, fmt.Errorf("%w: prefetch queue %d", ErrPageCacheReference, o.PrefetchQueue)
 	}
-	o.ResidentBytes = frames64 * int64(o.PageSize)
+	if o.ReadConcurrency == 0 {
+		o.ReadConcurrency = defaultReadConcurrency
+	}
+	if o.ReadConcurrency < 1 || o.ReadConcurrency > maxDeviceQueueDepth {
+		return PageCacheOptions{}, 0, fmt.Errorf("%w: read concurrency %d", ErrPageCacheReference, o.ReadConcurrency)
+	}
+	o.ResidentBytes = frames64 * int64(o.MaxPageSize)
 	return o, int(frames64), nil
 }
 
@@ -62,6 +88,7 @@ type pageCacheKey struct {
 	offset     uint64
 	logicalID  uint64
 	generation uint64
+	length     uint32
 	kind       PageKind
 }
 
@@ -121,6 +148,7 @@ type PageCache struct {
 	stop        chan struct{}
 	prefetch    chan PageRef
 	done        chan struct{}
+	workers     sync.WaitGroup
 
 	pageReads       uint64
 	readBytes       uint64
@@ -142,7 +170,7 @@ func NewPageCache(file *os.File, options PageCacheOptions) (*PageCache, error) {
 	if err != nil {
 		return nil, err
 	}
-	arena, err := allocateArena(frameCount * normalized.PageSize)
+	arena, err := allocateArena(frameCount * normalized.MaxPageSize)
 	if err != nil {
 		return nil, fmt.Errorf("simdjson: allocate Store page cache: %w", err)
 	}
@@ -158,10 +186,17 @@ func NewPageCache(file *os.File, options PageCacheOptions) (*PageCache, error) {
 	}
 	c.cond = sync.NewCond(&c.mu)
 	for i := range c.frames {
-		start := i * normalized.PageSize
-		c.frames[i].data = arena[start : start+normalized.PageSize : start+normalized.PageSize]
+		start := i * normalized.MaxPageSize
+		c.frames[i].data = arena[start : start+normalized.MaxPageSize : start+normalized.MaxPageSize]
 	}
-	go c.runPrefetch()
+	c.workers.Add(normalized.ReadConcurrency)
+	for range normalized.ReadConcurrency {
+		go c.runPrefetch()
+	}
+	go func() {
+		c.workers.Wait()
+		close(c.done)
+	}()
 	return c, nil
 }
 
@@ -277,15 +312,16 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 		data := frame.data
 		c.mu.Unlock()
 
-		n, readErr := c.file.ReadAt(data, int64(ref.Offset))
-		if readErr == nil && n != len(data) {
+		page := data[:int(ref.Length):int(ref.Length)]
+		n, readErr := c.file.ReadAt(page, int64(ref.Offset))
+		if readErr == nil && n != len(page) {
 			readErr = io.ErrUnexpectedEOF
 		}
 		if readErr == nil {
 			var payload []byte
 			var header PageHeader
-			header, payload, readErr = OpenPage(data)
-			if readErr == nil && (header.StoreID != c.options.StoreID || header.PageSize != uint32(c.options.PageSize) ||
+			header, payload, readErr = OpenPage(page)
+			if readErr == nil && (header.StoreID != c.options.StoreID || header.PageSize != ref.Length ||
 				header.LogicalID != ref.LogicalID || header.Generation != ref.Generation ||
 				header.Kind != ref.Kind || header.Flags != ref.Flags) {
 				readErr = fmt.Errorf("%w: physical page identity does not match reference", ErrPageCacheReference)
@@ -368,13 +404,20 @@ func resetPageCacheFrame(frame *pageCacheFrame) {
 
 func (c *PageCache) validateRef(ref PageRef) (pageCacheKey, error) {
 	pageSize := uint64(c.options.PageSize)
-	if ref.Length != uint32(c.options.PageSize) || ref.Flags != 0 || !validPageKind(ref.Kind) ||
+	length := uint64(ref.Length)
+	if length < pageSize || length > uint64(c.options.MaxPageSize) ||
+		!validPhysicalPageSize(ref.Length) || length%pageSize != 0 ||
+		ref.Length != uint32(c.options.PageSize) && ref.Kind != PageDocument && ref.Kind != PageOverflow ||
+		ref.Flags != 0 || !validPageKind(ref.Kind) ||
 		ref.LogicalID <= StateRootLogicalID || ref.Generation == 0 ||
 		ref.Offset < uint64(superblockCopies)*pageSize || ref.Offset%pageSize != 0 ||
-		ref.Offset > uint64(^uint64(0)>>1)-pageSize {
+		ref.Offset > uint64(^uint64(0)>>1)-length {
 		return pageCacheKey{}, fmt.Errorf("%w: offset, identity, kind, or length", ErrPageCacheReference)
 	}
-	return pageCacheKey{offset: ref.Offset, logicalID: ref.LogicalID, generation: ref.Generation, kind: ref.Kind}, nil
+	return pageCacheKey{
+		offset: ref.Offset, logicalID: ref.LogicalID, generation: ref.Generation,
+		length: ref.Length, kind: ref.Kind,
+	}, nil
 }
 
 func (c *PageCache) release(index int, key pageCacheKey) {
@@ -438,7 +481,7 @@ func (c *PageCache) Prefetch(refs []PageRef) (int, error) {
 }
 
 func (c *PageCache) runPrefetch() {
-	defer close(c.done)
+	defer c.workers.Done()
 	for {
 		select {
 		case <-c.stop:
@@ -459,7 +502,7 @@ func (c *PageCache) runPrefetch() {
 func (c *PageCache) Stats() PageCacheStats {
 	c.mu.Lock()
 	stats := PageCacheStats{
-		CapacityBytes:   uint64(len(c.frames) * c.options.PageSize),
+		CapacityBytes:   uint64(len(c.frames) * c.options.MaxPageSize),
 		PageReads:       c.pageReads,
 		ReadBytes:       c.readBytes,
 		CacheHits:       c.cacheHits,
@@ -471,7 +514,7 @@ func (c *PageCache) Stats() PageCacheStats {
 	}
 	for i := range c.frames {
 		if c.frames[i].state != pageCacheEmpty {
-			stats.ResidentBytes += uint64(c.options.PageSize)
+			stats.ResidentBytes += uint64(c.options.MaxPageSize)
 		}
 		if c.frames[i].pins != 0 {
 			stats.PinnedPages++
