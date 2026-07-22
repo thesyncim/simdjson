@@ -6,6 +6,8 @@ import (
 	"hash/crc32"
 	"simd/archsimd"
 	"unsafe"
+
+	xsyscpu "golang.org/x/sys/cpu"
 )
 
 // The folding schedule and constants are generated from the CRC32C polynomial
@@ -39,13 +41,87 @@ var (
 	}
 	crc32cReduce64QuotientPCLMUL = [2]uint64{0x4869ec38dea713f1, 0}
 	crc32cReduce64PolyPCLMUL     = [2]uint64{0x105ec76f1, 0}
+	crc32cInitialPCLMUL          = [2]uint64{0xffffffff, 0}
+	crc32cFold128PCLMUL          = [2]uint64{0x6992cea2, 0x0d3b6092}
+	crc32cFold64PCLMUL           = [2]uint64{0x740eef02, 0x9e4addf8}
+	crc32cFold32PCLMUL           = [2]uint64{0x3da6d0cb, 0xba4fc28e}
+	crc32cFold16PCLMUL           = [2]uint64{0xf20c0dfe, 0x493c7d27}
 )
 
 func pageChecksum(data []byte) uint32 {
-	if len(data) >= 256 && archsimd.X86.AVX512() && archsimd.X86.AVX512VPCLMULQDQ() {
-		return pageChecksumAVX512(data)
+	if len(data) >= 256 {
+		if archsimd.X86.AVX512() && archsimd.X86.AVX512VPCLMULQDQ() {
+			return pageChecksumAVX512(data)
+		}
+		if archsimd.X86.AVX() && xsyscpu.X86.HasPCLMULQDQ {
+			return pageChecksumPCLMUL8(data)
+		}
 	}
 	return crc32.Checksum(data, pageChecksumTable)
+}
+
+// pageChecksumPCLMUL8 folds eight independent 128-bit streams. Eight streams
+// cover 4 KiB and 64 KiB pages without a scalar tail and hide PCLMUL latency on
+// ordinary AVX-era amd64 CPUs. The exact PCLMUL feature is checked separately
+// from AVX before entry; neither feature implies the other architecturally.
+func pageChecksumPCLMUL8(data []byte) uint32 {
+	base := unsafe.SliceData(data)
+	x0 := loadCRC32CBlock128(base, 0).
+		Xor(archsimd.LoadUint64x2Array(&crc32cInitialPCLMUL))
+	x1 := loadCRC32CBlock128(base, 16)
+	x2 := loadCRC32CBlock128(base, 32)
+	x3 := loadCRC32CBlock128(base, 48)
+	x4 := loadCRC32CBlock128(base, 64)
+	x5 := loadCRC32CBlock128(base, 80)
+	x6 := loadCRC32CBlock128(base, 96)
+	x7 := loadCRC32CBlock128(base, 112)
+
+	fold := archsimd.LoadUint64x2Array(&crc32cFold128PCLMUL)
+	i := 128
+	for ; i+128 <= len(data); i += 128 {
+		y0 := x0.CarrylessMultiplyEven(fold)
+		x0 = x0.CarrylessMultiplyOdd(fold).Xor(y0).Xor(loadCRC32CBlock128(base, i))
+		y1 := x1.CarrylessMultiplyEven(fold)
+		x1 = x1.CarrylessMultiplyOdd(fold).Xor(y1).Xor(loadCRC32CBlock128(base, i+16))
+		y2 := x2.CarrylessMultiplyEven(fold)
+		x2 = x2.CarrylessMultiplyOdd(fold).Xor(y2).Xor(loadCRC32CBlock128(base, i+32))
+		y3 := x3.CarrylessMultiplyEven(fold)
+		x3 = x3.CarrylessMultiplyOdd(fold).Xor(y3).Xor(loadCRC32CBlock128(base, i+48))
+		y4 := x4.CarrylessMultiplyEven(fold)
+		x4 = x4.CarrylessMultiplyOdd(fold).Xor(y4).Xor(loadCRC32CBlock128(base, i+64))
+		y5 := x5.CarrylessMultiplyEven(fold)
+		x5 = x5.CarrylessMultiplyOdd(fold).Xor(y5).Xor(loadCRC32CBlock128(base, i+80))
+		y6 := x6.CarrylessMultiplyEven(fold)
+		x6 = x6.CarrylessMultiplyOdd(fold).Xor(y6).Xor(loadCRC32CBlock128(base, i+96))
+		y7 := x7.CarrylessMultiplyEven(fold)
+		x7 = x7.CarrylessMultiplyOdd(fold).Xor(y7).Xor(loadCRC32CBlock128(base, i+112))
+	}
+
+	fold = archsimd.LoadUint64x2Array(&crc32cFold16PCLMUL)
+	y0 := x0.CarrylessMultiplyEven(fold)
+	x0 = x0.CarrylessMultiplyOdd(fold).Xor(y0).Xor(x1)
+	y2 := x2.CarrylessMultiplyEven(fold)
+	x2 = x2.CarrylessMultiplyOdd(fold).Xor(y2).Xor(x3)
+	y4 := x4.CarrylessMultiplyEven(fold)
+	x4 = x4.CarrylessMultiplyOdd(fold).Xor(y4).Xor(x5)
+	y6 := x6.CarrylessMultiplyEven(fold)
+	x6 = x6.CarrylessMultiplyOdd(fold).Xor(y6).Xor(x7)
+
+	fold = archsimd.LoadUint64x2Array(&crc32cFold32PCLMUL)
+	y0 = x0.CarrylessMultiplyEven(fold)
+	x0 = x0.CarrylessMultiplyOdd(fold).Xor(y0).Xor(x2)
+	y4 = x4.CarrylessMultiplyEven(fold)
+	x4 = x4.CarrylessMultiplyOdd(fold).Xor(y4).Xor(x6)
+
+	fold = archsimd.LoadUint64x2Array(&crc32cFold64PCLMUL)
+	y0 = x0.CarrylessMultiplyEven(fold)
+	x0 = x0.CarrylessMultiplyOdd(fold).Xor(y0).Xor(x4)
+
+	crc := reduceCRC32C128PCLMUL(x0)
+	if i == len(data) {
+		return ^crc
+	}
+	return crc32.Update(^crc, pageChecksumTable, data[i:])
 }
 
 // pageChecksumAVX512 folds four independent 512-bit streams with VPCLMULQDQ.
@@ -110,6 +186,13 @@ func pageChecksumAVX512(data []byte) uint32 {
 // The returned vector owns no pointer and the helper retains no storage.
 func loadCRC32CBlock(base *byte, offset int) archsimd.Uint64x8 {
 	return archsimd.LoadUint64x8Array((*[8]uint64)(unsafe.Add(unsafe.Pointer(base), offset)))
+}
+
+// loadCRC32CBlock128 loads one complete 16-byte window. The PCLMUL caller
+// proves offset+16 <= len(data); x86 permits unaligned vector loads. The vector
+// owns no pointer and this helper retains no storage.
+func loadCRC32CBlock128(base *byte, offset int) archsimd.Uint64x2 {
+	return archsimd.LoadUint64x2Array((*[2]uint64)(unsafe.Add(unsafe.Pointer(base), offset)))
 }
 
 func reduceCRC32C128PCLMUL(value archsimd.Uint64x2) uint32 {

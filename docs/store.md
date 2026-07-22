@@ -343,16 +343,24 @@ now enforces generation-slot parity, Store identity, CRC32C/complement checks,
 page-aligned bounds, file high-water bounds, and referenced-state verification;
 recovery validates both state and free-tree roots and falls back when the
 newest root or either referenced page is torn. Physical Store page encoding,
-mutation attachment, the state-root schema, and extent reclamation are the
-remaining correctness boundary. A ready recycle or busy-worker notification
-stays on the atomic fast path; a full budget or an idle worker necessarily
-parks or wakes. Checksums stay scoped to `internal/storeio` and use no
-handwritten assembly: stable builds use Go's hardware-aware CRC32C, while SIMD
-builds runtime-gate pure-Go arm64 PMULL or amd64 AVX-512 VPCLMULQDQ and retain
-the standard fallback. On M4 Max, stable Go measured 383.3-387.5 ns per 4 KiB
+mutation attachment, directory payload schemas, and extent reclamation are the
+remaining correctness boundary. The implemented common page envelope binds a
+64-byte pointer-free header and full-page CRC32C trailer to Store id, kind,
+stable logical id, and generation. Its fixed 256-byte state root separates
+chunk, key, exact-index, and TTL directory references, and recovery verifies
+each referenced top-level page before generation selection. A ready recycle or
+busy-worker notification stays on the atomic fast path; a full budget or an
+idle worker necessarily parks or wakes. Checksums stay scoped to
+`internal/storeio` and use no handwritten assembly: stable builds use Go's
+hardware-aware CRC32C, while SIMD builds runtime-gate pure-Go arm64 PMULL, an
+eight-stream amd64 PCLMUL tier using exact AVX and PCLMUL feature checks, or a
+wider AVX-512 VPCLMULQDQ tier, and retain the standard fallback. On M4 Max,
+stable Go measured 383.3-387.5 ns per 4 KiB
 page and 5.924-6.296 us per 64 KiB page. The pure-Go SIMD path measured
 89.17-91.66 ns and 1.131-1.146 us respectively (about 4.2x and 5.5x faster),
-with zero allocations. Native CI records the amd64 result before it is claimed.
+with zero allocations. The complete 4 KiB state-root page measured
+170.0-171.6 ns to encode and 152.4-153.3 ns to verify/decode, also with zero
+allocations. Native CI records the amd64 result before it is claimed.
 
 Packed CHAMP nodes are a good fit for the cold page directory because their
 bitmap rank makes external blocks dense. The existing fixed-prefix directory

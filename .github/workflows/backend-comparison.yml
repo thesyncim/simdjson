@@ -88,7 +88,7 @@ jobs:
         run: |
           set -o pipefail
           go test ./internal/storeio \
-            -run '^$' -bench '^BenchmarkPageChecksum$' \
+            -run '^$' -bench '^(BenchmarkPageChecksum|BenchmarkStateRootCodec)$' \
             -benchmem -benchtime="$BENCHTIME" -count="$BENCHCOUNT" -cpu=1 \
             2>&1 | tee "$RUNNER_TEMP/stable-page-checksum-${RUNNER_ARCH}.txt"
       - name: SIMD durable-page checksum
@@ -98,7 +98,7 @@ jobs:
         run: |
           set -o pipefail
           "$RUNNER_TEMP/gotip/bin/go" test ./internal/storeio \
-            -run '^$' -bench '^BenchmarkPageChecksum$' \
+            -run '^$' -bench '^(BenchmarkPageChecksum|BenchmarkStateRootCodec)$' \
             -benchmem -benchtime="$BENCHTIME" -count="$BENCHCOUNT" -cpu=1 \
             2>&1 | tee "$RUNNER_TEMP/simd-page-checksum-${RUNNER_ARCH}.txt"
       - name: SIMD kernels

@@ -176,18 +176,33 @@ func SelectSuperblock(first, second []byte) (Superblock, int, error) {
 // pageScratch must be at least pageSize bytes and is reused for every check. A
 // corrupt newest root page falls back to the preceding valid generation.
 func RecoverSuperblock(file *os.File, pageSize uint32, pageScratch []byte) (Superblock, int, error) {
+	root, _, slot, err := recoverRoots(file, pageSize, pageScratch, false)
+	return root, slot, err
+}
+
+// RecoverStateRoot applies the same newest-to-oldest selection as
+// RecoverSuperblock, then also validates the common page envelope, state-root
+// schema, Store identity, generation, and every top-level page reference. A
+// semantically torn newest state falls back to the preceding generation even
+// when its outer checksum was recomputed. pageScratch is caller-owned and no
+// allocation is performed on success.
+func RecoverStateRoot(file *os.File, pageSize uint32, pageScratch []byte) (Superblock, StateRoot, int, error) {
+	return recoverRoots(file, pageSize, pageScratch, true)
+}
+
+func recoverRoots(file *os.File, pageSize uint32, pageScratch []byte, decodeState bool) (Superblock, StateRoot, int, error) {
 	if file == nil || !validPhysicalPageSize(pageSize) {
-		return Superblock{}, -1, fmt.Errorf("%w: invalid recovery file or page size", ErrInvalidWrite)
+		return Superblock{}, StateRoot{}, -1, fmt.Errorf("%w: invalid recovery file or page size", ErrInvalidWrite)
 	}
 	if uint64(len(pageScratch)) < uint64(pageSize) {
-		return Superblock{}, -1, fmt.Errorf("%w: have=%d need=%d", ErrRecoveryBufferTooSmall, len(pageScratch), pageSize)
+		return Superblock{}, StateRoot{}, -1, fmt.Errorf("%w: have=%d need=%d", ErrRecoveryBufferTooSmall, len(pageScratch), pageSize)
 	}
 	var headers [superblockCopies * SuperblockSize]byte
 	for slot := 0; slot < superblockCopies; slot++ {
 		buf := headers[slot*SuperblockSize : (slot+1)*SuperblockSize]
 		n, err := file.ReadAt(buf, int64(slot)*int64(pageSize))
 		if err != nil && !errors.Is(err, io.EOF) {
-			return Superblock{}, -1, err
+			return Superblock{}, StateRoot{}, -1, err
 		}
 		if n < len(buf) {
 			clear(buf[n:])
@@ -195,14 +210,14 @@ func RecoverSuperblock(file *os.File, pageSize uint32, pageScratch []byte) (Supe
 	}
 	candidates, count, err := orderedSuperblocks(headers[:SuperblockSize], headers[SuperblockSize:])
 	if err != nil {
-		return Superblock{}, -1, err
+		return Superblock{}, StateRoot{}, -1, err
 	}
 	info, err := file.Stat()
 	if err != nil {
-		return Superblock{}, -1, err
+		return Superblock{}, StateRoot{}, -1, err
 	}
 	if info.Size() < 0 {
-		return Superblock{}, -1, ErrSuperblockNotFound
+		return Superblock{}, StateRoot{}, -1, ErrSuperblockNotFound
 	}
 	fileSize := uint64(info.Size())
 	for i := 0; i < count; i++ {
@@ -213,23 +228,67 @@ func RecoverSuperblock(file *os.File, pageSize uint32, pageScratch []byte) (Supe
 		}
 		stateOK, readErr := readCheckedPage(file, root.StateOffset, root.StateLength, root.StateChecksum, pageScratch)
 		if readErr != nil {
-			return Superblock{}, -1, readErr
+			return Superblock{}, StateRoot{}, -1, readErr
 		}
 		if !stateOK {
 			continue
 		}
+		var state StateRoot
+		if decodeState {
+			state, err = DecodeStateRootPage(pageScratch[:root.StateLength], root.FileEnd)
+			if err != nil || state.StoreID != root.StoreID || state.Generation != root.Generation ||
+				state.PageSize != root.PageSize || stateRootReferencesOffset(state, root.StateOffset) ||
+				root.FreeLength != 0 && stateRootReferencesOffset(state, root.FreeOffset) {
+				continue
+			}
+			refsOK, refsErr := readStateRootRefs(file, state, pageScratch)
+			if refsErr != nil {
+				return Superblock{}, StateRoot{}, -1, refsErr
+			}
+			if !refsOK {
+				continue
+			}
+		}
 		if root.FreeLength != 0 {
 			freeOK, freeErr := readCheckedPage(file, root.FreeOffset, root.FreeLength, root.FreeChecksum, pageScratch)
 			if freeErr != nil {
-				return Superblock{}, -1, freeErr
+				return Superblock{}, StateRoot{}, -1, freeErr
 			}
 			if !freeOK {
 				continue
 			}
 		}
-		return root, candidate.slot, nil
+		return root, state, candidate.slot, nil
 	}
-	return Superblock{}, -1, ErrSuperblockNotFound
+	return Superblock{}, StateRoot{}, -1, ErrSuperblockNotFound
+}
+
+func stateRootReferencesOffset(root StateRoot, offset uint64) bool {
+	return root.ChunkDirectory.Offset == offset || root.KeyDirectory.Offset == offset ||
+		root.IndexDirectory.Offset == offset || root.TTLDirectory.Offset == offset
+}
+
+func readStateRootRefs(file *os.File, root StateRoot, scratch []byte) (bool, error) {
+	refs := [...]PageRef{root.ChunkDirectory, root.KeyDirectory, root.IndexDirectory, root.TTLDirectory}
+	for _, ref := range refs {
+		if ref == (PageRef{}) {
+			continue
+		}
+		buf := scratch[:ref.Length]
+		n, err := file.ReadAt(buf, int64(ref.Offset))
+		if err != nil && !errors.Is(err, io.EOF) {
+			return false, err
+		}
+		if n != len(buf) {
+			return false, nil
+		}
+		header, _, openErr := OpenPage(buf)
+		if openErr != nil || header.StoreID != root.StoreID || header.PageSize != root.PageSize ||
+			header.Kind != ref.Kind || header.LogicalID != ref.LogicalID || header.Generation != ref.Generation {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func readCheckedPage(file *os.File, offset uint64, length, checksum uint32, scratch []byte) (bool, error) {

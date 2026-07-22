@@ -3,10 +3,11 @@
 Status: accepted in stages. Transient construction, the caller-owned
 Store-image boundary with pointer-free base metadata, dense stable-slot Boolean
 workspaces, the scoped pure-Go Linux ring substrate, the bounded internal page
-committer, and checksummed double-superblock recovery are implemented. Store
-page encoding and attachment, the state-root schema, the swizzled read-page
-manager, and bounded residency remain proposed. Extends ADR 0004 without
-changing its borrowed-value lifetime contract.
+committer, checksummed double-superblock recovery, the common page envelope,
+and the state-root schema are implemented. Store document and directory page
+encoding and mutation attachment, the swizzled read-page manager, and bounded
+residency remain proposed. Extends ADR 0004 without changing its borrowed-value
+lifetime contract.
 
 ## Decision
 
@@ -279,17 +280,36 @@ header or either root page is torn, truncated, or corrupt. Caller-owned page
 scratch bounds recovery memory, and the encode/decode/select hot paths allocate
 zero bytes. The checksum implementation is scoped to `internal/storeio` and
 contains no handwritten assembly: stable builds use Go's hardware-aware
-CRC32C, while SIMD builds runtime-gate pure-Go PMULL on arm64 and AVX-512
-VPCLMULQDQ on amd64 before falling back to the same standard path. On M4 Max,
+CRC32C, while SIMD builds runtime-gate pure-Go PMULL on arm64, an eight-stream
+128-bit PCLMUL fold on ordinary amd64, and a wider AVX-512 VPCLMULQDQ tier.
+The amd64 path checks AVX and PCLMUL independently because neither feature
+implies the other; unsupported CPUs fall back to the same standard path. On M4 Max,
 stable Go measured 383.3-387.5 ns per 4 KiB page and 5.924-6.296 us per 64 KiB
 page. The pure-Go nine-stream PMULL fold measured 89.17-91.66 ns and
 1.131-1.146 us respectively: about 4.2x and 5.5x faster, with zero allocations.
-Native CI retains stable and SIMD samples for x64 and arm64 separately; amd64
-claims wait for those native measurements rather than cross-compiled evidence.
+Native CI retains stable and SIMD samples for x64 and arm64 separately. The
+128-bit amd64 tier remains gated on a native end-to-end win; emulation proves
+correctness and instruction coverage, not performance.
+
+Every attached-Store page now has a deterministic 64-byte pointer-free header
+and an eight-byte CRC32C/complement trailer. The header binds Store id, physical
+page size, kind, stable logical id, and copy-on-write generation. Encoders clear
+reused buffers, expose only a capacity-clipped payload window, require zero
+padding before sealing caller-filled pages, and checksum the complete physical
+page. Readers perform one checksum pass, reject reserved fields, and expose
+neither padding nor the trailer. The fixed 256-byte state-root payload records
+Store options and counts plus independent chunk, key, exact-index, and TTL
+directory roots. Each reference carries a physical offset and immutable
+logical-id/generation pair, so unchanged roots can be shared without a Go
+pointer or a global lookup. Recovery validates those top-level directory pages
+and their identities before selecting a generation; a torn or mismatched newer
+directory therefore falls back to the older root. On M4 Max, the complete
+pure-Go SIMD state-root encoder measured 170.0-171.6 ns per 4 KiB page and the
+decoder 152.4-153.3 ns, both at zero allocations.
 
 This is deliberately still internal: Store does not yet encode its changed
-micro-pages and copied key/index/TTL paths into these buffers, nor decode the
-referenced state-root schema. Therefore ordinary `Put`, `Delete`, and TTL
+micro-pages and copied key/index/TTL paths into the common page payloads or
+attach them to the committer. Therefore ordinary `Put`, `Delete`, and TTL
 operations are not yet automatically durable. Read-only checkpoint mappings
 never contain dirty transactional state.
 

@@ -133,6 +133,8 @@ duplicate_keys_contract_test.go
 internal/storeio/committer_test.go
 internal/storeio/device_test.go
 internal/storeio/index_pool_test.go
+internal/storeio/page_test.go
+internal/storeio/state_root_test.go
 internal/storeio/superblock_test.go
 field_cursor_test.go
 index_bitmap_test.go
@@ -222,6 +224,7 @@ resource_retention_test.go
 internal/storeio/committer_alloc_test.go
 internal/storeio/ring_alloc_linux_test.go
 internal/storeio/device_alloc_test.go
+internal/storeio/state_root_alloc_test.go
 internal/storeio/superblock_alloc_test.go
 ```
 
@@ -234,6 +237,7 @@ stage2_scalar_differential_test.go
 simd/features_simd_test.go
 internal/scanner/scan_policy_amd64_test.go
 internal/scanner/scan_simd_test.go
+internal/storeio/page_checksum_simd_amd64_test.go
 internal/kernels/stage1_index_portable_test.go
 internal/kernels/stage1_index_test.go
 internal/kernels/stage1_portable_test.go

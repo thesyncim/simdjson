@@ -40,3 +40,19 @@ check_target() {
 
 check_target amd64 pageChecksumAVX512 VPCLMULQDQ
 check_target arm64 pageChecksumPMULL9 VPMULL
+
+pclmul_assembly="$work/storeio-amd64-pclmul.asm"
+"$go_bin" tool objdump -s "^${package_pattern}\.pageChecksumPCLMUL8$" \
+	"$work/storeio-amd64.test" >"$pclmul_assembly"
+if ! grep -Eq '[[:space:]]VPCLMULQDQ[[:space:]]' "$pclmul_assembly"; then
+	echo 'amd64 128-bit checksum body did not retain VPCLMULQDQ' >&2
+	exit 1
+fi
+if grep -Eq 'runtime\.(newobject|mallocgc)' "$pclmul_assembly"; then
+	echo 'amd64 128-bit checksum body contains a heap-allocation call' >&2
+	exit 1
+fi
+if grep -Eq '[[:space:],]Z[0-9]+([[:space:],]|$)' "$pclmul_assembly"; then
+	echo 'amd64 128-bit checksum body unexpectedly requires ZMM registers' >&2
+	exit 1
+fi
