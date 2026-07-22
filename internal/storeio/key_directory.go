@@ -13,6 +13,7 @@ const (
 	KeyDirectoryBranchRecordSize  = 40
 	keyDirectoryVersion           = uint32(1)
 	keyDirectoryKnownFlags        = uint8(0)
+	keyDirectoryMaxLevel          = uint8(10)
 )
 
 // ErrKeyDirectoryCorrupt reports a checksum-valid common page whose key
@@ -343,7 +344,7 @@ func (v KeyDirectoryView) childRefAt(rank int) (PageRef, bool) {
 func validateKeyDirectoryHeader(header KeyDirectoryHeader, count, recordSize, dataLength int, nextLogicalID uint64) error {
 	if header.StoreID == ([16]byte{}) || header.Generation == 0 ||
 		header.LogicalID <= StateRootLogicalID || header.LogicalID >= nextLogicalID ||
-		!validPhysicalPageSize(header.PageSize) || header.Flags&^keyDirectoryKnownFlags != 0 ||
+		!validPhysicalPageSize(header.PageSize) || header.Level > keyDirectoryMaxLevel || header.Flags&^keyDirectoryKnownFlags != 0 ||
 		count <= 0 || count > int(^uint16(0)) || dataLength < 0 || uint64(dataLength) > uint64(^uint32(0)) {
 		return fmt.Errorf("%w: key-directory identity, count, or flags", ErrInvalidWrite)
 	}
