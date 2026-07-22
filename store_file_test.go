@@ -2,7 +2,9 @@ package simdjson
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/thesyncim/simdjson/internal/storeio"
@@ -16,6 +18,7 @@ func testFileStoreOptions() FileStoreOptions {
 		ReadConcurrency: 2, PrefetchQueue: 8, BufferCount: 64,
 		QueueSlots: 4, GroupLimit: 2, Backend: FileStoreBackendPortable,
 		MaxSnapshotLeases: 8, MaxRetiredExtents: 256,
+		Synchronous: true,
 	}
 }
 
@@ -77,5 +80,107 @@ func TestCreateFileStoreRequiresEmptyFile(t *testing.T) {
 	}
 	if _, err := CreateFileStore(file, testFileStoreOptions()); !errors.Is(err, ErrFileStoreNotEmpty) {
 		t.Fatalf("CreateFileStore = %v, want %v", err, ErrFileStoreNotEmpty)
+	}
+}
+
+func TestFileStoreMutationsOverflowSnapshotAndReopen(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-mutations-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testFileStoreOptions()
+	store, err := CreateFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make(map[string]string)
+	for i := range 10 {
+		key := fmt.Sprintf("key-%02d", i)
+		value := fmt.Sprintf(`{"key":%q,"value":%d}`, key, i)
+		created, putErr := store.Put(key, []byte(value))
+		if putErr != nil || !created {
+			t.Fatalf("Put(%q) = (%v,%v)", key, created, putErr)
+		}
+		want[key] = value
+	}
+	if store.Len() != uint64(len(want)) {
+		t.Fatalf("Len = %d, want %d", store.Len(), len(want))
+	}
+
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := want["key-01"]
+	large := `{"payload":"` + strings.Repeat("large-value-", 400) + `"}`
+	created, err := store.Put("key-01", []byte(large))
+	if err != nil || created {
+		t.Fatalf("update = (%v,%v), want existing", created, err)
+	}
+	want["key-01"] = large
+	if got, ok, err := snapshot.AppendRaw(nil, "key-01"); err != nil || !ok || string(got) != old {
+		t.Fatalf("old snapshot = (%q,%v,%v), want %q", got, ok, err, old)
+	}
+	if got, ok, err := store.AppendRaw(nil, "key-01"); err != nil || !ok || string(got) != large {
+		t.Fatalf("current overflow = (%d bytes,%v,%v), want %d bytes", len(got), ok, err, len(large))
+	}
+	deleted, err := store.Delete("key-02")
+	if err != nil || !deleted {
+		t.Fatalf("Delete existing = (%v,%v)", deleted, err)
+	}
+	delete(want, "key-02")
+	if deleted, err := store.Delete("key-02"); err != nil || deleted {
+		t.Fatalf("Delete missing = (%v,%v)", deleted, err)
+	}
+	if got, ok, err := snapshot.AppendRaw(nil, "key-02"); err != nil || !ok || string(got) == "" {
+		t.Fatalf("snapshot deleted key = (%q,%v,%v)", got, ok, err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.Len() != uint64(len(want)) {
+		t.Fatalf("reopened Len = %d, want %d", reopened.Len(), len(want))
+	}
+	for key, value := range want {
+		got, ok, getErr := reopened.AppendRaw(nil, key)
+		if getErr != nil || !ok || string(got) != value {
+			t.Fatalf("reopened %q = (%q,%v,%v), want %q", key, got, ok, getErr, value)
+		}
+	}
+	if got, ok, err := reopened.AppendRaw(nil, "key-02"); err != nil || ok || got != nil {
+		t.Fatalf("reopened deleted key = (%q,%v,%v)", got, ok, err)
+	}
+}
+
+func TestFileStoreRejectsInvalidMutationWithoutPublishing(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-invalid-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	store, err := CreateFileStore(file, testFileStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	generation := store.Generation()
+	if _, err := store.Put("bad", []byte(`{"unterminated":`)); err == nil {
+		t.Fatal("Put invalid JSON succeeded")
+	}
+	if store.Generation() != generation || store.Len() != 0 {
+		t.Fatalf("invalid Put published generation %d len %d", store.Generation(), store.Len())
+	}
+	if _, err := store.Put(strings.Repeat("k", store.options.MaxKeyBytes+1), []byte(`null`)); !errors.Is(err, ErrFileStoreKeyTooLarge) {
+		t.Fatalf("oversize key = %v, want %v", err, ErrFileStoreKeyTooLarge)
 	}
 }

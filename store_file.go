@@ -4,10 +4,12 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"math/bits"
 	"os"
 	"sync"
 	"sync/atomic"
 
+	"github.com/thesyncim/simdjson/document"
 	"github.com/thesyncim/simdjson/internal/storeio"
 )
 
@@ -109,6 +111,9 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 	}
 	overflowPages := (o.MaxDocumentBytes + overflowPayload - 1) / overflowPayload
 	maxTransactionPages := overflowPages + 32
+	if o.MaxRetiredExtents < maxTransactionPages {
+		return normalizedFileStoreOptions{}, fmt.Errorf("simdjson: FileStore MaxRetiredExtents must retain one worst-case transaction")
+	}
 	if o.BufferCount == 0 {
 		o.BufferCount = 1
 		for o.BufferCount <= maxTransactionPages {
@@ -152,9 +157,10 @@ type FileStore struct {
 	leases    *storeio.GenerationLeases
 	reclaimer *storeio.ExtentReclaimer
 
-	parseScratch []IndexEntry
-	appendChunk  uint32
-	appendLive   uint64
+	parseScratch  []IndexEntry
+	retireScratch []storeio.FreeExtent
+	appendChunk   uint32
+	appendLive    uint64
 }
 
 // CreateFileStore initializes an empty durable Store in file and fences its
@@ -236,7 +242,7 @@ func OpenFileStore(file *os.File, options FileStoreOptions) (*FileStore, error) 
 func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, storeID [16]byte) (*FileStore, error) {
 	committer, err := storeio.NewCommitter(file, storeio.DeviceOptions{
 		Backend: storeio.Backend(options.Backend), BufferCount: options.BufferCount,
-		BufferSize: options.MaxPageSize, QueueDepth: options.BufferCount,
+		BufferSize: max(options.MaxPageSize, os.Getpagesize()), QueueDepth: options.BufferCount,
 	}, storeio.CommitterOptions{
 		QueueSlots: options.QueueSlots, MaxPagesPerBatch: options.maxTransactionPages,
 		GroupLimit: options.GroupLimit,
@@ -269,6 +275,7 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 	return &FileStore{
 		file: file, options: options, storeID: storeID, committer: committer, cache: cache,
 		leases: leases, reclaimer: reclaimer,
+		retireScratch: make([]storeio.FreeExtent, 0, options.maxTransactionPages+32),
 	}, nil
 }
 
@@ -493,6 +500,603 @@ func (s *FileStore) DurableGeneration() uint64 {
 		return 0
 	}
 	return s.committer.DurableGeneration()
+}
+
+// Put validates and copies src, then atomically publishes a copy-on-write file
+// generation. created reports whether key was absent. Async mode returns after
+// the bounded committer accepts the generation; Synchronous waits for the
+// double-root durability fence.
+func (s *FileStore) Put(key string, src []byte) (created bool, err error) {
+	if s == nil {
+		return false, ErrFileStoreClosed
+	}
+	s.writer.Lock()
+	defer s.writer.Unlock()
+	if s.closed {
+		return false, ErrFileStoreClosed
+	}
+	if len(key) > s.options.MaxKeyBytes {
+		return false, ErrFileStoreKeyTooLarge
+	}
+	if len(src) > s.options.MaxDocumentBytes {
+		return false, ErrFileStoreDocumentTooLarge
+	}
+	if err := s.validateDocument(src); err != nil {
+		return false, err
+	}
+	state := s.state.Load()
+	if state == nil {
+		return false, ErrFileStoreClosed
+	}
+	keyBytes := []byte(key)
+	keyBounds := storeio.KeyTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		ChunkHighWater: state.root.ChunkHighWater,
+		ChunkDocuments: uint8(state.root.ChunkDocuments),
+	}
+	var location storeio.KeyLocation
+	found := false
+	if state.keyRoot != (storeio.PageRef{}) {
+		location, found, err = storeio.LookupKeyTree(s.cache, state.keyRoot, keyBytes, keyBounds)
+		if err != nil {
+			return false, err
+		}
+	}
+	created = !found
+	prospectiveHighWater := state.root.ChunkHighWater
+	if !found {
+		limit := fileStoreLiveMask(state.root.ChunkDocuments)
+		if s.appendChunk < state.root.ChunkHighWater && s.appendLive != limit {
+			location.Chunk = s.appendChunk
+			location.Slot = uint8(bits.TrailingZeros64(^s.appendLive & limit))
+		} else {
+			if state.root.ChunkHighWater == ^uint32(0) {
+				return false, ErrStoreTooLarge
+			}
+			location = storeio.KeyLocation{Chunk: state.root.ChunkHighWater}
+			prospectiveHighWater++
+		}
+	}
+	if err := s.ensureDirtyCapacity(); err != nil {
+		return false, err
+	}
+	return s.putLocked(state, keyBytes, src, location, created, prospectiveHighWater)
+}
+
+func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, location storeio.KeyLocation, created bool, prospectiveHighWater uint32) (bool, error) {
+	generation := state.root.Generation + 1
+	if generation == 0 {
+		return false, storeio.ErrGenerationOrder
+	}
+	tx, err := storeio.BeginWriteTransaction(s.committer, s.cache, s.options.maxTransactionPages, storeio.WriteTransactionOptions{
+		StoreID: s.storeID, Generation: generation, PageSize: uint32(s.options.PageSize),
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+	})
+	if err != nil {
+		return false, err
+	}
+	abort := true
+	retirementReserved := false
+	defer func() {
+		if abort {
+			if retirementReserved {
+				_ = s.reclaimer.CancelRetiredGeneration(state.root.Generation)
+			}
+			_ = tx.Abort()
+		}
+	}()
+	s.retireScratch = s.retireScratch[:0]
+
+	oldRef, oldView, oldLease, err := s.loadFileChunk(state, location.Chunk)
+	if err != nil {
+		return false, err
+	}
+	if oldLease != nil {
+		defer oldLease.Release()
+	}
+	if created {
+		if oldView != nil {
+			if _, occupied := oldView.Lookup(location.Slot); occupied {
+				return false, storeio.ErrDocumentPageCorrupt
+			}
+		}
+	} else {
+		if oldView == nil {
+			return false, storeio.ErrDocumentPageCorrupt
+		}
+		oldValue, ok := oldView.LookupKeyValue(location.Slot, key)
+		if !ok {
+			return false, storeio.ErrDocumentPageCorrupt
+		}
+		if err := s.appendOverflowRetirements(state, oldValue, location); err != nil {
+			return false, err
+		}
+	}
+	newRecord, err := s.stageFileValue(tx, location, key, src)
+	if err != nil {
+		return false, err
+	}
+	rows, live, err := s.buildFileRows(oldView, location.Slot, newRecord, true)
+	if err != nil {
+		return false, err
+	}
+	documentSize, err := s.fileDocumentPageSize(rows)
+	if err != nil {
+		return false, err
+	}
+	documentLogicalID := uint64(0)
+	if oldRef != (storeio.PageRef{}) {
+		documentLogicalID = oldRef.LogicalID
+	}
+	documentPage, err := tx.Allocate(storeio.PageDocument, documentSize, documentLogicalID)
+	if err != nil {
+		return false, err
+	}
+	if _, err := storeio.EncodeDocumentPageWithOverflow(documentPage.Bytes(), storeio.DocumentPageHeader{
+		StoreID: s.storeID, Generation: generation, LogicalID: documentPage.Ref().LogicalID,
+		PageSize: documentPage.Ref().Length, ChunkID: location.Chunk, Live: live,
+	}, rows, tx.NextLogicalID(), tx.FileEnd(), uint32(s.options.PageSize)); err != nil {
+		return false, err
+	}
+	if err := documentPage.Stage(); err != nil {
+		return false, err
+	}
+	chunkMutation, err := storeio.UpsertChunkTree(s.cache, tx, state.chunkRoot, location.Chunk, documentPage.Ref(), storeio.ChunkTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+	})
+	if err != nil {
+		return false, err
+	}
+	keyRoot := state.keyRoot
+	var keyMutation storeio.KeyTreeMutation
+	if created {
+		keyMutation, err = storeio.UpsertKeyTree(s.cache, tx, state.keyRoot, key, location, storeio.KeyTreeBounds{
+			FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+			ChunkHighWater: prospectiveHighWater, ChunkDocuments: uint8(state.root.ChunkDocuments),
+		})
+		if err != nil {
+			return false, err
+		}
+		keyRoot = keyMutation.Root
+	}
+	documentCount := state.root.DocumentCount
+	liveChunks := state.root.LiveChunks
+	if created {
+		documentCount++
+		if oldRef == (storeio.PageRef{}) {
+			liveChunks++
+		}
+	}
+	nextState, statePage, err := s.stageFileState(tx, state, generation, prospectiveHighWater, documentCount, liveChunks, chunkMutation.Root, keyRoot)
+	if err != nil {
+		return false, err
+	}
+	if err := s.reserveFileRetirements(state, oldRef, keyMutation, chunkMutation); err != nil {
+		return false, err
+	}
+	retirementReserved = true
+	if err := tx.Publish(statePage.Ref(), storeio.PageChecksum(statePage.Bytes()), 0, 0, 0); err != nil {
+		return false, err
+	}
+	abort = false
+	s.snapshotGate.Lock()
+	s.state.Store(nextState)
+	s.snapshotGate.Unlock()
+	if location.Chunk >= state.root.ChunkHighWater || location.Chunk == s.appendChunk {
+		s.appendChunk = location.Chunk
+		s.appendLive = live
+	}
+	if live == fileStoreLiveMask(state.root.ChunkDocuments) {
+		s.appendChunk = prospectiveHighWater
+		s.appendLive = 0
+	}
+	if s.options.Synchronous {
+		if err := s.committer.Wait(generation); err != nil {
+			return created, err
+		}
+		s.cache.MarkDurable(generation)
+	}
+	return created, nil
+}
+
+// Delete removes key through the same failure-atomic page publication.
+func (s *FileStore) Delete(key string) (bool, error) {
+	if s == nil {
+		return false, ErrFileStoreClosed
+	}
+	s.writer.Lock()
+	defer s.writer.Unlock()
+	if s.closed {
+		return false, ErrFileStoreClosed
+	}
+	state := s.state.Load()
+	if state == nil || state.keyRoot == (storeio.PageRef{}) {
+		return false, nil
+	}
+	location, found, err := storeio.LookupKeyTree(s.cache, state.keyRoot, []byte(key), storeio.KeyTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		ChunkHighWater: state.root.ChunkHighWater, ChunkDocuments: uint8(state.root.ChunkDocuments),
+	})
+	if err != nil || !found {
+		return false, err
+	}
+	if err := s.ensureDirtyCapacity(); err != nil {
+		return false, err
+	}
+	return s.deleteLocked(state, []byte(key), location)
+}
+
+func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location storeio.KeyLocation) (bool, error) {
+	generation := state.root.Generation + 1
+	tx, err := storeio.BeginWriteTransaction(s.committer, s.cache, s.options.maxTransactionPages, storeio.WriteTransactionOptions{
+		StoreID: s.storeID, Generation: generation, PageSize: uint32(s.options.PageSize),
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+	})
+	if err != nil {
+		return false, err
+	}
+	abort := true
+	retirementReserved := false
+	defer func() {
+		if abort {
+			if retirementReserved {
+				_ = s.reclaimer.CancelRetiredGeneration(state.root.Generation)
+			}
+			_ = tx.Abort()
+		}
+	}()
+	s.retireScratch = s.retireScratch[:0]
+	oldRef, oldView, oldLease, err := s.loadFileChunk(state, location.Chunk)
+	if err != nil || oldView == nil {
+		return false, err
+	}
+	defer oldLease.Release()
+	oldValue, ok := oldView.LookupKeyValue(location.Slot, key)
+	if !ok {
+		return false, storeio.ErrDocumentPageCorrupt
+	}
+	if err := s.appendOverflowRetirements(state, oldValue, location); err != nil {
+		return false, err
+	}
+	rows, live, err := s.buildFileRows(oldView, location.Slot, storeio.DocumentRecord{}, false)
+	if err != nil {
+		return false, err
+	}
+	chunkRoot := state.chunkRoot
+	var chunkMutation storeio.ChunkTreeMutation
+	if live == 0 {
+		chunkMutation, err = storeio.DeleteChunkTree(s.cache, tx, state.chunkRoot, location.Chunk, storeio.ChunkTreeBounds{
+			FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		})
+	} else {
+		documentSize, sizeErr := s.fileDocumentPageSize(rows)
+		if sizeErr != nil {
+			return false, sizeErr
+		}
+		documentPage, allocateErr := tx.Allocate(storeio.PageDocument, documentSize, oldRef.LogicalID)
+		if allocateErr != nil {
+			return false, allocateErr
+		}
+		if _, encodeErr := storeio.EncodeDocumentPageWithOverflow(documentPage.Bytes(), storeio.DocumentPageHeader{
+			StoreID: s.storeID, Generation: generation, LogicalID: documentPage.Ref().LogicalID,
+			PageSize: documentPage.Ref().Length, ChunkID: location.Chunk, Live: live,
+		}, rows, tx.NextLogicalID(), tx.FileEnd(), uint32(s.options.PageSize)); encodeErr != nil {
+			return false, encodeErr
+		}
+		if stageErr := documentPage.Stage(); stageErr != nil {
+			return false, stageErr
+		}
+		chunkMutation, err = storeio.UpsertChunkTree(s.cache, tx, state.chunkRoot, location.Chunk, documentPage.Ref(), storeio.ChunkTreeBounds{
+			FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		})
+	}
+	if err != nil {
+		return false, err
+	}
+	chunkRoot = chunkMutation.Root
+	keyMutation, err := storeio.DeleteKeyTree(s.cache, tx, state.keyRoot, key, storeio.KeyTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		ChunkHighWater: state.root.ChunkHighWater, ChunkDocuments: uint8(state.root.ChunkDocuments),
+	})
+	if err != nil || !keyMutation.Found {
+		return false, err
+	}
+	liveChunks := state.root.LiveChunks
+	if live == 0 {
+		liveChunks--
+	}
+	nextState, statePage, err := s.stageFileState(
+		tx, state, generation, state.root.ChunkHighWater,
+		state.root.DocumentCount-1, liveChunks, chunkRoot, keyMutation.Root,
+	)
+	if err != nil {
+		return false, err
+	}
+	if err := s.reserveFileRetirements(state, oldRef, keyMutation, chunkMutation); err != nil {
+		return false, err
+	}
+	retirementReserved = true
+	if err := tx.Publish(statePage.Ref(), storeio.PageChecksum(statePage.Bytes()), 0, 0, 0); err != nil {
+		return false, err
+	}
+	abort = false
+	s.snapshotGate.Lock()
+	s.state.Store(nextState)
+	s.snapshotGate.Unlock()
+	if location.Chunk == s.appendChunk {
+		s.appendLive = live
+	}
+	if s.options.Synchronous {
+		if err := s.committer.Wait(generation); err != nil {
+			return true, err
+		}
+		s.cache.MarkDurable(generation)
+	}
+	return true, nil
+}
+
+func (s *FileStore) validateDocument(src []byte) error {
+	estimate := len(src)/8 + 8
+	if estimate < 8 {
+		estimate = 8
+	}
+	if cap(s.parseScratch) < estimate {
+		s.parseScratch = make([]IndexEntry, estimate)
+	}
+	for {
+		_, err := BuildIndexOptions(src, s.parseScratch[:cap(s.parseScratch)], s.options.Store.IndexOptions)
+		if err != document.ErrIndexFull {
+			return err
+		}
+		if cap(s.parseScratch) > s.options.MaxDocumentBytes {
+			return ErrFileStoreDocumentTooLarge
+		}
+		s.parseScratch = make([]IndexEntry, cap(s.parseScratch)*2)
+	}
+}
+
+func (s *FileStore) ensureDirtyCapacity() error {
+	stats := s.cache.Stats()
+	required := uint64(s.options.maxTransactionPages * s.options.MaxPageSize)
+	if stats.CapacityBytes-stats.DirtyBytes >= required {
+		return nil
+	}
+	if err := s.committer.Flush(); err != nil {
+		return err
+	}
+	s.cache.MarkDurable(s.committer.DurableGeneration())
+	return nil
+}
+
+func (s *FileStore) stageFileValue(tx *storeio.WriteTransaction, location storeio.KeyLocation, key, src []byte) (storeio.DocumentRecord, error) {
+	record := storeio.DocumentRecord{Key: key, Slot: location.Slot}
+	if len(src) <= s.options.InlineValueBytes {
+		record.JSON = src
+		return record, nil
+	}
+	payloadBytes := s.options.MaxPageSize - storeio.PageHeaderSize - storeio.PageTrailerSize - storeio.OverflowPagePayloadHeaderSize
+	pageCount := (len(src) + payloadBytes - 1) / payloadBytes
+	pages := make([]storeio.TransactionPage, pageCount)
+	for i := range pages {
+		page, err := tx.Allocate(storeio.PageOverflow, uint32(s.options.MaxPageSize), 0)
+		if err != nil {
+			return storeio.DocumentRecord{}, err
+		}
+		pages[i] = page
+	}
+	position := 0
+	for i, page := range pages {
+		end := min(position+payloadBytes, len(src))
+		var next storeio.PageRef
+		if i+1 < len(pages) {
+			next = pages[i+1].Ref()
+		}
+		header := storeio.OverflowPageHeader{
+			StoreID: s.storeID, Generation: tx.Generation(), LogicalID: page.Ref().LogicalID,
+			PageSize: page.Ref().Length, Chunk: location.Chunk, Slot: location.Slot,
+			Total: uint64(len(src)), Offset: uint64(position), Next: next,
+		}
+		if _, err := storeio.EncodeOverflowPage(
+			page.Bytes(), header, src[position:end], tx.FileEnd(), tx.NextLogicalID(),
+			uint32(s.options.PageSize), location.Chunk+1, uint8(s.options.Store.ChunkDocuments),
+		); err != nil {
+			return storeio.DocumentRecord{}, err
+		}
+		if err := page.Stage(); err != nil {
+			return storeio.DocumentRecord{}, err
+		}
+		position = end
+	}
+	record.Overflow = pages[0].Ref()
+	record.JSONLength = uint64(len(src))
+	return record, nil
+}
+
+func (s *FileStore) loadFileChunk(state *fileStoreState, chunkID uint32) (storeio.PageRef, *storeio.DocumentPageView, *storeio.PageLease, error) {
+	if chunkID >= state.root.ChunkHighWater || state.chunkRoot == (storeio.PageRef{}) {
+		return storeio.PageRef{}, nil, nil, nil
+	}
+	ref, ok, err := storeio.LookupChunkTree(s.cache, state.chunkRoot, chunkID, storeio.ChunkTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+	})
+	if err != nil || !ok {
+		return storeio.PageRef{}, nil, nil, err
+	}
+	lease, err := s.cache.Acquire(ref)
+	if err != nil {
+		return storeio.PageRef{}, nil, nil, err
+	}
+	view, err := storeio.OpenDocumentPageWithOverflow(
+		lease.Page(), state.root.ChunkHighWater, state.root.NextLogicalID,
+		state.super.FileEnd, state.root.PageSize,
+	)
+	if err != nil {
+		lease.Release()
+		return storeio.PageRef{}, nil, nil, err
+	}
+	return ref, &view, &lease, nil
+}
+
+func (s *FileStore) buildFileRows(old *storeio.DocumentPageView, target uint8, replacement storeio.DocumentRecord, keep bool) ([]storeio.DocumentRecord, uint64, error) {
+	var storage [storeMaxChunkDocuments]storeio.DocumentRecord
+	position := 0
+	var live uint64
+	for slot := uint8(0); slot < uint8(s.options.Store.ChunkDocuments); slot++ {
+		if slot == target {
+			if keep {
+				storage[position] = replacement
+				position++
+				live |= uint64(1) << slot
+			}
+			continue
+		}
+		if old == nil {
+			continue
+		}
+		record, ok := old.Lookup(slot)
+		if !ok {
+			continue
+		}
+		storage[position] = record
+		position++
+		live |= uint64(1) << slot
+	}
+	if old != nil {
+		if _, existed := old.Lookup(target); !keep && !existed {
+			return nil, 0, storeio.ErrDocumentPageCorrupt
+		}
+	}
+	return storage[:position], live, nil
+}
+
+func (s *FileStore) fileDocumentPageSize(rows []storeio.DocumentRecord) (uint32, error) {
+	needed := storeio.PageHeaderSize + storeio.PageTrailerSize + storeio.DocumentPagePayloadHeaderSize + len(rows)*storeio.DocumentPageRecordSize
+	for _, row := range rows {
+		needed += len(row.Key)
+		if row.Overflow == (storeio.PageRef{}) {
+			needed += len(row.JSON)
+		} else {
+			needed += storeio.DocumentOverflowDescriptorSize
+		}
+	}
+	size := s.options.PageSize
+	for size < needed && size < s.options.MaxPageSize {
+		size <<= 1
+	}
+	if size < needed || size > s.options.MaxPageSize {
+		return 0, ErrFileStoreDocumentTooLarge
+	}
+	return uint32(size), nil
+}
+
+func (s *FileStore) stageFileState(tx *storeio.WriteTransaction, old *fileStoreState, generation uint64, chunkHighWater uint32, documentCount uint64, liveChunks uint32, chunkRoot, keyRoot storeio.PageRef) (*fileStoreState, storeio.TransactionPage, error) {
+	statePage, err := tx.Allocate(storeio.PageStateRoot, uint32(s.options.PageSize), storeio.StateRootLogicalID)
+	if err != nil {
+		return nil, storeio.TransactionPage{}, err
+	}
+	root := storeio.StateRoot{
+		StoreID: s.storeID, Generation: generation, PageSize: uint32(s.options.PageSize),
+		DocumentCount: documentCount, NextLogicalID: tx.NextLogicalID(),
+		ChunkHighWater: chunkHighWater, LiveChunks: liveChunks,
+		ChunkDocuments: uint32(s.options.Store.ChunkDocuments),
+		ChunkDirectory: chunkRoot, KeyDirectory: keyRoot,
+	}
+	if _, err := storeio.EncodeStateRootPage(statePage.Bytes(), root, tx.FileEnd()); err != nil {
+		return nil, storeio.TransactionPage{}, err
+	}
+	if err := statePage.Stage(); err != nil {
+		return nil, storeio.TransactionPage{}, err
+	}
+	super := storeio.Superblock{
+		StoreID: s.storeID, Generation: generation,
+		StateOffset: statePage.Ref().Offset, StateLength: statePage.Ref().Length,
+		StateChecksum: storeio.PageChecksum(statePage.Bytes()), FileEnd: tx.FileEnd(),
+		PageSize: uint32(s.options.PageSize),
+	}
+	return &fileStoreState{
+		root: root, super: super, stateRef: statePage.Ref(),
+		keyRoot: keyRoot, chunkRoot: chunkRoot,
+	}, statePage, nil
+}
+
+func (s *FileStore) reserveFileRetirements(old *fileStoreState, oldDocument storeio.PageRef, key storeio.KeyTreeMutation, chunk storeio.ChunkTreeMutation) error {
+	appendRef := func(ref storeio.PageRef) error {
+		if ref == (storeio.PageRef{}) {
+			return nil
+		}
+		if len(s.retireScratch) == cap(s.retireScratch) {
+			return storeio.ErrRetiredExtentCapacity
+		}
+		s.retireScratch = append(s.retireScratch, storeio.FreeExtent{
+			Offset: ref.Offset, Length: uint64(ref.Length), RetiredGeneration: old.root.Generation,
+		})
+		return nil
+	}
+	if err := appendRef(old.stateRef); err != nil {
+		return err
+	}
+	if err := appendRef(oldDocument); err != nil {
+		return err
+	}
+	for i := 0; i < int(key.RetiredCount); i++ {
+		if err := appendRef(key.Retired[i]); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < int(chunk.RetiredCount); i++ {
+		if err := appendRef(chunk.Retired[i]); err != nil {
+			return err
+		}
+	}
+	return s.reclaimer.RetireBatch(s.retireScratch)
+}
+
+func (s *FileStore) appendOverflowRetirements(state *fileStoreState, value storeio.DocumentValue, location storeio.KeyLocation) error {
+	ref := value.Overflow
+	if ref == (storeio.PageRef{}) {
+		return nil
+	}
+	offset := uint64(0)
+	for ref != (storeio.PageRef{}) {
+		if len(s.retireScratch) == cap(s.retireScratch) {
+			return storeio.ErrRetiredExtentCapacity
+		}
+		lease, err := s.cache.Acquire(ref)
+		if err != nil {
+			return err
+		}
+		view, err := storeio.OpenOverflowPage(
+			lease.Page(), state.super.FileEnd, state.root.NextLogicalID,
+			state.root.PageSize, state.root.ChunkHighWater, uint8(state.root.ChunkDocuments),
+		)
+		if err != nil {
+			lease.Release()
+			return err
+		}
+		header := view.Header()
+		if header.Chunk != location.Chunk || header.Slot != location.Slot ||
+			header.Total != value.Length || header.Offset != offset {
+			lease.Release()
+			return storeio.ErrOverflowPageCorrupt
+		}
+		s.retireScratch = append(s.retireScratch, storeio.FreeExtent{
+			Offset: ref.Offset, Length: uint64(ref.Length), RetiredGeneration: state.root.Generation,
+		})
+		offset += uint64(len(view.Data()))
+		ref = header.Next
+		lease.Release()
+	}
+	if offset != value.Length {
+		return storeio.ErrOverflowPageCorrupt
+	}
+	return nil
+}
+
+func fileStoreLiveMask(chunkDocuments uint32) uint64 {
+	if chunkDocuments >= 64 {
+		return ^uint64(0)
+	}
+	return uint64(1)<<chunkDocuments - 1
 }
 
 func (s *FileStore) restoreAppendChunk(state *fileStoreState) error {

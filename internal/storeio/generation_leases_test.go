@@ -153,6 +153,36 @@ func TestExtentReclaimerRejectsOverlap(t *testing.T) {
 	}
 }
 
+func TestExtentReclaimerBatchIsAtomicAndCancelable(t *testing.T) {
+	leases, _ := NewGenerationLeases(GenerationLeaseOptions{MaxLeases: 1})
+	reclaimer, _ := NewExtentReclaimer(leases, ExtentReclaimerOptions{MaxRetiredExtents: 3})
+	batch := []FreeExtent{
+		{Offset: 4096, Length: 4096, RetiredGeneration: 4},
+		{Offset: 8192, Length: 4096, RetiredGeneration: 4},
+	}
+	if err := reclaimer.RetireBatch(batch); err != nil {
+		t.Fatal(err)
+	}
+	if stats := reclaimer.Stats(); stats.Pending != 2 {
+		t.Fatalf("Stats after batch = %+v", stats)
+	}
+	if err := reclaimer.RetireBatch([]FreeExtent{
+		{Offset: 12288, Length: 4096, RetiredGeneration: 5},
+		{Offset: 16384, Length: 4096, RetiredGeneration: 5},
+	}); !errors.Is(err, ErrRetiredExtentCapacity) {
+		t.Fatalf("over-capacity batch = %v, want %v", err, ErrRetiredExtentCapacity)
+	}
+	if stats := reclaimer.Stats(); stats.Pending != 2 {
+		t.Fatalf("failed batch changed Stats = %+v", stats)
+	}
+	if err := reclaimer.CancelRetiredGeneration(4); err != nil {
+		t.Fatal(err)
+	}
+	if stats := reclaimer.Stats(); stats.Pending != 0 {
+		t.Fatalf("Stats after cancel = %+v", stats)
+	}
+}
+
 func TestGenerationLeaseAndReclaimerSteadyAllocation(t *testing.T) {
 	leases, _ := NewGenerationLeases(GenerationLeaseOptions{MaxLeases: 1})
 	reclaimer, _ := NewExtentReclaimer(leases, ExtentReclaimerOptions{MaxRetiredExtents: 1})

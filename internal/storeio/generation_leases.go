@@ -260,23 +260,63 @@ func NewExtentReclaimer(leases *GenerationLeases, options ExtentReclaimerOptions
 // Retire records an extent made unreachable by the next root. Overlap with an
 // already-pending extent is rejected before publication.
 func (r *ExtentReclaimer) Retire(extent FreeExtent) error {
-	if r == nil || extent.Offset == 0 || extent.Length == 0 || extent.RetiredGeneration == 0 ||
-		extent.Offset > ^uint64(0)-extent.Length {
-		return fmt.Errorf("%w: retired extent", ErrInvalidWrite)
+	return r.RetireBatch([]FreeExtent{extent})
+}
+
+// RetireBatch atomically reserves retirement metadata for a publication. No
+// extent is recorded if capacity, shape, or overlap validation fails.
+func (r *ExtentReclaimer) RetireBatch(extents []FreeExtent) error {
+	if r == nil {
+		return fmt.Errorf("%w: nil extent reclaimer", ErrInvalidWrite)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.pending) == r.limit {
+	if len(extents) > r.limit-len(r.pending) {
 		return ErrRetiredExtentCapacity
 	}
-	end := extent.Offset + extent.Length
-	for _, pending := range r.pending {
-		pendingEnd := pending.Offset + pending.Length
-		if extent.Offset < pendingEnd && pending.Offset < end {
-			return fmt.Errorf("%w: overlapping retired extent", ErrInvalidWrite)
+	for i, extent := range extents {
+		if extent.Offset == 0 || extent.Length == 0 || extent.RetiredGeneration == 0 ||
+			extent.Offset > ^uint64(0)-extent.Length {
+			return fmt.Errorf("%w: retired extent", ErrInvalidWrite)
+		}
+		end := extent.Offset + extent.Length
+		for _, pending := range r.pending {
+			pendingEnd := pending.Offset + pending.Length
+			if extent.Offset < pendingEnd && pending.Offset < end {
+				return fmt.Errorf("%w: overlapping retired extent", ErrInvalidWrite)
+			}
+		}
+		for j := 0; j < i; j++ {
+			other := extents[j]
+			otherEnd := other.Offset + other.Length
+			if extent.Offset < otherEnd && other.Offset < end {
+				return fmt.Errorf("%w: overlapping retired extent", ErrInvalidWrite)
+			}
 		}
 	}
-	r.pending = append(r.pending, extent)
+	r.pending = append(r.pending, extents...)
+	return nil
+}
+
+// CancelRetiredGeneration rolls back an unpublished serialized-writer
+// reservation. The generation must occupy the complete pending tail.
+func (r *ExtentReclaimer) CancelRetiredGeneration(generation uint64) error {
+	if r == nil || generation == 0 {
+		return fmt.Errorf("%w: retired generation", ErrInvalidWrite)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	first := len(r.pending)
+	for first > 0 && r.pending[first-1].RetiredGeneration == generation {
+		first--
+	}
+	for i := 0; i < first; i++ {
+		if r.pending[i].RetiredGeneration == generation {
+			return fmt.Errorf("%w: non-tail retired generation", ErrInvalidWrite)
+		}
+	}
+	clear(r.pending[first:])
+	r.pending = r.pending[:first]
 	return nil
 }
 
