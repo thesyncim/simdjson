@@ -78,6 +78,36 @@ func TestCommitterOptionsValidation(t *testing.T) {
 	}
 }
 
+func TestCommitterInitializeRecoveredGeneration(t *testing.T) {
+	committer, _, _ := newPortableCommitter(t, 2, 0)
+	defer committer.Close()
+	if err := committer.InitializeGeneration(41); err != nil {
+		t.Fatal(err)
+	}
+	if committer.PublishedGeneration() != 41 || committer.DurableGeneration() != 41 {
+		t.Fatalf("initialized generations = %d/%d", committer.PublishedGeneration(), committer.DurableGeneration())
+	}
+	if err := committer.InitializeGeneration(42); !errors.Is(err, ErrGenerationOrder) {
+		t.Fatalf("second InitializeGeneration = %v, want %v", err, ErrGenerationOrder)
+	}
+	batch, err := committer.Begin(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, _ := batch.RootBuffer()
+	clear(root)
+	root[0] = 1
+	if err := batch.SetRoot(0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Publish(42); err != nil {
+		t.Fatal(err)
+	}
+	if err := committer.Wait(42); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCommitterBatchValidationRetainsOwnership(t *testing.T) {
 	committer, _, pageSize := newPortableCommitter(t, 3, 1)
 	defer committer.Close()

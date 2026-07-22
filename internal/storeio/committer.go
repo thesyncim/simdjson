@@ -460,6 +460,19 @@ func (c *Committer) DurableGeneration() uint64 {
 	return c.durable.Load()
 }
 
+// InitializeGeneration seeds a newly opened Committer with the generation
+// already selected by crash recovery. It must be called before Begin or
+// Publish and keeps Flush/Stats meaningful before the first new mutation.
+func (c *Committer) InitializeGeneration(generation uint64) error {
+	if c == nil || generation == 0 || c.closing.Load() || c.head.Load() != c.tail.Load() ||
+		c.published.Load() != 0 || c.durable.Load() != 0 {
+		return ErrGenerationOrder
+	}
+	c.published.Store(generation)
+	c.durable.Store(generation)
+	return nil
+}
+
 // Wait blocks until generation is durable or persistence fails/closes.
 func (c *Committer) Wait(generation uint64) error {
 	if c == nil {
