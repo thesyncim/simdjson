@@ -67,6 +67,7 @@ func BenchmarkStorePersistOpenMapped(b *testing.B) {
 			b.SetBytes(size)
 			b.ReportAllocs()
 			b.ResetTimer()
+			var last *Store
 			for i := 0; i < b.N; i++ {
 				store, err := OpenStore(mapped)
 				if err != nil {
@@ -75,17 +76,22 @@ func BenchmarkStorePersistOpenMapped(b *testing.B) {
 				if store.Len() != storePersistBenchDocuments {
 					b.Fatalf("Len = %d", store.Len())
 				}
+				last = store
 				runtime.KeepAlive(store)
 			}
+			b.StopTimer()
+			stats := last.Stats()
 			b.ReportMetric(float64(size), "mapped-B")
+			b.ReportMetric(float64(stats.ExternalKeyBytes), "external-key-B")
+			b.ReportMetric(float64(stats.ExternalDocumentBytes), "external-doc-B")
 		})
 	}
 }
 
 // BenchmarkStorePersistMappedPointRead verifies that borrowing source bytes
 // does not tax the steady read path. Both forms return mapped bytes directly;
-// the compiled form also bypasses hashing and the key HAMT after its verified
-// stable-slot check.
+// the compiled form also bypasses hashing and both key directories after its
+// verified stable-slot check.
 func BenchmarkStorePersistMappedPointRead(b *testing.B) {
 	image, _ := storePersistBenchImage(b, false)
 	mapped := persistBenchMmap(b, image)

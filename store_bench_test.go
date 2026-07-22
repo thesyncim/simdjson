@@ -9,6 +9,8 @@ import (
 var (
 	storeRawSink  RawValue
 	storeKeysSink []string
+	storeRowsSink []StoreRow
+	storeWordsSink []uint64
 	storeBoolSink bool
 )
 
@@ -331,6 +333,62 @@ func BenchmarkStoreExactIndexProbe(b *testing.B) {
 			b.ReportMetric(bytesPerDoc[test.index], "index-B/doc")
 		})
 	}
+}
+
+func BenchmarkStoreDenseBitmapPlan(b *testing.B) {
+	store := benchmarkStore(b, StoreOptions{ChunkDocuments: 64, ShapeTapes: true}, 1<<16)
+	for _, definition := range []StoreIndexDefinition{
+		{Name: "group", Paths: []string{"/group"}},
+		{Name: "active", Paths: []string{"/active"}},
+	} {
+		info, err := store.CreateIndex(definition)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if info, err = store.BackfillIndex(info.Name, 0); err != nil || info.State != StoreIndexReady {
+			b.Fatalf("BackfillIndex(%s) = (%+v,%v)", definition.Name, info, err)
+		}
+	}
+	snapshot := store.Snapshot()
+	group := testScalarIndex(b, `7`)
+	active := testScalarIndex(b, `true`)
+	words := snapshot.StoreBitmapWords()
+	storage := make([]uint64, 0, words*3)
+	var err error
+	storage, err = snapshot.AppendIndexBitmap(storage, "group", group)
+	if err != nil {
+		b.Fatal(err)
+	}
+	storage, err = snapshot.AppendIndexBitmap(storage, "active", active)
+	if err != nil {
+		b.Fatal(err)
+	}
+	storage = snapshot.AppendLiveBitmap(storage)
+	groupWords := storage[:words]
+	activeWords := storage[words : 2*words]
+	liveWords := storage[2*words:]
+
+	b.Run("fused-and3", func(b *testing.B) {
+		out := make([]uint64, 0, words)
+		b.SetBytes(int64(words * 8 * 4))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			out = AppendStoreBitmapAnd3(out[:0], groupWords, activeWords, liveWords)
+		}
+		storeWordsSink = out
+	})
+	b.Run("fused-and3+ordered-rows", func(b *testing.B) {
+		out := make([]uint64, 0, words)
+		rows := make([]StoreRow, 0, snapshot.Len()/16)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			out = AppendStoreBitmapAnd3(out[:0], groupWords, activeWords, liveWords)
+			rows = snapshot.AppendBitmapRows(rows[:0], out)
+		}
+		storeRowsSink = rows
+	})
 }
 
 func BenchmarkStoreExactIndexBackfill(b *testing.B) {

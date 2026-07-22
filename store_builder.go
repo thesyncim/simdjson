@@ -130,7 +130,6 @@ func (b *StoreBuilder) Append(key string, src []byte) error {
 func newStoreBuilderChunk(options StoreOptions) *storeChunk {
 	chunk := &storeChunk{
 		keys: make([]string, options.ChunkDocuments),
-		ord:  make([]uint8, options.ChunkDocuments),
 	}
 	initChunkDocSet(&chunk.docs, options, options.Postings)
 	return chunk

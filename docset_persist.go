@@ -249,13 +249,14 @@ func (s *DocSet) writeToPersistWriter(pw *persistWriter, base int64) {
 
 	var smallOffsets [persistSmallManifestDocuments]uint64
 	var docOffsets []uint64
-	if len(s.docs) <= len(smallOffsets) {
-		docOffsets = smallOffsets[:len(s.docs)]
+	docCount := s.Len()
+	if docCount <= len(smallOffsets) {
+		docOffsets = smallOffsets[:docCount]
 	} else {
-		docOffsets = make([]uint64, len(s.docs))
+		docOffsets = make([]uint64, docCount)
 	}
 	var narrowTotal uint64
-	for i := range s.docs {
+	for i := 0; i < docCount; i++ {
 		docOffsets[i] = pw.writeDocRecord(s, i, shapeID, &narrowTotal, base)
 	}
 
@@ -296,7 +297,7 @@ func (pw *persistWriter) writeDocRecord(s *DocSet, i int, shapeID map[*shapeReco
 	pw.pad8()
 	offset := uint64(pw.off - base)
 
-	idx := s.docs[i]
+	idx := s.docAt(i)
 	ref := s.shapeTapeRefAt(i)
 
 	var (
@@ -333,11 +334,24 @@ func (pw *persistWriter) writeDocRecord(s *DocSet, i int, shapeID map[*shapeReco
 	pw.write(idx.src)
 	pw.pad8()
 	if kind == persistDocNarrow {
-		pw.writeNarrow(s.narrow[ref.off : ref.off+entries])
+		pw.writeNarrowDoc(s, i, ref, entries)
 	} else {
 		pw.writeEntries(idx.entries)
 	}
 	return offset
+}
+
+// writeNarrowDoc streams one compact tape from either the ordinary Go slab or
+// a Store page image. The fixed eight-byte scratch keeps re-checkpointing an
+// OpenStore zero-allocation per row and avoids materializing a second tape.
+func (pw *persistWriter) writeNarrowDoc(s *DocSet, doc int, ref shapeTapeRef, entries uint32) {
+	var raw [8]byte
+	for i := uint32(0); i < entries; i++ {
+		value := s.narrowAt(doc, ref, int(i))
+		binary.LittleEndian.PutUint32(raw[0:4], value.span)
+		binary.LittleEndian.PutUint32(raw[4:8], value.info)
+		pw.writeSmall(raw[:])
+	}
 }
 
 // writeShapeTable serializes the shared shapes: a count, then per shape a field
@@ -523,6 +537,17 @@ func Open(data []byte) (*DocSet, error) {
 // Store persistence uses it to initialize an embedded chunk DocSet without
 // copying a value that contains a synchronization primitive.
 func openDocSetInto(set *DocSet, data []byte) error {
+	return openDocSetIntoMode(set, data, nil, 0)
+}
+
+// openDocSetIntoStore reconstructs one Store micro-page with its per-document
+// slice/shape headers in the Store-wide pointer-free external descriptor
+// block. Public Open deliberately keeps its existing append-capable layout.
+func openDocSetIntoStore(set *DocSet, data []byte, mapped *storeMappedDocs, base uint64) error {
+	return openDocSetIntoMode(set, data, mapped, base)
+}
+
+func openDocSetIntoMode(set *DocSet, data []byte, mapped *storeMappedDocs, mappedBase uint64) error {
 	if uint64(len(data)) < persistHeaderLen+persistFooterLen {
 		return fmt.Errorf("%w: image shorter than its framing", ErrPersistCorrupt)
 	}
@@ -581,7 +606,16 @@ func openDocSetInto(set *DocSet, data []byte) error {
 		return fmt.Errorf("%w: narrow value total exceeds image", ErrPersistCorrupt)
 	}
 
+	compact := mapped != nil && persistNativeLittleEndian
 	*set = DocSet{source: data}
+	if compact {
+		set.mappedDocs = mapped
+		set.mappedBase = mappedBase
+		set.mappedCount = int(docCount)
+		if mappedBase+uint64(docCount) > uint64(len(mapped.refs)) {
+			return fmt.Errorf("%w: Store document directory span", ErrPersistCorrupt)
+		}
+	}
 	set.ShapeTapes = flags&persistFlagShapeTapes != 0
 	set.wideValueTapes = flags&persistFlagWideValueTapes != 0
 	set.Options = document.IndexOptions{HashKeys: flags&persistFlagHashKeys != 0}
@@ -595,17 +629,24 @@ func openDocSetInto(set *DocSet, data []byte) error {
 		return err
 	}
 
-	set.docs = make([]Index, docCount)
-	set.narrow = make([]shapeNarrowValue, 0, narrowTotal)
-	tapeRefs := make([]shapeTapeRef, docCount)
+	if compact {
+		set.mappedShapes = shapeRecs
+	} else {
+		set.docs = make([]Index, docCount)
+		set.narrow = make([]shapeNarrowValue, 0, narrowTotal)
+	}
+	var tapeRefs []shapeTapeRef
+	if !compact {
+		tapeRefs = make([]shapeTapeRef, docCount)
+	}
 	hasShape := false
-	for i := range set.docs {
+	for i := 0; i < int(docCount); i++ {
 		recOff := binary.LittleEndian.Uint64(manifest[persistManifestFixed+8*i:])
-		ref, err := set.openDocRecord(data, recOff, manifestOff, shapeRecs, i)
+		ref, err := set.openDocRecord(data, recOff, manifestOff, shapeRecs, i, compact)
 		if err != nil {
 			return err
 		}
-		if ref.rec != nil {
+		if ref.rec != nil && !compact {
 			tapeRefs[i] = ref
 			hasShape = true
 		}
@@ -625,7 +666,7 @@ func openDocSetInto(set *DocSet, data []byte) error {
 // returning its shape header (the zero ref for a classic document). It bounds
 // every span against the image so a malformed record fails closed rather than
 // aliasing out of range.
-func (set *DocSet) openDocRecord(data []byte, recOff, recLimit uint64, shapeRecs []*shapeRecord, i int) (shapeTapeRef, error) {
+func (set *DocSet) openDocRecord(data []byte, recOff, recLimit uint64, shapeRecs []*shapeRecord, i int, compact bool) (shapeTapeRef, error) {
 	if recOff < persistHeaderLen || recOff&7 != 0 || recOff > recLimit || recLimit-recOff < persistRecordHeaderLen {
 		return shapeTapeRef{}, fmt.Errorf("%w: record %d header out of range", ErrPersistCorrupt, i)
 	}
@@ -658,6 +699,13 @@ func (set *DocSet) openDocRecord(data []byte, recOff, recLimit uint64, shapeRecs
 
 	switch kind {
 	case persistDocClassic:
+		if compact {
+			set.mappedDocs.refs[set.mappedBase+uint64(i)] = storeMappedDocRef{
+				recordOff: recOff, srcLen: uint32(srcLen),
+				entryCount: uint32(entryCount), shapeID: storeMappedNoShape, kind: kind,
+			}
+			return shapeTapeRef{}, nil
+		}
 		set.docs[i] = Index{src: src, entries: openEntries(data, entriesOff, entryCount)}
 		return shapeTapeRef{}, nil
 	case persistDocWide:
@@ -668,6 +716,14 @@ func (set *DocSet) openDocRecord(data []byte, recOff, recLimit uint64, shapeRecs
 		if entryCount != uint64(len(rec.fields)) {
 			return shapeTapeRef{}, fmt.Errorf("%w: record %d value count != shape width", ErrPersistCorrupt, i)
 		}
+		if compact {
+			set.mappedDocs.refs[set.mappedBase+uint64(i)] = storeMappedDocRef{
+				recordOff: recOff, srcLen: uint32(srcLen),
+				entryCount: uint32(entryCount), start: start, end: end, shapeID: sid,
+				kind: kind, enriched: enriched,
+			}
+			return shapeTapeRef{rec: rec, start: start, end: end, enriched: enriched}, nil
+		}
 		set.docs[i] = Index{src: src, entries: openEntries(data, entriesOff, entryCount)}
 		return shapeTapeRef{rec: rec, start: start, end: end, enriched: enriched}, nil
 	case persistDocNarrow:
@@ -677,6 +733,15 @@ func (set *DocSet) openDocRecord(data []byte, recOff, recLimit uint64, shapeRecs
 		}
 		if entryCount != uint64(len(rec.fields)) {
 			return shapeTapeRef{}, fmt.Errorf("%w: record %d narrow count != shape width", ErrPersistCorrupt, i)
+		}
+		if compact {
+			set.mappedDocs.refs[set.mappedBase+uint64(i)] = storeMappedDocRef{
+				recordOff: recOff, srcLen: uint32(srcLen),
+				entryCount: uint32(entryCount), start: start, end: end, shapeID: sid,
+				kind: kind, enriched: enriched,
+			}
+			set.mappedNarrow += int(entryCount)
+			return shapeTapeRef{rec: rec, start: start, end: end, narrow: true, enriched: enriched}, nil
 		}
 		slabOff := uint32(len(set.narrow))
 		set.narrow = appendNarrow(set.narrow, data, entriesOff, entryCount)
@@ -773,13 +838,13 @@ func (set *DocSet) rebuildShape(synth []byte, fieldCount int) (*shapeRecord, err
 func (set *DocSet) rebuildAccelerators(flags uint32) {
 	if flags&persistFlagPostings != 0 {
 		set.Postings = true
-		for i := range set.docs {
-			set.indexPostings(i, set.docs[i], set.shapeTapeRefAt(i))
+		for i := 0; i < set.Len(); i++ {
+			set.indexPostings(i, set.docAt(i), set.shapeTapeRefAt(i))
 		}
 	}
 	if flags&persistFlagValueDict != 0 {
 		set.ValueDict = true
-		for i := range set.docs {
+		for i := 0; i < set.Len(); i++ {
 			set.valueDictAppend(i, set.shapeTapeRefAt(i))
 		}
 	}

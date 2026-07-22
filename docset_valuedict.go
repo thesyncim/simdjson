@@ -130,12 +130,12 @@ func (s *DocSet) valueDictAppend(i int, ref shapeTapeRef) {
 	if s.valueSeen == nil {
 		s.valueSeen = make(map[uint64]struct{})
 	}
-	idx := s.docs[i]
+	idx := s.docAt(i)
 	if ref.rec != nil {
 		// A shape-taped document's classic tape no longer exists; synthesize it
 		// for the walk and drop it — never through Doc, which would cache it and
 		// re-buy the storage the shape tape dropped.
-		idx = Index{src: s.docs[i].src, entries: s.synthShapeTape(i, ref)}
+		idx = Index{src: idx.src, entries: s.synthShapeTape(i, ref)}
 	}
 	vref := s.valueDictScan(idx)
 	for len(s.valueRefs) < i {

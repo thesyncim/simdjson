@@ -74,7 +74,7 @@ func (s Snapshot) AppendRowKeys(dst []string, rows []StoreRow) []string {
 		if chunk == nil || int(row.Slot) >= len(chunk.ord) || chunk.live&(uint64(1)<<row.Slot) == 0 {
 			panic("simdjson: StoreRow is not live in Snapshot")
 		}
-		dst = append(dst, chunk.keys[row.Slot])
+		dst = append(dst, chunk.key(int(row.Slot)))
 	}
 	return dst
 }

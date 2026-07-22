@@ -1,6 +1,8 @@
 package simdjson
 
 import (
+	"runtime"
+
 	"github.com/thesyncim/simdjson/document"
 )
 
@@ -127,6 +129,19 @@ func (n shapeNarrowValue) widen() IndexEntry {
 // slice is either empty or aligned with docs (commitDoc's invariant), so the
 // single bounds test covers both.
 func (s *DocSet) shapeTapeRefAt(i int) shapeTapeRef {
+	if s.mappedDocs != nil {
+		r := &s.mappedDocs.refs[s.mappedBase+uint64(i)]
+		if r.shapeID == storeMappedNoShape {
+			runtime.KeepAlive(s.mappedDocs)
+			return shapeTapeRef{}
+		}
+		ref := shapeTapeRef{
+			rec: s.mappedShapes[r.shapeID], start: r.start, end: r.end,
+			narrow: r.kind == persistDocNarrow, enriched: r.enriched,
+		}
+		runtime.KeepAlive(s.mappedDocs)
+		return ref
+	}
 	if uint(i) < uint(len(s.tapeRefs)) {
 		return s.tapeRefs[i]
 	}
@@ -276,9 +291,9 @@ func (s *DocSet) widenShapeTape(i int, r shapeTapeRef) Index {
 	s.widenMu.Lock()
 	defer s.widenMu.Unlock()
 	if entries, ok := s.widened[i]; ok {
-		return Index{src: s.docs[i].src, entries: entries}
+		return Index{src: s.docAt(i).src, entries: entries}
 	}
-	index := Index{src: s.docs[i].src, entries: s.synthShapeTape(i, r)}
+	index := Index{src: s.docAt(i).src, entries: s.synthShapeTape(i, r)}
 	if r.enriched {
 		enrichKeyHashes(&index)
 	}
@@ -299,8 +314,9 @@ func (s *DocSet) widenShapeTape(i int, r shapeTapeRef) Index {
 // bit-identical to the tape classic mode would have stored (enrichment,
 // applied by the caller, included), which the differential suite pins.
 func (s *DocSet) synthShapeTape(i int, r shapeTapeRef) []IndexEntry {
-	values := s.docs[i].entries
-	src := s.docs[i].src
+	doc := s.docAt(i)
+	values := doc.entries
+	src := doc.src
 	fields := r.rec.fields
 	entries := make([]IndexEntry, 2*len(fields)+1)
 	entries[0] = IndexEntry{
@@ -311,7 +327,7 @@ func (s *DocSet) synthShapeTape(i int, r shapeTapeRef) []IndexEntry {
 	}
 	for m := range fields {
 		if r.narrow {
-			entries[2*m+2] = s.narrow[int(r.off)+m].widen()
+			entries[2*m+2] = s.narrowAt(i, r, m).widen()
 		} else {
 			entries[2*m+2] = values[m]
 		}
@@ -420,18 +436,18 @@ type DocSetStats struct {
 // document table and reads nothing through Doc, so it is safe to call for
 // accounting at any point between appends.
 func (s *DocSet) Stats() DocSetStats {
-	st := DocSetStats{Docs: len(s.docs), Shapes: len(s.shapes.shapes)}
-	for i := range s.docs {
+	st := DocSetStats{Docs: s.Len(), Shapes: len(s.shapes.shapes)}
+	for i := 0; i < s.Len(); i++ {
 		switch r := s.shapeTapeRefAt(i); {
 		case r.rec == nil:
-			st.TapeEntries += int64(len(s.docs[i].entries))
+			st.TapeEntries += int64(len(s.docAt(i).entries))
 		case r.narrow:
 			st.ShapeTaped++
 			st.NarrowTaped++
 			st.NarrowValueEntries += int64(len(r.rec.fields))
 		default:
 			st.ShapeTaped++
-			st.ValueEntries += int64(len(s.docs[i].entries))
+			st.ValueEntries += int64(len(s.docAt(i).entries))
 		}
 	}
 	s.widenMu.Lock()

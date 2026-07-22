@@ -83,7 +83,7 @@ func (s Snapshot) appendWhereKeys(dst []string, kind storeProbeKind, path string
 			slots[chunk.ord[slot]] = uint8(slot)
 		}
 		for _, row := range rows {
-			dst = append(dst, chunk.keys[slots[row]])
+			dst = append(dst, chunk.key(int(slots[row])))
 		}
 		return true
 	})

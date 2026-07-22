@@ -21,7 +21,8 @@ import (
 // stable slots, key spellings, options, ready index definitions, TTL deadlines,
 // and reusable empty chunk ids. OpenStore views the immutable document bytes
 // and structural tapes directly from the caller's image, rebuilds the seeded
-// in-memory key directory, and reuses the ordinary exact-index bulk builder.
+// compact in-memory base key directory, and reuses the ordinary exact-index
+// bulk builder.
 // There is one document/tape format and one query engine.
 //
 // The format is intentionally unstable before v1. All integers are
@@ -32,7 +33,8 @@ import (
 // The fixed footer locates and checksums the variable manifest. Page offsets
 // and lengths are covered by that checksum; each nested DocSet image performs
 // its own framing and manifest validation. Key bytes reside in the Store
-// manifest so rebuilding the HAMT never faults document payload pages.
+// manifest so constructing the key directory never faults document payload
+// pages.
 
 const (
 	storePersistVersion = 1
@@ -165,7 +167,15 @@ func (s *Store) storePersistSnapshot() (storePersistSnapshot, error) {
 	if uint64(len(s.ttl.heap)) > math.MaxUint32 || uint64(len(state.indexes)) > math.MaxUint32 {
 		return storePersistSnapshot{}, ErrStorePersistTooLarge
 	}
-	deadlines := append([]storeDeadline(nil), s.ttl.heap...)
+	deadlines := make([]storeDeadline, len(s.ttl.heap))
+	for i, item := range s.ttl.heap {
+		loc := item.key.location()
+		chunk := state.chunks.get(loc.chunk)
+		if chunk == nil || chunk.live&(uint64(1)<<loc.slot) == 0 {
+			return storePersistSnapshot{}, fmt.Errorf("%w: TTL references absent row", ErrStorePersistCorrupt)
+		}
+		deadlines[i] = storeDeadline{key: chunk.key(int(loc.slot)), deadline: item.deadline}
+	}
 	slices.SortFunc(deadlines, func(a, b storeDeadline) int {
 		if a.key < b.key {
 			return -1
@@ -226,7 +236,7 @@ func buildStorePersistManifest(state *storeState, refs []storePersistChunkRef, d
 		buf = binary.LittleEndian.AppendUint64(buf, ref.length)
 		for live := chunk.live; live != 0; live &= live - 1 {
 			slot := bits.TrailingZeros64(live)
-			key := chunk.keys[slot]
+			key := chunk.key(slot)
 			if uint64(len(key)) > math.MaxUint32 {
 				return nil, ErrStorePersistTooLarge
 			}
@@ -281,7 +291,7 @@ func storePersistManifestSize(refs []storePersistChunkRef, indexes []StoreIndexI
 		}
 		for live := ref.chunk.live; live != 0; live &= live - 1 {
 			slot := bits.TrailingZeros64(live)
-			keyLen := uint64(len(ref.chunk.keys[slot]))
+			keyLen := uint64(len(ref.chunk.key(slot)))
 			if keyLen > math.MaxUint32 || !add(keyLen) {
 				return 0, ErrStorePersistTooLarge
 			}
@@ -477,6 +487,26 @@ func (m storePersistManifest) open(data []byte) (*Store, error) {
 		source:     data,
 		chunks:     storeChunkVectorWithHighWater(m.chunkHighWater),
 	}
+	baseKeys, err := newStoreMappedKeys(m.bytes, int(m.count))
+	if err != nil {
+		return nil, fmt.Errorf("simdjson: OpenStore key directory: %w", err)
+	}
+	state.baseKeys = baseKeys
+	opened := false
+	defer func() {
+		if opened {
+			return
+		}
+		baseKeys.release()
+		state.mappedDocs.release()
+	}()
+	if persistNativeLittleEndian {
+		mappedDocs, allocErr := newStoreMappedDocs(int(m.count))
+		if allocErr != nil {
+			return nil, fmt.Errorf("simdjson: OpenStore document directory: %w", allocErr)
+		}
+		state.mappedDocs = mappedDocs
+	}
 	store := &Store{Options: m.options, options: m.options}
 	store.free.pos = make(map[uint32]int)
 	store.postingChunks.pos = make(map[uint32]int)
@@ -503,10 +533,10 @@ func (m storePersistManifest) open(data []byte) (*Store, error) {
 		}
 
 		chunk := &storeChunk{
-			keys:  make([]string, m.options.ChunkDocuments),
-			ord:   make([]uint8, m.options.ChunkDocuments),
-			live:  live,
-			count: uint8(count),
+			mappedKeys: baseKeys,
+			mappedBase: uint64(seenKeys),
+			live:       live,
+			count:      uint8(count),
 		}
 		var slotsSeen, ordSeen uint64
 		for i := uint32(0); i < count; i++ {
@@ -516,6 +546,7 @@ func (m storePersistManifest) open(data []byte) (*Store, error) {
 			}
 			slot, ord := keyHeader[0], keyHeader[1]
 			keyLen := binary.LittleEndian.Uint32(keyHeader[4:8])
+			keyOffset := r.pos
 			keyBytes := r.bytes(uint64(keyLen))
 			bit := uint64(1) << slot
 			ordBit := uint64(1) << ord
@@ -526,13 +557,14 @@ func (m storePersistManifest) open(data []byte) (*Store, error) {
 			}
 			key := byteview.String(keyBytes)
 			hash := maphash.String(seed, key)
-			if _, duplicate := storeKeyLookup(state.keys, hash, key); duplicate {
+			ref := uint64(seenKeys)
+			baseKeys.refs[ref] = storeMappedKeyRef{
+				off: keyOffset, length: keyLen, loc: storeLocation{chunk: id, slot: slot},
+			}
+			if inserted := baseKeys.insert(hash, ref); !inserted {
 				return nil, fmt.Errorf("%w: duplicate key %q", ErrStorePersistCorrupt, key)
 			}
-			chunk.keys[slot], chunk.ord[slot] = key, ord
-			storeKeyInsertTransient(&state.keys, 0, &storeKeyLeaf{
-				hash: hash, key: key, loc: storeLocation{chunk: id, slot: slot},
-			})
+			chunk.ord[slot] = ord
 			slotsSeen |= bit
 			ordSeen |= ordBit
 			seenKeys++
@@ -540,8 +572,15 @@ func (m storePersistManifest) open(data []byte) (*Store, error) {
 		if slotsSeen != live || ordSeen != lowBits64(count) {
 			return nil, fmt.Errorf("%w: chunk %d incomplete slot map", ErrStorePersistCorrupt, id)
 		}
-		if err := openDocSetInto(&chunk.docs, data[offset:offset+length]); err != nil {
-			return nil, fmt.Errorf("%w: chunk %d: %v", ErrStorePersistCorrupt, id, err)
+		page := data[offset : offset+length]
+		var openErr error
+		if state.mappedDocs != nil {
+			openErr = openDocSetIntoStore(&chunk.docs, page, state.mappedDocs, uint64(seenKeys)-uint64(count))
+		} else {
+			openErr = openDocSetInto(&chunk.docs, page)
+		}
+		if openErr != nil {
+			return nil, fmt.Errorf("%w: chunk %d: %v", ErrStorePersistCorrupt, id, openErr)
 		}
 		if chunk.docs.Len() != int(count) || chunk.docs.ShapeTapes != m.options.ShapeTapes ||
 			chunk.docs.ValueDict != m.options.ValueDict || chunk.docs.Options != m.options.IndexOptions ||
@@ -580,6 +619,7 @@ func (m storePersistManifest) open(data []byte) (*Store, error) {
 		store.reclaim = &storeIndexReclaim{}
 	}
 	store.state.Store(state)
+	opened = true
 	return store, nil
 }
 
@@ -673,12 +713,11 @@ func (m storePersistManifest) openDeadlines(r *persistReader, store *Store, stat
 			return fmt.Errorf("%w: TTL keys not unique/sorted", ErrStorePersistCorrupt)
 		}
 		hash := maphash.String(state.seed, key)
-		loc, ok := storeKeyLookup(state.keys, hash, key)
+		_, loc, ok := storeStateKeyLookupChunk(state, hash, key)
 		if !ok {
 			return fmt.Errorf("%w: TTL key %q missing", ErrStorePersistCorrupt, key)
 		}
-		storedKey := state.chunks.get(loc.chunk).keys[loc.slot]
-		store.ttl.upsert(storedKey, storeInstant{sec: sec, nsec: int32(nsec)})
+		store.ttl.upsert(storeTTLKeyOf(loc), storeInstant{sec: sec, nsec: int32(nsec)})
 		previous = key
 	}
 	return nil

@@ -117,6 +117,10 @@ jobs:
         if: ${{ matrix.primary }}
         run: ./scripts/check-amd64-stage1-isa.sh "$RUNNER_TEMP/gotip/bin/go"
 
+      - name: Verify amd64 bitmap ISA policy
+        if: ${{ matrix.primary }}
+        run: ./scripts/check-amd64-bitset-isa.sh "$RUNNER_TEMP/gotip/bin/go"
+
       - name: Future compiler tag retains portable SIMD fallback
         run: >-
           $RUNNER_TEMP/gotip/bin/go test

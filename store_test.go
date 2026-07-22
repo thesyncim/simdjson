@@ -267,15 +267,15 @@ func TestStoreCoverageSparsePagesAndClone(t *testing.T) {
 
 func TestStoreTTLHeapDifferential(t *testing.T) {
 	var ttl storeTTLState
-	want := make(map[string]storeInstant)
+	want := make(map[storeTTLKey]storeInstant)
 	rng := rand.New(rand.NewSource(19))
 	for step := 0; step < 10_000; step++ {
-		key := fmt.Sprintf("k%d", rng.Intn(200))
+		key := storeTTLKey(rng.Intn(200))
 		if rng.Intn(4) == 0 {
 			removed := ttl.remove(key)
 			_, existed := want[key]
 			if removed != existed {
-				t.Fatalf("step %d remove(%q) = %v, want %v", step, key, removed, existed)
+				t.Fatalf("step %d remove(%d) = %v, want %v", step, key, removed, existed)
 			}
 			delete(want, key)
 		} else {

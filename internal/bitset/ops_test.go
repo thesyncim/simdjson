@@ -37,6 +37,9 @@ func TestBooleanDifferential(t *testing.T) {
 				t.Fatalf("%s n=%d mismatch", test.name, n)
 			}
 		}
+		if got, want := And3(append([]uint64{}, prefix...), a, b, a), refAnd3(append([]uint64{}, prefix...), a, b, a); !slices.Equal(got, want) {
+			t.Fatalf("and3 n=%d mismatch", n)
+		}
 
 		// Exact in-place aliasing is a load-before-store requirement of every
 		// vector block and catches accidental output/input overlap assumptions.
@@ -48,7 +51,13 @@ func TestBooleanDifferential(t *testing.T) {
 		}
 		aliasA := cloneWords(a, max(len(a), len(b)))
 		checkAlias("and-a", And(aliasA[:0], aliasA, b), refAnd(nil, a, b))
+		aliasA = cloneWords(a, max(len(a), len(b)))
+		checkAlias("and3-a", And3(aliasA[:0], aliasA, b, a), refAnd3(nil, a, b, a))
 		aliasB := cloneWords(b, max(len(a), len(b)))
+		checkAlias("and3-b", And3(aliasB[:0], a, aliasB, a), refAnd3(nil, a, b, a))
+		aliasC := cloneWords(a, max(len(a), len(b)))
+		checkAlias("and3-c", And3(aliasC[:0], a, b, aliasC), refAnd3(nil, a, b, a))
+		aliasB = cloneWords(b, max(len(a), len(b)))
 		checkAlias("and-b", And(aliasB[:0], a, aliasB), refAnd(nil, a, b))
 		aliasA = cloneWords(a, max(len(a), len(b)))
 		checkAlias("or-a", Or(aliasA[:0], aliasA, b), refOr(nil, a, b))
@@ -56,6 +65,8 @@ func TestBooleanDifferential(t *testing.T) {
 		checkAlias("or-b", Or(aliasB[:0], a, aliasB), refOr(nil, a, b))
 		aliasA = cloneWords(a, len(a))
 		checkAlias("and-not-a", AndNot(aliasA[:0], aliasA, b), refAndNot(nil, a, b))
+		aliasB = cloneWords(b, max(len(a), len(b)))
+		checkAlias("and-not-b", AndNot(aliasB[:0], a, aliasB), refAndNot(nil, a, b))
 	}
 }
 
@@ -68,6 +79,13 @@ func cloneWords(src []uint64, capacity int) []uint64 {
 func refAnd(dst, a, b []uint64) []uint64 {
 	for i := 0; i < min(len(a), len(b)); i++ {
 		dst = append(dst, a[i]&b[i])
+	}
+	return dst
+}
+
+func refAnd3(dst, a, b, c []uint64) []uint64 {
+	for i := 0; i < min(len(a), len(b), len(c)); i++ {
+		dst = append(dst, a[i]&b[i]&c[i])
 	}
 	return dst
 }
@@ -115,6 +133,12 @@ func TestBooleanSteadyAllocs(t *testing.T) {
 		if allocs != 0 {
 			t.Fatalf("%s allocated %.2f times, want 0", test.name, allocs)
 		}
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		dst = And3(dst[:0], a, b, a)
+	})
+	if allocs != 0 {
+		t.Fatalf("And3 allocated %.2f times, want 0", allocs)
 	}
 }
 

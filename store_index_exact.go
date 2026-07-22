@@ -472,7 +472,7 @@ func (s Snapshot) AppendLiveMasks(dst []StoreMask) []StoreMask {
 // AppendIndexKeys is [Snapshot.AppendIndexRows] with key materialization.
 func (s Snapshot) AppendIndexKeys(dst []string, name string, values ...Index) ([]string, error) {
 	err := s.visitIndexMatches(name, values, func(_ uint32, chunk *storeChunk, slot int) {
-		dst = append(dst, chunk.keys[slot])
+		dst = append(dst, chunk.key(slot))
 	})
 	return dst, err
 }

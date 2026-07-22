@@ -77,10 +77,19 @@ type DocSet struct {
 	// for the representation and its proof obligations.
 	Postings bool
 
-	docs       []Index
-	srcChunk   []byte       // current source arena chunk
-	entryChunk []IndexEntry // current entry arena chunk
-	scratch    []IndexEntry // spill tape for documents the entry chunk cannot hold
+	docs []Index
+	// mappedDocs is Store-only compact metadata for a DocSet page reopened
+	// from a validated image. It replaces per-document slice and shape pointers
+	// with pointer-free external descriptors; mappedShapes scales with distinct
+	// layouts, not documents. Public Open keeps the ordinary representation.
+	mappedDocs   *storeMappedDocs
+	mappedShapes []*shapeRecord
+	mappedBase   uint64
+	mappedCount  int
+	mappedNarrow int
+	srcChunk     []byte       // current source arena chunk
+	entryChunk   []IndexEntry // current entry arena chunk
+	scratch      []IndexEntry // spill tape for documents the entry chunk cannot hold
 
 	// Shape-tape state (docset_shape.go): tapeRefs is empty or docs-aligned
 	// and holds each document's dedup header; narrow is the slab of 8-byte
@@ -187,6 +196,9 @@ func (s *DocSet) entryChunkMinimum() int {
 
 // Len returns the number of stored documents.
 func (s *DocSet) Len() int {
+	if s.mappedDocs != nil {
+		return s.mappedCount
+	}
 	return len(s.docs)
 }
 
@@ -207,7 +219,7 @@ func (s *DocSet) Doc(i int) Index {
 	if r := s.shapeTapeRefAt(i); r.rec != nil {
 		return s.widenShapeTape(i, r)
 	}
-	return s.docs[i]
+	return s.docAt(i)
 }
 
 // Append copies src into the set, validates and indexes the copy, and returns
@@ -330,9 +342,9 @@ func (s *DocSet) AppendPointer(dst []RawValue, pointer CompiledPointer) ([]RawVa
 	if len(pointer.tokens) > 0 {
 		key0 = CompiledKey{key: pointer.tokens[0].text, hash: pointer.tokens[0].hash}
 	}
-	for i := range s.docs {
+	for i := 0; i < s.Len(); i++ {
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
-			doc := &s.docs[i]
+			doc := s.docAt(i)
 			if len(pointer.tokens) == 0 {
 				// The empty pointer selects the root; its span is the header's.
 				dst = append(dst, RawValue{src: doc.src[r.start:r.end]})
@@ -351,7 +363,7 @@ func (s *DocSet) AppendPointer(dst []RawValue, pointer CompiledPointer) ([]RawVa
 				// ValueDict a dictionary-backed value reads its interned span
 				// from the shared arena instead — byte-identical.
 				if r.narrow {
-					nv := s.narrow[r.off+uint32(ord)]
+					nv := s.narrowAt(i, r, int(ord))
 					raw := RawValue{src: doc.src[nv.span&0xFFFF : nv.span>>16]}
 					if s.ValueDict {
 						raw = s.valueRaw(i, nv.span&0xFFFF, raw)
@@ -375,7 +387,7 @@ func (s *DocSet) AppendPointer(dst []RawValue, pointer CompiledPointer) ([]RawVa
 			var wide IndexEntry
 			var node Node
 			if r.narrow {
-				wide = s.narrow[r.off+uint32(ord)].widen()
+				wide = s.narrowAt(i, r, int(ord)).widen()
 				node = Node{src: &doc.src[0], entry: &wide}
 			} else {
 				node = Node{src: &doc.src[0], entry: &doc.entries[ord]}
@@ -395,7 +407,7 @@ func (s *DocSet) AppendPointer(dst []RawValue, pointer CompiledPointer) ([]RawVa
 			dst = append(dst, raw)
 			continue
 		}
-		node, ok, err := s.docs[i].PointerCompiled(pointer)
+		node, ok, err := s.docAt(i).PointerCompiled(pointer)
 		if err != nil {
 			return dst[:mark], err
 		}
@@ -433,7 +445,7 @@ func (s *DocSet) AppendPointerRows(dst []RawValue, rows []int, pointer CompiledP
 	}
 	for _, i := range rows {
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
-			doc := &s.docs[i]
+			doc := s.docAt(i)
 			if len(pointer.tokens) == 0 {
 				dst = append(dst, RawValue{src: doc.src[r.start:r.end]})
 				continue
@@ -446,7 +458,7 @@ func (s *DocSet) AppendPointerRows(dst []RawValue, rows []int, pointer CompiledP
 			rest := pointer.tokens[1:]
 			if len(rest) == 0 {
 				if r.narrow {
-					nv := s.narrow[r.off+uint32(ord)]
+					nv := s.narrowAt(i, r, int(ord))
 					raw := RawValue{src: doc.src[nv.span&0xFFFF : nv.span>>16]}
 					if s.ValueDict {
 						raw = s.valueRaw(i, nv.span&0xFFFF, raw)
@@ -465,7 +477,7 @@ func (s *DocSet) AppendPointerRows(dst []RawValue, rows []int, pointer CompiledP
 			var wide IndexEntry
 			var node Node
 			if r.narrow {
-				wide = s.narrow[r.off+uint32(ord)].widen()
+				wide = s.narrowAt(i, r, int(ord)).widen()
 				node = Node{src: &doc.src[0], entry: &wide}
 			} else {
 				node = Node{src: &doc.src[0], entry: &doc.entries[ord]}
@@ -485,7 +497,7 @@ func (s *DocSet) AppendPointerRows(dst []RawValue, rows []int, pointer CompiledP
 			dst = append(dst, raw)
 			continue
 		}
-		node, ok, err := s.docs[i].PointerCompiled(pointer)
+		node, ok, err := s.docAt(i).PointerCompiled(pointer)
 		if err != nil {
 			return dst[:mark], err
 		}

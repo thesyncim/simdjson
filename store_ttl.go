@@ -18,6 +18,19 @@ type storeDeadline struct {
 	deadline storeInstant
 }
 
+// storeTTLKey is a stable-slot address packed without pointers. TTL metadata
+// is writer-owned and every delete removes its entry before the slot can be
+// reused, so no generation or key spelling is needed in the heap or pos map.
+type storeTTLKey uint64
+
+func storeTTLKeyOf(loc storeLocation) storeTTLKey {
+	return storeTTLKey(uint64(loc.chunk)<<8 | uint64(loc.slot))
+}
+
+func (k storeTTLKey) location() storeLocation {
+	return storeLocation{chunk: uint32(uint64(k) >> 8), slot: uint8(k)}
+}
+
 // storeInstant preserves nanosecond precision without time.UnixNano's 1678 to
 // 2262 range restriction. Lexicographic (seconds,nanoseconds) order is time
 // order because Time.Unix normalizes nanoseconds into [0,1e9).
@@ -43,20 +56,24 @@ func (i storeInstant) sub(t time.Time) time.Duration {
 }
 
 type storeTTLState struct {
-	heap []storeDeadline
-	pos  map[string]int
+	heap []storeTTLItem
+	pos  map[storeTTLKey]int
 	wake chan struct{}
 }
 
+type storeTTLItem struct {
+	key      storeTTLKey
+	deadline storeInstant
+}
+
 type storeExpiryItem struct {
-	key  string
 	hash uint64
 	loc  storeLocation
 }
 
-func (t *storeTTLState) upsert(key string, deadline storeInstant) {
+func (t *storeTTLState) upsert(key storeTTLKey, deadline storeInstant) {
 	if t.pos == nil {
-		t.pos = make(map[string]int)
+		t.pos = make(map[storeTTLKey]int)
 	}
 	if i, ok := t.pos[key]; ok {
 		old := t.heap[i].deadline
@@ -69,12 +86,12 @@ func (t *storeTTLState) upsert(key string, deadline storeInstant) {
 		return
 	}
 	i := len(t.heap)
-	t.heap = append(t.heap, storeDeadline{key: key, deadline: deadline})
+	t.heap = append(t.heap, storeTTLItem{key: key, deadline: deadline})
 	t.pos[key] = i
 	t.up(i)
 }
 
-func (t *storeTTLState) remove(key string) bool {
+func (t *storeTTLState) remove(key storeTTLKey) bool {
 	i, ok := t.pos[key]
 	if !ok {
 		return false
@@ -83,17 +100,17 @@ func (t *storeTTLState) remove(key string) bool {
 	return true
 }
 
-func (t *storeTTLState) removeAt(i int) storeDeadline {
+func (t *storeTTLState) removeAt(i int) storeTTLItem {
 	removed := t.heap[i]
 	last := len(t.heap) - 1
 	delete(t.pos, removed.key)
 	if i == last {
-		t.heap[last] = storeDeadline{}
+		t.heap[last] = storeTTLItem{}
 		t.heap = t.heap[:last]
 		return removed
 	}
 	t.heap[i] = t.heap[last]
-	t.heap[last] = storeDeadline{}
+	t.heap[last] = storeTTLItem{}
 	t.heap = t.heap[:last]
 	t.pos[t.heap[i].key] = i
 	if i > 0 && t.heap[i].deadline.before(t.heap[(i-1)/4].deadline) {
@@ -162,7 +179,7 @@ func (s *Store) SetDeadline(key string, deadline time.Time) bool {
 		return false
 	}
 	hash := maphashString(state.seed, key)
-	loc, ok := storeKeyLookup(state.keys, hash, key)
+	_, loc, ok := storeStateKeyLookupChunk(state, hash, key)
 	if !ok {
 		return false
 	}
@@ -170,8 +187,7 @@ func (s *Store) SetDeadline(key string, deadline time.Time) bool {
 	if !deadline.After(now) {
 		return s.deleteLocked(key)
 	}
-	storedKey := state.chunks.get(loc.chunk).keys[loc.slot]
-	s.ttl.upsert(storedKey, instantOf(deadline))
+	s.ttl.upsert(storeTTLKeyOf(loc), instantOf(deadline))
 	s.notifyExpiryLocked()
 	return true
 }
@@ -180,7 +196,15 @@ func (s *Store) SetDeadline(key string, deadline time.Time) bool {
 func (s *Store) Persist(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	removed := s.ttl.remove(key)
+	state := s.state.Load()
+	if state == nil {
+		return false
+	}
+	_, loc, ok := storeStateKeyLookupChunk(state, maphashString(state.seed, key), key)
+	if !ok {
+		return false
+	}
+	removed := s.ttl.remove(storeTTLKeyOf(loc))
 	if removed {
 		s.notifyExpiryLocked()
 	}
@@ -192,7 +216,15 @@ func (s *Store) Persist(key string) bool {
 func (s *Store) Deadline(key string) (time.Time, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	i, ok := s.ttl.pos[key]
+	state := s.state.Load()
+	if state == nil {
+		return time.Time{}, false
+	}
+	_, loc, ok := storeStateKeyLookupChunk(state, maphashString(state.seed, key), key)
+	if !ok {
+		return time.Time{}, false
+	}
+	i, ok := s.ttl.pos[storeTTLKeyOf(loc)]
 	if !ok {
 		return time.Time{}, false
 	}
@@ -205,7 +237,15 @@ func (s *Store) Deadline(key string) (time.Time, bool) {
 func (s *Store) TTLAt(key string, now time.Time) (time.Duration, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	i, ok := s.ttl.pos[key]
+	state := s.state.Load()
+	if state == nil {
+		return 0, false
+	}
+	_, loc, ok := storeStateKeyLookupChunk(state, maphashString(state.seed, key), key)
+	if !ok {
+		return 0, false
+	}
+	i, ok := s.ttl.pos[storeTTLKeyOf(loc)]
 	if !ok {
 		return 0, false
 	}
@@ -229,10 +269,13 @@ func (s *Store) ExpireDue(now time.Time, limit int) int {
 	s.expireScratch = s.expireScratch[:0]
 	for len(s.ttl.heap) != 0 && !s.ttl.heap[0].deadline.after(deadline) && (limit <= 0 || len(s.expireScratch) < limit) {
 		entry := s.ttl.removeAt(0)
-		hash := maphashString(state.seed, entry.key)
-		if loc, ok := storeKeyLookup(state.keys, hash, entry.key); ok {
-			s.expireScratch = append(s.expireScratch, storeExpiryItem{key: entry.key, hash: hash, loc: loc})
+		loc := entry.key.location()
+		chunk := state.chunks.get(loc.chunk)
+		if chunk == nil || chunk.live&(uint64(1)<<loc.slot) == 0 {
+			continue
 		}
+		hash := maphashString(state.seed, chunk.key(int(loc.slot)))
+		s.expireScratch = append(s.expireScratch, storeExpiryItem{hash: hash, loc: loc})
 	}
 	if len(s.expireScratch) == 0 {
 		return 0
@@ -257,16 +300,16 @@ func (s *Store) ExpireDue(now time.Time, limit int) int {
 	catalogChanged, secondaryChanged := false, false
 	for first := 0; first < len(s.expireScratch); {
 		chunkID := s.expireScratch[first].loc.chunk
+		old := state.chunks.get(chunkID)
 		last := first
 		var remove uint64
 		for last < len(s.expireScratch) && s.expireScratch[last].loc.chunk == chunkID {
 			item := s.expireScratch[last]
 			remove |= uint64(1) << item.loc.slot
-			next.keys = storeKeyDelete(next.keys, item.hash, item.key)
+			next.keys = storeKeyDelete(next.keys, item.hash, old.key(int(item.loc.slot)))
 			next.count--
 			last++
 		}
-		old := state.chunks.get(chunkID)
 		chunk, err := buildStoreChunk(state.options, s.postingsRequiredLocked(), old, old.live&^remove, -1, "", nil)
 		if err != nil {
 			panic("simdjson: rebuilding validated Store chunk: " + err.Error())

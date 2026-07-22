@@ -29,6 +29,14 @@ type StoreStats struct {
 	IndexedChunks int
 	// IndexReclaiming reports detached physical postings still being removed.
 	IndexReclaiming bool
+	// MappedImageBytes is the caller-owned image retained by OpenStore.
+	MappedImageBytes uint64
+	// ExternalKeyBytes is pointer-free mapped key-directory metadata outside
+	// Go HeapAlloc on supported Unix platforms. It remains process RSS.
+	ExternalKeyBytes uint64
+	// ExternalDocumentBytes is pointer-free mapped document-descriptor
+	// metadata outside Go HeapAlloc on supported Unix platforms.
+	ExternalDocumentBytes uint64
 }
 
 // Stats returns current writer and publication counters without traversing
@@ -45,7 +53,7 @@ func (s *Store) Stats() StoreStats {
 		}
 		return StoreStats{ChunkDocuments: chunkDocuments}
 	}
-	return StoreStats{
+	stats := StoreStats{
 		Generation:      state.generation,
 		Keys:            state.count,
 		Chunks:          state.chunkCount,
@@ -57,6 +65,10 @@ func (s *Store) Stats() StoreStats {
 		IndexedChunks:   len(s.postingChunks.ids),
 		IndexReclaiming: s.reclaim != nil,
 	}
+	stats.MappedImageBytes = uint64(len(state.source))
+	stats.ExternalKeyBytes = state.baseKeys.externalBytes()
+	stats.ExternalDocumentBytes = state.mappedDocs.externalBytes()
+	return stats
 }
 
 // NextExpiration returns the earliest assigned deadline. Expired keys remain

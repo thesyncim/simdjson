@@ -66,20 +66,20 @@ const (
 func (c *ShapeCache) AppendFieldInt64(dst []int64, valid []bool, s *DocSet, name string) ([]int64, []bool) {
 	fs := newFieldScan(name)
 	var th shapeTapeHint
-	for i := range s.docs {
+	for i := 0; i < s.Len(); i++ {
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
 			// A shape-taped document's proven value entry takes the same
 			// kernel dispatch as a proven positional read below.
 			var n int64
 			var ok bool
 			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
-				doc := &s.docs[i]
+				doc := s.docAt(i)
 				if r.narrow {
 					// The verbatim info word keeps the integer probe
 					// identical; only the span unpacks, and only the rare
 					// non-integer spelling widens into a stack entry for
 					// the accessor.
-					nv := s.narrow[r.off+uint32(ord)]
+					nv := s.narrowAt(i, r, int(ord))
 					if nv.info&infoIntNumberMask == infoIntNumberBits {
 						n, ok = tapeInt64(&doc.src[0], nv.span&0xFFFF, nv.span>>16)
 					} else {
@@ -99,7 +99,7 @@ func (c *ShapeCache) AppendFieldInt64(dst []int64, valid []bool, s *DocSet, name
 			valid = append(valid, ok)
 			continue
 		}
-		root := s.docs[i].Root()
+		root := s.docAt(i).Root()
 		if root.entry == nil {
 			dst = append(dst, 0)
 			valid = append(valid, false)
@@ -144,14 +144,14 @@ func (c *ShapeCache) AppendFieldInt64(dst []int64, valid []bool, s *DocSet, name
 func (c *ShapeCache) AppendFieldFloat64(dst []float64, valid []bool, s *DocSet, name string) ([]float64, []bool) {
 	fs := newFieldScan(name)
 	var th shapeTapeHint
-	for i := range s.docs {
+	for i := 0; i < s.Len(); i++ {
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
 			var f float64
 			var ok bool
 			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
-				doc := &s.docs[i]
+				doc := s.docAt(i)
 				if r.narrow {
-					c.wide = s.narrow[r.off+uint32(ord)].widen()
+					c.wide = s.narrowAt(i, r, int(ord)).widen()
 					f, ok = (Node{src: &doc.src[0], entry: &c.wide}).Float64()
 				} else {
 					f, ok = (Node{src: &doc.src[0], entry: &doc.entries[ord]}).Float64()
@@ -164,7 +164,7 @@ func (c *ShapeCache) AppendFieldFloat64(dst []float64, valid []bool, s *DocSet, 
 			valid = append(valid, ok)
 			continue
 		}
-		root := s.docs[i].Root()
+		root := s.docAt(i).Root()
 		if root.entry == nil {
 			dst = append(dst, 0)
 			valid = append(valid, false)
@@ -198,14 +198,14 @@ func (c *ShapeCache) AppendFieldFloat64(dst []float64, valid []bool, s *DocSet, 
 func (c *ShapeCache) AppendFieldBool(dst []bool, valid []bool, s *DocSet, name string) ([]bool, []bool) {
 	fs := newFieldScan(name)
 	var th shapeTapeHint
-	for i := range s.docs {
+	for i := 0; i < s.Len(); i++ {
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
 			var b bool
 			var ok bool
 			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
-				doc := &s.docs[i]
+				doc := s.docAt(i)
 				if r.narrow {
-					c.wide = s.narrow[r.off+uint32(ord)].widen()
+					c.wide = s.narrowAt(i, r, int(ord)).widen()
 					b, ok = (Node{src: &doc.src[0], entry: &c.wide}).Bool()
 				} else {
 					b, ok = (Node{src: &doc.src[0], entry: &doc.entries[ord]}).Bool()
@@ -215,7 +215,7 @@ func (c *ShapeCache) AppendFieldBool(dst []bool, valid []bool, s *DocSet, name s
 			valid = append(valid, ok)
 			continue
 		}
-		root := s.docs[i].Root()
+		root := s.docAt(i).Root()
 		if root.entry == nil {
 			dst = append(dst, false)
 			valid = append(valid, false)

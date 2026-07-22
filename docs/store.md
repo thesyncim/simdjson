@@ -32,7 +32,7 @@ raw, ok := view.GetRaw("user:42")
 | `Put(key, json)` | `created=true` on insert; validates and copies input | O(replacement bytes + one chunk's metadata + radix height) |
 | `Delete(key)` | true when the key existed | O(one chunk's metadata + radix height) |
 | `Snapshot()` | immutable current view | O(1) |
-| `GetRaw(key)` / `Snapshot.GetRaw(key)` | borrowed exact JSON bytes | O(keyed-HAMT depth + full-key check) |
+| `GetRaw(key)` / `Snapshot.GetRaw(key)` | borrowed exact JSON bytes | O(heap-directory depth or mapped group probes + full-key check) |
 | `Get(key)` / `Snapshot.Get(key)` | borrowed navigable `Index` | same lookup; first compact-tape widening may allocate |
 | `CompileKey(key)` | caches seeded hash and verified stable slot | one ordinary key lookup |
 | `GetRawKey` / `GetKey` | compiled-key read with safe full-lookup fallback | O(chunk radix height) on a stable-slot hit |
@@ -49,6 +49,8 @@ raw, ok := view.GetRaw("user:42")
 | `BackfillIndex(name, k)` | examines at most `k` start-snapshot chunks | exact: O(k × live slots × columns); wildcard: O(k bounded chunk builds) |
 | `ReclaimIndexes(k)` | rebuilds at most `k` physically indexed chunks | O(k bounded chunk builds) |
 | `AppendIndexRows/Masks/Keys` | exact lookup through one declared index | O(posting chunks + exact collision checks) |
+| `AppendIndexBitmap` / `AppendLiveBitmap` | append one dense stable-slot word per logical page | O(page high-water + exact lookup work) |
+| `AppendStoreBitmapAnd/And3/Or/AndNot` | combine dense caller-owned workspaces | O(shortest or longest input words), zero allocation with capacity |
 | `query.RunSnapshotInto` | late-bound indexed query over a snapshot | candidate masks + selected-column work |
 
 A non-positive `ExpireDue`, `BackfillIndex`, or `ReclaimIndexes` limit means all
@@ -188,22 +190,21 @@ key := store.CompileKey("session:7")
 raw, ok := store.Snapshot().GetRawKey(key)
 ```
 
-The fast path verifies the live bit and complete key spelling before returning
-bytes. If delete/reinsert moved the key, it was absent at compilation, or the
-handle is accidentally used with another Store, lookup falls back to the full
-seeded HAMT path. A handle stores no chunk pointer, so keeping it does not pin an
-obsolete document page. On the 65,536-key fixture, `GetRawKey` measures
-7.99-8.50 ns versus 21.92-23.88 ns for ordinary `GetRaw`, both at zero
-allocations.
+The fast path verifies the live bit. Within the exact generation captured at
+compile time, the publication identity proves the slot's complete spelling;
+after any publication it rechecks the current spelling or resolves through the
+key directories. Delete/reinsert, an initially absent key, and cross-Store use
+therefore fall back safely. A handle stores no chunk pointer, so keeping it does
+not pin an obsolete document page. Both ordinary and compiled reads allocate
+zero bytes.
 
 ## Store images and mapped source bytes
 
-Store source arenas are `[]byte` objects. They contain no pointers, so the GC
-does not scan each JSON byte, but they still count as live heap and therefore
-affect the pacer and heap target. Moving payload bytes to an external mapping
-can lower Go `HeapAlloc`; it does not make those bytes disappear from RSS or
-from the Store's total memory footprint, and the key directory, tapes, shapes,
-snapshots, TTL, and index metadata remain ordinary Go objects.
+Heap-built Store source arenas are `[]byte` objects. They contain no pointers,
+so the GC does not scan each JSON byte, but they still count as live heap and
+therefore affect the pacer and heap target. A mapped image lowers Go
+`HeapAlloc`; it does not make those bytes disappear from RSS or the Store's
+total memory footprint.
 
 `Store.WriteTo` emits a Store-native container of the existing bounded `DocSet`
 page images plus a checksummed tail manifest. It records effective options,
@@ -218,12 +219,18 @@ Applications can checkpoint periodically for backup or faster restart; a
 durable primary store still needs the append-only page/root commit path below.
 
 `OpenStore(image)` validates the complete directory before publishing a
-mutable Store. Source bytes and native tape sections view `image` directly;
-the key directory receives a fresh process-local `maphash` seed; exact-index
-roots are rebuilt by the normal bulk constructor; and later `Put`, `Delete`,
-TTL, and index operations publish ordinary immutable generations. A Store
-image cannot contain a `Building` index: finish or drop the definition before
-calling `WriteTo`.
+mutable Store. Source bytes and native tape sections view `image` directly.
+On supported Unix systems, one process-seeded Swiss-style key directory and
+one 32-byte-per-row record directory live in anonymous pointer-free mappings,
+outside Go `HeapAlloc`; their eight-control-byte group probes use native SWAR
+and every hit still verifies the complete key. A chunk holds only Store-wide
+owners and base ordinals, rather than a string header and two slice pointers
+per row. Post-open changes use the existing immutable HAMT only as a delta.
+TTL locations are packed integers, so the deadline heap and position map retain
+no key strings. Exact-index roots and distinct shape records are still rebuilt
+as Go objects. Later `Put`, `Delete`, TTL, and index operations publish ordinary
+immutable generations. A Store image cannot contain a `Building` index: finish
+or drop the definition before calling `WriteTo`.
 
 For a file-backed image, map it read-only and pass the mapped slice to
 `OpenStore`. The caller owns the mapping and must keep it immutable and mapped
@@ -235,20 +242,48 @@ copy-out and allocate zero bytes when `dst` has enough capacity. Automatic
 unmapping and finalizer-based ownership remain deliberately absent.
 
 The image is a startup/off-heap boundary, not yet the completed 100x-RAM
-engine. On the 16,384-document local fixture, the mapped image is 5.40 MB;
-`OpenStore` currently reconstructs about 3.35 MB of heap metadata in 1.74-1.94
-ms for keys only, or 3.58 MB in 3.41-3.48 ms with one compound exact index.
-Mapping avoids the 5.40 MB heap copy, but opening still eagerly constructs the
-per-document key HAMT, `DocSet` row metadata, and exact-index root. The exact
+engine. On the 16,384-document local fixture, the mapped image is 5.40 MB. A
+key-only open takes 1.04-1.05 ms and allocates 234,688-234,689 Go-heap bytes in
+273 allocations; its pointer-free metadata is 688,136 external key bytes plus
+524,288 external row bytes. Compared with the former per-key HAMT/per-row
+`Index` reopen (about 3.36 MiB, 19,206 allocations, and 1.74-1.82 ms), that is
+about 93% less Go-heap metadata, 98.6% fewer allocations, and 40% lower open
+latency. One compound exact index raises open to 2.64-2.67 ms and about 450.6
+KB Go heap because that root is not mapped yet. The exact
 root rebuild can fault document pages. `BenchmarkStorePersistOpenMapped`
-reports both `mapped-B` and `B/op` so this ratio cannot disappear behind a
-throughput number.
+reports `mapped-B`, both external metadata classes, `B/op`, and `allocs/op` so
+the RSS/heap distinction cannot disappear behind one throughput number.
 
 Once open, mapped source bytes add no steady allocation or ownership wrapper:
-ordinary keyed reads measured 7.69-7.87 ns and compiled stable-slot reads
-5.095-5.110 ns. A nested two-column exact query selecting 32 documents from two
-of 256 micro-pages measured 2.28-2.32 us, also at zero allocations. These rows
+ordinary keyed reads measured 9.22-9.29 ns and generation-pinned compiled reads
+4.63-4.66 ns. A nested two-column exact query selecting 32 documents from two
+of 256 micro-pages measured 2.55-2.61 us, also at zero allocations. These rows
 measure a hot mapping after eager open; they are not cold-storage latency.
+
+### Dense Boolean workspaces
+
+`StoreMask` is the compact interchange form for selective predicates: a sorted
+`(chunk, uint64)` stream omits empty pages. A repeated or less-selective plan can
+instead call `StoreBitmapWords`, fill reusable buffers with
+`AppendIndexBitmap`/`AppendLiveBitmap`, and combine them with
+`AppendStoreBitmapAnd`, `AppendStoreBitmapAnd3`, `AppendStoreBitmapOr`, or
+`AppendStoreBitmapAndNot`. The word index is the logical page id and each bit is
+a stable slot, so no row decoding occurs until `AppendBitmapRows` or
+`AppendBitmapKeys` consumes the final candidates.
+
+Every append form is allocation-free with sufficient caller capacity and
+supports exact in-place Boolean execution. Three-way AND is fused to avoid an
+intermediate write/read pass. Pinned Go 1.27 `GOEXPERIMENT=simd` builds use two
+independent 256-bit vectors per loop on amd64. GOAMD64 v1/v2 performs one
+process-constant AVX2 capability branch per bitmap call and otherwise executes
+the scalar reference; v3+ calls AVX2 directly. Generated-code CI verifies that
+the v1/v2 dispatch contains no vector instruction before the guard and that
+the vector bodies retain `VPAND`, `VPOR`, `VPANDN`, and `VZEROUPPER`. M4 Max
+NEON measured only parity with the scalar loop at roughly 75-80 GB/s, so arm64
+deliberately keeps the scalar dispatch. Sparse page-id merges remain scalar
+because converting a selective stream to dense words merely to reach SIMD
+would lose. `BenchmarkStoreDenseBitmapPlan` measures both the fused kernel and
+ordered row decoding through the public Store surface.
 
 `WriteTo` streams the same 5.40 MB image in 1.07-1.09 ms (4.96-5.04 GB/s)
 with three allocations total on this fixture. Persistence headers, endian
@@ -345,9 +380,12 @@ format and churn benchmark exist.
 
 ## TTL
 
-TTL metadata is writer-only: one indexed four-ary heap node and one position
-entry per expiring key. Changing a deadline updates that node in place;
-`Persist` removes it. Repeated changes do not create stale generations.
+TTL metadata is writer-only: one pointer-free packed `(chunk, slot)` plus a
+deadline in the indexed four-ary heap, and one integer-keyed position entry per
+expiring row. It retains no key string. Changing a deadline updates that node
+in place; `Persist` removes it. Delete removes the entry before its stable slot
+can be reused, so repeated changes do not create stale generations or require a
+slot-generation pointer.
 
 ```go
 store.SetTTL("session:7", 30*time.Minute) // ttl <= 0 deletes immediately
@@ -541,6 +579,8 @@ allocation-free operational snapshot:
 - `ReusableChunks`: partial or empty ids available to writes;
 - `ExpiringKeys`: exact heap-node count;
 - `Indexes`, `IndexedChunks`, and `IndexReclaiming`.
+- `MappedImageBytes`, `ExternalKeyBytes`, and `ExternalDocumentBytes`; mapped
+  bytes remain RSS even when they do not contribute to Go `HeapAlloc`.
 
 `Snapshot.AppendIndexes` returns reader-visible index name, kind, ordered paths,
 state, covered chunks, and total chunks. `Snapshot.IndexStats` adds the physical

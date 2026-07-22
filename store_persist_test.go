@@ -98,8 +98,16 @@ func TestStorePersistRoundTripIndexesTTLAndMutation(t *testing.T) {
 		t.Fatalf("Options = %+v, want %+v", reopened.Options, store.Options)
 	}
 	afterStats := reopened.Stats()
-	if afterStats != beforeStats {
-		t.Fatalf("Stats = %+v, want %+v", afterStats, beforeStats)
+	if afterStats.MappedImageBytes != uint64(image.Len()) || afterStats.ExternalKeyBytes == 0 ||
+		afterStats.ExternalDocumentBytes == 0 {
+		t.Fatalf("mapped Stats = %+v, want image=%d and external key metadata", afterStats, image.Len())
+	}
+	afterComparable := afterStats
+	afterComparable.MappedImageBytes = 0
+	afterComparable.ExternalKeyBytes = 0
+	afterComparable.ExternalDocumentBytes = 0
+	if afterComparable != beforeStats {
+		t.Fatalf("Stats = %+v, want operational fields %+v", afterStats, beforeStats)
 	}
 	checkStoreSnapshot(t, reopened.Snapshot(), want)
 	for key, deadline := range deadlines {

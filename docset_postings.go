@@ -160,7 +160,7 @@ func (p *docPostings) indexShapeValues(s *DocSet, index Index, ref shapeTapeRef,
 	for m := range rec.fields {
 		var entry *IndexEntry
 		if ref.narrow {
-			p.wide = s.narrow[int(ref.off)+m].widen()
+			p.wide = s.narrowAt(int(ord), ref, m).widen()
 			entry = &p.wide
 		} else {
 			entry = &index.entries[m]
@@ -229,7 +229,7 @@ func (p *docPostings) addValue(pathHash uint32, valueHash uint64, ord int32) {
 // already appended, so the query paths fall back to a correct full scan rather
 // than trusting a partial index.
 func (s *DocSet) postingsReady() bool {
-	return s.postings != nil && s.postings.docs == len(s.docs)
+	return s.postings != nil && s.postings.docs == s.Len()
 }
 
 // WhereExists returns, in ascending order, the ordinals of the documents whose
@@ -268,7 +268,7 @@ func (s *DocSet) AppendWhereExists(dst []int, path string) []int {
 		}
 	}
 	for _, ord := range p.remainder {
-		if _, ok := s.docs[ord].Root().Get(path); ok {
+		if _, ok := s.docAt(int(ord)).Root().Get(path); ok {
 			dst = append(dst, int(ord))
 		}
 	}
@@ -290,14 +290,14 @@ func (s *DocSet) whereExistsScan(path string) []int {
 
 func (s *DocSet) appendWhereExistsScan(dst []int, path string) []int {
 	key := CompileKey(path)
-	for i := range s.docs {
+	for i := 0; i < s.Len(); i++ {
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
 			if _, ok := r.rec.fieldOrd(key.key, key.hash); ok {
 				dst = append(dst, i)
 			}
 			continue
 		}
-		if _, ok := s.docs[i].Root().GetCompiled(key); ok {
+		if _, ok := s.docAt(i).Root().GetCompiled(key); ok {
 			dst = append(dst, i)
 		}
 	}
@@ -369,7 +369,7 @@ func (s *DocSet) whereContainsScan(path string, needle Node) []int {
 
 func (s *DocSet) appendWhereContainsScan(dst []int, path string, needle Node) []int {
 	key := CompileKey(path)
-	for i := range s.docs {
+	for i := 0; i < s.Len(); i++ {
 		if s.fieldContainsAt(i, key, needle) {
 			dst = append(dst, i)
 		}
@@ -390,13 +390,13 @@ func (s *DocSet) fieldContainsAt(doc int, key CompiledKey, needle Node) bool {
 		if !ok {
 			return false
 		}
-		stored := &s.docs[doc]
+		stored := s.docAt(doc)
 		if r.narrow {
-			return narrowContains(stored.src, s.narrow[int(r.off+ord)], needle)
+			return narrowContains(stored.src, s.narrowAt(doc, r, int(ord)), needle)
 		}
 		return (Node{src: &stored.src[0], entry: &stored.entries[ord]}).Contains(needle)
 	}
-	v, ok := s.docs[doc].Root().GetCompiled(key)
+	v, ok := s.docAt(doc).Root().GetCompiled(key)
 	return ok && v.Contains(needle)
 }
 

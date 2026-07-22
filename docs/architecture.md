@@ -78,29 +78,36 @@ replace mode deliberately resets absent state.
 ## Mutable Store publication
 
 `Store` is the only root type that combines mutation with concurrent reads.
-Mutation is serialized; readers retain an immutable state pointer. The keyed
-HAMT and chunk radix vector are path-copied, and a changed document chunk is
-built completely before atomic publication. A replacement owns new source and
-tape storage; unchanged rows share their already-immutable source and classic
-tape backing into the new chunk. Dense row headers and the chunk-relative
-narrow-value slab are private copies. The new shape cache imports only records
-referenced by surviving rows, so sharing cannot accumulate dead layout history.
-TTL and index-lifecycle cursors remain writer-only. Reader state contains only
-immutable index metadata and declared-index roots. A declared posting addresses
-one bounded chunk through a stable-slot `uint64`; Boolean planning therefore
-combines 64 rows at a time before `ord[slot]` maps survivors into the dense
-`DocSet`. Nested keys reuse compiled-pointer/shape extraction instead of a
-parallel decoder. `Snapshot.GetRaw` never locks, reads a clock, checks a
-tombstone, or consults mutable metadata. `Snapshot.Get` retains the existing
-`DocSet.Doc` contract: the first access to a compact shape tape may enter a
-synchronized memoization cache and allocate its equivalent classic tape.
+Mutation is serialized; readers retain an immutable state pointer. Heap-built
+Stores path-copy a keyed HAMT and the chunk radix vector. `OpenStore` instead
+keeps its immutable base keys in one pointer-free Swiss-style directory and
+uses the HAMT only as a post-open delta; a hit always verifies complete key
+spelling. A changed document chunk is built completely before atomic
+publication. A replacement owns new source and tape storage; unchanged rows
+share their already-immutable source and classic tape backing into the new
+chunk. Dense row headers and the chunk-relative narrow-value slab are private
+copies. The new shape cache imports only records referenced by surviving rows,
+so sharing cannot accumulate dead layout history. TTL and index-lifecycle
+cursors remain writer-only. Reader state contains only immutable index metadata
+and declared-index roots. A declared posting addresses one bounded chunk
+through a stable-slot `uint64`; Boolean planning therefore combines 64 rows at
+a time before `ord[slot]` maps survivors into the dense `DocSet`. Nested keys
+reuse compiled-pointer/shape extraction instead of a parallel decoder.
+`Snapshot.GetRaw` never locks, reads a clock, checks a tombstone, or consults
+mutable metadata. `Snapshot.Get` retains the existing `DocSet.Doc` contract:
+the first access to a compact shape tape may enter a synchronized memoization
+cache and allocate its equivalent classic tape.
 
 `Store.WriteTo` serializes one captured publication as bounded `DocSet` page
 images plus Store metadata. `OpenStore` validates the complete directory,
-borrows source/native tape sections from the caller's image, rebuilds the
-process-seeded key and declared-index roots through the normal constructors,
-and publishes an ordinary mutable Store. Later states keep the base image
-reachable. The caller owns any underlying mapping; the package never unmaps it.
+borrows source/native tape sections from the caller's image, builds a
+process-seeded external key directory and 32-byte external row descriptors,
+rebuilds declared-index roots and distinct shapes through the normal
+constructors, and publishes an ordinary mutable Store. Later states keep the
+base image and external-directory owners reachable. The caller owns any
+underlying file mapping; the package never unmaps it. Anonymous pointer-free
+metadata mappings are released only when no state or chunk can reach their
+owner; finalizers are a resource backstop, not borrowed-value lifetime policy.
 
 Deleted rows are absent from the rebuilt dense row table; deleting a final row
 publishes a nil radix leaf without constructing an empty chunk. Tree traversal

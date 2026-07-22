@@ -1,10 +1,11 @@
 # ADR 0005: one Store surface, bulk construction, and mapped pages
 
 Status: accepted in stages. Transient construction, the caller-owned
-Store-image boundary, the scoped pure-Go Linux ring substrate, and the bounded
-internal page committer are implemented. Store page encoding and attachment,
-double-root recovery, the swizzled read-page manager, and bounded residency
-remain proposed. Extends ADR 0004 without changing its borrowed-value lifetime
+Store-image boundary with pointer-free base metadata, dense stable-slot Boolean
+workspaces, the scoped pure-Go Linux ring substrate, and the bounded internal
+page committer are implemented. Store page encoding and attachment, double-root
+recovery, the swizzled read-page manager, and bounded residency remain
+proposed. Extends ADR 0004 without changing its borrowed-value lifetime
 contract.
 
 ## Decision
@@ -98,10 +99,12 @@ the existing bounded `DocSet` page images. Its checksummed tail manifest holds
 effective options, generation, stable slot/key maps, reusable empty page ids,
 Ready index definitions, wildcard posting consumers, and TTL deadlines.
 `OpenStore` validates that directory, views source/native tape sections in the
-caller's image, rebuilds the process-seeded key HAMT and exact-index roots
-through the normal bulk constructors, and returns a Store that can immediately
-be updated or deleted from. Subsequent publications retain the mapped base
-through the immutable state graph.
+caller's image, constructs a process-seeded Swiss-style base key directory and
+32-byte row descriptors in pointer-free anonymous memory, rebuilds exact-index
+roots through the normal bulk constructors, and returns a Store that can
+immediately be updated or deleted from. The persistent HAMT is only a post-open
+mutation delta. Subsequent publications retain the mapped base owners through
+the immutable state graph.
 
 `WriteTo` is a full checkpoint/export, not the transaction persistence path.
 It writes every live micro-page, and mutations after `OpenStore` do not update
@@ -115,17 +118,21 @@ copy-out with zero allocation when capacity is sufficient. A `Building` index
 cannot be serialized because restoring partial coverage would make latency and
 fallback behavior image-dependent.
 
-The 16,384-document fixture produces a 5.40 MB image. Mapped open currently
-allocates about 3.35 MB and takes 1.74-1.94 ms for keys only; one compound exact
-index raises that to about 3.58 MB and 3.41-3.48 ms. Those bytes are eager key,
-row, shape, and index metadata. This is a useful off-heap payload/startup
-boundary, but the ratio is explicit evidence that it is not the final
-greater-than-memory representation.
+The 16,384-document fixture produces a 5.40 MB image. A key-only mapped open
+takes 1.04-1.05 ms and allocates 234,688-234,689 Go-heap bytes in 273
+allocations, plus 688,136 pointer-free external key bytes and 524,288 external
+row bytes. Against the earlier per-key HAMT/per-row reopen, this is about 93%
+less Go heap, 98.6% fewer allocations, and 40% lower open latency. One compound
+exact index raises open to 2.64-2.67 ms and about 450.6 KB Go heap because its
+root is not mapped yet. This is a useful off-heap payload/startup boundary, but
+the remaining eager validation and root reconstruction are explicit evidence
+that it is not the final greater-than-memory representation.
 
-After open, the same mapping measured 7.69-7.87 ns for ordinary keyed reads,
-5.095-5.110 ns for compiled stable-slot reads, and 2.28-2.32 us for a zero-
-allocation compound query selecting 32 rows from two of 256 micro-pages. These
-are hot-mapping measurements, not promises for storage faults.
+After open, the same mapping measured 9.22-9.29 ns for ordinary keyed reads,
+4.63-4.66 ns for compiled generation-pinned stable-slot reads, and 2.55-2.61 us
+for a zero-allocation compound query selecting 32 rows from two of 256
+micro-pages. These are hot-mapping measurements, not promises for storage
+faults.
 
 Writing the 5.40 MB fixture measures 1.07-1.09 ms (4.96-5.04 GB/s) and three
 allocations total. Generated-code inspection showed that passing stack record
@@ -136,11 +143,12 @@ stream every nested page without per-row or per-page heap objects.
 ## Greater-than-memory mode
 
 The current Store image can be larger than physical memory as a virtual
-mapping, but `OpenStore` eagerly rebuilds metadata for every key and row and
-rebuilds exact roots from documents. It therefore cannot promise a bounded
-resident working set or a 100x-RAM corpus yet. The mapping is bounded by
-virtual address space, Go's `int` slice length, the image format, and existing
-per-document 32-bit coordinate limits.
+mapping, but `OpenStore` still validates every key and row, allocates external
+metadata proportional to both, and rebuilds distinct shapes and exact roots
+from documents. It therefore cannot promise a bounded resident working set or
+a 100x-RAM corpus yet. The mapping is bounded by virtual address space, Go's
+`int` slice length, the image format, and existing per-document 32-bit
+coordinate limits.
 
 The engineering target for mapped Store is a data image at least 100 times the
 configured resident budget, provided the workload's hot key/index/page working
@@ -353,10 +361,13 @@ I/O rather than demand-paged writable mappings.
 ## Query and TTL consequences
 
 Declared nested and compound indexes keep the same scalar fingerprint and
-mandatory exact-recheck semantics. Their physical posting becomes a hierarchy
-of page-level masks; Boolean composition remains one native word per 64 rows.
-The executor must expose page-fault and bytes-touched metrics in addition to
-nanoseconds and result counts.
+mandatory exact-recheck semantics. Current postings already expose sparse
+page-level masks plus caller-owned dense words with one bit per stable slot.
+Two- and fused three-input Boolean kernels use runtime-gated 256-bit AVX2 on
+amd64 when it wins; selective sparse streams stay scalar. The external physical
+posting becomes a hierarchy of the same page masks. That executor must expose
+page-fault and bytes-touched metrics in addition to nanoseconds and result
+counts.
 
 TTL remains publication-based. Deadlines can live in a compact writer-side
 heap for the active write process or in a persistent deadline index, but an

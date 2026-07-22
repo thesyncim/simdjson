@@ -155,6 +155,7 @@ shape_column_typed_test.go
 shape_test.go
 store_test.go
 store_builder_test.go
+store_bitmap_test.go
 store_index_exact_test.go
 store_persist_test.go
 internal/storeio/ring_linux_test.go
@@ -196,7 +197,9 @@ encoder_lifetime_test.go
 gc_corruption_test.go
 gc_lifetime_test.go
 internal/byteview/byteview_test.go
+internal/storemem/block_test.go
 ownership_lifetime_test.go
+store_mapped_keys_test.go
 typed_slice_words_test.go
 ```
 
@@ -235,6 +238,7 @@ internal/kernels/stage1_portable_test.go
 internal/kernels/stage1_stream_test.go
 internal/kernels/stage1_test.go
 internal/kernels/stage2_index_test.go
+internal/bitset/ops_dispatch_amd64_test.go
 internal/bitset/ops_test.go
 ```
 

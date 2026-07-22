@@ -71,15 +71,15 @@ import (
 func (c *ShapeCache) AppendField(dst []RawValue, s *DocSet, name string) []RawValue {
 	fs := newFieldScan(name)
 	var th shapeTapeHint
-	for i := range s.docs {
+	for i := 0; i < s.Len(); i++ {
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
-			doc := &s.docs[i]
+			doc := s.docAt(i)
 			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
 				// Both widths are one array index; the narrow read unpacks
 				// its two 16-bit offsets from half the memory traffic.
 				var start, end uint32
 				if r.narrow {
-					nv := s.narrow[r.off+uint32(ord)]
+					nv := s.narrowAt(i, r, int(ord))
 					start, end = nv.span&0xFFFF, nv.span>>16
 				} else {
 					v := &doc.entries[ord]
@@ -91,7 +91,7 @@ func (c *ShapeCache) AppendField(dst []RawValue, s *DocSet, name string) []RawVa
 			}
 			continue
 		}
-		root := s.docs[i].Root()
+		root := s.docAt(i).Root()
 		if root.entry == nil {
 			dst = append(dst, RawValue{})
 			continue
@@ -126,11 +126,11 @@ func (c *ShapeCache) AppendFieldRows(dst []RawValue, s *DocSet, rows []int, name
 	var th shapeTapeHint
 	for _, i := range rows {
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
-			doc := &s.docs[i]
+			doc := s.docAt(i)
 			if ord := th.lookup(r.rec, fs.key); ord >= 0 {
 				var start, end uint32
 				if r.narrow {
-					nv := s.narrow[r.off+uint32(ord)]
+					nv := s.narrowAt(i, r, int(ord))
 					start, end = nv.span&0xFFFF, nv.span>>16
 				} else {
 					v := &doc.entries[ord]
@@ -146,7 +146,7 @@ func (c *ShapeCache) AppendFieldRows(dst []RawValue, s *DocSet, rows []int, name
 			}
 			continue
 		}
-		root := s.docs[i].Root()
+		root := s.docAt(i).Root()
 		if root.entry == nil {
 			dst = append(dst, RawValue{})
 			continue
@@ -438,9 +438,9 @@ func (c *ShapeCache) AppendFields(dst [][]RawValue, s *DocSet, names ...string) 
 		tapeRec  *shapeRecord
 		tapeOrds []int32
 	)
-	for i := range s.docs {
+	for i := 0; i < s.Len(); i++ {
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
-			doc := &s.docs[i]
+			doc := s.docAt(i)
 			if r.rec != tapeRec {
 				tapeRec = r.rec
 				if tapeOrds == nil {
@@ -457,7 +457,7 @@ func (c *ShapeCache) AppendFields(dst [][]RawValue, s *DocSet, names ...string) 
 				if ord >= 0 {
 					var start, end uint32
 					if r.narrow {
-						nv := s.narrow[r.off+uint32(ord)]
+						nv := s.narrowAt(i, r, int(ord))
 						start, end = nv.span&0xFFFF, nv.span>>16
 					} else {
 						v := &doc.entries[ord]
@@ -470,7 +470,7 @@ func (c *ShapeCache) AppendFields(dst [][]RawValue, s *DocSet, names ...string) 
 			}
 			continue
 		}
-		root := s.docs[i].Root()
+		root := s.docAt(i).Root()
 		var shape Shape
 		var ok bool
 		switch e := root.entry; {

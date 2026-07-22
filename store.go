@@ -99,6 +99,12 @@ type storeState struct {
 	seed       maphash.Seed
 	options    StoreOptions
 	keys       *storeKeyNode
+	// baseKeys is the compact immutable directory of an OpenStore image.
+	// keys is then only the path-copied overlay for post-open insertions and
+	// moved keys. Heap-built Stores leave baseKeys nil and keep the complete
+	// directory in keys, preserving their existing hot path and mutation cost.
+	baseKeys   *storeMappedKeys
+	mappedDocs *storeMappedDocs
 	chunks     storeChunkVector
 	indexes    []StoreIndexInfo
 	secondary  []storeIndexSnapshot
@@ -110,11 +116,13 @@ type storeState struct {
 }
 
 type storeChunk struct {
-	docs  DocSet
-	keys  []string
-	ord   []uint8
-	live  uint64
-	count uint8
+	docs       DocSet
+	keys       []string
+	mappedKeys *storeMappedKeys
+	mappedBase uint64
+	ord        [storeMaxChunkDocuments]uint8
+	live       uint64
+	count      uint8
 }
 
 type storeIDSet struct {
@@ -217,7 +225,7 @@ func prepareStoreDocSet(docs *DocSet, options StoreOptions, postings bool, old *
 			// An insertion has no old row to size from. Reserve the current
 			// average so a same-shape replacement—the common case when a freed
 			// slot is reused—does not grow and recopy the whole narrow slab.
-			narrowCap += len(old.docs.narrow) / int(old.count)
+			narrowCap += old.docs.narrowLen() / int(old.count)
 		}
 	}
 	if narrowCap != 0 {
@@ -231,7 +239,7 @@ func prepareStoreDocSet(docs *DocSet, options StoreOptions, postings bool, old *
 // and rewrite the private offset before commit. commitDoc then rebuilds any
 // enabled chunk-local postings or value dictionary against the new ordinal.
 func appendStoreDoc(dst *DocSet, old *DocSet, oldOrd int) int {
-	index := old.docs[oldOrd]
+	index := old.docAt(oldOrd)
 	ref := old.shapeTapeRefAt(oldOrd)
 	promoted := false
 	if ref.rec == nil && dst.ShapeTapes {
@@ -239,9 +247,11 @@ func appendStoreDoc(dst *DocSet, old *DocSet, oldOrd int) int {
 	}
 	if ref.narrow && !promoted {
 		n := uint32(len(ref.rec.fields))
-		start := ref.off
+		oldRef := ref
 		ref.off = uint32(len(dst.narrow))
-		dst.narrow = append(dst.narrow, old.narrow[start:start+n]...)
+		for i := uint32(0); i < n; i++ {
+			dst.narrow = append(dst.narrow, old.narrowAt(oldOrd, oldRef, int(i)))
+		}
 	}
 	return dst.commitDoc(index, ref)
 }
@@ -300,11 +310,13 @@ func buildStoreChunk(options StoreOptions, postings bool, old *storeChunk, live 
 	}
 	chunk := &storeChunk{
 		keys: make([]string, options.ChunkDocuments),
-		ord:  make([]uint8, options.ChunkDocuments),
 	}
 	prepareStoreDocSet(&chunk.docs, options, postings, old, live, replaceSlot)
 	if old != nil {
-		copy(chunk.keys, old.keys)
+		for bitsLeft := old.live; bitsLeft != 0; bitsLeft &= bitsLeft - 1 {
+			slot := bits.TrailingZeros64(bitsLeft)
+			chunk.keys[slot] = old.key(slot)
+		}
 	}
 	chunk.live = live
 	if old != nil {
@@ -357,7 +369,14 @@ func cloneStoreChunk(options StoreOptions, postings bool, old *storeChunk) (*sto
 }
 
 func (c *storeChunk) rawSlot(slot int) []byte {
-	return c.docs.docs[c.ord[slot]].src
+	return c.docs.rawAt(int(c.ord[slot]))
+}
+
+func (c *storeChunk) key(slot int) string {
+	if c.keys != nil {
+		return c.keys[slot]
+	}
+	return c.mappedKeys.keyAt(c.mappedBase, c.ord[slot])
 }
 
 func (s *Store) initLocked() (*storeState, error) {
@@ -388,10 +407,9 @@ func (s *Store) Put(key string, src []byte) (created bool, err error) {
 		return false, err
 	}
 	hash := maphash.String(state.seed, key)
-	loc, found := storeKeyLookup(state.keys, hash, key)
+	old, loc, found := storeStateKeyLookupChunk(state, hash, key)
 	if found {
-		old := state.chunks.get(loc.chunk)
-		storedKey := old.keys[loc.slot]
+		storedKey := old.key(int(loc.slot))
 		chunk, err := rebuildStoreChunk(state.options, s.postingsRequiredLocked(), old, int(loc.slot), storedKey, src, true)
 		if err != nil {
 			return false, err
@@ -466,11 +484,10 @@ func (s *Store) deleteLocked(key string) bool {
 		return false
 	}
 	hash := maphash.String(state.seed, key)
-	loc, found := storeKeyLookup(state.keys, hash, key)
+	old, loc, found := storeStateKeyLookupChunk(state, hash, key)
 	if !found {
 		return false
 	}
-	old := state.chunks.get(loc.chunk)
 	chunk, err := rebuildStoreChunk(state.options, s.postingsRequiredLocked(), old, int(loc.slot), "", nil, false)
 	if err != nil {
 		panic("simdjson: rebuilding validated Store chunk: " + err.Error())
@@ -485,7 +502,7 @@ func (s *Store) deleteLocked(key string) bool {
 	}
 	s.noteChunkPostingsLocked(loc.chunk, old, chunk)
 	s.addFreeLocked(loc.chunk)
-	if s.ttl.remove(key) {
+	if s.ttl.remove(storeTTLKeyOf(loc)) {
 		s.notifyExpiryLocked()
 	}
 	catalogChanged, secondaryChanged := s.noteIndexesForChunkLocked(loc.chunk, old, chunk, uint64(1)<<loc.slot)
@@ -595,12 +612,23 @@ func (s Snapshot) GetRaw(key string) (RawValue, bool) {
 		return RawValue{}, false
 	}
 	hash := maphash.String(s.state.seed, key)
-	loc, ok := storeKeyLookup(s.state.keys, hash, key)
-	if !ok {
-		return RawValue{}, false
+	// An untouched mapped directory has no heap overlay. Replacements keep a
+	// base key at its stable slot and deletes clear the live bit; inserting any
+	// non-base location creates the overlay. This dominant reopen/read path can
+	// therefore avoid the general overlay router and a duplicate chunk walk.
+	if s.state.baseKeys != nil && s.state.keys == nil {
+		loc, ok := s.state.baseKeys.lookup(hash, key)
+		if !ok {
+			return RawValue{}, false
+		}
+		chunk := s.state.chunks.get(loc.chunk)
+		if chunk == nil || chunk.live&(uint64(1)<<loc.slot) == 0 {
+			return RawValue{}, false
+		}
+		return RawValue{src: chunk.rawSlot(int(loc.slot))}, true
 	}
-	chunk := s.state.chunks.get(loc.chunk)
-	if chunk == nil || chunk.live&(uint64(1)<<loc.slot) == 0 {
+	chunk, loc, ok := storeStateKeyLookupChunk(s.state, hash, key)
+	if !ok {
 		return RawValue{}, false
 	}
 	return RawValue{src: chunk.rawSlot(int(loc.slot))}, true
@@ -615,12 +643,19 @@ func (s Snapshot) Get(key string) (Index, bool) {
 		return Index{}, false
 	}
 	hash := maphash.String(s.state.seed, key)
-	loc, ok := storeKeyLookup(s.state.keys, hash, key)
-	if !ok {
-		return Index{}, false
+	if s.state.baseKeys != nil && s.state.keys == nil {
+		loc, ok := s.state.baseKeys.lookup(hash, key)
+		if !ok {
+			return Index{}, false
+		}
+		chunk := s.state.chunks.get(loc.chunk)
+		if chunk == nil || chunk.live&(uint64(1)<<loc.slot) == 0 {
+			return Index{}, false
+		}
+		return chunk.docs.Doc(int(chunk.ord[loc.slot])), true
 	}
-	chunk := s.state.chunks.get(loc.chunk)
-	if chunk == nil || chunk.live&(uint64(1)<<loc.slot) == 0 {
+	chunk, loc, ok := storeStateKeyLookupChunk(s.state, hash, key)
+	if !ok {
 		return Index{}, false
 	}
 	return chunk.docs.Doc(int(chunk.ord[loc.slot])), true
@@ -635,7 +670,7 @@ func (s Snapshot) Range(fn func(key string, value RawValue) bool) {
 	s.state.chunks.each(func(_ uint32, chunk *storeChunk) bool {
 		for live := chunk.live; live != 0; live &= live - 1 {
 			slot := bits.TrailingZeros64(live)
-			if !fn(chunk.keys[slot], RawValue{src: chunk.rawSlot(slot)}) {
+			if !fn(chunk.key(slot), RawValue{src: chunk.rawSlot(slot)}) {
 				return false
 			}
 		}

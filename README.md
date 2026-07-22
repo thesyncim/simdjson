@@ -159,8 +159,8 @@ store.Delete("session:42")
 // The old immutable view remains valid after both mutations.
 raw, ok := before.GetRaw("session:42")
 
-// Repeated reads can bypass hashing and the key trie through a verified stable
-// slot; delete/reinsert movement falls back to the complete lookup.
+// Repeated reads can bypass hashing and the key directory through a verified
+// stable slot; delete/reinsert movement falls back to the complete lookup.
 raw, ok = before.GetRawKey(sessionKey)
 ```
 
@@ -208,9 +208,11 @@ dst, ok := reopened.AppendRaw(make([]byte, 0, 256), "session:42")
 The image bytes must remain immutable and live until the Store, retained
 snapshots, and borrowed values are dead. `AppendRaw`/`AppendRawKey` make an
 owned copy into caller capacity and allocate nothing after capacity is warm.
-Opening currently rebuilds key/row metadata and exact-index roots eagerly, so
-this is an off-heap payload boundary rather than a completed bounded-residency
-database. `WriteTo` is a full checkpoint, not a per-write durability path;
+Opening keeps the immutable key directory and 32-byte row descriptors in
+pointer-free anonymous memory on supported Unix systems. Page roots and chunk
+owners, the mutation overlay, shapes, optional accelerators, and exact-index
+roots remain Go objects. This is still not a completed bounded-residency
+database: `WriteTo` is a full checkpoint, not a per-write durability path, and
 post-open mutations do not update the image. The measured limit and automatic
 append-only 100x-RAM design are in
 [Mutable Store operations](docs/store.md).
@@ -250,6 +252,13 @@ var workspace query.Workspace
 err = q.RunSnapshotInto(&result, store.Snapshot(), &workspace)
 ```
 
+For a custom planner, `AppendIndexBitmap` and `AppendLiveBitmap` fill reusable
+dense page-word buffers. `AppendStoreBitmapAnd`, `AppendStoreBitmapAnd3`,
+`AppendStoreBitmapOr`, and `AppendStoreBitmapAndNot` combine them in place with
+zero allocation. Pinned Go 1.27 SIMD builds use runtime-gated 256-bit AVX2 on
+GOAMD64 v1/v2 and direct AVX2 on v3+, while sparse `(page, mask)` lists keep
+their scalar merge path.
+
 Online indexes publish as `Building`, dual-maintain concurrent writes, backfill
 in caller-bounded chunk batches, and become `Ready` at complete coverage.
 Snapshot probes remain exact during build through scan fallback. Dropping
@@ -278,17 +287,18 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Immutable `Store.GetRaw` point read | 21.9-23.9 ns, 0 allocations |
 | Compiled stable-slot `Store.GetRawKey` | 8.0-8.5 ns, 0 allocations |
 | Bulk `StoreBuilder` vs repeated `Put` | about 7.7x throughput, 93.7% fewer transient bytes |
-| Mapped `OpenStore`, 16,384 keys / 5.40 MB image | 1.74-1.94 ms, 3.35 MB heap metadata |
-| Mapped `OpenStore`, one compound exact index | 3.41-3.48 ms, 3.58 MB heap metadata |
-| Mapped keyed read, ordinary / compiled stable slot | 7.69-7.87 ns / 5.095-5.110 ns, 0 allocations |
-| Mapped compound query, 32 rows in 2/256 pages | 2.28-2.32 us, 0 allocations |
+| Mapped `OpenStore`, 16,384 keys / 5.40 MB image | 1.04-1.05 ms, 234.7 KB Go heap, 1.21 MB pointer-free external metadata |
+| Mapped `OpenStore`, one compound exact index | 2.64-2.67 ms, 450.6 KB Go heap, 1.21 MB pointer-free external metadata |
+| Mapped keyed read, ordinary / compiled stable slot | 9.22-9.29 ns / 4.63-4.66 ns, 0 allocations |
+| Mapped compound query, 32 rows in 2/256 pages | 2.55-2.61 us, 0 allocations |
 | `Store.WriteTo`, 5.40 MB / 16,384 documents | 1.07-1.09 ms, 4.96-5.04 GB/s, 3 allocations |
 | Default-chunk Store replace | 2.24 us median, 9.8 KiB/op |
 | Exact-index replace, indexed tuple unchanged | 2.46-2.49 us, 9.9 KiB/op, no added allocations |
 | Indexed Snapshot equality at 10% selectivity | 12.44 ns/input doc, 0 allocations |
 | Indexed Snapshot compound point query | 2.82 ns/input doc, 0 allocations |
+| Dense Store fused 3-predicate bitmap / ordered 4,096-row decode | 410-416 ns / 4.03-4.08 us, 0 allocations |
 | Change an existing TTL | 45 ns, 0 allocations |
-| Native-bitmap SIMD `AND` vs scalar | 2.1-2.6x six-run median, 0 allocations |
+| Dense bitmap Boolean pass on M4 Max | 75-80 GB/s, 0 allocations; NEON did not beat scalar and is not dispatched |
 
 One caveat belongs next to that table: a one-shot, single-path lookup on a
 document seen once favors non-validating scanners — gjson scans only for the

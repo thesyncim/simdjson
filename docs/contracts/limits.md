@@ -132,11 +132,15 @@ could wrap the persistent vector's address space. Empty ids are reused, making
 the theoretical limit unreachable under ordinary churn, but this is not a
 process memory budget.
 
-Each live Store key is present in the immutable key directory and one chunk
-slot. Each expiring key adds exactly one writer-side heap node and position-map
-entry; changing a TTL does not add a generation. Each physical posting chunk
-appears exactly once in writer reclamation metadata, even when multiple logical
-posting index names share it.
+Each live Store key is present in one chunk slot and is reachable through the
+heap key directory, the mapped immutable base directory, or a post-open heap
+delta. Mapped-base entries can remain after delete, but the stable-slot live bit
+and an exact spelling check make them unreachable; they are not reader-visible
+tombstones or version chains. Each expiring key adds exactly one pointer-free
+packed stable-slot/deadline heap node and one integer-keyed position-map entry;
+changing a TTL does not add a stale generation or retain the key string. Each
+physical posting chunk appears exactly once in writer reclamation metadata,
+even when multiple logical posting index names share it.
 
 A declared exact index has one to four RFC 6901 paths. Missing paths,
 incompatible traversal steps, and JSON containers are not indexed. Each
@@ -189,11 +193,22 @@ are unreachable. The package does not call `munmap`, retain an OS file handle,
 or infer lifetime from finalizers. `AppendRaw` and `AppendRawKey` copy exact JSON
 into caller storage when an independently owned result is required.
 
-Mapped image bytes do not count toward Go `HeapAlloc`, but current open still
-eagerly rebuilds per-key, per-row, shape, accelerator, and exact-index metadata.
-The image size is therefore not a resident-memory limit. Applications must
-measure both mapped bytes and reconstructed heap metadata; current Store images
-do not yet provide an eviction budget or a 100x-RAM guarantee.
+Mapped image bytes do not count toward Go `HeapAlloc`. On supported Unix
+systems, the immutable base key directory and one 32-byte descriptor per row
+also use pointer-free anonymous mappings outside `HeapAlloc`; they still count
+toward RSS. `OpenStore` validates every key and row and still eagerly rebuilds
+distinct shapes, optional accelerators, and declared exact-index roots as Go
+objects. The image size is therefore not a resident-memory limit. Applications
+must measure mapped image bytes, external metadata, and reconstructed heap
+metadata separately; current Store images do not yet provide an eviction budget
+or a 100x-RAM guarantee.
+
+Dense Store bitmap workspaces use one `uint64` per logical chunk high-water id,
+including empty historical ids. Prefer sparse `StoreMask` streams for selective
+predicates or unusually sparse address spaces. Empty ids are reused under
+ordinary churn. `StoreBitmapWords` panics before returning a wrapped length if
+an otherwise valid address span cannot be represented by the platform's `int`
+slice length.
 
 ## Limits that applications must add
 

@@ -9,16 +9,21 @@ import "hash/maphash"
 //
 // A StoreKey remains correct across updates and snapshots. When its key is
 // still live at the cached stable slot, lookup bypasses both string hashing and
-// the key HAMT. Delete/reinsert movement, an initially absent key, or use with
-// another Store falls back to a complete seeded-hash and full-key lookup. The
-// key spelling is borrowed like [CompiledKey]; keep that string immutable.
+// the key directories. Delete/reinsert movement, an initially absent key, or
+// use with another Store falls back to a complete seeded-hash and full-key
+// lookup. The key spelling is borrowed like [CompiledKey]; keep that string
+// immutable.
 // The zero value names the empty key and is safe to use.
 type StoreKey struct {
-	key     string
-	seed    maphash.Seed
-	hash    uint64
-	loc     storeLocation
-	located bool
+	key  string
+	seed maphash.Seed
+	hash uint64
+	loc  storeLocation
+	// generation proves that loc was resolved against the exact current
+	// publication. It adds no GC edge and lets repeated reads skip a redundant
+	// full-key comparison until any mutation publishes a newer state.
+	generation uint64
+	located    bool
 }
 
 // String returns the key spelling.
@@ -35,7 +40,8 @@ func (s Snapshot) CompileKey(key string) StoreKey {
 	}
 	compiled.seed = s.state.seed
 	compiled.hash = maphash.String(compiled.seed, key)
-	compiled.loc, compiled.located = storeKeyLookup(s.state.keys, compiled.hash, key)
+	compiled.loc, compiled.located = storeStateKeyLookup(s.state, compiled.hash, key)
+	compiled.generation = s.state.generation
 	return compiled
 }
 
@@ -53,13 +59,8 @@ func storeKeyCompiledFallback(state *storeState, key StoreKey) (*storeChunk, sto
 	if key.seed != state.seed {
 		hash = maphash.String(state.seed, key.key)
 	}
-	loc, ok := storeKeyLookup(state.keys, hash, key.key)
+	chunk, loc, ok := storeStateKeyLookupChunk(state, hash, key.key)
 	if !ok {
-		return nil, storeLocation{}, false
-	}
-	chunk := state.chunks.get(loc.chunk)
-	if chunk == nil || int(loc.slot) >= len(chunk.keys) ||
-		chunk.live&(uint64(1)<<loc.slot) == 0 || chunk.keys[loc.slot] != key.key {
 		return nil, storeLocation{}, false
 	}
 	return chunk, loc, true
@@ -72,8 +73,8 @@ func (s Snapshot) GetRawKey(key StoreKey) (RawValue, bool) {
 	if state != nil && key.located && key.seed == state.seed {
 		loc := key.loc
 		chunk := state.chunks.get(loc.chunk)
-		if chunk != nil && int(loc.slot) < len(chunk.keys) &&
-			chunk.live&(uint64(1)<<loc.slot) != 0 && chunk.keys[loc.slot] == key.key {
+		if chunk != nil && chunk.live&(uint64(1)<<loc.slot) != 0 &&
+			(key.generation == state.generation || chunk.key(int(loc.slot)) == key.key) {
 			return RawValue{src: chunk.rawSlot(int(loc.slot))}, true
 		}
 	}
@@ -91,8 +92,8 @@ func (s Snapshot) GetKey(key StoreKey) (Index, bool) {
 	if state != nil && key.located && key.seed == state.seed {
 		loc := key.loc
 		chunk := state.chunks.get(loc.chunk)
-		if chunk != nil && int(loc.slot) < len(chunk.keys) &&
-			chunk.live&(uint64(1)<<loc.slot) != 0 && chunk.keys[loc.slot] == key.key {
+		if chunk != nil && chunk.live&(uint64(1)<<loc.slot) != 0 &&
+			(key.generation == state.generation || chunk.key(int(loc.slot)) == key.key) {
 			return chunk.docs.Doc(int(chunk.ord[loc.slot])), true
 		}
 	}
