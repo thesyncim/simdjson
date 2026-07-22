@@ -144,7 +144,7 @@ func TestWriteTransactionReusesAndRollsBackSafeExtents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if page.Ref().Offset != 2*pageSize || tx.FileEnd() != 4*pageSize || reusable[0].Offset != 3*pageSize {
+	if page.Ref().Offset != 3*pageSize || tx.FileEnd() != 4*pageSize || reusable[0].Offset != 2*pageSize || reusable[0].Length != pageSize {
 		t.Fatalf("reused allocation = ref %+v fileEnd %d pool %+v", page.Ref(), tx.FileEnd(), reusable)
 	}
 	if err := tx.Abort(); err != nil {
@@ -172,7 +172,7 @@ func TestWriteTransactionReusesAndRollsBackSafeExtents(t *testing.T) {
 	if err := tx.Publish(state.Ref(), PageChecksum(state.Bytes()), 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if reusable[0].Offset != 3*pageSize || reusable[0].Length != pageSize {
+	if reusable[0].Offset != 2*pageSize || reusable[0].Length != pageSize {
 		t.Fatalf("Publish rolled back pool: %+v", reusable)
 	}
 }

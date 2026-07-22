@@ -111,7 +111,7 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 		return normalizedFileStoreOptions{}, fmt.Errorf("simdjson: FileStore overflow page has no payload")
 	}
 	overflowPages := (o.MaxDocumentBytes + overflowPayload - 1) / overflowPayload
-	maxTransactionPages := overflowPages + 32
+	maxTransactionPages := overflowPages + 48
 	if o.MaxRetiredExtents < maxTransactionPages {
 		return normalizedFileStoreOptions{}, fmt.Errorf("simdjson: FileStore MaxRetiredExtents must retain one worst-case transaction")
 	}
@@ -136,6 +136,7 @@ type fileStoreState struct {
 	stateRef  storeio.PageRef
 	keyRoot   storeio.PageRef
 	chunkRoot storeio.PageRef
+	freeRoot  storeio.PageRef
 }
 
 // FileStore is a bounded-residency, page-oriented JSON document store. It owns
@@ -162,6 +163,8 @@ type FileStore struct {
 	retireScratch []storeio.FreeExtent
 	reusable      []storeio.FreeExtent
 	reuseJournal  []storeio.ReuseEdit
+	freeLoaded    bool
+	unpersisted   int
 	appendChunk   uint32
 	appendLive    uint64
 }
@@ -266,9 +269,31 @@ func OpenFileStore(file *os.File, options FileStoreOptions) (*FileStore, error) 
 		Offset: super.StateOffset, LogicalID: storeio.StateRootLogicalID,
 		Generation: root.Generation, Length: super.StateLength, Kind: storeio.PageStateRoot,
 	}
+	var freeRoot storeio.PageRef
+	if super.FreeLength != 0 {
+		page := scratch[:super.FreeLength]
+		n, readErr := file.ReadAt(page, int64(super.FreeOffset))
+		if readErr != nil || n != len(page) {
+			_ = store.closeResources()
+			if readErr != nil {
+				return nil, readErr
+			}
+			return nil, storeio.ErrFreeDirectoryCorrupt
+		}
+		view, openErr := storeio.OpenFreeDirectoryPage(page, super.FileEnd, root.NextLogicalID)
+		if openErr != nil {
+			_ = store.closeResources()
+			return nil, openErr
+		}
+		header := view.Header()
+		freeRoot = storeio.PageRef{
+			Offset: super.FreeOffset, LogicalID: header.LogicalID, Generation: header.Generation,
+			Length: super.FreeLength, Kind: storeio.PageFreeDirectory,
+		}
+	}
 	state := &fileStoreState{
 		root: root, super: super, stateRef: stateRef,
-		keyRoot: root.KeyDirectory, chunkRoot: root.ChunkDirectory,
+		keyRoot: root.KeyDirectory, chunkRoot: root.ChunkDirectory, freeRoot: freeRoot,
 	}
 	store.state.Store(state)
 	store.appendChunk = root.ChunkHighWater
@@ -360,6 +385,7 @@ func (s *FileStore) createInitialState() error {
 		FileEnd: tx.FileEnd(), PageSize: uint32(s.options.PageSize),
 	}
 	s.state.Store(&fileStoreState{root: root, super: super, stateRef: statePage.Ref()})
+	s.freeLoaded = true
 	return nil
 }
 
@@ -733,11 +759,13 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, location s
 	if generation == 0 {
 		return false, storeio.ErrGenerationOrder
 	}
-	s.refreshReusable(state)
+	if err := s.refreshReusable(state); err != nil {
+		return false, err
+	}
 	tx, err := storeio.BeginWriteTransaction(s.committer, s.cache, s.options.maxTransactionPages, storeio.WriteTransactionOptions{
 		StoreID: s.storeID, Generation: generation, PageSize: uint32(s.options.PageSize),
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-		Reusable: s.reusable, ReuseJournal: s.reuseJournal,
+		Reusable: s.reusable, ReuseJournal: s.reuseJournal, SingleReuseExtent: true,
 	})
 	if err != nil {
 		return false, err
@@ -834,7 +862,11 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, location s
 			liveChunks++
 		}
 	}
-	nextState, statePage, err := s.stageFileState(tx, state, generation, prospectiveHighWater, documentCount, liveChunks, chunkMutation.Root, keyRoot)
+	freeRoot, freeChecksum, promoted, err := s.syncFileFreeTree(tx, state)
+	if err != nil {
+		return false, err
+	}
+	nextState, statePage, err := s.stageFileState(tx, state, generation, prospectiveHighWater, documentCount, liveChunks, chunkMutation.Root, keyRoot, freeRoot, freeChecksum)
 	if err != nil {
 		return false, err
 	}
@@ -842,11 +874,11 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, location s
 		return false, err
 	}
 	retirementReserved = true
-	if err := tx.Publish(statePage.Ref(), storeio.PageChecksum(statePage.Bytes()), 0, 0, 0); err != nil {
+	if err := tx.Publish(statePage.Ref(), storeio.PageChecksum(statePage.Bytes()), nextState.super.FreeOffset, nextState.super.FreeLength, nextState.super.FreeChecksum); err != nil {
 		return false, err
 	}
 	abort = false
-	s.compactReusable()
+	s.finalizeReusable(promoted)
 	s.snapshotGate.Lock()
 	s.state.Store(nextState)
 	s.snapshotGate.Unlock()
@@ -896,11 +928,13 @@ func (s *FileStore) Delete(key string) (bool, error) {
 
 func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location storeio.KeyLocation) (bool, error) {
 	generation := state.root.Generation + 1
-	s.refreshReusable(state)
+	if err := s.refreshReusable(state); err != nil {
+		return false, err
+	}
 	tx, err := storeio.BeginWriteTransaction(s.committer, s.cache, s.options.maxTransactionPages, storeio.WriteTransactionOptions{
 		StoreID: s.storeID, Generation: generation, PageSize: uint32(s.options.PageSize),
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-		Reusable: s.reusable, ReuseJournal: s.reuseJournal,
+		Reusable: s.reusable, ReuseJournal: s.reuseJournal, SingleReuseExtent: true,
 	})
 	if err != nil {
 		return false, err
@@ -975,9 +1009,13 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 	if live == 0 {
 		liveChunks--
 	}
+	freeRoot, freeChecksum, promoted, err := s.syncFileFreeTree(tx, state)
+	if err != nil {
+		return false, err
+	}
 	nextState, statePage, err := s.stageFileState(
 		tx, state, generation, state.root.ChunkHighWater,
-		state.root.DocumentCount-1, liveChunks, chunkRoot, keyMutation.Root,
+		state.root.DocumentCount-1, liveChunks, chunkRoot, keyMutation.Root, freeRoot, freeChecksum,
 	)
 	if err != nil {
 		return false, err
@@ -986,11 +1024,11 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 		return false, err
 	}
 	retirementReserved = true
-	if err := tx.Publish(statePage.Ref(), storeio.PageChecksum(statePage.Bytes()), 0, 0, 0); err != nil {
+	if err := tx.Publish(statePage.Ref(), storeio.PageChecksum(statePage.Bytes()), nextState.super.FreeOffset, nextState.super.FreeLength, nextState.super.FreeChecksum); err != nil {
 		return false, err
 	}
 	abort = false
-	s.compactReusable()
+	s.finalizeReusable(promoted)
 	s.snapshotGate.Lock()
 	s.state.Store(nextState)
 	s.snapshotGate.Unlock()
@@ -1039,22 +1077,42 @@ func (s *FileStore) ensureDirtyCapacity() error {
 	return nil
 }
 
-func (s *FileStore) refreshReusable(state *fileStoreState) {
+func (s *FileStore) refreshReusable(state *fileStoreState) error {
+	if !s.freeLoaded {
+		before := len(s.reusable)
+		var err error
+		s.reusable, err = storeio.AppendFreeTreeExtents(
+			s.cache, state.freeRoot,
+			storeio.FreeTreeBounds{FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID},
+			s.reusable, s.options.MaxRetiredExtents,
+		)
+		if err != nil {
+			clear(s.reusable[before:])
+			s.reusable = s.reusable[:before]
+			return err
+		}
+		s.freeLoaded = true
+	}
 	durable := s.committer.DurableGeneration()
 	s.cache.MarkDurable(durable)
 	stats := s.reclaimer.Stats()
 	if stats.Pending > uint64(cap(s.reusable)-len(s.reusable)) {
-		return
+		return nil
 	}
 	oldestRecovery := uint64(1)
 	if durable > 1 {
 		oldestRecovery = durable - 1
 	}
+	before := len(s.reusable)
 	s.reusable = s.reclaimer.AppendReusable(s.reusable, state.root.Generation, oldestRecovery)
-	if len(s.reusable) < 2 {
-		return
+	added := len(s.reusable) - before
+	if added == 0 {
+		return nil
 	}
-	slices.SortFunc(s.reusable, func(a, b storeio.FreeExtent) int {
+	s.unpersisted += added
+	start := len(s.reusable) - s.unpersisted
+	tail := s.reusable[start:]
+	slices.SortFunc(tail, func(a, b storeio.FreeExtent) int {
 		if a.Offset < b.Offset {
 			return -1
 		}
@@ -1063,8 +1121,8 @@ func (s *FileStore) refreshReusable(state *fileStoreState) {
 		}
 		return 0
 	})
-	out := s.reusable[:0]
-	for _, extent := range s.reusable {
+	out := tail[:0]
+	for _, extent := range tail {
 		last := len(out) - 1
 		if last >= 0 && out[last].Offset+out[last].Length == extent.Offset {
 			out[last].Length += extent.Length
@@ -1073,19 +1131,100 @@ func (s *FileStore) refreshReusable(state *fileStoreState) {
 		}
 		out = append(out, extent)
 	}
-	clear(s.reusable[len(out):])
-	s.reusable = out
+	clear(tail[len(out):])
+	s.reusable = s.reusable[:start+len(out)]
+	s.unpersisted = len(out)
+	return nil
 }
 
-func (s *FileStore) compactReusable() {
+func (s *FileStore) finalizeReusable(promoted int) {
+	persisted := len(s.reusable) - s.unpersisted
+	if promoted >= persisted {
+		s.reusable[persisted], s.reusable[promoted] = s.reusable[promoted], s.reusable[persisted]
+		persisted++
+		s.unpersisted--
+	}
 	out := s.reusable[:0]
-	for _, extent := range s.reusable {
+	for _, extent := range s.reusable[:persisted] {
+		if extent.Length != 0 {
+			out = append(out, extent)
+		}
+	}
+	newPersisted := len(out)
+	for _, extent := range s.reusable[persisted:] {
 		if extent.Length != 0 {
 			out = append(out, extent)
 		}
 	}
 	clear(s.reusable[len(out):])
 	s.reusable = out
+	s.unpersisted = len(out) - newPersisted
+}
+
+func (s *FileStore) syncFileFreeTree(tx *storeio.WriteTransaction, state *fileStoreState) (storeio.PageRef, uint32, int, error) {
+	root := state.freeRoot
+	promoted := -1
+	persisted := len(s.reusable) - s.unpersisted
+	chosen := -1
+	if edits := tx.ReuseEdits(); len(edits) != 0 {
+		chosen = int(edits[0].Index)
+	} else if s.unpersisted != 0 {
+		chosen = persisted
+	}
+	exclude := -1
+	if chosen >= persisted {
+		exclude = chosen
+	}
+	if err := tx.SetReuseRange(persisted, len(s.reusable), exclude); err != nil {
+		return storeio.PageRef{}, 0, -1, err
+	}
+	if chosen >= 0 {
+		bounds := storeio.FreeTreeBounds{FileEnd: tx.FileEnd(), NextLogicalID: tx.NextLogicalID()}
+		current := s.reusable[chosen]
+		var mutation storeio.FreeTreeMutation
+		var err error
+		if chosen < persisted {
+			before := tx.ReuseEdits()[0].Before
+			if current.Length == 0 {
+				mutation, err = storeio.DeleteFreeTree(s.cache, tx, root, before.Offset, bounds)
+			} else {
+				mutation, err = storeio.UpsertFreeTree(s.cache, tx, root, current, bounds)
+			}
+		} else {
+			promoted = chosen
+			if current.Length != 0 {
+				mutation, err = storeio.UpsertFreeTree(s.cache, tx, root, current, bounds)
+			}
+		}
+		if err != nil {
+			return storeio.PageRef{}, 0, -1, err
+		}
+		if mutation.Changed {
+			root = mutation.Root
+			for i := 0; i < int(mutation.RetiredCount); i++ {
+				if len(s.retireScratch) == cap(s.retireScratch) {
+					return storeio.PageRef{}, 0, -1, storeio.ErrRetiredExtentCapacity
+				}
+				ref := mutation.Retired[i]
+				s.retireScratch = append(s.retireScratch, storeio.FreeExtent{
+					Offset: ref.Offset, Length: uint64(ref.Length), RetiredGeneration: state.root.Generation,
+				})
+			}
+		}
+	}
+	if root == (storeio.PageRef{}) {
+		return root, 0, promoted, nil
+	}
+	if root == state.freeRoot {
+		return root, state.super.FreeChecksum, promoted, nil
+	}
+	lease, err := s.cache.Acquire(root)
+	if err != nil {
+		return storeio.PageRef{}, 0, -1, err
+	}
+	checksum := storeio.PageChecksum(lease.Page())
+	lease.Release()
+	return root, checksum, promoted, nil
 }
 
 func (s *FileStore) stageFileValue(tx *storeio.WriteTransaction, location storeio.KeyLocation, key, src []byte) (storeio.DocumentRecord, error) {
@@ -1209,7 +1348,7 @@ func (s *FileStore) fileDocumentPageSize(rows []storeio.DocumentRecord) (uint32,
 	return uint32(size), nil
 }
 
-func (s *FileStore) stageFileState(tx *storeio.WriteTransaction, old *fileStoreState, generation uint64, chunkHighWater uint32, documentCount uint64, liveChunks uint32, chunkRoot, keyRoot storeio.PageRef) (*fileStoreState, storeio.TransactionPage, error) {
+func (s *FileStore) stageFileState(tx *storeio.WriteTransaction, old *fileStoreState, generation uint64, chunkHighWater uint32, documentCount uint64, liveChunks uint32, chunkRoot, keyRoot, freeRoot storeio.PageRef, freeChecksum uint32) (*fileStoreState, storeio.TransactionPage, error) {
 	statePage, err := tx.Allocate(storeio.PageStateRoot, uint32(s.options.PageSize), storeio.StateRootLogicalID)
 	if err != nil {
 		return nil, storeio.TransactionPage{}, err
@@ -1233,9 +1372,14 @@ func (s *FileStore) stageFileState(tx *storeio.WriteTransaction, old *fileStoreS
 		StateChecksum: storeio.PageChecksum(statePage.Bytes()), FileEnd: tx.FileEnd(),
 		PageSize: uint32(s.options.PageSize),
 	}
+	if freeRoot != (storeio.PageRef{}) {
+		super.FreeOffset = freeRoot.Offset
+		super.FreeLength = freeRoot.Length
+		super.FreeChecksum = freeChecksum
+	}
 	return &fileStoreState{
 		root: root, super: super, stateRef: statePage.Ref(),
-		keyRoot: keyRoot, chunkRoot: chunkRoot,
+		keyRoot: keyRoot, chunkRoot: chunkRoot, freeRoot: freeRoot,
 	}, statePage, nil
 }
 

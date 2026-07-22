@@ -247,3 +247,60 @@ func TestFileStoreReusesExtentsWithoutViolatingSnapshots(t *testing.T) {
 		t.Fatalf("latest value = (%q,%v,%v)", got, ok, err)
 	}
 }
+
+func TestFileStorePersistsReusableExtentsAcrossReopen(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-free-tree-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testFileStoreOptions()
+	options.MaxRetiredExtents = 512
+	store, err := CreateFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("hot", []byte(`0`)); err != nil {
+		t.Fatal(err)
+	}
+	for version := 1; version <= 30; version++ {
+		if _, err := store.Put("hot", []byte(fmt.Sprintf(`%d`, version))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if store.state.Load().freeRoot == (storeio.PageRef{}) || store.state.Load().super.FreeLength == 0 {
+		t.Fatal("churn did not publish a durable free-tree root")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.freeLoaded {
+		t.Fatal("OpenFileStore eagerly walked the free tree")
+	}
+	if _, err := reopened.Put("hot", []byte(`31`)); err != nil {
+		t.Fatal(err)
+	}
+	if !reopened.freeLoaded {
+		t.Fatal("first mutation did not lazily load the bounded free tree")
+	}
+	for version := 32; version <= 50; version++ {
+		if _, err := reopened.Put("hot", []byte(fmt.Sprintf(`%d`, version))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plateau := reopened.Stats().FileEnd
+	for version := 51; version <= 80; version++ {
+		if _, err := reopened.Put("hot", []byte(fmt.Sprintf(`%d`, version))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := reopened.Stats().FileEnd; got != plateau {
+		t.Fatalf("reopened allocator did not plateau: %d -> %d", plateau, got)
+	}
+}

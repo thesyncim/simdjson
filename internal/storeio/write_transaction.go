@@ -19,6 +19,8 @@ type WriteTransactionOptions struct {
 	Reusable []FreeExtent
 	// ReuseJournal is caller-owned scratch with capacity for maxPages edits.
 	ReuseJournal []ReuseEdit
+	// SingleReuseExtent bounds one transaction to one free-tree edit.
+	SingleReuseExtent bool
 }
 
 // ReuseEdit is one allocator rollback record. Callers supply storage but must
@@ -32,15 +34,20 @@ type ReuseEdit struct {
 // append extents, and publishes exactly one state root. It is single-owner and
 // must be aborted or published.
 type WriteTransaction struct {
-	committer  *Committer
-	cache      *PageCache
-	batch      *Batch
-	options    WriteTransactionOptions
-	fileEnd    uint64
-	nextID     uint64
-	allocated  int
-	reuseEdits []ReuseEdit
-	active     bool
+	committer    *Committer
+	cache        *PageCache
+	batch        *Batch
+	options      WriteTransactionOptions
+	fileEnd      uint64
+	nextID       uint64
+	allocated    int
+	reuseEdits   []ReuseEdit
+	reuseEnabled bool
+	reuseIndex   int
+	reuseStart   int
+	reuseEnd     int
+	reuseExclude int
+	active       bool
 }
 
 // TransactionPage is one staging buffer and its prospective durable reference.
@@ -100,7 +107,8 @@ func BeginWriteTransaction(committer *Committer, cache *PageCache, maxPages int,
 	return &WriteTransaction{
 		committer: committer, cache: cache, batch: batch, options: options,
 		fileEnd: options.FileEnd, nextID: options.NextLogicalID,
-		reuseEdits: options.ReuseJournal[:0], active: true,
+		reuseEdits: options.ReuseJournal[:0], reuseEnabled: true, reuseIndex: -1,
+		reuseEnd: len(options.Reusable), reuseExclude: -1, active: true,
 	}, nil
 }
 
@@ -149,34 +157,94 @@ func (t *WriteTransaction) Allocate(kind PageKind, length uint32, logicalID uint
 
 func (t *WriteTransaction) allocatePhysical(length uint32) (uint64, bool, error) {
 	want := uint64(length)
-	for i := range t.options.Reusable {
+	if !t.reuseEnabled {
+		if want > maxSuperblockFileOffset-t.fileEnd {
+			return 0, false, fmt.Errorf("%w: physical file exhausted", ErrInvalidWrite)
+		}
+		return t.fileEnd, false, nil
+	}
+	if t.options.SingleReuseExtent && t.reuseIndex >= 0 {
+		extent := t.options.Reusable[t.reuseIndex]
+		if extent.Length < want {
+			return t.fileEnd, false, nil
+		}
+		return t.allocateFromReusable(t.reuseIndex, extent, want)
+	}
+	selected := -1
+	for i := t.reuseStart; i < t.reuseEnd; i++ {
+		if i == t.reuseExclude {
+			continue
+		}
 		extent := t.options.Reusable[i]
 		if extent.Length < want {
 			continue
 		}
-		if extent.Offset < 2*uint64(t.options.PageSize) || extent.Offset%uint64(t.options.PageSize) != 0 ||
-			extent.Length%uint64(t.options.PageSize) != 0 || extent.Length > t.options.FileEnd ||
-			extent.Offset > t.options.FileEnd-extent.Length ||
-			extent.RetiredGeneration == 0 || extent.RetiredGeneration >= t.options.Generation {
-			return 0, false, fmt.Errorf("%w: reusable extent", ErrInvalidWrite)
+		if selected < 0 || t.options.SingleReuseExtent && extent.Length > t.options.Reusable[selected].Length {
+			selected = i
+			if !t.options.SingleReuseExtent {
+				break
+			}
 		}
-		if len(t.reuseEdits) == cap(t.reuseEdits) {
-			return 0, false, ErrTooManyPages
-		}
-		t.reuseEdits = append(t.reuseEdits, ReuseEdit{Index: uint32(i), Before: extent})
-		offset := extent.Offset
-		extent.Offset += want
-		extent.Length -= want
-		if extent.Length == 0 {
-			extent = FreeExtent{}
-		}
-		t.options.Reusable[i] = extent
-		return offset, true, nil
+	}
+	if selected >= 0 {
+		t.reuseIndex = selected
+		return t.allocateFromReusable(selected, t.options.Reusable[selected], want)
 	}
 	if want > maxSuperblockFileOffset-t.fileEnd {
 		return 0, false, fmt.Errorf("%w: physical file exhausted", ErrInvalidWrite)
 	}
 	return t.fileEnd, false, nil
+}
+
+func (t *WriteTransaction) allocateFromReusable(index int, extent FreeExtent, want uint64) (uint64, bool, error) {
+	if extent.Offset < 2*uint64(t.options.PageSize) || extent.Offset%uint64(t.options.PageSize) != 0 ||
+		extent.Length%uint64(t.options.PageSize) != 0 || extent.Length > t.options.FileEnd ||
+		extent.Offset > t.options.FileEnd-extent.Length ||
+		extent.RetiredGeneration == 0 || extent.RetiredGeneration >= t.options.Generation {
+		return 0, false, fmt.Errorf("%w: reusable extent", ErrInvalidWrite)
+	}
+	if len(t.reuseEdits) == cap(t.reuseEdits) {
+		return 0, false, ErrTooManyPages
+	}
+	t.reuseEdits = append(t.reuseEdits, ReuseEdit{Index: uint32(index), Before: extent})
+	offset := extent.Offset + extent.Length - want
+	extent.Length -= want
+	if extent.Length == 0 {
+		extent = FreeExtent{}
+	}
+	t.options.Reusable[index] = extent
+	return offset, true, nil
+}
+
+// DisableReuse seals allocator edits for this transaction. Subsequent
+// metadata pages append above FileEnd, allowing a free-tree root to describe
+// the final reusable pool without recursively consuming from itself.
+func (t *WriteTransaction) DisableReuse() {
+	if t != nil {
+		t.reuseEnabled = false
+	}
+}
+
+// SetReuseRange starts a new bounded allocation phase over [start,end),
+// optionally excluding one extent whose value is being encoded into metadata.
+func (t *WriteTransaction) SetReuseRange(start, end, exclude int) error {
+	if t == nil || !t.active || start < 0 || end < start || end > len(t.options.Reusable) || exclude >= end {
+		return fmt.Errorf("%w: reusable range", ErrInvalidWrite)
+	}
+	t.reuseEnabled = true
+	t.reuseIndex = -1
+	t.reuseStart = start
+	t.reuseEnd = end
+	t.reuseExclude = exclude
+	return nil
+}
+
+// ReuseEdits returns the caller-owned allocator journal accumulated so far.
+func (t *WriteTransaction) ReuseEdits() []ReuseEdit {
+	if t == nil {
+		return nil
+	}
+	return t.reuseEdits
 }
 
 // FileEnd returns the prospective exclusive allocation high-water mark.
