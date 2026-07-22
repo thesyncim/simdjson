@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/bits"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -159,8 +160,47 @@ type FileStore struct {
 
 	parseScratch  []IndexEntry
 	retireScratch []storeio.FreeExtent
+	reusable      []storeio.FreeExtent
+	reuseJournal  []storeio.ReuseEdit
 	appendChunk   uint32
 	appendLive    uint64
+}
+
+// FileStoreStats is a point-in-time resource and I/O accounting snapshot.
+// Every byte and queue counter corresponds to a configured finite budget.
+type FileStoreStats struct {
+	CapacityBytes   uint64
+	ResidentBytes   uint64
+	PinnedPages     uint64
+	DirtyBytes      uint64
+	PageReads       uint64
+	ReadBytes       uint64
+	CacheHits       uint64
+	PrefetchHits    uint64
+	Evictions       uint64
+	PrefetchQueued  uint64
+	PrefetchDropped uint64
+	ReadQueueDepth  uint64
+
+	PublishedGeneration uint64
+	DurableGeneration   uint64
+	CommitQueueDepth    uint64
+	DeviceCommits       uint64
+	CommittedBatches    uint64
+	LargestCommitGroup  uint32
+	Backend             FileStoreBackend
+
+	SnapshotCapacity         uint64
+	ActiveSnapshots          uint64
+	OldestSnapshotGeneration uint64
+	RetiredExtentCapacity    uint64
+	PendingRetiredExtents    uint64
+	PendingRetiredBytes      uint64
+	ReusableExtents          uint64
+	ReusableBytes            uint64
+	DocumentCount            uint64
+	LiveChunks               uint32
+	FileEnd                  uint64
 }
 
 // CreateFileStore initializes an empty durable Store in file and fences its
@@ -276,6 +316,8 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 		file: file, options: options, storeID: storeID, committer: committer, cache: cache,
 		leases: leases, reclaimer: reclaimer,
 		retireScratch: make([]storeio.FreeExtent, 0, options.maxTransactionPages+32),
+		reusable:      make([]storeio.FreeExtent, 0, options.MaxRetiredExtents),
+		reuseJournal:  make([]storeio.ReuseEdit, 0, options.maxTransactionPages),
 	}, nil
 }
 
@@ -431,6 +473,74 @@ func (s *FileSnapshot) AppendRaw(dst []byte, key string) ([]byte, bool, error) {
 	return dst, err == nil, err
 }
 
+// PrefetchKeys resolves keys through the pinned directories and submits their
+// document extents to the bounded asynchronous read queue in physical order.
+// It returns the number submitted; missing keys are ignored and queue pressure
+// is visible through FileStoreStats.PrefetchDropped.
+func (s *FileSnapshot) PrefetchKeys(keys []string) (int, error) {
+	if s == nil || s.store == nil || s.state == nil {
+		return 0, ErrFileStoreClosed
+	}
+	var refs [64]storeio.PageRef
+	count := 0
+	queued := 0
+	flush := func() error {
+		if count == 0 {
+			return nil
+		}
+		batch := refs[:count]
+		slices.SortFunc(batch, func(a, b storeio.PageRef) int {
+			if a.Offset < b.Offset {
+				return -1
+			}
+			if a.Offset > b.Offset {
+				return 1
+			}
+			return 0
+		})
+		unique := batch[:0]
+		for _, ref := range batch {
+			if len(unique) == 0 || unique[len(unique)-1].Offset != ref.Offset {
+				unique = append(unique, ref)
+			}
+		}
+		n, err := s.store.cache.Prefetch(unique)
+		queued += n
+		count = 0
+		return err
+	}
+	state := s.state
+	keyBounds := storeio.KeyTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		ChunkHighWater: state.root.ChunkHighWater, ChunkDocuments: uint8(state.root.ChunkDocuments),
+	}
+	chunkBounds := storeio.ChunkTreeBounds{FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID}
+	for _, key := range keys {
+		location, ok, err := storeio.LookupKeyTree(s.store.cache, state.keyRoot, []byte(key), keyBounds)
+		if err != nil {
+			return queued, err
+		}
+		if !ok {
+			continue
+		}
+		ref, ok, err := storeio.LookupChunkTree(s.store.cache, state.chunkRoot, location.Chunk, chunkBounds)
+		if err != nil {
+			return queued, err
+		}
+		if !ok {
+			return queued, storeio.ErrChunkDirectoryCorrupt
+		}
+		refs[count] = ref
+		count++
+		if count == len(refs) {
+			if err := flush(); err != nil {
+				return queued, err
+			}
+		}
+	}
+	return queued, flush()
+}
+
 func (s *FileSnapshot) appendOverflow(dst []byte, value storeio.DocumentValue, location storeio.KeyLocation) ([]byte, error) {
 	ref := value.Overflow
 	offset := uint64(0)
@@ -478,6 +588,17 @@ func (s *FileStore) AppendRaw(dst []byte, key string) ([]byte, bool, error) {
 	return snapshot.AppendRaw(dst, key)
 }
 
+// PrefetchKeys submits current-snapshot document reads to the bounded
+// asynchronous prefetch queue.
+func (s *FileStore) PrefetchKeys(keys []string) (int, error) {
+	snapshot, err := s.Snapshot()
+	if err != nil {
+		return 0, err
+	}
+	defer snapshot.Close()
+	return snapshot.PrefetchKeys(keys)
+}
+
 // Len returns the current durable-state key count.
 func (s *FileStore) Len() uint64 {
 	if s == nil || s.state.Load() == nil {
@@ -500,6 +621,50 @@ func (s *FileStore) DurableGeneration() uint64 {
 		return 0
 	}
 	return s.committer.DurableGeneration()
+}
+
+// Stats reports configured residency, page I/O, prefetch, durability queue,
+// snapshot, and reclamation pressure without performing file I/O.
+func (s *FileStore) Stats() FileStoreStats {
+	if s == nil || s.cache == nil || s.committer == nil {
+		return FileStoreStats{}
+	}
+	s.writer.Lock()
+	defer s.writer.Unlock()
+	cache := s.cache.Stats()
+	commit := s.committer.Stats()
+	state := s.state.Load()
+	current := uint64(0)
+	if state != nil {
+		current = state.root.Generation
+	}
+	leases := s.leases.Stats(current)
+	retired := s.reclaimer.Stats()
+	stats := FileStoreStats{
+		CapacityBytes: cache.CapacityBytes, ResidentBytes: cache.ResidentBytes,
+		PinnedPages: cache.PinnedPages, DirtyBytes: cache.DirtyBytes,
+		PageReads: cache.PageReads, ReadBytes: cache.ReadBytes, CacheHits: cache.CacheHits,
+		PrefetchHits: cache.PrefetchHits, Evictions: cache.Evictions,
+		PrefetchQueued: cache.PrefetchQueued, PrefetchDropped: cache.PrefetchDropped,
+		ReadQueueDepth:      cache.QueueDepth,
+		PublishedGeneration: commit.PublishedGeneration, DurableGeneration: commit.DurableGeneration,
+		CommitQueueDepth: commit.QueuedGenerations, DeviceCommits: commit.DeviceCommits,
+		CommittedBatches: commit.CommittedBatches, LargestCommitGroup: commit.LargestGroup,
+		Backend:          FileStoreBackend(commit.Backend),
+		SnapshotCapacity: leases.Capacity, ActiveSnapshots: leases.Active,
+		OldestSnapshotGeneration: leases.MinimumGeneration,
+		RetiredExtentCapacity:    retired.Capacity, PendingRetiredExtents: retired.Pending,
+		PendingRetiredBytes: retired.PendingBytes, ReusableExtents: uint64(len(s.reusable)),
+	}
+	for _, extent := range s.reusable {
+		stats.ReusableBytes += extent.Length
+	}
+	if state != nil {
+		stats.DocumentCount = state.root.DocumentCount
+		stats.LiveChunks = state.root.LiveChunks
+		stats.FileEnd = state.super.FileEnd
+	}
+	return stats
 }
 
 // Put validates and copies src, then atomically publishes a copy-on-write file
@@ -568,9 +733,11 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, location s
 	if generation == 0 {
 		return false, storeio.ErrGenerationOrder
 	}
+	s.refreshReusable(state)
 	tx, err := storeio.BeginWriteTransaction(s.committer, s.cache, s.options.maxTransactionPages, storeio.WriteTransactionOptions{
 		StoreID: s.storeID, Generation: generation, PageSize: uint32(s.options.PageSize),
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		Reusable: s.reusable, ReuseJournal: s.reuseJournal,
 	})
 	if err != nil {
 		return false, err
@@ -679,6 +846,7 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, location s
 		return false, err
 	}
 	abort = false
+	s.compactReusable()
 	s.snapshotGate.Lock()
 	s.state.Store(nextState)
 	s.snapshotGate.Unlock()
@@ -728,9 +896,11 @@ func (s *FileStore) Delete(key string) (bool, error) {
 
 func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location storeio.KeyLocation) (bool, error) {
 	generation := state.root.Generation + 1
+	s.refreshReusable(state)
 	tx, err := storeio.BeginWriteTransaction(s.committer, s.cache, s.options.maxTransactionPages, storeio.WriteTransactionOptions{
 		StoreID: s.storeID, Generation: generation, PageSize: uint32(s.options.PageSize),
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		Reusable: s.reusable, ReuseJournal: s.reuseJournal,
 	})
 	if err != nil {
 		return false, err
@@ -820,6 +990,7 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 		return false, err
 	}
 	abort = false
+	s.compactReusable()
 	s.snapshotGate.Lock()
 	s.state.Store(nextState)
 	s.snapshotGate.Unlock()
@@ -866,6 +1037,55 @@ func (s *FileStore) ensureDirtyCapacity() error {
 	}
 	s.cache.MarkDurable(s.committer.DurableGeneration())
 	return nil
+}
+
+func (s *FileStore) refreshReusable(state *fileStoreState) {
+	durable := s.committer.DurableGeneration()
+	s.cache.MarkDurable(durable)
+	stats := s.reclaimer.Stats()
+	if stats.Pending > uint64(cap(s.reusable)-len(s.reusable)) {
+		return
+	}
+	oldestRecovery := uint64(1)
+	if durable > 1 {
+		oldestRecovery = durable - 1
+	}
+	s.reusable = s.reclaimer.AppendReusable(s.reusable, state.root.Generation, oldestRecovery)
+	if len(s.reusable) < 2 {
+		return
+	}
+	slices.SortFunc(s.reusable, func(a, b storeio.FreeExtent) int {
+		if a.Offset < b.Offset {
+			return -1
+		}
+		if a.Offset > b.Offset {
+			return 1
+		}
+		return 0
+	})
+	out := s.reusable[:0]
+	for _, extent := range s.reusable {
+		last := len(out) - 1
+		if last >= 0 && out[last].Offset+out[last].Length == extent.Offset {
+			out[last].Length += extent.Length
+			out[last].RetiredGeneration = max(out[last].RetiredGeneration, extent.RetiredGeneration)
+			continue
+		}
+		out = append(out, extent)
+	}
+	clear(s.reusable[len(out):])
+	s.reusable = out
+}
+
+func (s *FileStore) compactReusable() {
+	out := s.reusable[:0]
+	for _, extent := range s.reusable {
+		if extent.Length != 0 {
+			out = append(out, extent)
+		}
+	}
+	clear(s.reusable[len(out):])
+	s.reusable = out
 }
 
 func (s *FileStore) stageFileValue(tx *storeio.WriteTransaction, location storeio.KeyLocation, key, src []byte) (storeio.DocumentRecord, error) {

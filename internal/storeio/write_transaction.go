@@ -1,6 +1,9 @@
 package storeio
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // WriteTransactionOptions binds one copy-on-write publication to its current
 // physical and logical allocation high-water marks.
@@ -10,20 +13,34 @@ type WriteTransactionOptions struct {
 	PageSize      uint32
 	FileEnd       uint64
 	NextLogicalID uint64
+	// Reusable contains snapshot- and recovery-safe physical extents owned by
+	// the serialized caller. Allocate shrinks entries in place; Publish keeps
+	// those edits and Abort restores them from ReuseJournal.
+	Reusable []FreeExtent
+	// ReuseJournal is caller-owned scratch with capacity for maxPages edits.
+	ReuseJournal []ReuseEdit
+}
+
+// ReuseEdit is one allocator rollback record. Callers supply storage but must
+// otherwise treat values as opaque.
+type ReuseEdit struct {
+	Index  uint32
+	Before FreeExtent
 }
 
 // WriteTransaction reserves worst-case committer capacity, allocates immutable
 // append extents, and publishes exactly one state root. It is single-owner and
 // must be aborted or published.
 type WriteTransaction struct {
-	committer *Committer
-	cache     *PageCache
-	batch     *Batch
-	options   WriteTransactionOptions
-	fileEnd   uint64
-	nextID    uint64
-	allocated int
-	active    bool
+	committer  *Committer
+	cache      *PageCache
+	batch      *Batch
+	options    WriteTransactionOptions
+	fileEnd    uint64
+	nextID     uint64
+	allocated  int
+	reuseEdits []ReuseEdit
+	active     bool
 }
 
 // TransactionPage is one staging buffer and its prospective durable reference.
@@ -82,7 +99,8 @@ func BeginWriteTransaction(committer *Committer, cache *PageCache, maxPages int,
 	}
 	return &WriteTransaction{
 		committer: committer, cache: cache, batch: batch, options: options,
-		fileEnd: options.FileEnd, nextID: options.NextLogicalID, active: true,
+		fileEnd: options.FileEnd, nextID: options.NextLogicalID,
+		reuseEdits: options.ReuseJournal[:0], active: true,
 	}, nil
 }
 
@@ -109,8 +127,9 @@ func (t *WriteTransaction) Allocate(kind PageKind, length uint32, logicalID uint
 	if kind == PageStateRoot && logicalID != StateRootLogicalID || kind != PageStateRoot && logicalID == StateRootLogicalID {
 		return TransactionPage{}, fmt.Errorf("%w: state-root logical id", ErrInvalidWrite)
 	}
-	if uint64(length) > maxSuperblockFileOffset-t.fileEnd {
-		return TransactionPage{}, fmt.Errorf("%w: physical file exhausted", ErrInvalidWrite)
+	offset, reused, err := t.allocatePhysical(length)
+	if err != nil {
+		return TransactionPage{}, err
 	}
 	index := t.allocated
 	buffer, err := t.batch.PageBuffer(index)
@@ -118,12 +137,46 @@ func (t *WriteTransaction) Allocate(kind PageKind, length uint32, logicalID uint
 		return TransactionPage{}, err
 	}
 	ref := PageRef{
-		Offset: t.fileEnd, LogicalID: logicalID, Generation: t.options.Generation,
+		Offset: offset, LogicalID: logicalID, Generation: t.options.Generation,
 		Length: length, Kind: kind,
 	}
-	t.fileEnd += uint64(length)
+	if !reused {
+		t.fileEnd += uint64(length)
+	}
 	t.allocated++
 	return TransactionPage{tx: t, index: index, ref: ref, bytes: buffer[:int(length):int(length)]}, nil
+}
+
+func (t *WriteTransaction) allocatePhysical(length uint32) (uint64, bool, error) {
+	want := uint64(length)
+	for i := range t.options.Reusable {
+		extent := t.options.Reusable[i]
+		if extent.Length < want {
+			continue
+		}
+		if extent.Offset < 2*uint64(t.options.PageSize) || extent.Offset%uint64(t.options.PageSize) != 0 ||
+			extent.Length%uint64(t.options.PageSize) != 0 || extent.Length > t.options.FileEnd ||
+			extent.Offset > t.options.FileEnd-extent.Length ||
+			extent.RetiredGeneration == 0 || extent.RetiredGeneration >= t.options.Generation {
+			return 0, false, fmt.Errorf("%w: reusable extent", ErrInvalidWrite)
+		}
+		if len(t.reuseEdits) == cap(t.reuseEdits) {
+			return 0, false, ErrTooManyPages
+		}
+		t.reuseEdits = append(t.reuseEdits, ReuseEdit{Index: uint32(i), Before: extent})
+		offset := extent.Offset
+		extent.Offset += want
+		extent.Length -= want
+		if extent.Length == 0 {
+			extent = FreeExtent{}
+		}
+		t.options.Reusable[i] = extent
+		return offset, true, nil
+	}
+	if want > maxSuperblockFileOffset-t.fileEnd {
+		return 0, false, fmt.Errorf("%w: physical file exhausted", ErrInvalidWrite)
+	}
+	return t.fileEnd, false, nil
 }
 
 // FileEnd returns the prospective exclusive allocation high-water mark.
@@ -178,6 +231,18 @@ func (t *WriteTransaction) Publish(stateRef PageRef, stateChecksum uint32, freeO
 	if err := t.batch.ResizePages(t.allocated); err != nil {
 		return err
 	}
+	// Reused best-fit extents need not be selected in physical order. Device
+	// commits require a sorted, non-overlapping write vector for deterministic
+	// validation and sequential submission.
+	slices.SortFunc(t.batch.pages, func(a, b Write) int {
+		if a.Offset < b.Offset {
+			return -1
+		}
+		if a.Offset > b.Offset {
+			return 1
+		}
+		return 0
+	})
 	root := Superblock{
 		StoreID: t.options.StoreID, Generation: t.options.Generation,
 		StateOffset: stateRef.Offset, StateLength: stateRef.Length, StateChecksum: stateChecksum,
@@ -203,6 +268,11 @@ func (t *WriteTransaction) Abort() error {
 	}
 	err := t.batch.Abort()
 	if err == nil {
+		for i := len(t.reuseEdits) - 1; i >= 0; i-- {
+			edit := t.reuseEdits[i]
+			t.options.Reusable[edit.Index] = edit.Before
+		}
+		t.reuseEdits = t.reuseEdits[:0]
 		t.active = false
 		t.batch = nil
 		if t.cache != nil {

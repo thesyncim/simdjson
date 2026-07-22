@@ -151,6 +151,13 @@ func TestFileStoreMutationsOverflowSnapshotAndReopen(t *testing.T) {
 	if reopened.Len() != uint64(len(want)) {
 		t.Fatalf("reopened Len = %d, want %d", reopened.Len(), len(want))
 	}
+	queued, err := reopened.PrefetchKeys([]string{"key-09", "key-00", "missing", "key-05", "key-01"})
+	if err != nil || queued == 0 {
+		t.Fatalf("PrefetchKeys = (%d,%v)", queued, err)
+	}
+	if stats := reopened.Stats(); stats.PrefetchQueued < uint64(queued) || stats.CapacityBytes == 0 || stats.DocumentCount != uint64(len(want)) {
+		t.Fatalf("Stats after prefetch = %+v", stats)
+	}
 	for key, value := range want {
 		got, ok, getErr := reopened.AppendRaw(nil, key)
 		if getErr != nil || !ok || string(got) != value {
@@ -182,5 +189,61 @@ func TestFileStoreRejectsInvalidMutationWithoutPublishing(t *testing.T) {
 	}
 	if _, err := store.Put(strings.Repeat("k", store.options.MaxKeyBytes+1), []byte(`null`)); !errors.Is(err, ErrFileStoreKeyTooLarge) {
 		t.Fatalf("oversize key = %v, want %v", err, ErrFileStoreKeyTooLarge)
+	}
+}
+
+func TestFileStoreReusesExtentsWithoutViolatingSnapshots(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-reuse-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testFileStoreOptions()
+	options.MaxRetiredExtents = 512
+	store, err := CreateFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Put("hot", []byte(`{"version":0}`)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforePinned := store.state.Load().super.FileEnd
+	for version := 1; version <= 20; version++ {
+		if _, err := store.Put("hot", []byte(fmt.Sprintf(`{"version":%d}`, version))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	afterPinned := store.state.Load().super.FileEnd
+	if afterPinned <= beforePinned {
+		t.Fatalf("active snapshot did not fence reuse: fileEnd %d -> %d", beforePinned, afterPinned)
+	}
+	if got, ok, err := snapshot.AppendRaw(nil, "hot"); err != nil || !ok || string(got) != `{"version":0}` {
+		t.Fatalf("pinned value after churn = (%q,%v,%v)", got, ok, err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for version := 21; version <= 40; version++ {
+		if _, err := store.Put("hot", []byte(fmt.Sprintf(`{"version":%d}`, version))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plateau := store.state.Load().super.FileEnd
+	for version := 41; version <= 80; version++ {
+		if _, err := store.Put("hot", []byte(fmt.Sprintf(`{"version":%d}`, version))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := store.state.Load().super.FileEnd; got != plateau {
+		t.Fatalf("copy-on-write file did not plateau: %d -> %d", plateau, got)
+	}
+	if got, ok, err := store.AppendRaw(nil, "hot"); err != nil || !ok || string(got) != `{"version":80}` {
+		t.Fatalf("latest value = (%q,%v,%v)", got, ok, err)
 	}
 }

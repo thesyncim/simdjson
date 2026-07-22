@@ -120,3 +120,59 @@ func TestWriteTransactionValidationAndAbort(t *testing.T) {
 		t.Fatalf("Allocate after abort = %v, want %v", err, ErrTooManyPages)
 	}
 }
+
+func TestWriteTransactionReusesAndRollsBackSafeExtents(t *testing.T) {
+	committer, _, _ := newPortableCommitter(t, 4, 2)
+	defer committer.Close()
+	pageSize := uint64(testSuperblockPageSize)
+	reusable := []FreeExtent{{Offset: 2 * pageSize, Length: 2 * pageSize, RetiredGeneration: 1}}
+	journal := make([]ReuseEdit, 0, 2)
+	begin := func() *WriteTransaction {
+		tx, err := BeginWriteTransaction(committer, nil, 2, WriteTransactionOptions{
+			StoreID: testStoreID, Generation: 3, PageSize: testSuperblockPageSize,
+			FileEnd: 4 * pageSize, NextLogicalID: 2,
+			Reusable: reusable, ReuseJournal: journal,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tx
+	}
+
+	tx := begin()
+	page, err := tx.Allocate(PageDocument, testSuperblockPageSize, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Ref().Offset != 2*pageSize || tx.FileEnd() != 4*pageSize || reusable[0].Offset != 3*pageSize {
+		t.Fatalf("reused allocation = ref %+v fileEnd %d pool %+v", page.Ref(), tx.FileEnd(), reusable)
+	}
+	if err := tx.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if reusable[0].Offset != 2*pageSize || reusable[0].Length != 2*pageSize {
+		t.Fatalf("Abort did not restore pool: %+v", reusable)
+	}
+
+	tx = begin()
+	state, err := tx.Allocate(PageStateRoot, testSuperblockPageSize, StateRootLogicalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := StateRoot{
+		StoreID: testStoreID, Generation: 3, PageSize: testSuperblockPageSize,
+		NextLogicalID: tx.NextLogicalID(), ChunkDocuments: 64,
+	}
+	if _, err := EncodeStateRootPage(state.Bytes(), root, tx.FileEnd()); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Stage(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Publish(state.Ref(), PageChecksum(state.Bytes()), 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if reusable[0].Offset != 3*pageSize || reusable[0].Length != pageSize {
+		t.Fatalf("Publish rolled back pool: %+v", reusable)
+	}
+}
