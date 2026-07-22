@@ -16,24 +16,33 @@ import (
 // two-vector block. Keeping them separate from the unrolled scalar fallback
 // avoids a second call on tiny bitmaps without bloating every wrapper.
 func andWordsSmall(dst, a, b []uint64) {
+	a = a[:len(dst)]
+	b = b[:len(dst)]
 	for i := range dst {
 		dst[i] = a[i] & b[i]
 	}
 }
 
 func and3WordsSmall(dst, a, b, c []uint64) {
+	a = a[:len(dst)]
+	b = b[:len(dst)]
+	c = c[:len(dst)]
 	for i := range dst {
 		dst[i] = a[i] & b[i] & c[i]
 	}
 }
 
 func orWordsSmall(dst, a, b []uint64) {
+	a = a[:len(dst)]
+	b = b[:len(dst)]
 	for i := range dst {
 		dst[i] = a[i] | b[i]
 	}
 }
 
 func andNotWordsSmall(dst, a, b []uint64) {
+	a = a[:len(dst)]
+	b = b[:len(dst)]
 	for i := range dst {
 		dst[i] = a[i] &^ b[i]
 	}
