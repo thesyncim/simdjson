@@ -2,11 +2,11 @@
 
 Status: accepted in stages. Transient construction, the caller-owned
 Store-image boundary with pointer-free base metadata, dense stable-slot Boolean
-workspaces, the scoped pure-Go Linux ring substrate, and the bounded internal
-page committer are implemented. Store page encoding and attachment, double-root
-recovery, the swizzled read-page manager, and bounded residency remain
-proposed. Extends ADR 0004 without changing its borrowed-value lifetime
-contract.
+workspaces, the scoped pure-Go Linux ring substrate, the bounded internal page
+committer, and checksummed double-superblock recovery are implemented. Store
+page encoding and attachment, the state-root schema, the swizzled read-page
+manager, and bounded residency remain proposed. Extends ADR 0004 without
+changing its borrowed-value lifetime contract.
 
 ## Decision
 
@@ -268,11 +268,30 @@ policies fall back to the portable device. SQ polling and direct I/O remain
 opt-in benchmark decisions because each changes CPU, memory-lock, or alignment
 economics. This cannot change commit semantics.
 
+The internal root layer now writes a deterministic 128-byte record into one of
+two page-isolated slots selected by generation parity. CRC32C plus stored
+complements covers torn checksums and generation fields; a 128-bit Store id
+rejects roots copied from another file; page-aligned extents and the exclusive
+file high-water mark are checked before use. Recovery reads both slots, rejects
+a valid record in the wrong parity slot, verifies the referenced state and
+free-tree root bytes, and falls back to the older generation if the newest
+header or either root page is torn, truncated, or corrupt. Caller-owned page
+scratch bounds recovery memory, and the encode/decode/select hot paths allocate
+zero bytes. The checksum implementation is scoped to `internal/storeio` and
+contains no handwritten assembly: stable builds use Go's hardware-aware
+CRC32C, while SIMD builds runtime-gate pure-Go PMULL on arm64 and AVX-512
+VPCLMULQDQ on amd64 before falling back to the same standard path. On M4 Max,
+stable Go measured 383.3-387.5 ns per 4 KiB page and 5.924-6.296 us per 64 KiB
+page. The pure-Go nine-stream PMULL fold measured 89.17-91.66 ns and
+1.131-1.146 us respectively: about 4.2x and 5.5x faster, with zero allocations.
+Native CI retains stable and SIMD samples for x64 and arm64 separately; amd64
+claims wait for those native measurements rather than cross-compiled evidence.
+
 This is deliberately still internal: Store does not yet encode its changed
-micro-pages and copied key/index/TTL paths into these buffers, nor recover a
-checksummed double root. Therefore ordinary `Put`, `Delete`, and TTL operations
-are not yet automatically durable. Read-only checkpoint mappings never contain
-dirty transactional state.
+micro-pages and copied key/index/TTL paths into these buffers, nor decode the
+referenced state-root schema. Therefore ordinary `Put`, `Delete`, and TTL
+operations are not yet automatically durable. Read-only checkpoint mappings
+never contain dirty transactional state.
 
 The old root stays valid until the final step. Recovery chooses the newest
 valid superblock and ignores unreferenced partial pages. This follows the

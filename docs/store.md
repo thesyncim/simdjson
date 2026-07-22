@@ -338,10 +338,21 @@ backpressure, sticky failures, natural group commit, and a zero-allocation
 backend with registered off-heap buffers and files; other systems, unsupported
 kernels, and blocked sandboxes use positional writes and data-integrity
 barriers. The root is submitted only after every data page succeeds. This is
-not yet a public Store persistence mode: physical page encoding, mutation
-attachment, double-root recovery, and extent reclamation are the remaining
-correctness boundary. A ready recycle or busy-worker notification stays on the
-atomic fast path; a full budget or an idle worker necessarily parks or wakes.
+not yet a public Store persistence mode. The internal double-superblock codec
+now enforces generation-slot parity, Store identity, CRC32C/complement checks,
+page-aligned bounds, file high-water bounds, and referenced-state verification;
+recovery validates both state and free-tree roots and falls back when the
+newest root or either referenced page is torn. Physical Store page encoding,
+mutation attachment, the state-root schema, and extent reclamation are the
+remaining correctness boundary. A ready recycle or busy-worker notification
+stays on the atomic fast path; a full budget or an idle worker necessarily
+parks or wakes. Checksums stay scoped to `internal/storeio` and use no
+handwritten assembly: stable builds use Go's hardware-aware CRC32C, while SIMD
+builds runtime-gate pure-Go arm64 PMULL or amd64 AVX-512 VPCLMULQDQ and retain
+the standard fallback. On M4 Max, stable Go measured 383.3-387.5 ns per 4 KiB
+page and 5.924-6.296 us per 64 KiB page. The pure-Go SIMD path measured
+89.17-91.66 ns and 1.131-1.146 us respectively (about 4.2x and 5.5x faster),
+with zero allocations. Native CI records the amd64 result before it is claimed.
 
 Packed CHAMP nodes are a good fit for the cold page directory because their
 bitmap rank makes external blocks dense. The existing fixed-prefix directory

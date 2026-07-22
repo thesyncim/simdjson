@@ -91,12 +91,13 @@ const (
 // Committer's single producer. After Publish or Abort, every Batch method is
 // invalid until Begin returns that slot again.
 type Batch struct {
-	committer  *Committer
-	pages      []Write
-	root       Write
-	generation uint64
-	index      uint32
-	state      atomic.Uint32
+	committer      *Committer
+	pages          []Write
+	root           Write
+	rootGeneration uint64
+	generation     uint64
+	index          uint32
+	state          atomic.Uint32
 }
 
 // PageBuffer returns page's reusable staging buffer.
@@ -138,6 +139,30 @@ func (b *Batch) SetRoot(offset int64, length int) error {
 	}
 	b.root.Offset = offset
 	b.root.Length = uint32(length)
+	b.rootGeneration = 0
+	return nil
+}
+
+// SetSuperblock encodes a checksummed double-root record into the reusable root
+// buffer and selects its alternate fixed page. Publish must receive the same
+// generation, preventing a durable-generation counter from naming different
+// on-disk state. No allocation is performed.
+func (b *Batch) SetSuperblock(root Superblock) error {
+	if b == nil || b.state.Load() != batchOwned {
+		return ErrBatchState
+	}
+	buffer := b.committer.buffers[b.root.Buffer]
+	encoded, err := EncodeSuperblock(buffer, root)
+	if err != nil {
+		return err
+	}
+	offset, err := SuperblockOffset(root.Generation, root.PageSize)
+	if err != nil {
+		return err
+	}
+	b.root.Offset = offset
+	b.root.Length = uint32(len(encoded))
+	b.rootGeneration = root.Generation
 	return nil
 }
 
@@ -360,6 +385,9 @@ func (c *Committer) publish(batch *Batch, generation uint64) error {
 		return failure.err
 	}
 	if generation == 0 || generation <= c.published.Load() {
+		return ErrGenerationOrder
+	}
+	if batch.rootGeneration != 0 && batch.rootGeneration != generation {
 		return ErrGenerationOrder
 	}
 	if err := validateCommit(c.bufferCount, c.bufferSize, c.producerSeen, batch.pages, batch.root); err != nil {

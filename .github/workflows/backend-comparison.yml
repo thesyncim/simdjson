@@ -83,6 +83,24 @@ jobs:
             -run '^$' -bench '^(BenchmarkBoolean|BenchmarkStage1|BenchmarkScan)' \
             -benchmem -benchtime="$BENCHTIME" -count="$BENCHCOUNT" -cpu=1 \
             2>&1 | tee "$RUNNER_TEMP/purego-kernels-${RUNNER_ARCH}.txt"
+      - name: Stable durable-page checksum
+        shell: bash
+        run: |
+          set -o pipefail
+          go test ./internal/storeio \
+            -run '^$' -bench '^BenchmarkPageChecksum$' \
+            -benchmem -benchtime="$BENCHTIME" -count="$BENCHCOUNT" -cpu=1 \
+            2>&1 | tee "$RUNNER_TEMP/stable-page-checksum-${RUNNER_ARCH}.txt"
+      - name: SIMD durable-page checksum
+        shell: bash
+        env:
+          GOEXPERIMENT: simd
+        run: |
+          set -o pipefail
+          "$RUNNER_TEMP/gotip/bin/go" test ./internal/storeio \
+            -run '^$' -bench '^BenchmarkPageChecksum$' \
+            -benchmem -benchtime="$BENCHTIME" -count="$BENCHCOUNT" -cpu=1 \
+            2>&1 | tee "$RUNNER_TEMP/simd-page-checksum-${RUNNER_ARCH}.txt"
       - name: SIMD kernels
         shell: bash
         env:

@@ -182,6 +182,7 @@ func (c *Committer) release(batch *Batch) {
 	c.freeBuffers.push(uint32(batch.root.Buffer))
 	batch.pages = batch.pages[:0]
 	batch.root = Write{}
+	batch.rootGeneration = 0
 	batch.generation = 0
 	batch.state.Store(batchFree)
 	c.freeBatches.push(batch.index)
@@ -198,6 +199,7 @@ func (c *Committer) releasePartial(batch *Batch, acquired int) {
 	}
 	batch.pages = batch.pages[:0]
 	batch.root = Write{}
+	batch.rootGeneration = 0
 	batch.state.Store(batchFree)
 	c.freeBatches.push(batch.index)
 }
