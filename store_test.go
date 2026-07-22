@@ -207,6 +207,107 @@ func TestStoreMutationSnapshotDifferential(t *testing.T) {
 	}
 }
 
+func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
+	store := NewStore(StoreOptions{ChunkDocuments: 8, ShapeTapes: true})
+	for i := 0; i < 8; i++ {
+		doc := fmt.Sprintf(`{"id":%d,"group":1,"active":true,"name":"old"}`, i)
+		if _, err := store.Put(fmt.Sprintf("k%d", i), []byte(doc)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	lookupSource := func(key string) []byte {
+		state := store.state.Load()
+		loc, ok := storeKeyLookup(state.keys, maphashString(state.seed, key), key)
+		if !ok {
+			t.Fatalf("missing key %q", key)
+		}
+		return state.chunks.get(loc.chunk).rawSlot(int(loc.slot))
+	}
+	before := store.Snapshot()
+	beforeChunk := before.state.chunks.get(0)
+	beforeSources := make([][]byte, 8)
+	for i := range beforeSources {
+		beforeSources[i] = lookupSource(fmt.Sprintf("k%d", i))
+		ref := beforeChunk.docs.shapeTapeRefAt(int(beforeChunk.ord[i]))
+		if ref.rec == nil || !ref.narrow {
+			t.Fatalf("slot %d was not promoted to a narrow shape tape", i)
+		}
+	}
+	if got := len(beforeChunk.docs.shapes.shapes); got != 1 {
+		t.Fatalf("compiled shapes = %d, want 1", got)
+	}
+
+	replacement := []byte(`{"id":3,"group":9,"active":false,"name":"new"}`)
+	if created, err := store.Put("k3", replacement); err != nil || created {
+		t.Fatalf("Put update = (%v,%v), want (false,nil)", created, err)
+	}
+	replacement[7] = '8'
+	after := store.Snapshot()
+	afterChunk := after.state.chunks.get(0)
+	for i := 0; i < 8; i++ {
+		current := lookupSource(fmt.Sprintf("k%d", i))
+		if i == 3 {
+			if &current[0] == &beforeSources[i][0] {
+				t.Fatal("replacement reused the old source")
+			}
+			continue
+		}
+		if &current[0] != &beforeSources[i][0] {
+			t.Fatalf("unchanged slot %d copied its source", i)
+		}
+	}
+	if &afterChunk.docs.narrow[0] == &beforeChunk.docs.narrow[0] {
+		t.Fatal("new chunk reused the published narrow-value slab")
+	}
+	if raw, ok := before.GetRaw("k3"); !ok || string(raw.Bytes()) != `{"id":3,"group":1,"active":true,"name":"old"}` {
+		t.Fatalf("old snapshot changed after update: %q, %v", raw.Bytes(), ok)
+	}
+	if raw, ok := after.GetRaw("k3"); !ok || string(raw.Bytes()) != `{"id":3,"group":9,"active":false,"name":"new"}` {
+		t.Fatalf("new snapshot aliases caller input: %q, %v", raw.Bytes(), ok)
+	}
+
+	if !store.Delete("k4") {
+		t.Fatal("Delete(k4) missed")
+	}
+	deleted := store.Snapshot()
+	for i := 0; i < 8; i++ {
+		if i == 4 {
+			continue
+		}
+		current := lookupSource(fmt.Sprintf("k%d", i))
+		state := after.state
+		loc, _ := storeKeyLookup(state.keys, maphashString(state.seed, fmt.Sprintf("k%d", i)), fmt.Sprintf("k%d", i))
+		prior := state.chunks.get(loc.chunk).rawSlot(int(loc.slot))
+		if &current[0] != &prior[0] {
+			t.Fatalf("delete copied surviving source %d", i)
+		}
+	}
+	if _, ok := deleted.GetRaw("k4"); ok {
+		t.Fatal("deleted snapshot retained k4")
+	}
+	if _, ok := after.GetRaw("k4"); !ok {
+		t.Fatal("older snapshot lost k4")
+	}
+
+	// Replace the complete live A layout with B. The final cache must contain
+	// only B: sharing live immutable records cannot turn into shape history.
+	churn := NewStore(StoreOptions{ChunkDocuments: 3, ShapeTapes: true})
+	for i := 0; i < 3; i++ {
+		_, _ = churn.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"a":%d,"x":true}`, i)))
+	}
+	oldRec := churn.state.Load().chunks.get(0).docs.shapes.shapes[0]
+	for i := 0; i < 3; i++ {
+		if _, err := churn.Put(fmt.Sprintf("k%d", i), []byte(fmt.Sprintf(`{"b":%d,"y":false}`, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	currentShapes := churn.state.Load().chunks.get(0).docs.shapes.shapes
+	if len(currentShapes) != 1 || currentShapes[0] == oldRec {
+		t.Fatalf("live shape cache retained obsolete records: %p old=%p", currentShapes[0], oldRec)
+	}
+}
+
 func checkStoreSnapshot(t testing.TB, snapshot Snapshot, want map[string]string) {
 	t.Helper()
 	if snapshot.Len() != len(want) {

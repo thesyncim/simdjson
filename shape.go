@@ -155,6 +155,43 @@ type ShapeCache struct {
 	wide IndexEntry
 }
 
+// seedRecord installs one already-compiled immutable record in a fresh cache.
+// Store chunk rebuilds use it to carry live shapes across publications without
+// compiling the same key layout again. The record's fields, lookup table, and
+// interned strings are immutable, so sharing them is safe; callers seed only
+// records referenced by the new chunk, which prevents dead historical shapes
+// from accumulating across updates.
+func (c *ShapeCache) seedRecord(rec *shapeRecord) {
+	if rec == nil {
+		return
+	}
+	if len(c.table) == 0 {
+		c.grow()
+	}
+	mask := uint32(len(c.table) - 1)
+	for slot := uint32(rec.fingerprint) & mask; ; slot = (slot + 1) & mask {
+		stored := c.table[slot]
+		if stored == 0 {
+			break
+		}
+		if stored&shapePendingBit == 0 && c.shapes[stored-1] == rec {
+			return
+		}
+	}
+	if (c.used+1)*4 >= len(c.table)*3 {
+		c.grow()
+		mask = uint32(len(c.table) - 1)
+	}
+	for slot := uint32(rec.fingerprint) & mask; ; slot = (slot + 1) & mask {
+		if c.table[slot] == 0 {
+			c.shapes = append(c.shapes, rec)
+			c.table[slot] = uint32(len(c.shapes))
+			c.used++
+			return
+		}
+	}
+}
+
 // The arena grows geometrically between the interner's chunk bounds; the
 // table starts small and doubles at three-quarters load. The record, field,
 // and slot chunks are fixed-size, with oversized requests getting a chunk of

@@ -54,9 +54,11 @@ func (o StoreOptions) normalized() (StoreOptions, error) {
 // A Store is a keyed, mutable collection of JSON documents with immutable
 // snapshots and a lock-free raw read path. Writes are serialized, rebuild at
 // most one bounded document chunk, path-copy only bounded-radix metadata, and
-// publish one new state through an atomic pointer. Deletes rebuild the affected
-// chunk without the document: no tombstone enters a read path and no later
-// compaction is required to restore scan speed.
+// publish one new state through an atomic pointer. A replacement parses only
+// its new document; unchanged source and structural-tape storage is immutable
+// and shared into the new chunk. Deletes rebuild dense row metadata without the
+// document: no tombstone enters a read path and no later compaction is required
+// to restore scan speed.
 //
 // The zero Store is ready to use. Set Options before the first Put or AddIndex,
 // or use NewStore. A Store is safe for concurrent use. Snapshot readers take
@@ -140,15 +142,133 @@ func (s *storeIDSet) remove(id uint32) {
 	}
 }
 
-func newChunkDocSet(options StoreOptions, postings bool) DocSet {
-	return DocSet{
-		Options:         options.IndexOptions,
-		ShapeTapes:      options.ShapeTapes,
-		Postings:        postings,
-		ValueDict:       options.ValueDict,
-		arenaMinSrc:     256,
+func initChunkDocSet(docs *DocSet, options StoreOptions, postings bool) {
+	*docs = DocSet{
+		Options:    options.IndexOptions,
+		ShapeTapes: options.ShapeTapes,
+		Postings:   postings,
+		ValueDict:  options.ValueDict,
+		// A Store carries unchanged document sources directly into the next
+		// immutable chunk. Exact first source chunks prevent a short document
+		// from pinning stream-sized spare capacity for its whole live tenure.
+		arenaMinSrc:     1,
 		arenaMinEntries: 16,
 	}
+}
+
+// prepareStoreDocSet reserves the dense per-chunk tables and seeds its shape
+// cache with exactly the immutable shape records referenced by surviving rows.
+// Source bytes and classic tapes remain independently immutable and may be
+// shared; row tables and the narrow-value slab are copied because their offsets
+// are chunk-local. Excluding replaceSlot is what prevents an updated-away
+// shape from becoming historical cache debt.
+func prepareStoreDocSet(docs *DocSet, options StoreOptions, postings bool, old *storeChunk, live uint64, replaceSlot int) {
+	initChunkDocSet(docs, options, postings)
+	count := bits.OnesCount64(live)
+	docs.docs = make([]Index, 0, count)
+	if !options.ShapeTapes {
+		return
+	}
+	// A one-row replacement cannot reach the repeat-sighting gate, and has no
+	// shape ref to store. Let commitDoc allocate lazily for the uncommon case
+	// where a delete leaves one already-shaped survivor; this keeps the
+	// ChunkDocuments=1 update path at its original allocation count.
+	if count > 1 {
+		docs.tapeRefs = make([]shapeTapeRef, 0, count)
+	}
+	if old == nil {
+		return
+	}
+	narrowCap := 0
+	for bitsLeft := live; bitsLeft != 0; bitsLeft &= bitsLeft - 1 {
+		slot := bits.TrailingZeros64(bitsLeft)
+		if slot == replaceSlot || old.live&(uint64(1)<<uint(slot)) == 0 {
+			continue
+		}
+		ref := old.docs.shapeTapeRefAt(int(old.ord[slot]))
+		if ref.narrow {
+			narrowCap += len(ref.rec.fields)
+		}
+		docs.shapes.seedRecord(ref.rec)
+	}
+	if replaceSlot >= 0 {
+		if old.live&(uint64(1)<<uint(replaceSlot)) != 0 {
+			ref := old.docs.shapeTapeRefAt(int(old.ord[replaceSlot]))
+			if ref.narrow {
+				narrowCap += len(ref.rec.fields)
+			}
+		} else if old.count != 0 {
+			// An insertion has no old row to size from. Reserve the current
+			// average so a same-shape replacement—the common case when a freed
+			// slot is reused—does not grow and recopy the whole narrow slab.
+			narrowCap += len(old.docs.narrow) / int(old.count)
+		}
+	}
+	if narrowCap != 0 {
+		docs.narrow = make([]shapeNarrowValue, 0, narrowCap)
+	}
+}
+
+// appendStoreDoc carries one validated immutable document into a new dense
+// DocSet without copying its source or rebuilding its structural tape. Narrow
+// shape values are the sole set-relative storage: copy them into the new slab
+// and rewrite the private offset before commit. commitDoc then rebuilds any
+// enabled chunk-local postings or value dictionary against the new ordinal.
+func appendStoreDoc(dst *DocSet, old *DocSet, oldOrd int) int {
+	index := old.docs[oldOrd]
+	ref := old.shapeTapeRefAt(oldOrd)
+	promoted := false
+	if ref.rec == nil && dst.ShapeTapes {
+		index, ref, promoted = copyStoreShapeTape(dst, index)
+	}
+	if ref.narrow && !promoted {
+		n := uint32(len(ref.rec.fields))
+		start := ref.off
+		ref.off = uint32(len(dst.narrow))
+		dst.narrow = append(dst.narrow, old.narrow[start:start+n]...)
+	}
+	return dst.commitDoc(index, ref)
+}
+
+// copyStoreShapeTape promotes one reused classic flat object into the new
+// chunk's compact representation without modifying its immutable old tape.
+// Resolve preserves the ordinary repeat-sighting economics, and the exact key
+// comparison preserves shapeTapeCompact's collision-proof trust boundary.
+func copyStoreShapeTape(dst *DocSet, index Index) (Index, shapeTapeRef, bool) {
+	entries := index.entries
+	if len(entries) == 0 {
+		return index, shapeTapeRef{}, false
+	}
+	root := &entries[0]
+	count := int(root.Count())
+	if root.Kind() != document.Object || count == 0 {
+		return index, shapeTapeRef{}, false
+	}
+	shape, ok := dst.shapes.Resolve(nodeFromStorage(index.src, entries))
+	if !ok || shape.rec.dupKeys {
+		return index, shapeTapeRef{}, false
+	}
+	rec := shape.rec
+	if !shapeTapeConforms(index, rec) {
+		return index, shapeTapeRef{}, false
+	}
+	ref := shapeTapeRef{
+		rec:      rec,
+		start:    root.start,
+		end:      root.end,
+		enriched: root.keysHashed(),
+	}
+	if root.end <= shapeNarrowMaxEnd && !dst.wideValueTapes &&
+		uint64(len(dst.narrow))+uint64(count) <= uint64(^uint32(0)) {
+		ref.narrow = true
+		ref.off = dst.appendNarrowShapeValues(entries, count)
+		return Index{src: index.src}, ref, true
+	}
+	values := make([]IndexEntry, count)
+	for m := range values {
+		values[m] = entries[2*m+2]
+	}
+	return Index{src: index.src, entries: values}, ref, true
 }
 
 // buildStoreChunk is the single bounded rebuild primitive used by inserts,
@@ -156,11 +276,17 @@ func newChunkDocSet(options StoreOptions, postings bool) DocSet {
 // live is the exact post-edit slot mask. replaceSlot selects one slot whose
 // bytes come from src; -1 means every remaining document comes from old.
 func buildStoreChunk(options StoreOptions, postings bool, old *storeChunk, live uint64, replaceSlot int, key string, src []byte) (*storeChunk, error) {
+	if live == 0 {
+		// Deleting or expiring the final row removes the vector leaf outright.
+		// There is no replacement to validate and no empty chunk object to
+		// publish, so avoid constructing tables that would be discarded below.
+		return nil, nil
+	}
 	chunk := &storeChunk{
-		docs: newChunkDocSet(options, postings),
 		keys: make([]string, options.ChunkDocuments),
 		ord:  make([]uint8, options.ChunkDocuments),
 	}
+	prepareStoreDocSet(&chunk.docs, options, postings, old, live, replaceSlot)
 	if old != nil {
 		copy(chunk.keys, old.keys)
 	}
@@ -175,13 +301,15 @@ func buildStoreChunk(options StoreOptions, postings bool, old *storeChunk, live 
 	}
 	for bitsLeft := chunk.live; bitsLeft != 0; bitsLeft &= bitsLeft - 1 {
 		i := bits.TrailingZeros64(bitsLeft)
-		doc := src
-		if i != replaceSlot {
-			doc = old.rawSlot(i)
-		}
-		ord, err := chunk.docs.Append(doc)
-		if err != nil {
-			return nil, err
+		var ord int
+		if i == replaceSlot {
+			var err error
+			ord, err = chunk.docs.Append(src)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			ord = appendStoreDoc(&chunk.docs, &old.docs, int(old.ord[i]))
 		}
 		chunk.ord[i] = uint8(ord)
 		chunk.count++

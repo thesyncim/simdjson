@@ -159,6 +159,11 @@ store.Delete("session:42")
 raw, ok := before.GetRaw("session:42")
 ```
 
+An update parses only its replacement. Unchanged source and structural-tape
+storage stays immutable and is shared into the next bounded chunk; deletes copy
+only dense row metadata and remove the last-row chunk directly. There are no
+version chains, tombstones, or later compaction threshold.
+
 TTL lives in a writer-side indexed four-ary heap—one mutable node per expiring
 key, no stale deadline generations—and due keys are grouped by chunk and
 published in one delete batch. `RunExpiry` sleeps until the next deadline;
@@ -189,6 +194,7 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Extract one field across a document set | 8.1 ns/doc |
 | Extract a typed `int64` column | 12 ns/doc |
 | Immutable `Store.GetRaw` point read | 19-21 ns, 0 allocations |
+| Default-chunk Store replace | 2.36 us median, 9.8 KiB/op |
 | Change an existing TTL | 43 ns, 0 allocations |
 | Native-bitmap SIMD `AND` vs scalar | 2.1-2.6x six-run median, 0 allocations |
 

@@ -144,6 +144,12 @@ while updating hot keys intentionally retains old versions. The package cannot
 bound that memory without invalidating the snapshot contract; applications must
 bound snapshot age or count according to their workload.
 
+The current Store version may share unchanged source and structural-tape
+backing with an older publication, but it retains no parent chunk or historical
+version list. Replacing or deleting a row makes that row's old backing
+collectible as soon as no retained snapshot reaches it. Compact narrow-value
+slabs and dense row headers are publication-private.
+
 A building online index temporarily retains the immutable chunk-vector root
 captured by `AddIndex` so its bounded cursor cannot miss an original live
 chunk. Coverage is a sparse-paged bitmap: dense populated pages cost one bit per

@@ -1,179 +1,97 @@
-# ADR 0002: document-store building blocks
+# ADR 0002: document-store substrate
 
-Status: accepted (planning). Owner: the index/multi-document layer.
+Status: accepted and implemented.
 
-## Goal
+## Context
 
-Provide the building blocks from which a fast in-memory JSON document store is
-assembled — the substrate under ADR 0003's query surface. The competitive
-target is RedisJSON with RediSearch: a single-threaded, in-memory JSON store
-with a JSONPath read API and a secondary-index/aggregation engine. The store
-must beat it on single-core read speed and in-memory footprint while offering
-far more expressive reads (ADR 0003), and preserve semantics a re-encoding
-store discards: key order, duplicate keys, exact number spellings. This
-library ships mechanism only — in-memory and serialized representations, index
-structures, and read primitives. Durability, replication, and concurrency
-policy belong to the consuming engine.
+The structural `Index` is efficient for one document, but a document engine
+also needs batch ingest, repeated-layout compression, column reads, selective
+predicates, and restart without reparsing. Building those features outside the
+repository would duplicate the tape, shape, interner, and containment logic and
+would lose the existing correctness and unsafe-code gates.
 
-## Why this is winnable
+The comparison target is the in-memory part of RedisJSON with RediSearch. This
+is a mechanism comparison, not a claim of protocol, durability, replication,
+or clustering parity.
 
-RedisJSON and RediSearch pay costs this design avoids, single-threaded on both
-sides (the fair comparison — Redis is single-threaded per shard, and single
-core is our target):
+## Decision
 
-1. **In-memory representation.** RedisJSON stores a decoded tree of nodes with
-   per-node headers and pointers — it does not compress, so its footprint
-   typically exceeds the minified text. We keep the original bytes plus a tape
-   whose cost the levers below drive below the source, so a deduplicated
-   DocSet is smaller than RedisJSON's live representation of the same corpus.
-2. **Read machinery.** A JSONPath `JSON.GET` walks that tree per call; our
-   compiled shapes and columnar extractors read fields at 8-12 ns/document in
-   one pass over contiguous arenas.
-3. **Query expressiveness and setup.** RediSearch answers filters and
-   aggregations only over fields declared up front in an `FT.CREATE` schema,
-   and has no JSON containment operator. Our reads need no pre-declared index,
-   and `RawContains` gives containment natively — a capability edge, not only
-   a speed one (ADR 0003).
-4. **Index build.** RediSearch index construction is a separate, non-trivial
-   pass; our ingest validates, indexes, and enriches in one streaming pass at
-   7+ GiB/s, and shape/interner structures amortize across documents.
+Keep the multi-document substrate in this repository:
 
-Honest caveat, recorded up front: an in-process library and a networked server
-are not identical shapes. The harness (ADR 0003) measures single-core,
-single-connection on shared corpora; the consuming engine spends the remaining
-margin on serving and durability and must still come out ahead.
+- `DocSet` owns immutable document sources and structural tapes in append-only
+  arenas.
+- `ShapeTapes` stores recurring flat-object keys once per proven shape and
+  retains only per-document values. Documents whose root fits below 64 KiB use
+  8-byte narrow value entries; wider documents use 16-byte entries.
+- `ValueDict` records repeated value spans in a shared dictionary while
+  preserving byte-exact materialization and random access.
+- `Postings` provides top-level existence and exact-containment candidate
+  lists. Hashes only prune: every candidate is verified by the exact evaluator.
+- `AppendPointer`, typed shape columns, and sparse row gathers expose the data
+  without materializing Go object trees.
+- versioned `DocSet` serialization stores sources, tapes, shapes, dictionaries,
+  and postings in a reopenable image. Formats remain unstable before v1.
 
-## Space model
+The root module keeps no third-party dependency. Comparison servers and their
+clients remain in the nested benchmark module.
 
-At-rest cost per corpus = source bytes + tape + shared structures (shapes,
-interner, postings). The classic tape costs 16 B/entry (~1x minified text on
-dense JSON); the levers drive it down:
+## Required invariants
 
-- **Shape-deduplicated tapes** (phase 1): keys live once in the shape;
-  per-document tape = header + value entries (~48% tape reduction measured on
-  clustered corpora; extraction becomes dense value-array indexing).
-- **Dual-width tapes** (phase 2): documents under 64 KiB take 8-byte entries,
-  halving the remaining tape.
-- **Value dictionary** (Gap A): repeated value spans interned once, each later
-  occurrence a 4-byte reference — structural dedup with O(1) access, no
-  decompression.
+1. Source bytes and tape entries are immutable for every handle lifetime.
+2. Shape fingerprints route work but never authorize a field read. Compact
+   shape tapes are created only after exact key-byte conformance.
+3. Narrow and wide tapes return the same `Index`, `Node`, and raw bytes as the
+   classic representation.
+4. Posting and dictionary hashes may add work but cannot change an answer.
+5. Buffered column, posting, and query operations allocate zero bytes once the
+   caller-provided result and workspace capacities are warm.
+6. A serialized image is rejected transactionally on corrupt bounds, counts,
+   references, or checksums.
+7. SIMD is admitted only for an already-native dense representation and must
+   retain a safe portable implementation with identical results.
 
-Because RedisJSON does not compress and carries tree overhead, the space
-comparison favors us once dedup lands: the goal is a deduplicated DocSet
-materially smaller than RedisJSON's keyspace memory for the same corpus, with
-the value dictionary widening the margin on real corpora rich in repeated
-values. Absolute internal metrics — tape bytes/document and the dedup rate —
-track progress; the competitive number is measured by the ADR 0003 harness.
-Misses are reported as measured.
+## Representation choices
 
-## Measured baseline (2026-07-21)
+The classic tape costs 16 bytes per structural entry and retains the original
+JSON spelling. Shape tapes remove repeated object-key entries; narrow values
+halve the remaining value-entry width. The value dictionary attacks a different
+source of redundancy—repeated complete value spans—without decompression on
+read. These mechanisms compose and remain optional because heterogeneous data
+can make their ingest or metadata cost unprofitable.
 
-Internal measurement on real and synthetic corpora recorded the starting
-point and the phase 1+2 result: the classic tape roughly matched the source;
-shape-deduplicated dual-width tapes cut clustered-corpus tape storage 48% at a
-99% dedup rate (retained bytes 938 -> 606 MiB on the 1M-document synthetic
-set), and single-core ingest ran 0.5-2.2 GB/s depending on document size.
-Extraction is 5-12 ns/document on conforming corpora. The value dictionary
-(Gap A) targets real corpora rich in repeated values; the landed posting layer
-answers existence and exact containment sublinearly and feeds ADR 0003's
-selection-pushdown executor. These feed the ADR 0003 harness that compares them
-to RedisJSON.
+Sparse postings remain sorted ordinals. A native dense bitmap may use the
+allocation-free word kernels in `internal/bitset`, but an ephemeral posting
+list is not converted merely to reach SIMD. End-to-end measurements found that
+list-to-bitmap build plus result decode outweighed the faster Boolean kernel.
 
-## Phases
+## API boundary
 
-**Phase 1 - shape-deduplicated tapes** (landed). The space keystone;
-differential-tested byte-for-byte against the classic tape, classic the
-fallback for non-conforming documents.
+This ADR owns storage and execution primitives. ADR 0003 owns the SQL-shaped
+read interface. ADR 0004 owns keyed mutation, snapshots, TTL, and online index
+lifecycle. Joins, distributed planning, serving, durability policy, and
+replication remain outside the library.
 
-**Phase 2 - dual-width tapes** (landed). Opt-in; fused extractors read narrow
-entries natively; oversize documents fall back to wide.
+## Evidence and acceptance
 
-**Phase 3 - persistence.** A versioned, mmap-friendly serialization of a
-DocSet (source arenas, tapes, shapes, interner, postings) for zero-parse
-reopen. Formats are explicitly unstable before v1.
+The implementation is held by classic-versus-compact differential tests,
+bounded exhaustive representation checks, corrupt-image tests, retained-value
+and forced-GC tests, portable/SIMD parity, race and `checkptr` runs, and
+allocation benchmarks.
 
-**Phase 4 - the inverted layer (landed).** Key-existence postings via interner
-x shapes (key ID -> shape set -> documents, implicit in shape-deduplicated
-storage); (path hash, value hash) -> document postings for containment
-candidate pruning, verified by the exact `Node.Contains` evaluator. Buffered
-forms accept caller-owned result storage and a prebuilt needle index, and are
-held to zero steady-state allocations even for narrow shape tapes, long
-escaped strings, escaped object keys, and empty containers. This is the
-execution layer for ADR 0003's `WHERE`.
+Machine-specific results belong in reproducible benchmark output rather than
+in this decision record. The current commands and comparison boundary are in:
 
-## Placement
+- [`benchmarks/README.md`](../../benchmarks/README.md) for local benchmark
+  methodology;
+- [`benchmarks/redisbench/redis-methodology.md`](../../benchmarks/redisbench/redis-methodology.md)
+  for RedisJSON/RediSearch; and
+- [`docs/store.md`](../store.md) for mutable Store behavior and measurements.
 
-All phases live in this repository. The litmus test: anything that needs the
-tape, arena, interner, or shape internals — or that answers "how fast can one
-core do this to documents" — is mechanism and lives here, inheriting the
-differential, corruption, and benchmark gates. The basic query surface (ADR
-0003) is the thin product tier over it; a full engine's planning, joins,
-multi-core scheduling, durability, and serving stay in a consuming repository.
-The root module stays free of third-party dependencies; comparison tooling
-with heavy dependencies is quarantined in the separate benchmarks module.
+## Consequences
 
-## Gap closure designs
-
-**Gap A - real-corpus space via a value dictionary.** Repeated value spans —
-the enum strings, names, and labels that recur thousands of times in real
-corpora — are interned once into a corpus-wide dictionary, each later
-occurrence a reference, while every value stays directly addressable at tape
-speed (no decompression). Shape tapes remove key redundancy, the dictionary
-removes value redundancy. Optional stdlib flate wraps only cold at-rest
-residuals where random access is surrendered (phase 3). This is the lever that
-widens the space margin over RedisJSON on repeat-heavy corpora; a landed
-in-memory dictionary is measured first, flate at persistence.
-
-**Gap B - existence and containment via postings.** Two opt-in posting
-families: key existence resolves as interner ID -> shapes containing the key
--> their document lists plus a scan of the non-conforming remainder; value
-containment prunes through (path hash, value hash) -> document postings, with
-candidates verified by RawContains. RawContains is independent of the postings
-and has landed. These make ADR 0003's selective `WHERE` sublinear.
-
-**Gap C - extraction.** The phase-1 fast path fixed the shape-tape engagement
-(34 -> 5 ns/document); dual-width tapes (phase 2) halved the remaining memory
-traffic. Re-measured before any further mechanism.
-
-**Gap D - large-document ingest.** Diagnosed: a 466 KiB-document corpus
-ingests at 800 MB/s through Append but 338 MB/s through ReadFrom, so the cost
-is ReadFrom-specific. Its one-pass fast walk caps its window (so a mid-fill
-build cannot be invalidated by a later chunk roll), sending large documents to
-a two-scan slow path (structural framer then build) where Append scans once.
-The fix is a bounded tradeoff — walk to the buffered edge and refill-and-retry
-for fully-buffered documents — in the corruption-gated stream path, without
-regressing the fast small/mixed rows.
-
-## Mutable write path (landed)
-
-ADR 0004 replaces the earlier append-version/tombstone proposal with bounded
-immutable chunks and persistent metadata. The hard reader constraint remains:
-`Snapshot.GetRaw` takes no lock, clock call, TTL/version branch, or allocation.
-The implementation is stronger on delete behavior than the original plan:
-deletes rebuild one at-most-64-document `DocSet` densely, empty ids are reused,
-and persistent-radix traversal skips nil subtrees. No tombstone enters a scan
-and no background compaction is required to restore read speed.
-
-The root `Store` now provides keyed insert/replace/delete, immutable concurrent
-snapshots, publication generations, an external zero-read-tax TTL heap with
-batched expiry, and online posting add/backfill/drop/reclaim. Full contracts,
-operational tuning, and measured write/read costs are in ADR 0004 and
-`docs/store.md`.
-
-Persistence remains separate. A future WAL or manifest can record successful
-publication generations, but it must not introduce a read-time overlay or
-weaken the immutable snapshot lifetime.
-
-## Non-goals
-
-Replication, distributed consensus, query planning beyond ADR 0003's basic
-surface, joins, multi-core scheduling (single-core is the target; sharding is
-trivial caller-side composition), and stable on-disk formats before v1.
-
-## Standing constraints
-
-Every phase lands through the existing gates: differential correctness against
-reference semantics, exhaustive bounded-domain equivalence checks for novel
-representations, GOGC=1 corruption tests for unsafe code, the zero-regression
-corpus bench gate, and honest rejection with measurements when a lever does
-not pay.
+The substrate preserves key order, duplicate keys, and exact number spellings
+that a decoded-tree store normally discards, and lets a consuming engine shard
+by owning multiple sets or Stores. In exchange, options must be chosen before
+ingest, compact shape tapes may allocate once if widened through `Doc`, and the
+library deliberately does not promise Redis-compatible persistence or server
+semantics.

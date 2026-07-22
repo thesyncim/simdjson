@@ -77,6 +77,34 @@ func BenchmarkStoreMutation(b *testing.B) {
 	}
 }
 
+func BenchmarkStoreMutationModes(b *testing.B) {
+	for _, mode := range []struct {
+		name    string
+		options StoreOptions
+	}{
+		{"classic", StoreOptions{ChunkDocuments: 64}},
+		{"shape-tapes", StoreOptions{ChunkDocuments: 64, ShapeTapes: true}},
+		{"shape-tapes+postings", StoreOptions{ChunkDocuments: 64, ShapeTapes: true, Postings: true}},
+		{"shape-tapes+value-dict", StoreOptions{ChunkDocuments: 64, ShapeTapes: true, ValueDict: true}},
+	} {
+		b.Run(mode.name, func(b *testing.B) {
+			store := benchmarkStore(b, mode.options, 1024)
+			keys := make([]string, 1024)
+			for i := range keys {
+				keys[i] = fmt.Sprintf("key-%05d", i)
+			}
+			doc := []byte(`{"id":7,"group":3,"active":true,"name":"replacement"}`)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := store.Put(keys[i&1023], doc); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkStoreTTLChange(b *testing.B) {
 	store := benchmarkStore(b, StoreOptions{ChunkDocuments: 8}, 1)
 	base := time.Now().Add(24 * time.Hour)

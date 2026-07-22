@@ -79,18 +79,24 @@ replace mode deliberately resets absent state.
 `Store` is the only root type that combines mutation with concurrent reads.
 Mutation is serialized; readers retain an immutable state pointer. The keyed
 HAMT and chunk radix vector are path-copied, and a changed document chunk is
-built completely before atomic publication. TTL and index-lifecycle structures
-remain writer-only. `Snapshot.GetRaw` therefore never locks, reads a clock,
-checks a tombstone, or consults mutable metadata. `Snapshot.Get` retains the
-existing `DocSet.Doc` contract: the first access to a compact shape tape may
-enter a synchronized memoization cache and allocate its equivalent classic
-tape.
+built completely before atomic publication. A replacement owns new source and
+tape storage; unchanged rows share their already-immutable source and classic
+tape backing into the new chunk. Dense row headers and the chunk-relative
+narrow-value slab are private copies. The new shape cache imports only records
+referenced by surviving rows, so sharing cannot accumulate dead layout history.
+TTL and index-lifecycle structures remain writer-only. `Snapshot.GetRaw`
+therefore never locks, reads a clock, checks a tombstone, or consults mutable
+metadata. `Snapshot.Get` retains the existing `DocSet.Doc` contract: the first
+access to a compact shape tape may enter a synchronized memoization cache and
+allocate its equivalent classic tape.
 
-Deleted rows are absent from the rebuilt dense `DocSet`; deleted chunks are nil
-radix leaves. Tree traversal skips nil subtrees, while writer-side reusable-id
-sets prevent address growth under churn. TTL expiry and physical index removal
-reuse the same bounded chunk rebuild as explicit mutation. Detailed invariants,
-complexity, and rejected alternatives are in ADR 0004.
+Deleted rows are absent from the rebuilt dense row table; deleting a final row
+publishes a nil radix leaf without constructing an empty chunk. Tree traversal
+skips nil subtrees, while writer-side reusable-id sets prevent address growth
+under churn. No current chunk points to a parent version. TTL expiry and
+physical index removal reuse the same bounded chunk primitive as explicit
+mutation. Detailed invariants, complexity, and rejected alternatives are in
+ADR 0004.
 
 ## Typed plans and specialization
 

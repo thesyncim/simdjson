@@ -1,129 +1,89 @@
-# ADR 0003: a basic query surface — competing with RedisJSON
+# ADR 0003: compiled single-table query surface
 
-Status: accepted (planning). Builds on ADR 0002 (the document-store substrate).
+Status: accepted and implemented. Builds on ADR 0002.
 
-## Motivation
+## Context
 
-ADR 0002 delivers building blocks: index, dedup tapes, containment, columnar
-extraction. Building blocks are not a product, and a full query engine is a
-separate repository's job. The useful middle is a fast in-memory JSON store
-that answers a **basic SQL query** — and the head-to-head competitor for that
-is RedisJSON with RediSearch: single-threaded, in-memory, JSONPath plus
-`FT.AGGREGATE`. Single-threaded is the key: our single-core target is a fair,
-winnable fight, not an apples-to-oranges one.
+`DocSet` exposes the fast primitives, but applications should not have to
+rebuild projection, filtering, aggregation, grouping, ordering, and posting
+selection around them. A full SQL engine would put unrelated planning and
+distributed policy in the core package.
 
-Every execution primitive this needs already exists and is measured:
+## Decision
 
-- projection and typed aggregation -> `ShapeCache.AppendField(s)` and the
-  typed columns (`AppendFieldInt64/Float64/Bool`), 8-12 ns/document;
-- scalar predicates -> shape-compiled extraction plus a typed compare;
-- containment predicates -> `Node.Contains` / `RawContains` (RedisJSON has no
-  containment operator; this is a capability edge, not just a speed one);
-- selective predicates -> the phase-4 postings (ADR 0002 Gap B), which this
-  ADR promotes from "eventually" to "needed next";
-- grouping -> the `KeyInterner` for group keys.
+Provide a `query` subpackage for a deliberately bounded, read-only,
+single-`DocSet` query:
 
-A query compiles once and runs over the corpus at primitive speed; the parse
-and plan cost amortize to nothing across a million rows.
+- path projection;
+- `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`;
+- scalar comparisons, containment, `EXISTS`, and null tests;
+- `AND`, `OR`, and `NOT` composition;
+- `GROUP BY`, stable `ORDER BY`, and `LIMIT`; and
+- equivalent SQL text and programmatic builder front ends.
 
-## Scope — deliberately basic
+Compilation produces one immutable plan. `Run` is the allocating convenience.
+`RunInto` accepts a reusable `Result` and `Workspace`; after their row,
+posting, decoded-text, ordering, and group capacities warm, execution allocates
+zero bytes.
 
-The table is one `DocSet`; each document is a row; columns are JSON paths.
+## Execution
 
-Supported: `SELECT` of path projections and aggregates (`COUNT`, `SUM`, `AVG`,
-`MIN`, `MAX`); `WHERE` with conjunctions and disjunctions of comparisons
-(`= != < <= > >=`), containment (`@>`), and `IS NULL` / `EXISTS`; `GROUP BY`
-with aggregates; `ORDER BY`; `LIMIT`.
+Dense predicates and columns stream over compact tapes. A selective posting
+probe runs first and sparse row gathers materialize only candidates. The
+executor switches to sparse gathering only below its measured crossover, then
+rechecks the complete compiled predicate over every candidate. A posting hash
+collision can therefore increase work but cannot admit a false result.
 
-Explicitly out of scope for "basic": joins, subqueries, window functions,
-SQL mutation/DDL syntax, transactions, and full SQL-dialect coverage. ADR 0004
-now supplies programmatic Store mutation and online posting lifecycle beneath
-this package; it does not expand the SQL grammar. This ADR admits a thin,
-single-table, read-only query surface — mechanism plus the minimum policy to be
-a product; everything above stays out.
+Projection, aggregation, and grouping consume typed columns directly.
+Shape-taped rows are read at their native narrow or wide width and are not
+widened into classic tapes. Group keys use the same byte-exact semantics as the
+document layer. Stable ordering retains input order for equal keys.
 
-## Execution model
+## Correctness and ownership
 
-The query compiles to a small plan IR (a programmatic builder is the IR; the
-SQL text parser produces it). The executor is column-oriented:
+- SQL and builder plans must execute identically.
+- Dense and posting-accelerated routes must execute identically.
+- Classic, hashed, narrow/wide shape-taped, posting, and dictionary-backed
+  `DocSet`s must execute identically.
+- Numeric comparison uses exact decimal semantics; it does not route through a
+  lossy `float64` conversion.
+- Results and workspaces are caller-owned and belong to one executing worker.
+  The compiled query is immutable and may be shared.
+- Failure leaves caller-owned result prefixes in the documented transactional
+  state.
 
-- projections and aggregates read typed/raw columns directly off the tape;
-- a `WHERE` predicate with no useful posting bound is a dense per-row scan;
-  when the posting result covers at most half the corpus, selection is pushed
-  below materialization and `AppendFieldRows` / `AppendPointerRows` gather only
-  candidate cells from compact tapes before the exact predicate recheck;
-- `GROUP BY` interns each group key and accumulates per group;
-- results are columnar, streamed or materialized.
+The differential suite compares every accelerated route to the dense executor
+and an independent reference model. Allocation tests cover warmed projection,
+filtering, containment, grouping, ordering, and aggregation.
 
-The sparse path is O(candidates), preserves posting order and multiplicity,
-and never widens a shape-deduplicated tape. The dense path remains one pass
-over the arenas; the conservative half-corpus crossover avoids paying random
-gather when a streaming scan is cheaper.
+## Index interaction
 
-## API
+`DocSet.Postings` is a physical acceleration option. ADR 0004 adds logical
+Store indexes that backfill it online. A Store snapshot may contain a mixture
+of covered and uncovered chunks: covered chunks use postings and uncovered
+chunks use the exact scan fallback. Readiness is operational state, never a
+correctness precondition.
 
-A `query` subpackage over the core: `query.Compile(sql string) (*Query,
-error)` and `(*Query).Run(*DocSet) (Result, error)`, plus a builder that
-constructs the same plan without SQL text for callers that prefer it. The core
-library gains no query dependency; the subpackage depends on the core.
+Sorted sparse posting lists use linear merge/intersection. Native dense masks
+may use the internal SIMD Boolean kernel. Transient sparse-to-dense conversion
+is intentionally rejected until a complete build/combine/decode benchmark wins.
 
-## Competitive target and acceptance
+## Competitive boundary
 
-RedisJSON + RediSearch, pinned images via docker (the redisbench harness
-under benchmarks/), single connection, single shard — the single-core rule
-both sides.
-Scenarios on shared corpora: path projection, filtered scan, scalar
-aggregation, and group-by aggregation, against `JSON.GET` / `FT.SEARCH` /
-`FT.AGGREGATE`. Acceptance: at or above parity on every scenario single-core,
-with the containment predicate as a capability RedisJSON lacks; space per ADR
-0002. Reproducible harness, misses reported with causes — the same honesty
-rules as the gjson/sonic scoreboard.
+The comparable Redis surface is RedisJSON with RediSearch projection,
+filtering, and aggregation on one shard and one connection. Containment is an
+additional capability because RediSearch has no equivalent exact JSON
+containment operator. Server round-trip time, durability, and replication are
+reported separately from in-process execution.
 
-## Reprioritization of ADR 0002
+The reproducible setup is
+[`benchmarks/redisbench/redis-methodology.md`](../../benchmarks/redisbench/redis-methodology.md).
+Machine-specific ratios belong in generated benchmark reports, not as timeless
+API promises in this ADR.
 
-- **Postings (Gap B) move to next**: selective `WHERE` needs them; the
-  `RawContains` verifier they prune for has landed.
-- **Value dictionary (Gap A) continues**: it is the store's space margin over
-  RedisJSON's uncompressed keyspace, and orthogonal to the query surface.
-- The query surface is the new headline deliverable; the ADR 0002 substrate is
-  its execution layer.
+## Non-goals
 
-## Phases
-
-0. Plan IR and executor for projection and aggregation over the typed columns
-   (no `WHERE`) — measured against `FT.AGGREGATE`.
-1. `WHERE`: scalar predicates and containment, full-scan first, then
-   postings-accelerated.
-2. `GROUP BY`, `ORDER BY`, `LIMIT`.
-3. The SQL-text parser for the subset.
-4. The RedisJSON/RediSearch scoreboard.
-
-## Post-acceptance performance result
-
-The first query-tier postings implementation still extracted every value and
-numeric column before consulting its candidate seam. On the 20,000-document
-selectivity benchmark that left scalar equality at 35.9-38.2 ns/document even
-when only 0.1% of rows matched. Selection pushdown changes that row to
-0.094-0.095 ns/source-document (1.87-1.91 microseconds/query), a 399x reduction
-in elapsed time and a 954x reduction in allocated bytes (about 4.21 MB to
-4.4 KB). At 1% it measures 0.71-0.73 ns/document and at 10% 7.08-7.16
-ns/document. These are six-run, 300 ms samples on Apple M4 Max, Go 1.26.1,
-darwin/arm64; the benchmark source and full selectivity sweep live in
-`query/postings_bench_test.go`.
-
-Correctness does not trust the posting hash. Accelerated queries still run the
-ordinary compiled predicate over every gathered row, and the bounded
-differential requires accelerated results to equal both the dense executor and
-an independent reference across classic, hashed, narrow/wide shape-taped, and
-dictionary-backed storage. Buffered sparse gathers are separately held to zero
-steady-state allocations. The posting probes they consume have the same
-contract through `AppendWhereExists` and `AppendWhereContainsIndex`: reuse the
-result slice and prebuild the containment needle, and the warmed lookup makes
-no heap allocation. Exact verification remains allocation-free for compact
-tapes and for escaped scalar and object-key spellings of arbitrary length.
-
-SQL mutation and DDL syntax remain outside this basic query package. ADR 0004
-adds programmatic Store mutation, immutable snapshots, TTL, and online posting
-lifecycle in the root package without creating a reverse dependency from the
-core into `query`. Durability, replication, distribution, multi-core planning,
-and full SQL remain non-goals.
+SQL mutation or DDL, joins, subqueries, window functions, transactions,
+multi-table planning, multi-core scheduling, durability, replication, and a
+complete SQL dialect are outside this package. Keyed programmatic mutation is
+the responsibility of `Store` under ADR 0004.

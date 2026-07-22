@@ -165,6 +165,38 @@ func (s *DocSet) commitDoc(index Index, ref shapeTapeRef) int {
 	return ord
 }
 
+// shapeTapeConforms is the single exact-key proof for every route that turns a
+// classic flat-object tape into a compact shape tape. Resolve's fingerprint is
+// routing only; this byte comparison is the authorization boundary that makes
+// positional compact reads collision-safe.
+func shapeTapeConforms(index Index, rec *shapeRecord) bool {
+	entries := index.entries
+	if rec == nil || len(entries) != 2*len(rec.fields)+1 {
+		return false
+	}
+	for m := range rec.fields {
+		key := &entries[2*m+1]
+		if !bytesEqualString(index.src[key.start+1:key.end-1], rec.fields[m].raw) {
+			return false
+		}
+	}
+	return true
+}
+
+// appendNarrowShapeValues packs the value entries of one proven flat classic
+// tape into s's narrow slab and returns their first offset.
+func (s *DocSet) appendNarrowShapeValues(entries []IndexEntry, count int) uint32 {
+	off := uint32(len(s.narrow))
+	for m := 0; m < count; m++ {
+		value := &entries[2*m+2]
+		s.narrow = append(s.narrow, shapeNarrowValue{
+			span: value.start | value.end<<16,
+			info: value.info,
+		})
+	}
+	return off
+}
+
 // shapeTapeCompact converts a just-built, still-uncommitted classic tape to
 // its shape-deduplicated form when the document qualifies, compacting the
 // value entries to the front of index.entries in place and returning the
@@ -200,13 +232,10 @@ func (s *DocSet) shapeTapeCompact(index Index) (Index, shapeTapeRef) {
 	if rec.dupKeys {
 		return index, shapeTapeRef{}
 	}
-	for m := 0; m < count; m++ {
-		ke := &entries[2*m+1]
-		if !bytesEqualString(index.src[ke.start+1:ke.end-1], rec.fields[m].raw) {
-			// A fingerprint collision routed a foreign layout here; the
-			// proof fails closed to classic storage.
-			return index, shapeTapeRef{}
-		}
+	if !shapeTapeConforms(index, rec) {
+		// A fingerprint collision routed a foreign layout here; the proof
+		// fails closed to classic storage.
+		return index, shapeTapeRef{}
 	}
 	ref := shapeTapeRef{
 		rec:      rec,
@@ -221,12 +250,14 @@ func (s *DocSet) shapeTapeCompact(index Index) (Index, shapeTapeRef) {
 		// and the document keeps no entry-arena storage at all. The slab
 		// bound keeps ref.off exact; a set past four billion narrow entries
 		// falls back to the wide form rather than overflowing it.
-		ref.narrow, ref.off = true, uint32(len(s.narrow))
-		for m := 0; m < count; m++ {
-			v := &entries[2*m+2]
-			s.narrow = append(s.narrow, shapeNarrowValue{span: v.start | v.end<<16, info: v.info})
-		}
-		index.entries = entries[:0:0]
+		ref.narrow = true
+		ref.off = s.appendNarrowShapeValues(entries, count)
+		// No stored entry is needed at the narrow width. A nil slice also
+		// releases the temporary classic entry arena when a Store carries this
+		// document into a later immutable chunk version; a zero-capacity slice
+		// could otherwise keep that whole build buffer live through its data
+		// pointer.
+		index.entries = nil
 		return index, ref
 	}
 	for m := 0; m < count; m++ {
