@@ -257,6 +257,15 @@ func recoverRoots(file *os.File, pageSize uint32, pageScratch []byte, decodeStat
 			if !freeOK {
 				continue
 			}
+			if decodeState {
+				free, freeOpenErr := OpenFreeDirectoryPage(pageScratch[:root.FreeLength], root.FileEnd, state.NextLogicalID)
+				freeHeader := free.Header()
+				if freeOpenErr != nil || freeHeader.StoreID != root.StoreID ||
+					freeHeader.PageSize != root.PageSize || freeHeader.Generation > root.Generation ||
+					freeHeader.LogicalID == StateRootLogicalID {
+					continue
+				}
+			}
 		}
 		return root, state, candidate.slot, nil
 	}
