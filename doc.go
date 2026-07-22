@@ -142,6 +142,11 @@
 // chunks, bulk-builds declared exact indexes, and publishes one completed
 // Store, avoiding per-row persistent path copies while retaining the same
 // ownership and validation rules.
+// [Store.WriteTo] emits one immutable Store generation and [OpenStore]
+// reconstructs a mutable Store whose source/native tape bytes borrow the
+// caller's image. The image must remain immutable and live as long as the Store,
+// retained snapshots, or derived borrowed values; [Snapshot.AppendRaw] and
+// [Snapshot.AppendRawKey] provide lifetime-independent caller-buffered copy-out.
 // Snapshot GetRaw reads are lock-free, clock-free, and allocation-free;
 // [StoreKey] lets repeated reads verify a cached stable slot and bypass both
 // hashing and the key trie, with a safe full-lookup fallback after movement.

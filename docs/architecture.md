@@ -64,6 +64,7 @@ bounds and lifetime are already established by typed state.
 | Reader views and cursors | Borrow the reader's rolling buffer. | Invalid after the next advancing operation or `Close`. |
 | Encoder and writer output | Returned bytes belong to the caller. | Source graphs must not overlap output capacity being appended to. |
 | `Store` snapshot values | Borrow immutable chunks reachable from the snapshot state. | Keep the snapshot or a derived handle alive; later writes never invalidate it. |
+| `OpenStore` image-backed values | Borrow the caller's complete immutable image through the Store state graph. | Keep the image mapped until the Store, snapshots, and all borrowed handles are dead; use `AppendRaw` for owned copy-out. |
 
 Borrowing avoids a copy; it never hides a pointer. Compiled plans contain no
 source or destination pointer and are immutable after construction. Mutable
@@ -93,6 +94,13 @@ parallel decoder. `Snapshot.GetRaw` never locks, reads a clock, checks a
 tombstone, or consults mutable metadata. `Snapshot.Get` retains the existing
 `DocSet.Doc` contract: the first access to a compact shape tape may enter a
 synchronized memoization cache and allocate its equivalent classic tape.
+
+`Store.WriteTo` serializes one captured publication as bounded `DocSet` page
+images plus Store metadata. `OpenStore` validates the complete directory,
+borrows source/native tape sections from the caller's image, rebuilds the
+process-seeded key and declared-index roots through the normal constructors,
+and publishes an ordinary mutable Store. Later states keep the base image
+reachable. The caller owns any underlying mapping; the package never unmaps it.
 
 Deleted rows are absent from the rebuilt dense row table; deleting a final row
 publishes a nil radix leaf without constructing an empty chunk. Tree traversal

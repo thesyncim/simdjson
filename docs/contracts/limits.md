@@ -174,6 +174,27 @@ A non-positive limit means all currently eligible work, which may be large.
 Production event loops should normally choose a positive batch size and expose
 `Store.Stats`/`Snapshot.AppendIndexes` as progress metrics.
 
+`Store.WriteTo` uses 32-bit counts and lengths for chunk/index/TTL metadata and
+key/path spellings, 32-bit chunk ids, and 64-bit image offsets. It returns
+`ErrStorePersistTooLarge` instead of truncating those fields. Only `Ready`
+indexes can be written. `OpenStore` rejects unknown flags, nonzero reserved
+fields, unaligned nested page images, inconsistent stable slots, duplicate
+keys/indexes/TTLs, impossible counts, malformed nested `DocSet` images, and a
+bad manifest checksum before publishing a Store. The pre-v1 format is versioned
+but not yet promised stable across releases.
+
+`OpenStore` borrows its complete input slice. A file mapping must remain
+immutable and mapped until the Store, all snapshots, and every borrowed value
+are unreachable. The package does not call `munmap`, retain an OS file handle,
+or infer lifetime from finalizers. `AppendRaw` and `AppendRawKey` copy exact JSON
+into caller storage when an independently owned result is required.
+
+Mapped image bytes do not count toward Go `HeapAlloc`, but current open still
+eagerly rebuilds per-key, per-row, shape, accelerator, and exact-index metadata.
+The image size is therefore not a resident-memory limit. Applications must
+measure both mapped bytes and reconstructed heap metadata; current Store images
+do not yet provide an eviction budget or a 100x-RAM guarantee.
+
 ## Limits that applications must add
 
 The package does not provide a process-wide memory budget, total-stream byte or

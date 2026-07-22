@@ -1,6 +1,7 @@
 package simdjson_test
 
 import (
+	"bytes"
 	"fmt"
 	"time"
 
@@ -35,6 +36,22 @@ func ExampleStoreBuilder() {
 
 	// Output:
 	// 1 [user:1]
+}
+
+func ExampleOpenStore() {
+	var original simdjson.Store
+	_, _ = original.Put("user:42", []byte(`{"name":"Ada"}`))
+
+	var image bytes.Buffer
+	_, _ = original.WriteTo(&image)
+	reopened, _ := simdjson.OpenStore(image.Bytes())
+
+	dst := make([]byte, 0, 32)
+	dst, ok := reopened.AppendRaw(dst, "user:42")
+	fmt.Printf("%v %s\n", ok, dst)
+
+	// Output:
+	// true {"name":"Ada"}
 }
 
 func ExampleStore_SetDeadline() {

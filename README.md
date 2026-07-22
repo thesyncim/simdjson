@@ -189,6 +189,32 @@ JSON bytes after `Append`; declared nested or compound indexes are returned
 `Ready`, and the Store immediately supports ordinary mutation, snapshots, TTL,
 and online index changes.
 
+`Store.WriteTo` checkpoints one generation into a Store-native container of the
+same bounded `DocSet` page images. `OpenStore` can borrow a caller-owned
+read-only mmap and returns a normally mutable Store:
+
+```go
+var image bytes.Buffer
+if _, err := store.WriteTo(&image); err != nil {
+	return err
+}
+reopened, err := simdjson.OpenStore(image.Bytes())
+if err != nil {
+	return err
+}
+dst, ok := reopened.AppendRaw(make([]byte, 0, 256), "session:42")
+```
+
+The image bytes must remain immutable and live until the Store, retained
+snapshots, and borrowed values are dead. `AppendRaw`/`AppendRawKey` make an
+owned copy into caller capacity and allocate nothing after capacity is warm.
+Opening currently rebuilds key/row metadata and exact-index roots eagerly, so
+this is an off-heap payload boundary rather than a completed bounded-residency
+database. `WriteTo` is a full checkpoint, not a per-write durability path;
+post-open mutations do not update the image. The measured limit and automatic
+append-only 100x-RAM design are in
+[Mutable Store operations](docs/store.md).
+
 An update parses only its replacement. Unchanged source and structural-tape
 storage stays immutable and is shared into the next bounded chunk; deletes copy
 only dense row metadata and remove the last-row chunk directly. There are no
@@ -252,6 +278,11 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Immutable `Store.GetRaw` point read | 21.9-23.9 ns, 0 allocations |
 | Compiled stable-slot `Store.GetRawKey` | 8.0-8.5 ns, 0 allocations |
 | Bulk `StoreBuilder` vs repeated `Put` | about 7.7x throughput, 93.7% fewer transient bytes |
+| Mapped `OpenStore`, 16,384 keys / 5.40 MB image | 1.74-1.94 ms, 3.35 MB heap metadata |
+| Mapped `OpenStore`, one compound exact index | 3.41-3.48 ms, 3.58 MB heap metadata |
+| Mapped keyed read, ordinary / compiled stable slot | 7.69-7.87 ns / 5.095-5.110 ns, 0 allocations |
+| Mapped compound query, 32 rows in 2/256 pages | 2.28-2.32 us, 0 allocations |
+| `Store.WriteTo`, 5.40 MB / 16,384 documents | 1.07-1.09 ms, 4.96-5.04 GB/s, 3 allocations |
 | Default-chunk Store replace | 2.24 us median, 9.8 KiB/op |
 | Exact-index replace, indexed tuple unchanged | 2.46-2.49 us, 9.9 KiB/op, no added allocations |
 | Indexed Snapshot equality at 10% selectivity | 12.44 ns/input doc, 0 allocations |

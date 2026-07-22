@@ -1,8 +1,9 @@
 # ADR 0005: one Store surface, bulk construction, and mapped pages
 
-Status: accepted in stages. Transient Store construction, including declared
-exact indexes, is implemented; mapped mutable pages remain proposed. Extends
-ADR 0004 without changing its current lifetime contract.
+Status: accepted in stages. Transient construction and the caller-owned
+Store-image boundary are implemented; lazy mapped directories, durable
+copy-on-write pages, and bounded residency remain proposed. Extends ADR 0004
+without changing its borrowed-value lifetime contract.
 
 ## Decision
 
@@ -16,8 +17,9 @@ The migration has three ordered stages:
 
 1. add a transient bulk Store builder that creates complete micro-pages, the
    key directory, and declared exact indexes before one atomic publication;
-2. define a Store-compatible read-only mapped image with explicit lifetime
-   ownership; and
+2. define a Store-compatible caller-owned mapped image with explicit lifetime
+   ownership and ordinary mutable heap publications above its immutable base;
+   and
 3. deprecate the old set-facing API only after bulk, persistence, query, and
    memory-map users have a measured Store replacement.
 
@@ -87,13 +89,56 @@ Consequently:
 - require an end-to-end Store benchmark, retained-byte measurement, compiler
   inlining report, and churn test before changing either representation.
 
+## Implemented Store-image boundary
+
+`Store.WriteTo` now writes one immutable generation as a Store container around
+the existing bounded `DocSet` page images. Its checksummed tail manifest holds
+effective options, generation, stable slot/key maps, reusable empty page ids,
+Ready index definitions, wildcard posting consumers, and TTL deadlines.
+`OpenStore` validates that directory, views source/native tape sections in the
+caller's image, rebuilds the process-seeded key HAMT and exact-index roots
+through the normal bulk constructors, and returns a Store that can immediately
+be updated or deleted from. Subsequent publications retain the mapped base
+through the immutable state graph.
+
+`WriteTo` is a full checkpoint/export, not the transaction persistence path.
+It writes every live micro-page, and mutations after `OpenStore` do not update
+the input image. Keeping this API is useful for backups, interchange, and a
+bounded recovery base; requiring it after every mutation is rejected.
+
+This stage deliberately does not own or unmap the caller's bytes. The mapping
+must outlive the Store, retained snapshots, and derived borrowed handles.
+Caller-buffered `AppendRaw` and `AppendRawKey` provide lifetime-independent
+copy-out with zero allocation when capacity is sufficient. A `Building` index
+cannot be serialized because restoring partial coverage would make latency and
+fallback behavior image-dependent.
+
+The 16,384-document fixture produces a 5.40 MB image. Mapped open currently
+allocates about 3.35 MB and takes 1.74-1.94 ms for keys only; one compound exact
+index raises that to about 3.58 MB and 3.41-3.48 ms. Those bytes are eager key,
+row, shape, and index metadata. This is a useful off-heap payload/startup
+boundary, but the ratio is explicit evidence that it is not the final
+greater-than-memory representation.
+
+After open, the same mapping measured 7.69-7.87 ns for ordinary keyed reads,
+5.095-5.110 ns for compiled stable-slot reads, and 2.28-2.32 us for a zero-
+allocation compound query selecting 32 rows from two of 256 micro-pages. These
+are hot-mapping measurements, not promises for storage faults.
+
+Writing the 5.40 MB fixture measures 1.07-1.09 ms (4.96-5.04 GB/s) and three
+allocations total. Generated-code inspection showed that passing stack record
+headers through `io.Writer` originally created per-document escapes. Fixed
+writer-owned scratch, bounded page manifests, and relative-offset rebasing now
+stream every nested page without per-row or per-page heap objects.
+
 ## Greater-than-memory mode
 
-The current mutable Store is heap-resident and cannot promise a data set larger
-than physical memory. A serialized immutable image opened from a caller-owned
-mmap can already be larger than RAM: the operating system faults in only the
-working set. This is bounded by virtual address space, Go's `int` slice length,
-the image format, and the existing per-document 32-bit coordinate limits.
+The current Store image can be larger than physical memory as a virtual
+mapping, but `OpenStore` eagerly rebuilds metadata for every key and row and
+rebuilds exact roots from documents. It therefore cannot promise a bounded
+resident working set or a 100x-RAM corpus yet. The mapping is bounded by
+virtual address space, Go's `int` slice length, the image format, and existing
+per-document 32-bit coordinate limits.
 
 The engineering target for mapped Store is a data image at least 100 times the
 configured resident budget, provided the workload's hot key/index/page working
@@ -146,6 +191,22 @@ size, directory cache size, prefetch depth, and overflow threshold are format
 or Store options with conservative defaults; none may change query semantics.
 
 ## Publication and crash consistency
+
+An attached file persists automatically through one background writer. Store
+mutation is already serialized, so publication can place a generation/change
+descriptor into a preallocated single-producer ring without another mutex or a
+steady heap allocation. Readers never load that queue or a durability counter.
+The consumer groups adjacent generations and executes the copy-on-write commit
+below once per batch.
+
+Async mutation returns after reader publication; `DurableGeneration` reports
+the newest crash-safe root and `Flush`/`Close` waits until a requested
+generation reaches it. A synchronous option waits after each mutation. It
+cannot be zero-latency because ordered storage writes and a durability barrier
+are physical work. Queue saturation applies backpressure instead of silently
+dropping durability records or retaining unbounded historical states. Any
+background I/O error becomes sticky, stops durable-generation advancement, and
+is returned by fencing and subsequent persistence-aware mutations.
 
 One transaction follows a failure-atomic sequence:
 
@@ -239,5 +300,6 @@ The mapped Store is not complete until it passes:
 - working sets below, near, and above physical RAM; and
 - bounded reclamation under a deliberately long-lived snapshot.
 
-Until those gates pass, `Store` remains an in-memory engine and `Open` remains
-the read-only mapped-corpus mechanism.
+Until those gates pass, `OpenStore` is a caller-owned off-heap payload boundary,
+not a bounded-residency or durable mapped database. `Open` remains the
+lower-level `DocSet` image mechanism used inside it.

@@ -45,8 +45,8 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `docset_persist.go` — `(*DocSet).openDocRecord`
 - `docset_persist.go` — `(*persistWriter).writeEntries`
 - `docset_persist.go` — `(*persistWriter).writeNarrow`
-- `docset_persist.go` — `Open`
 - `docset_persist.go` — `appendNarrow`
+- `docset_persist.go` — `openDocSetInto`
 - `docset_persist.go` — `openEntries`
 - `docset_persist.go` — `package scope`
 - `docset_stream.go` — `(*DocSet).buildDocPrefix`

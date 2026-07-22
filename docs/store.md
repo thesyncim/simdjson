@@ -36,7 +36,10 @@ raw, ok := view.GetRaw("user:42")
 | `Get(key)` / `Snapshot.Get(key)` | borrowed navigable `Index` | same lookup; first compact-tape widening may allocate |
 | `CompileKey(key)` | caches seeded hash and verified stable slot | one ordinary key lookup |
 | `GetRawKey` / `GetKey` | compiled-key read with safe full-lookup fallback | O(chunk radix height) on a stable-slot hit |
+| `AppendRaw` / `AppendRawKey` | append exact JSON into caller storage | same lookup + O(value bytes); zero allocation with capacity |
 | `Range(fn)` | visits live keys in chunk/slot order | O(materialized radix nodes + live keys) |
+| `WriteTo(w)` | stream one full immutable checkpoint/export | O(image bytes + manifest metadata) |
+| `OpenStore(image)` | validate and open a mutable Store borrowing an image | O(keys + eager page metadata + exact-index rebuild) |
 | `SetTTL`, `SetDeadline` | true when the key existed | O(log4 expiring keys) |
 | `Persist` | true when an expiration was removed | O(log4 expiring keys) |
 | `ExpireDue(now, limit)` | number of due keys published as deleted | heap work + one rebuild per affected chunk |
@@ -166,10 +169,10 @@ immutable versions; bound snapshot age or count at the application boundary.
 
 ## Zero-allocation boundary
 
-With sufficient caller-owned capacity, `Snapshot`, `GetRaw`, `GetRawKey`, `Range`,
-`AppendPointer`, `AppendPointerRows`, buffered exact/posting probes, compiled
-`query.RunInto`/`query.RunSnapshotInto`, and warmed TTL deadline changes
-allocate zero bytes.
+With sufficient caller-owned capacity, `Snapshot`, `GetRaw`, `GetRawKey`,
+`AppendRaw`, `AppendRawKey`, `Range`, `AppendPointer`, `AppendPointerRows`,
+buffered exact/posting probes, compiled `query.RunInto`/
+`query.RunSnapshotInto`, and warmed TTL deadline changes allocate zero bytes.
 
 `Put` and `Delete` allocate the new immutable publication. A zero-allocation
 mutation would have to borrow caller memory after return or overwrite storage
@@ -193,7 +196,7 @@ obsolete document page. On the 65,536-key fixture, `GetRawKey` measures
 7.99-8.50 ns versus 21.92-23.88 ns for ordinary `GetRaw`, both at zero
 allocations.
 
-## Go heap and mapped source bytes
+## Store images and mapped source bytes
 
 Store source arenas are `[]byte` objects. They contain no pointers, so the GC
 does not scan each JSON byte, but they still count as live heap and therefore
@@ -202,22 +205,91 @@ can lower Go `HeapAlloc`; it does not make those bytes disappear from RSS or
 from the Store's total memory footprint, and the key directory, tapes, shapes,
 snapshots, TTL, and index metadata remain ordinary Go objects.
 
-Serialized `DocSet` images already support this mode: memory-map the image
-read-only and pass the mapped slice to `Open`. Reopened sources and native tape
-sections view the mapping directly. The caller must keep it mapped until the
-`DocSet` and every derived `Index`, `Node`, and `RawValue` are dead. On the local
-persistence fixture, `BenchmarkDocSetPersistOpenMapped` reduced per-open Go
-heap allocation from 5.46 MiB to 4.15 MiB by avoiding the 1.31 MiB image copy;
-the remaining allocation is reconstructed metadata and opt-in accelerators.
+`Store.WriteTo` emits a Store-native container of the existing bounded `DocSet`
+page images plus a checksummed tail manifest. It records effective options,
+stable slots and keys, generation, reusable empty page ids, ready nested or
+compound index definitions, wildcard posting consumers, and TTL deadlines.
+There is no second JSON, tape, or query representation.
 
-The mutable Store deliberately does not expose automatic external allocation
-yet. `Snapshot.GetRaw` returns a plain borrowed slice, and `Snapshot.Get`
-returns an `Index`; neither handle carries a mapping owner. A finalizer or
-automatic `munmap` could therefore invalidate a still-live returned view. A
-safe mutable design must make the lifetime explicit—for example a scoped read
-lease plus `AppendRaw(dst, key)` for owned zero-allocation copy-out—or add an
-owner-bearing handle and measure its read-path cost. Until that contract exists,
-keeping Store bytes Go-owned is the safe choice.
+This is a full checkpoint: each call writes every live micro-page. It is not a
+per-mutation persistence requirement or an incremental durability protocol.
+Mutations made after `OpenStore` are not written back into the borrowed image.
+Applications can checkpoint periodically for backup or faster restart; a
+durable primary store still needs the append-only page/root commit path below.
+
+`OpenStore(image)` validates the complete directory before publishing a
+mutable Store. Source bytes and native tape sections view `image` directly;
+the key directory receives a fresh process-local `maphash` seed; exact-index
+roots are rebuilt by the normal bulk constructor; and later `Put`, `Delete`,
+TTL, and index operations publish ordinary immutable generations. A Store
+image cannot contain a `Building` index: finish or drop the definition before
+calling `WriteTo`.
+
+For a file-backed image, map it read-only and pass the mapped slice to
+`OpenStore`. The caller owns the mapping and must keep it immutable and mapped
+until the Store, every retained `Snapshot`, and every derived `RawValue`,
+`Index`, or `Node` are unreachable. Do not unmap based only on dropping the
+current Store variable: later states and old snapshots may still share base
+pages. `AppendRaw(dst, key)` and `AppendRawKey` provide lifetime-independent
+copy-out and allocate zero bytes when `dst` has enough capacity. Automatic
+unmapping and finalizer-based ownership remain deliberately absent.
+
+The image is a startup/off-heap boundary, not yet the completed 100x-RAM
+engine. On the 16,384-document local fixture, the mapped image is 5.40 MB;
+`OpenStore` currently reconstructs about 3.35 MB of heap metadata in 1.74-1.94
+ms for keys only, or 3.58 MB in 3.41-3.48 ms with one compound exact index.
+Mapping avoids the 5.40 MB heap copy, but opening still eagerly constructs the
+per-document key HAMT, `DocSet` row metadata, and exact-index root. The exact
+root rebuild can fault document pages. `BenchmarkStorePersistOpenMapped`
+reports both `mapped-B` and `B/op` so this ratio cannot disappear behind a
+throughput number.
+
+Once open, mapped source bytes add no steady allocation or ownership wrapper:
+ordinary keyed reads measured 7.69-7.87 ns and compiled stable-slot reads
+5.095-5.110 ns. A nested two-column exact query selecting 32 documents from two
+of 256 micro-pages measured 2.28-2.32 us, also at zero allocations. These rows
+measure a hot mapping after eager open; they are not cold-storage latency.
+
+`WriteTo` streams the same 5.40 MB image in 1.07-1.09 ms (4.96-5.04 GB/s)
+with three allocations total on this fixture. Persistence headers, endian
+scratch, nested page offset rebasing, and at-most-64-row page manifests use
+writer-owned fixed storage; only the top-level reference list, Store manifest,
+and writer object allocate. The manifest must be buffered to checksum before a
+generic `io.Writer` receives it.
+
+Supporting a corpus around 100 times larger than RAM while keeping a bounded
+hot set needs the next four changes:
+
+1. open chunks as small mapped descriptors and materialize `DocSet` page state
+   only after a keyed read or candidate mask reaches that page;
+2. store a position-independent packed key directory and exact/posting roots
+   in the image, with a small process-seeded persistent overlay for mutations;
+3. cache decoded directory/posting pages under an explicit byte budget and
+   expose faults, bytes touched, prefetches, and evictions; and
+4. publish replacement pages and roots through append-only copy-on-write with
+   snapshot-aware extent reclamation and checksummed root selection.
+
+The intended attached-file mode is automatic without taxing readers. The
+serialized Store writer is already single-threaded, so it can enqueue a
+generation into a preallocated single-producer ring without another lock or a
+heap allocation. A background writer appends changed pages and copied
+directory/index/TTL paths, group-commits their root, and advances a durable
+generation counter. `Flush`/`Close` fence a requested generation. A synchronous
+option waits on each mutation and necessarily pays storage latency. An async
+`Put` is reader-visible before it is crash-durable; hiding that distinction
+would be an incorrect safety contract.
+
+Packed CHAMP nodes are a good fit for the cold mapped directory because their
+bitmap rank makes external blocks dense. The existing fixed-prefix directory
+remains preferable for the tiny hot overlay and compiled stable-slot reads: a
+measured heap prototype saved 59% directory bytes but made keyed lookup about
+20% slower. The hybrid keeps cold footprint low without taxing every hot hit.
+
+A selective mapped query can beat a heap scan by combining resident 64-slot
+index masks and never faulting rejected JSON pages. A random cold point read
+cannot be faster than DRAM; it pays storage latency. The 100x target is
+therefore accepted only when the measured hot working set fits the configured
+resident budget and the workload is indexed or locality-friendly.
 
 ## TTL
 

@@ -210,13 +210,19 @@ can already borrow a caller-owned mmap through `Open`; this moves the image out
 of `HeapAlloc` while leaving total mapped memory unchanged. The mapping must
 outlive the set and every derived borrowed view.
 
-Automatic mmap ownership is rejected for the mutable Store's current API.
-`RawValue.Bytes` is a plain slice and `Index` also borrows its source, so either
-can outlive the Store or Snapshot value that produced it. Finalizer-driven or
-eager unmapping could invalidate such a live handle. A future external-byte
-mode must use an explicit scoped lease/callback and caller-buffered copy-out, or
-owner-bearing read handles whose latency and size are accepted by benchmark.
-No unsafe lifetime shortcut is hidden behind `StoreOptions`.
+`Store.WriteTo` and `OpenStore` now expose caller-owned external source bytes.
+The reopened Store is mutable, but its immutable base source/native tape
+sections continue to borrow the complete input image through every derived
+state and snapshot. `AppendRaw` and `AppendRawKey` provide caller-buffered,
+lifetime-independent copy-out.
+
+Automatic mmap ownership remains rejected. `RawValue.Bytes` is a plain slice
+and `Index` also borrows its source, so either can outlive the Store or Snapshot
+value that produced it. Finalizer-driven or eager unmapping could invalidate a
+live handle. The caller must keep the image mapped until all borrowed values
+are dead. A future automatic mode still requires an explicit scoped lease or
+owner-bearing handles whose latency and size are accepted by benchmark. No
+unsafe lifetime shortcut is hidden behind `StoreOptions`.
 
 ## Measured mutation result
 
@@ -261,5 +267,6 @@ Operational semantics, complexity, examples, and tuning live in
 
 This decision does not add a WAL, crash recovery, replication, eviction,
 distributed consensus, cross-Store transactions, multi-core query scheduling,
-or a stable serialized Store format. Those features may consume publication
-generations but cannot weaken the reader contract.
+or a stable post-v1 Store format. The current image format is explicitly
+versioned and pre-v1. Those features may consume publication generations but
+cannot weaken the reader contract.

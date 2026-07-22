@@ -110,3 +110,35 @@ func (s *Store) GetRawKey(key StoreKey) (RawValue, bool) {
 
 // GetKey is the current-snapshot convenience form of Snapshot.GetKey.
 func (s *Store) GetKey(key StoreKey) (Index, bool) { return s.Snapshot().GetKey(key) }
+
+// AppendRaw appends key's exact JSON spelling to caller-owned storage. It is
+// the lifetime-independent counterpart to GetRaw: with sufficient capacity it
+// allocates nothing, and the returned bytes remain valid after the Snapshot or
+// a caller-owned mapped Store image is released. A miss leaves dst unchanged.
+func (s Snapshot) AppendRaw(dst []byte, key string) ([]byte, bool) {
+	raw, ok := s.GetRaw(key)
+	if !ok {
+		return dst, false
+	}
+	return append(dst, raw.Bytes()...), true
+}
+
+// AppendRawKey is AppendRaw through a reusable compiled Store key.
+func (s Snapshot) AppendRawKey(dst []byte, key StoreKey) ([]byte, bool) {
+	raw, ok := s.GetRawKey(key)
+	if !ok {
+		return dst, false
+	}
+	return append(dst, raw.Bytes()...), true
+}
+
+// AppendRaw is the current-snapshot convenience form of Snapshot.AppendRaw.
+func (s *Store) AppendRaw(dst []byte, key string) ([]byte, bool) {
+	return s.Snapshot().AppendRaw(dst, key)
+}
+
+// AppendRawKey is the current-snapshot convenience form of
+// Snapshot.AppendRawKey.
+func (s *Store) AppendRawKey(dst []byte, key StoreKey) ([]byte, bool) {
+	return s.Snapshot().AppendRawKey(dst, key)
+}

@@ -189,7 +189,9 @@ func (b *StoreBuilder) buildExactIndexes(store *Store, state *storeState) {
 	if len(b.exact) == 0 {
 		return
 	}
-	store.indexes = make(map[string]*storeIndexBuild, len(b.exact))
+	if store.indexes == nil {
+		store.indexes = make(map[string]*storeIndexBuild, len(b.exact))
+	}
 	for name, exact := range b.exact {
 		pending := make(map[uint64][]storeIndexChunkMask)
 		state.chunks.each(func(id uint32, chunk *storeChunk) bool {

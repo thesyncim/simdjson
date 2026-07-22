@@ -129,6 +129,11 @@ import (
 const (
 	persistVersion = 1
 
+	// Store writes one bounded DocSet image per at-most-64-row micro-page. Keep
+	// that manifest and its offsets in fixed scratch so persistence allocation
+	// is page-granular rather than row-granular.
+	persistSmallManifestDocuments = 64
+
 	persistHeaderMagic   = "SJDOCSET"
 	persistManifestMagic = "SJDSMANI"
 	persistFooterMagic   = "SJDSFOOT"
@@ -214,11 +219,25 @@ func persistChecksum(b []byte) uint64 {
 // Doc and accessor is byte-identical to this one's.
 func (s *DocSet) WriteTo(w io.Writer) (int64, error) {
 	pw := &persistWriter{w: w}
+	s.writeToPersistWriter(pw, 0)
+	return pw.off, pw.err
+}
+
+// writeToNested writes a self-contained image through parent while keeping
+// all offsets relative to the nested image. Reusing the outer writer avoids
+// allocating one io.Writer adapter and scratch block per Store micro-page.
+func (s *DocSet) writeToNested(pw *persistWriter) (int64, error) {
+	base := pw.off
+	s.writeToPersistWriter(pw, base)
+	return pw.off - base, pw.err
+}
+
+func (s *DocSet) writeToPersistWriter(pw *persistWriter, base int64) {
 
 	var header [persistHeaderLen]byte
 	copy(header[0:8], persistHeaderMagic)
 	binary.LittleEndian.PutUint32(header[8:12], persistVersion)
-	pw.write(header[:])
+	pw.writeSmall(header[:])
 
 	// Shape records are addressed by their compiled id — their position in the
 	// cache's shape list, which is stable — so a record names its shape by that
@@ -228,20 +247,26 @@ func (s *DocSet) WriteTo(w io.Writer) (int64, error) {
 		shapeID[rec] = uint32(id)
 	}
 
-	docOffsets := make([]uint64, len(s.docs))
+	var smallOffsets [persistSmallManifestDocuments]uint64
+	docOffsets := smallOffsets[:0]
+	if len(s.docs) <= len(smallOffsets) {
+		docOffsets = smallOffsets[:len(s.docs)]
+	} else {
+		docOffsets = make([]uint64, len(s.docs))
+	}
 	var narrowTotal uint64
 	for i := range s.docs {
-		docOffsets[i] = pw.writeDocRecord(s, i, shapeID, &narrowTotal)
+		docOffsets[i] = pw.writeDocRecord(s, i, shapeID, &narrowTotal, base)
 	}
 
 	pw.pad8()
-	shapeTableOffset := uint64(pw.off)
+	shapeTableOffset := uint64(pw.off - base)
 	pw.writeShapeTable(s)
-	shapeTableLength := uint64(pw.off) - shapeTableOffset
+	shapeTableLength := uint64(pw.off-base) - shapeTableOffset
 
 	pw.pad8()
-	manifestOffset := uint64(pw.off)
-	manifest := s.buildManifest(docOffsets, narrowTotal, shapeTableOffset, shapeTableLength)
+	manifestOffset := uint64(pw.off - base)
+	manifest := s.buildManifest(pw.small[:0], docOffsets, narrowTotal, shapeTableOffset, shapeTableLength)
 	pw.write(manifest)
 
 	var footer [persistFooterLen]byte
@@ -250,9 +275,8 @@ func (s *DocSet) WriteTo(w io.Writer) (int64, error) {
 	binary.LittleEndian.PutUint64(footer[16:24], uint64(len(manifest)))
 	binary.LittleEndian.PutUint64(footer[24:32], persistChecksum(manifest))
 	binary.LittleEndian.PutUint32(footer[32:36], persistVersion)
-	pw.write(footer[:])
+	pw.writeSmall(footer[:])
 
-	return pw.off, pw.err
 }
 
 // writeDocRecord lays down document i's self-describing record and returns its
@@ -268,9 +292,9 @@ func (s *DocSet) WriteTo(w io.Writer) (int64, error) {
 //	 srcLen  source byte length            start/end  shape-taped root span
 //	 nEntry  entry/value count             shape      shape id (classic: ^0)
 //	 k       storage class (persistDoc*)   e          key-hash enrichment flag
-func (pw *persistWriter) writeDocRecord(s *DocSet, i int, shapeID map[*shapeRecord]uint32, narrowTotal *uint64) uint64 {
+func (pw *persistWriter) writeDocRecord(s *DocSet, i int, shapeID map[*shapeRecord]uint32, narrowTotal *uint64, base int64) uint64 {
 	pw.pad8()
-	offset := uint64(pw.off)
+	offset := uint64(pw.off - base)
 
 	idx := s.docs[i]
 	ref := s.shapeTapeRefAt(i)
@@ -305,7 +329,7 @@ func (pw *persistWriter) writeDocRecord(s *DocSet, i int, shapeID map[*shapeReco
 	if ref.enriched {
 		header[21] = 1
 	}
-	pw.write(header[:])
+	pw.writeSmall(header[:])
 	pw.write(idx.src)
 	pw.pad8()
 	if kind == persistDocNarrow {
@@ -325,14 +349,14 @@ func (pw *persistWriter) writeDocRecord(s *DocSet, i int, shapeID map[*shapeReco
 func (pw *persistWriter) writeShapeTable(s *DocSet) {
 	var scratch [4]byte
 	binary.LittleEndian.PutUint32(scratch[:], uint32(len(s.shapes.shapes)))
-	pw.write(scratch[:])
+	pw.writeSmall(scratch[:])
 	for _, rec := range s.shapes.shapes {
 		binary.LittleEndian.PutUint32(scratch[:], uint32(len(rec.fields)))
-		pw.write(scratch[:])
+		pw.writeSmall(scratch[:])
 		for f := range rec.fields {
 			raw := rec.fields[f].raw
 			binary.LittleEndian.PutUint32(scratch[:], uint32(len(raw)))
-			pw.write(scratch[:])
+			pw.writeSmall(scratch[:])
 			if len(raw) > 0 {
 				pw.write(byteview.Bytes(raw))
 			}
@@ -344,8 +368,15 @@ func (pw *persistWriter) writeShapeTable(s *DocSet) {
 // version, flags, options, counts, and the shape table span) followed by the
 // offsets index — the absolute offset of every document record, which is the
 // snapshot's live set. It is buffered whole so WriteTo can checksum it.
-func (s *DocSet) buildManifest(docOffsets []uint64, narrowTotal, shapeTableOffset, shapeTableLength uint64) []byte {
-	buf := make([]byte, persistManifestFixed+8*len(docOffsets))
+func (s *DocSet) buildManifest(dst []byte, docOffsets []uint64, narrowTotal, shapeTableOffset, shapeTableLength uint64) []byte {
+	need := persistManifestFixed + 8*len(docOffsets)
+	if cap(dst) < need {
+		dst = make([]byte, need)
+	} else {
+		dst = dst[:need]
+		clear(dst)
+	}
+	buf := dst
 	copy(buf[0:8], persistManifestMagic)
 	binary.LittleEndian.PutUint32(buf[8:12], persistVersion)
 	binary.LittleEndian.PutUint32(buf[12:16], s.persistFlags())
@@ -387,27 +418,51 @@ func (s *DocSet) persistFlags() uint32 {
 // WriteTo so callers stream without tracking either. Once an error is latched
 // every later write is a no-op and WriteTo returns it.
 type persistWriter struct {
-	w   io.Writer
-	off int64
-	err error
+	w     io.Writer
+	off   int64
+	err   error
+	small [persistManifestFixed + 8*persistSmallManifestDocuments]byte
 }
 
-func (pw *persistWriter) write(b []byte) {
+// Write lets nested persistence formats stream through one offset/error
+// tracker. It also upgrades a short write with no explicit error to
+// io.ErrShortWrite, as io.WriterTo requires.
+func (pw *persistWriter) Write(b []byte) (int, error) {
 	if pw.err != nil || len(b) == 0 {
-		return
+		return 0, pw.err
 	}
 	n, err := pw.w.Write(b)
 	pw.off += int64(n)
+	if err == nil && n != len(b) {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		pw.err = err
 	}
+	return n, err
+}
+
+func (pw *persistWriter) write(b []byte) {
+	_, _ = pw.Write(b)
+}
+
+// writeSmall copies a short stack-backed field into writer-owned storage
+// before crossing the io.Writer interface. Without this boundary, record
+// headers and endian scratch arrays escape once per document. All callers are
+// synchronous and len(b) is at most the fixed footer width.
+func (pw *persistWriter) writeSmall(b []byte) {
+	if len(b) > len(pw.small) {
+		panic("simdjson: internal persistence field exceeds scratch")
+	}
+	copy(pw.small[:], b)
+	pw.write(pw.small[:len(b)])
 }
 
 // pad8 writes zero bytes up to the next eight-byte boundary.
 func (pw *persistWriter) pad8() {
 	if r := pw.off & 7; r != 0 {
-		var zero [8]byte
-		pw.write(zero[:8-r])
+		clear(pw.small[:8])
+		pw.write(pw.small[:8-r])
 	}
 }
 
@@ -422,13 +477,12 @@ func (pw *persistWriter) writeEntries(e []IndexEntry) {
 		pw.write(unsafe.Slice((*byte)(unsafe.Pointer(&e[0])), len(e)*int(unsafe.Sizeof(IndexEntry{}))))
 		return
 	}
-	var buf [16]byte
 	for i := range e {
-		binary.LittleEndian.PutUint32(buf[0:4], e[i].start)
-		binary.LittleEndian.PutUint32(buf[4:8], e[i].end)
-		binary.LittleEndian.PutUint32(buf[8:12], e[i].next)
-		binary.LittleEndian.PutUint32(buf[12:16], e[i].info)
-		pw.write(buf[:])
+		binary.LittleEndian.PutUint32(pw.small[0:4], e[i].start)
+		binary.LittleEndian.PutUint32(pw.small[4:8], e[i].end)
+		binary.LittleEndian.PutUint32(pw.small[8:12], e[i].next)
+		binary.LittleEndian.PutUint32(pw.small[12:16], e[i].info)
+		pw.write(pw.small[:16])
 	}
 }
 
@@ -442,11 +496,10 @@ func (pw *persistWriter) writeNarrow(v []shapeNarrowValue) {
 		pw.write(unsafe.Slice((*byte)(unsafe.Pointer(&v[0])), len(v)*int(unsafe.Sizeof(shapeNarrowValue{}))))
 		return
 	}
-	var buf [8]byte
 	for i := range v {
-		binary.LittleEndian.PutUint32(buf[0:4], v[i].span)
-		binary.LittleEndian.PutUint32(buf[4:8], v[i].info)
-		pw.write(buf[:])
+		binary.LittleEndian.PutUint32(pw.small[0:4], v[i].span)
+		binary.LittleEndian.PutUint32(pw.small[4:8], v[i].info)
+		pw.write(pw.small[:8])
 	}
 }
 
@@ -459,22 +512,33 @@ func (pw *persistWriter) writeNarrow(v []shapeNarrowValue) {
 // ErrPersistVersion, or ErrPersistCorrupt without panicking on any truncated or
 // malformed input.
 func Open(data []byte) (*DocSet, error) {
+	set := new(DocSet)
+	if err := openDocSetInto(set, data); err != nil {
+		return nil, err
+	}
+	return set, nil
+}
+
+// openDocSetInto reconstructs an image directly into caller-owned storage.
+// Store persistence uses it to initialize an embedded chunk DocSet without
+// copying a value that contains a synchronization primitive.
+func openDocSetInto(set *DocSet, data []byte) error {
 	if uint64(len(data)) < persistHeaderLen+persistFooterLen {
-		return nil, fmt.Errorf("%w: image shorter than its framing", ErrPersistCorrupt)
+		return fmt.Errorf("%w: image shorter than its framing", ErrPersistCorrupt)
 	}
 	if string(data[0:8]) != persistHeaderMagic {
-		return nil, fmt.Errorf("%w: header magic", ErrPersistMagic)
+		return fmt.Errorf("%w: header magic", ErrPersistMagic)
 	}
 	if v := binary.LittleEndian.Uint32(data[8:12]); v != persistVersion {
-		return nil, fmt.Errorf("%w: header version %d != %d", ErrPersistVersion, v, persistVersion)
+		return fmt.Errorf("%w: header version %d != %d", ErrPersistVersion, v, persistVersion)
 	}
 
 	footer := data[uint64(len(data))-persistFooterLen:]
 	if string(footer[0:8]) != persistFooterMagic {
-		return nil, fmt.Errorf("%w: footer magic", ErrPersistMagic)
+		return fmt.Errorf("%w: footer magic", ErrPersistMagic)
 	}
 	if v := binary.LittleEndian.Uint32(footer[32:36]); v != persistVersion {
-		return nil, fmt.Errorf("%w: footer version %d != %d", ErrPersistVersion, v, persistVersion)
+		return fmt.Errorf("%w: footer version %d != %d", ErrPersistVersion, v, persistVersion)
 	}
 	manifestOff := binary.LittleEndian.Uint64(footer[8:16])
 	manifestLen := binary.LittleEndian.Uint64(footer[16:24])
@@ -483,16 +547,16 @@ func Open(data []byte) (*DocSet, error) {
 	limit := uint64(len(data)) - persistFooterLen
 	if manifestOff < persistHeaderLen || manifestLen < persistManifestFixed ||
 		manifestOff > limit || manifestLen > limit-manifestOff {
-		return nil, fmt.Errorf("%w: manifest span out of range", ErrPersistCorrupt)
+		return fmt.Errorf("%w: manifest span out of range", ErrPersistCorrupt)
 	}
 	manifest := data[manifestOff : manifestOff+manifestLen]
 	if persistChecksum(manifest) != checksum {
-		return nil, fmt.Errorf("%w: manifest checksum", ErrPersistCorrupt)
+		return fmt.Errorf("%w: manifest checksum", ErrPersistCorrupt)
 	}
 
 	if string(manifest[0:8]) != persistManifestMagic ||
 		binary.LittleEndian.Uint32(manifest[8:12]) != persistVersion {
-		return nil, fmt.Errorf("%w: manifest header", ErrPersistCorrupt)
+		return fmt.Errorf("%w: manifest header", ErrPersistCorrupt)
 	}
 	flags := binary.LittleEndian.Uint32(manifest[12:16])
 	maxDepth := int64(binary.LittleEndian.Uint64(manifest[16:24]))
@@ -507,17 +571,17 @@ func Open(data []byte) (*DocSet, error) {
 	// against real bytes so no allocation trusts the header. The span check is
 	// unconditional so even a zero-length table cannot slice past the image.
 	if uint64(docCount) > (manifestLen-persistManifestFixed)/8 {
-		return nil, fmt.Errorf("%w: document count exceeds manifest", ErrPersistCorrupt)
+		return fmt.Errorf("%w: document count exceeds manifest", ErrPersistCorrupt)
 	}
 	if shapeTableOffset > manifestOff || shapeTableLength > manifestOff-shapeTableOffset ||
 		(shapeTableLength != 0 && shapeTableOffset < persistHeaderLen) {
-		return nil, fmt.Errorf("%w: shape table span out of range", ErrPersistCorrupt)
+		return fmt.Errorf("%w: shape table span out of range", ErrPersistCorrupt)
 	}
 	if uint64(narrowTotal) > limit/uint64(unsafe.Sizeof(shapeNarrowValue{})) {
-		return nil, fmt.Errorf("%w: narrow value total exceeds image", ErrPersistCorrupt)
+		return fmt.Errorf("%w: narrow value total exceeds image", ErrPersistCorrupt)
 	}
 
-	set := &DocSet{source: data}
+	*set = DocSet{source: data}
 	set.ShapeTapes = flags&persistFlagShapeTapes != 0
 	set.wideValueTapes = flags&persistFlagWideValueTapes != 0
 	set.Options = document.IndexOptions{HashKeys: flags&persistFlagHashKeys != 0}
@@ -528,7 +592,7 @@ func Open(data []byte) (*DocSet, error) {
 
 	shapeRecs, err := set.openShapes(data[shapeTableOffset : shapeTableOffset+shapeTableLength])
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	set.docs = make([]Index, docCount)
@@ -539,7 +603,7 @@ func Open(data []byte) (*DocSet, error) {
 		recOff := binary.LittleEndian.Uint64(manifest[persistManifestFixed+8*i:])
 		ref, err := set.openDocRecord(data, recOff, manifestOff, shapeRecs, i)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if ref.rec != nil {
 			tapeRefs[i] = ref
@@ -553,7 +617,7 @@ func Open(data []byte) (*DocSet, error) {
 	}
 
 	set.rebuildAccelerators(flags)
-	return set, nil
+	return nil
 }
 
 // openDocRecord reconstructs document i from the record at recOff, storing its
