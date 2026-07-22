@@ -121,6 +121,23 @@ func (b *Batch) SetPage(page int, offset int64, length int) error {
 	return nil
 }
 
+// ResizePages returns unused trailing page buffers before publication. It is
+// useful when a bounded copy-on-write operation reserves its worst-case tree
+// height before it knows whether a split or prune is required. A batch cannot
+// grow after Begin; every retained page must still be initialized with
+// SetPage.
+func (b *Batch) ResizePages(pageCount int) error {
+	if b == nil || b.state.Load() != batchOwned || pageCount < 0 || pageCount > len(b.pages) {
+		return ErrBatchState
+	}
+	for i := pageCount; i < len(b.pages); i++ {
+		b.committer.freeBuffers.push(uint32(b.pages[i].Buffer))
+		b.pages[i] = Write{}
+	}
+	b.pages = b.pages[:pageCount]
+	return nil
+}
+
 // RootBuffer returns the alternate-root staging buffer.
 func (b *Batch) RootBuffer() ([]byte, error) {
 	if b == nil || b.state.Load() != batchOwned {

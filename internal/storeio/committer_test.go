@@ -144,6 +144,54 @@ func TestCommitterBatchValidationRetainsOwnership(t *testing.T) {
 	}
 }
 
+func TestCommitterBatchResizeReturnsUnusedBuffers(t *testing.T) {
+	committer, _, pageSize := newPortableCommitter(t, 4, 3)
+	defer committer.Close()
+	batch, err := committer.Begin(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.ResizePages(1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := batch.PageBuffer(1); !errors.Is(err, ErrBatchState) {
+		t.Fatalf("released PageBuffer = %v, want %v", err, ErrBatchState)
+	}
+	page, err := batch.PageBuffer(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(page)
+	page[0] = 1
+	if err := batch.SetPage(0, int64(2*pageSize), pageSize); err != nil {
+		t.Fatal(err)
+	}
+	root, err := batch.RootBuffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clear(root)
+	root[0] = 2
+	if err := batch.SetRoot(0, 128); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Publish(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := committer.Wait(1); err != nil {
+		t.Fatal(err)
+	}
+	// The two returned page buffers plus the completed batch capacity make a
+	// worst-case reservation available again.
+	next, err := committer.Begin(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := next.Abort(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCommitterStickyFailure(t *testing.T) {
 	committer, file, pageSize := newPortableCommitter(t, 2, 1)
 	if err := file.Close(); err != nil {
