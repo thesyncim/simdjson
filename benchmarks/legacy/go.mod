@@ -15,7 +15,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.9 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	golang.org/x/arch v0.0.0-20210923205945-b76863e36670 // indirect
-	golang.org/x/sys v0.22.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 )
 
 replace github.com/thesyncim/simdjson => ../..
