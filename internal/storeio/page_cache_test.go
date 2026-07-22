@@ -29,6 +29,9 @@ func TestPageCacheBoundedAdmissionEvictionAndIdentity(t *testing.T) {
 	if err != nil || len(first.Payload()) != 32 || first.Payload()[0] != 1 {
 		t.Fatalf("first Acquire = payload %v, %v", first.Payload(), err)
 	}
+	if len(first.Page()) != pageCacheTestPageSize || cap(first.Page()) != pageCacheTestPageSize {
+		t.Fatalf("first Page = %d/%d", len(first.Page()), cap(first.Page()))
+	}
 	second, err := cache.Acquire(refs[1])
 	if err != nil || second.Payload()[0] != 2 {
 		t.Fatalf("second Acquire = payload %v, %v", second.Payload(), err)

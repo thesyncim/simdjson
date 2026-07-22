@@ -210,6 +210,7 @@ type PageLease struct {
 	frame   int
 	key     pageCacheKey
 	header  PageHeader
+	page    []byte
 	payload []byte
 }
 
@@ -230,6 +231,15 @@ func (l *PageLease) Payload() []byte {
 	return l.payload
 }
 
+// Page returns the complete capacity-clipped common page for typed page
+// decoders. It becomes invalid after Release.
+func (l *PageLease) Page() []byte {
+	if l == nil {
+		return nil
+	}
+	return l.page
+}
+
 // Release unpins the frame. It is idempotent for one PageLease value.
 func (l *PageLease) Release() {
 	if l == nil || l.cache == nil {
@@ -238,6 +248,7 @@ func (l *PageLease) Release() {
 	cache := l.cache
 	cache.release(l.frame, l.key)
 	l.cache = nil
+	l.page = nil
 	l.payload = nil
 	l.header = PageHeader{}
 }
@@ -353,7 +364,8 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 					frame.prefetched = false
 					c.prefetchHits++
 				}
-				lease := PageLease{cache: c, frame: index, key: key, header: frame.header, payload: frame.payload}
+				page := frame.data[:int(key.length):int(key.length)]
+				lease := PageLease{cache: c, frame: index, key: key, header: frame.header, page: page, payload: frame.payload}
 				c.mu.Unlock()
 				return lease, nil
 			}
@@ -413,7 +425,7 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 					c.mu.Unlock()
 					return PageLease{}, nil
 				}
-				lease := PageLease{cache: c, frame: index, key: key, header: header, payload: payload}
+				lease := PageLease{cache: c, frame: index, key: key, header: header, page: data[:int(ref.Length):int(ref.Length)], payload: payload}
 				c.mu.Unlock()
 				return lease, nil
 			}
