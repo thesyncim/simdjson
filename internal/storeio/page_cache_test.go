@@ -249,6 +249,57 @@ func TestPageCacheVariableDocumentExtent(t *testing.T) {
 	}
 }
 
+func TestPageCacheDirtyAdmissionWaitsForDurability(t *testing.T) {
+	file, storeID, refs := newPageCacheFixture(t, 2)
+	page := make([]byte, pageCacheTestPageSize)
+	if _, err := file.ReadAt(page, int64(refs[0].Offset)); err != nil {
+		t.Fatal(err)
+	}
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, ResidentBytes: pageCacheTestPageSize,
+		StoreID: storeID, ReadConcurrency: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := cache.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	if err := cache.AdmitDirty(refs[0], page, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte{0xff}, int64(refs[0].Offset+PageHeaderSize)); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := cache.Acquire(refs[0])
+	if err != nil || lease.Payload()[0] != 1 {
+		t.Fatalf("Acquire admitted = (%v,%v)", lease.Payload(), err)
+	}
+	lease.Release()
+	if _, err := cache.Acquire(refs[1]); !errors.Is(err, ErrPageCachePinned) {
+		t.Fatalf("Acquire with dirty cache = %v, want %v", err, ErrPageCachePinned)
+	}
+	stats := cache.Stats()
+	if stats.DirtyBytes != pageCacheTestPageSize || stats.PageReads != 0 || stats.CacheHits != 1 {
+		t.Fatalf("dirty Stats = %+v", stats)
+	}
+	cache.MarkDurable(1)
+	if stats := cache.Stats(); stats.DirtyBytes != pageCacheTestPageSize {
+		t.Fatalf("early MarkDurable cleared page: %+v", stats)
+	}
+	cache.MarkDurable(2)
+	second, err := cache.Acquire(refs[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.Release()
+	if stats := cache.Stats(); stats.DirtyBytes != 0 || stats.PageReads != 1 || stats.Evictions != 1 {
+		t.Fatalf("durable Stats = %+v", stats)
+	}
+}
+
 func newPageCacheFixture(t testing.TB, count int) (*os.File, [16]byte, []PageRef) {
 	t.Helper()
 	file, err := os.CreateTemp(t.TempDir(), "store-page-cache-*")

@@ -1,6 +1,7 @@
 package storeio
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -103,6 +104,7 @@ type pageCacheFrame struct {
 	payload    []byte
 	key        pageCacheKey
 	header     PageHeader
+	dirty      uint64
 	pins       uint32
 	state      uint8
 	referenced bool
@@ -116,6 +118,7 @@ type PageCacheStats struct {
 	CapacityBytes   uint64
 	ResidentBytes   uint64
 	PinnedPages     uint64
+	DirtyBytes      uint64
 	PageReads       uint64
 	ReadBytes       uint64
 	CacheHits       uint64
@@ -244,6 +247,76 @@ func (l *PageLease) Release() {
 // contains no unleased victim; it never grows the resident set.
 func (c *PageCache) Acquire(ref PageRef) (PageLease, error) {
 	return c.load(ref, true, false)
+}
+
+// AdmitDirty copies one newly encoded immutable page into the bounded cache
+// before its asynchronous commit becomes durable. dirtyGeneration is the
+// publication whose final root will make ref reachable. Dirty frames are not
+// eviction candidates until MarkDurable advances past that generation, so a
+// following mutation never has to read an as-yet-unwritten page from disk.
+func (c *PageCache) AdmitDirty(ref PageRef, src []byte, dirtyGeneration uint64) error {
+	key, err := c.validateRef(ref)
+	if err != nil || dirtyGeneration == 0 || dirtyGeneration < ref.Generation || len(src) < int(ref.Length) {
+		return fmt.Errorf("%w: dirty page reference, generation, or bytes", ErrPageCacheReference)
+	}
+	src = src[:int(ref.Length)]
+	header, _, err := OpenPage(src)
+	if err != nil {
+		return err
+	}
+	if header.StoreID != c.options.StoreID || header.PageSize != ref.Length ||
+		header.LogicalID != ref.LogicalID || header.Generation != ref.Generation ||
+		header.Kind != ref.Kind || header.Flags != ref.Flags {
+		return fmt.Errorf("%w: dirty page identity does not match reference", ErrPageCacheReference)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing || c.closed {
+		return ErrPageCacheClosed
+	}
+	if index, ok := c.byKey[key]; ok {
+		frame := &c.frames[index]
+		if frame.state != pageCacheReady || frame.dirty != dirtyGeneration ||
+			!bytes.Equal(frame.data[:int(ref.Length)], src) {
+			return fmt.Errorf("%w: conflicting dirty page", ErrPageCacheReference)
+		}
+		return nil
+	}
+	index, ok := c.reserveLocked()
+	if !ok {
+		return ErrPageCachePinned
+	}
+	frame := &c.frames[index]
+	page := frame.data[:int(ref.Length):int(ref.Length)]
+	copy(page, src)
+	header, payload, err := OpenPage(page)
+	if err != nil {
+		return err
+	}
+	frame.key = key
+	frame.header = header
+	frame.payload = payload
+	frame.dirty = dirtyGeneration
+	frame.state = pageCacheReady
+	frame.referenced = true
+	c.byKey[key] = index
+	return nil
+}
+
+// MarkDurable makes admitted pages through generation ordinary eviction
+// candidates. It performs no file I/O.
+func (c *PageCache) MarkDurable(generation uint64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	for i := range c.frames {
+		if c.frames[i].dirty != 0 && c.frames[i].dirty <= generation {
+			c.frames[i].dirty = 0
+		}
+	}
+	c.mu.Unlock()
 }
 
 func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
@@ -377,7 +450,7 @@ func (c *PageCache) reserveLocked() (int, bool) {
 			c.hand = 0
 		}
 		frame := &c.frames[index]
-		if frame.state != pageCacheReady || frame.pins != 0 {
+		if frame.state != pageCacheReady || frame.pins != 0 || frame.dirty != 0 {
 			continue
 		}
 		if frame.referenced {
@@ -396,6 +469,7 @@ func resetPageCacheFrame(frame *pageCacheFrame) {
 	frame.payload = nil
 	frame.key = pageCacheKey{}
 	frame.header = PageHeader{}
+	frame.dirty = 0
 	frame.pins = 0
 	frame.state = pageCacheEmpty
 	frame.referenced = false
@@ -518,6 +592,9 @@ func (c *PageCache) Stats() PageCacheStats {
 		}
 		if c.frames[i].pins != 0 {
 			stats.PinnedPages++
+		}
+		if c.frames[i].dirty != 0 {
+			stats.DirtyBytes += uint64(c.options.MaxPageSize)
 		}
 	}
 	c.mu.Unlock()
