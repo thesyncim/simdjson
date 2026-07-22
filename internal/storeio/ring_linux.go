@@ -469,8 +469,7 @@ func (r *Ring) RegisterBuffers(count, size int) error {
 	if count > maxInt()/size {
 		return syscall.EOVERFLOW
 	}
-	mapping, err := syscall.Mmap(-1, 0, count*size, syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_PRIVATE|syscall.MAP_ANON)
+	mapping, err := allocateArena(count * size)
 	if err != nil {
 		return fmt.Errorf("io_uring allocate fixed buffers: %w", err)
 	}
@@ -479,7 +478,7 @@ func (r *Ring) RegisterBuffers(count, size int) error {
 		vectors[i] = ioVector{Base: uintptr(unsafe.Pointer(&mapping[i*size])), Len: uintptr(size)}
 	}
 	if err := ioUringRegister(r.fd, ioUringRegisterBuffers, unsafe.Pointer(&vectors[0]), uint32(len(vectors))); err != nil {
-		_ = syscall.Munmap(mapping)
+		_ = releaseArena(mapping)
 		return fmt.Errorf("io_uring register buffers: %w", err)
 	}
 	runtime.KeepAlive(vectors)
@@ -739,7 +738,7 @@ func (r *Ring) Close() error {
 		result = errors.Join(result, err)
 	}
 	if len(r.bufferMap) != 0 {
-		if err := syscall.Munmap(r.bufferMap); err != nil {
+		if err := releaseArena(r.bufferMap); err != nil {
 			result = errors.Join(result, err)
 		}
 	}

@@ -130,6 +130,9 @@ docset_postings_test.go
 docset_test.go
 docset_valuedict_test.go
 duplicate_keys_contract_test.go
+internal/storeio/committer_test.go
+internal/storeio/device_test.go
+internal/storeio/index_pool_test.go
 field_cursor_test.go
 index_bitmap_test.go
 index_contract_helpers_test.go
@@ -212,7 +215,9 @@ encoder_sequence_fuzz_test.go
 marshal_hint_test.go
 query/workspace_test.go
 resource_retention_test.go
+internal/storeio/committer_alloc_test.go
 internal/storeio/ring_alloc_linux_test.go
+internal/storeio/device_alloc_test.go
 ```
 
 ### `ROUTE`

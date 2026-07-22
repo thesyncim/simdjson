@@ -248,7 +248,7 @@ func (s *DocSet) writeToPersistWriter(pw *persistWriter, base int64) {
 	}
 
 	var smallOffsets [persistSmallManifestDocuments]uint64
-	docOffsets := smallOffsets[:0]
+	var docOffsets []uint64
 	if len(s.docs) <= len(smallOffsets) {
 		docOffsets = smallOffsets[:len(s.docs)]
 	} else {

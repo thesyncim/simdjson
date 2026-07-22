@@ -287,6 +287,18 @@ option waits on each mutation and necessarily pays storage latency. An async
 `Put` is reader-visible before it is crash-durable; hiding that distinction
 would be an incorrect safety contract.
 
+The internal I/O half of that contract is implemented. It has a lock-free SPSC
+generation ring, ABA-resistant lock-free buffer/descriptor recycling, bounded
+backpressure, sticky failures, natural group commit, and a zero-allocation
+`Begin`/fill/`Publish`/`Wait` test. Linux uses a scoped pure-Go `io_uring`
+backend with registered off-heap buffers and files; other systems, unsupported
+kernels, and blocked sandboxes use positional writes and data-integrity
+barriers. The root is submitted only after every data page succeeds. This is
+not yet a public Store persistence mode: physical page encoding, mutation
+attachment, double-root recovery, and extent reclamation are the remaining
+correctness boundary. A ready recycle or busy-worker notification stays on the
+atomic fast path; a full budget or an idle worker necessarily parks or wakes.
+
 Packed CHAMP nodes are a good fit for the cold page directory because their
 bitmap rank makes external blocks dense. The existing fixed-prefix directory
 remains preferable for the tiny hot overlay and compiled stable-slot reads: a
@@ -298,6 +310,38 @@ index masks and never reading rejected JSON pages. A random cold point read
 cannot be faster than DRAM; it pays storage latency. The 100x target is
 therefore accepted only when the measured hot working set fits the configured
 resident budget and the workload is indexed or locality-friendly.
+
+### Capacity planning for 1 TiB
+
+There are two different answers until the paged mode is complete. The current
+heap Store measured 62.4 MiB for 25.0 MiB of clustered source JSON with one
+low-cardinality exact index: 2.50 live heap bytes per source byte. A linear
+1 TiB extrapolation would therefore require about 2.50 TiB of live heap. That
+is workload evidence, not a universal multiplier, but it makes clear that the
+current implementation is not a 1 TiB-on-64-GiB database.
+
+The bounded paged target sizes RAM from the hot working set rather than total
+JSON. The following directory estimates extrapolate the measured 65,536-key
+fixed and packed-CHAMP prototypes; the per-index column extrapolates the
+measured 4.2 bytes/document 16-value exact index. They exclude key spelling,
+TTL entries, high-cardinality value directories, allocator rounding, and the
+resident JSON-page cache.
+
+| average JSON/document | documents in 1 TiB | hot fixed directory | packed cold directory | each measured enum index |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 KiB | 1.07 billion | 147 GiB | 60.3 GiB | 4.2 GiB |
+| 4 KiB | 268 million | 36.7 GiB | 15.1 GiB | 1.05 GiB |
+| 16 KiB | 67.1 million | 9.17 GiB | 3.77 GiB | 0.26 GiB |
+
+For the 4 KiB example, a literal 100x page-cache ratio contributes another
+10.24 GiB. About 32 GiB is therefore only a lower-bound configuration with a
+paged cold directory and a few compact indexes; 64 GiB is a practical starting
+point, and 128 GiB buys a materially larger hot set. One-kilobyte documents or
+many unique/high-cardinality and compound indexes can require 128–256 GiB even
+though JSON pages remain bounded. Disk must additionally hold page headers,
+index/value dictionaries, copy-on-write generations awaiting reclamation, and
+free-space headroom; no fixed disk multiplier is claimed until the durable page
+format and churn benchmark exist.
 
 ## TTL
 

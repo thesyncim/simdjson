@@ -3,6 +3,7 @@
 package storeio
 
 import (
+	"os"
 	"runtime"
 	"testing"
 )
@@ -39,5 +40,68 @@ func TestFixedWriteSteadyAllocation(t *testing.T) {
 		}
 	}); allocs != 0 {
 		t.Fatalf("fixed write allocations = %g, want 0", allocs)
+	}
+}
+
+func TestRingDeviceCommitSteadyAllocation(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	device, _ := newRingTestDevice(t)
+	defer func() {
+		if err := device.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+	const page = "ring-page"
+	const root = "ring-root"
+	copy(deviceBuffer(t, device, 0), page)
+	copy(deviceBuffer(t, device, 1), root)
+	writes := [...]Write{{Offset: int64(os.Getpagesize()), Length: uint32(len(page)), Buffer: 0}}
+	rootWrite := Write{Length: uint32(len(root)), Buffer: 1}
+	if allocs := testing.AllocsPerRun(20, func() {
+		if err := device.Commit(writes[:], rootWrite); err != nil {
+			panic(err)
+		}
+	}); allocs != 0 {
+		t.Fatalf("ring Commit allocations = %g, want 0", allocs)
+	}
+}
+
+func TestRingCommitterSteadyAllocation(t *testing.T) {
+	committer, _ := newRingTestCommitter(t)
+	defer committer.Close()
+	pageSize := os.Getpagesize()
+	var generation uint64
+	if allocs := testing.AllocsPerRun(20, func() {
+		generation++
+		batch, err := committer.Begin(1)
+		if err != nil {
+			panic(err)
+		}
+		page, err := batch.PageBuffer(0)
+		if err != nil {
+			panic(err)
+		}
+		root, err := batch.RootBuffer()
+		if err != nil {
+			panic(err)
+		}
+		copy(page, "page")
+		copy(root, "root")
+		if err := batch.SetPage(0, int64(pageSize), 4); err != nil {
+			panic(err)
+		}
+		if err := batch.SetRoot(0, 4); err != nil {
+			panic(err)
+		}
+		if err := batch.Publish(generation); err != nil {
+			panic(err)
+		}
+		if err := committer.Wait(generation); err != nil {
+			panic(err)
+		}
+	}); allocs != 0 {
+		t.Fatalf("ring Begin/fill/Publish/Wait allocations = %g, want 0", allocs)
 	}
 }

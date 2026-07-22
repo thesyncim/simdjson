@@ -5,6 +5,7 @@ package storeio
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"testing"
@@ -107,6 +108,100 @@ func TestFixedWriteAndDataSync(t *testing.T) {
 	}
 }
 
+func TestRingDeviceCommit(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	device, file := newRingTestDevice(t)
+	defer func() {
+		if err := device.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+	if device.Backend() != BackendIOUring {
+		t.Fatalf("backend = %v, want io_uring", device.Backend())
+	}
+	pageSize := os.Getpagesize()
+	page0 := []byte("ring-page-zero")
+	page1 := []byte("ring-page-one")
+	root := []byte("ring-root")
+	copy(deviceBuffer(t, device, 0), page0)
+	copy(deviceBuffer(t, device, 1), page1)
+	copy(deviceBuffer(t, device, 2), root)
+	writes := [...]Write{
+		{Offset: int64(pageSize), Length: uint32(len(page0)), Buffer: 0},
+		{Offset: int64(2 * pageSize), Length: uint32(len(page1)), Buffer: 1},
+	}
+	if err := device.Commit(writes[:], Write{Length: uint32(len(root)), Buffer: 2}); err != nil {
+		t.Fatal(err)
+	}
+	assertFileBytes(t, file, int64(pageSize), page0)
+	assertFileBytes(t, file, int64(2*pageSize), page1)
+	assertFileBytes(t, file, 0, root)
+}
+
+func TestRingCommitter(t *testing.T) {
+	committer, file := newRingTestCommitter(t)
+	pageSize := os.Getpagesize()
+	page := []byte("ring-committer-page")
+	root := []byte("ring-committer-root")
+	publishTestGeneration(t, committer, 1,
+		[]testPage{{offset: int64(pageSize), data: page}}, 0, root)
+	if err := committer.Wait(1); err != nil {
+		t.Fatal(err)
+	}
+	if got := committer.Stats().Backend; got != BackendIOUring {
+		t.Fatalf("backend = %v, want io_uring", got)
+	}
+	assertFileBytes(t, file, int64(pageSize), page)
+	assertFileBytes(t, file, 0, root)
+	if err := committer.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRingDataFailureDoesNotSubmitRoot(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	path := filepath.Join(t.TempDir(), "read-only-ring-store")
+	wantRoot := []byte("old-root")
+	if err := os.WriteFile(path, wantRoot, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	device, err := OpenDevice(file, DeviceOptions{
+		Backend: BackendIOUring, BufferCount: 2, BufferSize: os.Getpagesize(),
+		QueueDepth: 8, SingleIssuer: true,
+	})
+	if errors.Is(err, ErrUnavailable) || errors.Is(err, ErrUnsupported) {
+		t.Skip(err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer device.Close()
+	copy(deviceBuffer(t, device, 0), "new-page")
+	copy(deviceBuffer(t, device, 1), "new-root")
+	if err := device.Commit(
+		[]Write{{Offset: int64(os.Getpagesize()), Length: 8, Buffer: 0}},
+		Write{Offset: 0, Length: 8, Buffer: 1},
+	); err == nil {
+		t.Fatal("Commit to read-only file succeeded")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(wantRoot) {
+		t.Fatalf("root changed after data failure: %q", got)
+	}
+}
+
 func newFixedTestRing(t *testing.T) (*Ring, *os.File) {
 	t.Helper()
 	ring, err := Open(Config{Entries: 8, SingleIssuer: true})
@@ -134,4 +229,43 @@ func newFixedTestRing(t *testing.T) (*Ring, *os.File) {
 		t.Fatal(err)
 	}
 	return ring, file
+}
+
+func newRingTestDevice(t *testing.T) (Device, *os.File) {
+	t.Helper()
+	file, err := os.CreateTemp(t.TempDir(), "ring-device")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	device, err := OpenDevice(file, DeviceOptions{
+		Backend: BackendIOUring, BufferCount: 3, BufferSize: os.Getpagesize(),
+		QueueDepth: 8, SingleIssuer: true,
+	})
+	if errors.Is(err, ErrUnavailable) || errors.Is(err, ErrUnsupported) {
+		t.Skip(err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return device, file
+}
+
+func newRingTestCommitter(t *testing.T) (*Committer, *os.File) {
+	t.Helper()
+	file, err := os.CreateTemp(t.TempDir(), "ring-committer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	committer, err := NewCommitter(file, DeviceOptions{
+		Backend: BackendIOUring, BufferCount: 3, BufferSize: os.Getpagesize(), QueueDepth: 8,
+	}, CommitterOptions{QueueSlots: 4, MaxPagesPerBatch: 1, GroupLimit: 4})
+	if errors.Is(err, ErrUnavailable) || errors.Is(err, ErrUnsupported) {
+		t.Skip(err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return committer, file
 }

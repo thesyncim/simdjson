@@ -1,10 +1,11 @@
 # ADR 0005: one Store surface, bulk construction, and mapped pages
 
 Status: accepted in stages. Transient construction, the caller-owned
-Store-image boundary, and the scoped pure-Go Linux ring substrate are
-implemented; the automatic copy-on-write committer, swizzled page manager, and
-bounded residency remain proposed. Extends ADR 0004 without changing its
-borrowed-value lifetime contract.
+Store-image boundary, the scoped pure-Go Linux ring substrate, and the bounded
+internal page committer are implemented. Store page encoding and attachment,
+double-root recovery, the swizzled read-page manager, and bounded residency
+remain proposed. Extends ADR 0004 without changing its borrowed-value lifetime
+contract.
 
 ## Decision
 
@@ -232,17 +233,38 @@ One transaction follows a failure-atomic sequence:
 6. atomically select the descriptor through a checksummed double superblock.
 
 The writer does not mutate durable structures through a writable mapping.
-Conventional files use explicit positional/vector writes followed by the
-platform's data-integrity barrier (`fdatasync` where available), then persist
-the alternate superblock. The implemented Linux page-I/O substrate is pure Go
-and uses no cgo; the automatic committer has not been connected to it yet. The
-ring uses one locked writer thread, registered files, anonymous off-heap fixed
-buffers, linked fixed-buffer I/O, runtime opcode probing, and explicit
-completion/overflow checks. Unsupported kernels and sandbox policies will
-fall back to the portable backend. SQ polling and direct I/O remain opt-in
-benchmark decisions because each changes CPU, memory-lock, or alignment
-economics. This cannot change the commit semantics. Read-only checkpoint
-mappings never contain dirty transactional state.
+Conventional files use explicit positional writes followed by the platform's
+data-integrity barrier (`fdatasync` on Linux, `File.Sync` elsewhere), then
+persist the alternate superblock. The implemented internal committer accepts
+already-encoded page images, recycles a fixed buffer/descriptor budget through
+ABA-resistant tagged free lists, and publishes work through a preallocated
+single-producer/single-consumer generation ring. Its uncontended
+`Begin`/fill and publication into the generation ring are lock-free and
+zero-allocation while capacity is available. Recycling and worker notification
+touch no channel on their ready/busy fast paths; exhausting capacity or waking
+an actually parked worker enters the runtime's blocking machinery. `Wait` and
+`Flush` are explicit blocking durability fences.
+On the Apple M4 Max development host, recycling one index through the tagged
+pool measured 8.70-8.79 ns versus 16.47-16.74 ns through a capacity-one Go
+channel, both at zero allocations. This isolates control-plane reuse and does
+not include storage latency. Reserving and aborting a one-page batch—one
+descriptor plus two buffers—measured 16.17-16.38 ns and zero allocations.
+
+The committer drives either the portable device or the pure-Go Linux ring
+device. The latter uses no cgo and owns one locked writer thread, registered
+files, anonymous off-heap fixed buffers, fixed-buffer I/O, runtime opcode
+probing, and explicit completion/overflow checks. It writes all data pages,
+passes a data barrier, writes only the newest grouped root, and passes the final
+barrier before advancing `DurableGeneration`. Unsupported kernels and sandbox
+policies fall back to the portable device. SQ polling and direct I/O remain
+opt-in benchmark decisions because each changes CPU, memory-lock, or alignment
+economics. This cannot change commit semantics.
+
+This is deliberately still internal: Store does not yet encode its changed
+micro-pages and copied key/index/TTL paths into these buffers, nor recover a
+checksummed double root. Therefore ordinary `Put`, `Delete`, and TTL operations
+are not yet automatically durable. Read-only checkpoint mappings never contain
+dirty transactional state.
 
 The old root stays valid until the final step. Recovery chooses the newest
 valid superblock and ignores unreferenced partial pages. This follows the

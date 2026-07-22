@@ -1,13 +1,10 @@
-// Package storeio provides the narrow asynchronous-file-I/O substrate
+// Package storeio provides the bounded page-I/O and automatic commit substrate
 // used by Store persistence. It is intentionally not a general io_uring
 // binding: constraining the surface keeps kernel pointer lifetimes, queue
-// ownership, and completion accounting reviewable.
+// ownership, durability ordering, and completion accounting reviewable.
 package storeio
 
-import (
-	"errors"
-	"syscall"
-)
+import "errors"
 
 var (
 	// ErrUnavailable reports that io_uring is absent, disabled, blocked by the
@@ -28,7 +25,7 @@ var (
 	// must treat the ring as failed because request accounting is no longer
 	// trustworthy.
 	ErrOverflow = errors.New("simdjson: io_uring queue accounting lost")
-	// ErrClosed reports use after Ring.Close.
+	// ErrClosed reports use after a Store I/O owner begins closing.
 	ErrClosed = errors.New("simdjson: io_uring ring closed")
 )
 
@@ -57,12 +54,4 @@ type Completion struct {
 	UserData uint64
 	Result   int32
 	Flags    uint32
-}
-
-// Err converts a negative completion result to syscall.Errno.
-func (c Completion) Err() error {
-	if c.Result >= 0 {
-		return nil
-	}
-	return syscall.Errno(-c.Result)
 }
