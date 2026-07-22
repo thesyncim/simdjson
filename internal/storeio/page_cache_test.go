@@ -303,6 +303,47 @@ func TestPageCacheDirtyAdmissionWaitsForDurability(t *testing.T) {
 	}
 }
 
+func TestPageCacheDiscardDirtyGeneration(t *testing.T) {
+	file, storeID, refs := newPageCacheFixture(t, 1)
+	page := make([]byte, pageCacheTestPageSize)
+	if _, err := file.ReadAt(page, int64(refs[0].Offset)); err != nil {
+		t.Fatal(err)
+	}
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, ResidentBytes: pageCacheTestPageSize,
+		StoreID: storeID, ReadConcurrency: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+	if err := cache.AdmitDirty(refs[0], page, 3); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := cache.Acquire(refs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.DiscardDirty(3); !errors.Is(err, ErrPageCachePinned) {
+		t.Fatalf("pinned DiscardDirty = %v, want %v", err, ErrPageCachePinned)
+	}
+	lease.Release()
+	if err := cache.DiscardDirty(3); err != nil {
+		t.Fatal(err)
+	}
+	if stats := cache.Stats(); stats.ResidentBytes != 0 || stats.DirtyBytes != 0 {
+		t.Fatalf("Stats after discard = %+v", stats)
+	}
+	lease, err = cache.Acquire(refs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Release()
+	if stats := cache.Stats(); stats.PageReads != 1 {
+		t.Fatalf("discarded page did not read from file: %+v", stats)
+	}
+}
+
 func newPageCacheFixture(t testing.TB, count int) (*os.File, [16]byte, []PageRef) {
 	t.Helper()
 	file, err := os.CreateTemp(t.TempDir(), "store-page-cache-*")

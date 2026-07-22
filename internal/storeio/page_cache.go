@@ -330,6 +330,30 @@ func (c *PageCache) MarkDurable(generation uint64) {
 	c.mu.Unlock()
 }
 
+// DiscardDirty removes unreachable pages from an aborted publication. Callers
+// must release any internal planning lease first.
+func (c *PageCache) DiscardDirty(generation uint64) error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.frames {
+		frame := &c.frames[i]
+		if frame.dirty == generation && frame.pins != 0 {
+			return ErrPageCachePinned
+		}
+	}
+	for i := range c.frames {
+		frame := &c.frames[i]
+		if frame.dirty == generation {
+			delete(c.byKey, frame.key)
+			resetPageCacheFrame(frame)
+		}
+	}
+	return nil
+}
+
 func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 	key, err := c.validateRef(ref)
 	if err != nil {
