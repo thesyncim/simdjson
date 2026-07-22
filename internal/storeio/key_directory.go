@@ -9,9 +9,9 @@ import (
 
 const (
 	KeyDirectoryPayloadHeaderSize = 32
-	KeyDirectoryLeafRecordSize    = 16
+	KeyDirectoryLeafRecordSize    = 24
 	KeyDirectoryBranchRecordSize  = 40
-	keyDirectoryVersion           = uint32(1)
+	keyDirectoryVersion           = uint32(2)
 	keyDirectoryKnownFlags        = uint8(0)
 	keyDirectoryMaxLevel          = uint8(10)
 )
@@ -23,8 +23,9 @@ var ErrKeyDirectoryCorrupt = errors.New("simdjson: corrupt Store key directory")
 
 // KeyLocation is the stable Store row address stored in a key-directory leaf.
 type KeyLocation struct {
-	Chunk uint32
-	Slot  uint8
+	Chunk    uint32
+	Slot     uint8
+	Deadline int64
 }
 
 // KeyDirectoryEntry is one transient leaf input. Key is borrowed only for the
@@ -106,6 +107,7 @@ func EncodeKeyDirectoryLeaf(dst []byte, header KeyDirectoryHeader, entries []Key
 		binary.LittleEndian.PutUint32(record[0:4], uint32(position))
 		binary.LittleEndian.PutUint32(record[4:8], entry.Location.Chunk)
 		record[8] = entry.Location.Slot
+		binary.LittleEndian.PutUint64(record[16:24], uint64(entry.Location.Deadline))
 	}
 	page := dst[:int(header.PageSize)]
 	if _, err := sealInitializedPage(page); err != nil {
@@ -228,7 +230,7 @@ func OpenKeyDirectoryPage(src []byte, fileEnd, nextLogicalID uint64, chunkHighWa
 			return KeyDirectoryView{}, fmt.Errorf("%w: key order", ErrKeyDirectoryCorrupt)
 		}
 		if header.Level == 0 {
-			if !allZero(record[9:KeyDirectoryLeafRecordSize]) ||
+			if !allZero(record[9:16]) ||
 				binary.LittleEndian.Uint32(record[4:8]) >= chunkHighWater || record[8] >= chunkDocuments {
 				return KeyDirectoryView{}, fmt.Errorf("%w: leaf location or reserved bytes", ErrKeyDirectoryCorrupt)
 			}
@@ -277,7 +279,10 @@ func (v KeyDirectoryView) Lookup(key []byte) (KeyLocation, bool) {
 		return KeyLocation{}, false
 	}
 	record := v.payload[KeyDirectoryPayloadHeaderSize+low*KeyDirectoryLeafRecordSize:]
-	return KeyLocation{Chunk: binary.LittleEndian.Uint32(record[4:8]), Slot: record[8]}, true
+	return KeyLocation{
+		Chunk: binary.LittleEndian.Uint32(record[4:8]), Slot: record[8],
+		Deadline: int64(binary.LittleEndian.Uint64(record[16:24])),
+	}, true
 }
 
 // EntryAt returns a borrowed leaf entry at rank.
@@ -287,8 +292,11 @@ func (v KeyDirectoryView) EntryAt(rank int) (KeyDirectoryEntry, bool) {
 	}
 	record := v.payload[KeyDirectoryPayloadHeaderSize+rank*KeyDirectoryLeafRecordSize:]
 	return KeyDirectoryEntry{
-		Key:      v.keyAt(rank, KeyDirectoryLeafRecordSize),
-		Location: KeyLocation{Chunk: binary.LittleEndian.Uint32(record[4:8]), Slot: record[8]},
+		Key: v.keyAt(rank, KeyDirectoryLeafRecordSize),
+		Location: KeyLocation{
+			Chunk: binary.LittleEndian.Uint32(record[4:8]), Slot: record[8],
+			Deadline: int64(binary.LittleEndian.Uint64(record[16:24])),
+		},
 	}, true
 }
 

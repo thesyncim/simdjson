@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/thesyncim/simdjson/document"
 	"github.com/thesyncim/simdjson/internal/storeio"
@@ -25,6 +26,9 @@ var (
 	// ErrFileStoreDocumentTooLarge reports a JSON value beyond the configured
 	// transaction bound.
 	ErrFileStoreDocumentTooLarge = errors.New("simdjson: FileStore document exceeds configured bound")
+	// ErrFileStoreDeadlineRange reports a deadline outside the durable signed
+	// Unix-nanosecond representation.
+	ErrFileStoreDeadlineRange = errors.New("simdjson: FileStore deadline is outside Unix-nanosecond range")
 )
 
 // FileStoreBackend selects the durable page-I/O implementation.
@@ -136,6 +140,7 @@ type fileStoreState struct {
 	stateRef  storeio.PageRef
 	keyRoot   storeio.PageRef
 	chunkRoot storeio.PageRef
+	ttlRoot   storeio.PageRef
 	freeRoot  storeio.PageRef
 }
 
@@ -254,7 +259,7 @@ func OpenFileStore(file *os.File, options FileStoreOptions) (*FileStore, error) 
 	if err != nil {
 		return nil, err
 	}
-	if root.ChunkDocuments != uint32(normalized.Store.ChunkDocuments) || root.IndexCount != 0 || root.TTLCount != 0 {
+	if root.ChunkDocuments != uint32(normalized.Store.ChunkDocuments) || root.IndexCount != 0 {
 		return nil, fmt.Errorf("simdjson: FileStore options or unsupported durable catalog mismatch")
 	}
 	store, err := newFileStoreResources(file, normalized, root.StoreID)
@@ -293,7 +298,8 @@ func OpenFileStore(file *os.File, options FileStoreOptions) (*FileStore, error) 
 	}
 	state := &fileStoreState{
 		root: root, super: super, stateRef: stateRef,
-		keyRoot: root.KeyDirectory, chunkRoot: root.ChunkDirectory, freeRoot: freeRoot,
+		keyRoot: root.KeyDirectory, chunkRoot: root.ChunkDirectory,
+		ttlRoot: root.TTLDirectory, freeRoot: freeRoot,
 	}
 	store.state.Store(state)
 	store.appendChunk = root.ChunkHighWater
@@ -866,7 +872,10 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, location s
 	if err != nil {
 		return false, err
 	}
-	nextState, statePage, err := s.stageFileState(tx, state, generation, prospectiveHighWater, documentCount, liveChunks, chunkMutation.Root, keyRoot, freeRoot, freeChecksum)
+	nextState, statePage, err := s.stageFileState(
+		tx, state, generation, prospectiveHighWater, documentCount, state.root.TTLCount,
+		liveChunks, chunkMutation.Root, keyRoot, state.ttlRoot, freeRoot, freeChecksum,
+	)
 	if err != nil {
 		return false, err
 	}
@@ -924,6 +933,265 @@ func (s *FileStore) Delete(key string) (bool, error) {
 		return false, err
 	}
 	return s.deleteLocked(state, []byte(key), location)
+}
+
+// SetTTL assigns a deadline relative to the current clock. A non-positive TTL
+// publishes an ordinary delete.
+func (s *FileStore) SetTTL(key string, ttl time.Duration) (bool, error) {
+	if ttl <= 0 {
+		return s.Delete(key)
+	}
+	return s.SetDeadline(key, time.Now().Add(ttl))
+}
+
+// SetDeadline durably assigns an absolute expiration. Ordinary reads never
+// consult the clock; ExpireDue makes a due key invisible through a normal
+// copy-on-write delete.
+func (s *FileStore) SetDeadline(key string, deadline time.Time) (bool, error) {
+	if !deadline.After(time.Now()) {
+		return s.Delete(key)
+	}
+	nanos := deadline.UnixNano()
+	if !time.Unix(0, nanos).Equal(deadline) || nanos == 0 {
+		return false, ErrFileStoreDeadlineRange
+	}
+	if s == nil {
+		return false, ErrFileStoreClosed
+	}
+	s.writer.Lock()
+	defer s.writer.Unlock()
+	if s.closed {
+		return false, ErrFileStoreClosed
+	}
+	state := s.state.Load()
+	if state == nil || state.keyRoot == (storeio.PageRef{}) {
+		return false, nil
+	}
+	location, found, err := storeio.LookupKeyTree(s.cache, state.keyRoot, []byte(key), storeio.KeyTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		ChunkHighWater: state.root.ChunkHighWater, ChunkDocuments: uint8(state.root.ChunkDocuments),
+	})
+	if err != nil || !found {
+		return false, err
+	}
+	if location.Deadline == nanos {
+		return true, nil
+	}
+	if err := s.ensureDirtyCapacity(); err != nil {
+		return false, err
+	}
+	return s.setDeadlineLocked(state, []byte(key), location, nanos)
+}
+
+// Persist removes key's expiration without changing the document.
+func (s *FileStore) Persist(key string) (bool, error) {
+	if s == nil {
+		return false, ErrFileStoreClosed
+	}
+	s.writer.Lock()
+	defer s.writer.Unlock()
+	if s.closed {
+		return false, ErrFileStoreClosed
+	}
+	state := s.state.Load()
+	if state == nil || state.keyRoot == (storeio.PageRef{}) {
+		return false, nil
+	}
+	location, found, err := storeio.LookupKeyTree(s.cache, state.keyRoot, []byte(key), storeio.KeyTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		ChunkHighWater: state.root.ChunkHighWater, ChunkDocuments: uint8(state.root.ChunkDocuments),
+	})
+	if err != nil || !found || location.Deadline == 0 {
+		return false, err
+	}
+	if err := s.ensureDirtyCapacity(); err != nil {
+		return false, err
+	}
+	return s.setDeadlineLocked(state, []byte(key), location, 0)
+}
+
+func (s *FileStore) setDeadlineLocked(state *fileStoreState, key []byte, location storeio.KeyLocation, deadline int64) (bool, error) {
+	generation := state.root.Generation + 1
+	if err := s.refreshReusable(state); err != nil {
+		return false, err
+	}
+	tx, err := storeio.BeginWriteTransaction(s.committer, s.cache, s.options.maxTransactionPages, storeio.WriteTransactionOptions{
+		StoreID: s.storeID, Generation: generation, PageSize: uint32(s.options.PageSize),
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		Reusable: s.reusable, ReuseJournal: s.reuseJournal, SingleReuseExtent: true,
+	})
+	if err != nil {
+		return false, err
+	}
+	abort := true
+	retirementReserved := false
+	defer func() {
+		if abort {
+			if retirementReserved {
+				_ = s.reclaimer.CancelRetiredGeneration(state.root.Generation)
+			}
+			_ = tx.Abort()
+		}
+	}()
+	s.retireScratch = s.retireScratch[:0]
+	ttlRoot := state.ttlRoot
+	ttlCount := state.root.TTLCount
+	bounds := storeio.TTLTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		ChunkHighWater: state.root.ChunkHighWater, ChunkDocuments: uint8(state.root.ChunkDocuments),
+	}
+	if location.Deadline != 0 {
+		mutation, deleteErr := storeio.DeleteTTLTree(s.cache, tx, ttlRoot, storeio.TTLKey{
+			Deadline: location.Deadline, Chunk: location.Chunk, Slot: location.Slot,
+		}, bounds)
+		if deleteErr != nil {
+			return false, deleteErr
+		}
+		if !mutation.Found {
+			return false, storeio.ErrTTLDirectoryCorrupt
+		}
+		ttlRoot = mutation.Root
+		ttlCount--
+		if err := s.appendTTLRetirements(state, mutation); err != nil {
+			return false, err
+		}
+	}
+	if deadline != 0 {
+		bounds.FileEnd, bounds.NextLogicalID = tx.FileEnd(), tx.NextLogicalID()
+		mutation, insertErr := storeio.UpsertTTLTree(s.cache, tx, ttlRoot, storeio.TTLKey{
+			Deadline: deadline, Chunk: location.Chunk, Slot: location.Slot,
+		}, bounds)
+		if insertErr != nil {
+			return false, insertErr
+		}
+		ttlRoot = mutation.Root
+		ttlCount++
+		if err := s.appendTTLRetirements(state, mutation); err != nil {
+			return false, err
+		}
+	}
+	location.Deadline = deadline
+	keyMutation, err := storeio.UpsertKeyTree(s.cache, tx, state.keyRoot, key, location, storeio.KeyTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		ChunkHighWater: state.root.ChunkHighWater, ChunkDocuments: uint8(state.root.ChunkDocuments),
+	})
+	if err != nil || !keyMutation.Found {
+		return false, err
+	}
+	freeRoot, freeChecksum, promoted, err := s.syncFileFreeTree(tx, state)
+	if err != nil {
+		return false, err
+	}
+	nextState, statePage, err := s.stageFileState(
+		tx, state, generation, state.root.ChunkHighWater, state.root.DocumentCount, ttlCount,
+		state.root.LiveChunks, state.chunkRoot, keyMutation.Root, ttlRoot, freeRoot, freeChecksum,
+	)
+	if err != nil {
+		return false, err
+	}
+	if err := s.reserveFileRetirements(state, storeio.PageRef{}, keyMutation, storeio.ChunkTreeMutation{}); err != nil {
+		return false, err
+	}
+	retirementReserved = true
+	if err := tx.Publish(statePage.Ref(), storeio.PageChecksum(statePage.Bytes()), nextState.super.FreeOffset, nextState.super.FreeLength, nextState.super.FreeChecksum); err != nil {
+		return false, err
+	}
+	abort = false
+	s.finalizeReusable(promoted)
+	s.snapshotGate.Lock()
+	s.state.Store(nextState)
+	s.snapshotGate.Unlock()
+	if s.options.Synchronous {
+		if err := s.committer.Wait(generation); err != nil {
+			return true, err
+		}
+		s.cache.MarkDurable(generation)
+	}
+	return true, nil
+}
+
+// Deadline returns the deadline encoded beside the key in this snapshot.
+func (s *FileSnapshot) Deadline(key string) (time.Time, bool, error) {
+	if s == nil || s.store == nil || s.state == nil {
+		return time.Time{}, false, ErrFileStoreClosed
+	}
+	state := s.state
+	location, found, err := storeio.LookupKeyTree(s.store.cache, state.keyRoot, []byte(key), storeio.KeyTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+		ChunkHighWater: state.root.ChunkHighWater, ChunkDocuments: uint8(state.root.ChunkDocuments),
+	})
+	if err != nil || !found || location.Deadline == 0 {
+		return time.Time{}, false, err
+	}
+	return time.Unix(0, location.Deadline), true, nil
+}
+
+func (s *FileStore) Deadline(key string) (time.Time, bool, error) {
+	snapshot, err := s.Snapshot()
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	defer snapshot.Close()
+	return snapshot.Deadline(key)
+}
+
+func (s *FileStore) TTLAt(key string, now time.Time) (time.Duration, bool, error) {
+	deadline, ok, err := s.Deadline(key)
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	return deadline.Sub(now), true, nil
+}
+
+// ExpireDue publishes up to limit normal deletes ordered by deadline. A
+// non-positive limit drains every deadline due at now with bounded memory.
+func (s *FileStore) ExpireDue(now time.Time, limit int) (int, error) {
+	if s == nil {
+		return 0, ErrFileStoreClosed
+	}
+	s.writer.Lock()
+	defer s.writer.Unlock()
+	if s.closed {
+		return 0, ErrFileStoreClosed
+	}
+	nowNanos := now.UnixNano()
+	if !time.Unix(0, nowNanos).Equal(now) {
+		return 0, ErrFileStoreDeadlineRange
+	}
+	expired := 0
+	for limit <= 0 || expired < limit {
+		state := s.state.Load()
+		if state == nil || state.ttlRoot == (storeio.PageRef{}) {
+			break
+		}
+		entry, ok, err := storeio.FirstTTLTree(s.cache, state.ttlRoot, storeio.TTLTreeBounds{
+			FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+			ChunkHighWater: state.root.ChunkHighWater, ChunkDocuments: uint8(state.root.ChunkDocuments),
+		})
+		if err != nil {
+			return expired, err
+		}
+		if !ok || entry.Deadline > nowNanos {
+			break
+		}
+		_, view, lease, err := s.loadFileChunk(state, entry.Chunk)
+		if err != nil || view == nil {
+			return expired, err
+		}
+		record, found := view.Lookup(entry.Slot)
+		if !found {
+			lease.Release()
+			return expired, storeio.ErrTTLDirectoryCorrupt
+		}
+		location := storeio.KeyLocation{Chunk: entry.Chunk, Slot: entry.Slot, Deadline: entry.Deadline}
+		_, err = s.deleteLocked(state, record.Key, location)
+		lease.Release()
+		if err != nil {
+			return expired, err
+		}
+		expired++
+	}
+	return expired, nil
 }
 
 func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location storeio.KeyLocation) (bool, error) {
@@ -1005,6 +1273,27 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 	if err != nil || !keyMutation.Found {
 		return false, err
 	}
+	ttlRoot := state.ttlRoot
+	ttlCount := state.root.TTLCount
+	if location.Deadline != 0 {
+		ttlMutation, ttlErr := storeio.DeleteTTLTree(s.cache, tx, ttlRoot, storeio.TTLKey{
+			Deadline: location.Deadline, Chunk: location.Chunk, Slot: location.Slot,
+		}, storeio.TTLTreeBounds{
+			FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+			ChunkHighWater: state.root.ChunkHighWater, ChunkDocuments: uint8(state.root.ChunkDocuments),
+		})
+		if ttlErr != nil {
+			return false, ttlErr
+		}
+		if !ttlMutation.Found {
+			return false, storeio.ErrTTLDirectoryCorrupt
+		}
+		ttlRoot = ttlMutation.Root
+		ttlCount--
+		if err := s.appendTTLRetirements(state, ttlMutation); err != nil {
+			return false, err
+		}
+	}
 	liveChunks := state.root.LiveChunks
 	if live == 0 {
 		liveChunks--
@@ -1015,7 +1304,8 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 	}
 	nextState, statePage, err := s.stageFileState(
 		tx, state, generation, state.root.ChunkHighWater,
-		state.root.DocumentCount-1, liveChunks, chunkRoot, keyMutation.Root, freeRoot, freeChecksum,
+		state.root.DocumentCount-1, ttlCount, liveChunks,
+		chunkRoot, keyMutation.Root, ttlRoot, freeRoot, freeChecksum,
 	)
 	if err != nil {
 		return false, err
@@ -1348,17 +1638,17 @@ func (s *FileStore) fileDocumentPageSize(rows []storeio.DocumentRecord) (uint32,
 	return uint32(size), nil
 }
 
-func (s *FileStore) stageFileState(tx *storeio.WriteTransaction, old *fileStoreState, generation uint64, chunkHighWater uint32, documentCount uint64, liveChunks uint32, chunkRoot, keyRoot, freeRoot storeio.PageRef, freeChecksum uint32) (*fileStoreState, storeio.TransactionPage, error) {
+func (s *FileStore) stageFileState(tx *storeio.WriteTransaction, old *fileStoreState, generation uint64, chunkHighWater uint32, documentCount, ttlCount uint64, liveChunks uint32, chunkRoot, keyRoot, ttlRoot, freeRoot storeio.PageRef, freeChecksum uint32) (*fileStoreState, storeio.TransactionPage, error) {
 	statePage, err := tx.Allocate(storeio.PageStateRoot, uint32(s.options.PageSize), storeio.StateRootLogicalID)
 	if err != nil {
 		return nil, storeio.TransactionPage{}, err
 	}
 	root := storeio.StateRoot{
 		StoreID: s.storeID, Generation: generation, PageSize: uint32(s.options.PageSize),
-		DocumentCount: documentCount, NextLogicalID: tx.NextLogicalID(),
+		DocumentCount: documentCount, TTLCount: ttlCount, NextLogicalID: tx.NextLogicalID(),
 		ChunkHighWater: chunkHighWater, LiveChunks: liveChunks,
 		ChunkDocuments: uint32(s.options.Store.ChunkDocuments),
-		ChunkDirectory: chunkRoot, KeyDirectory: keyRoot,
+		ChunkDirectory: chunkRoot, KeyDirectory: keyRoot, TTLDirectory: ttlRoot,
 	}
 	if _, err := storeio.EncodeStateRootPage(statePage.Bytes(), root, tx.FileEnd()); err != nil {
 		return nil, storeio.TransactionPage{}, err
@@ -1379,7 +1669,7 @@ func (s *FileStore) stageFileState(tx *storeio.WriteTransaction, old *fileStoreS
 	}
 	return &fileStoreState{
 		root: root, super: super, stateRef: statePage.Ref(),
-		keyRoot: keyRoot, chunkRoot: chunkRoot, freeRoot: freeRoot,
+		keyRoot: keyRoot, chunkRoot: chunkRoot, ttlRoot: ttlRoot, freeRoot: freeRoot,
 	}, statePage, nil
 }
 
@@ -1413,6 +1703,19 @@ func (s *FileStore) reserveFileRetirements(old *fileStoreState, oldDocument stor
 		}
 	}
 	return s.reclaimer.RetireBatch(s.retireScratch)
+}
+
+func (s *FileStore) appendTTLRetirements(old *fileStoreState, mutation storeio.TTLTreeMutation) error {
+	for i := 0; i < int(mutation.RetiredCount); i++ {
+		if len(s.retireScratch) == cap(s.retireScratch) {
+			return storeio.ErrRetiredExtentCapacity
+		}
+		ref := mutation.Retired[i]
+		s.retireScratch = append(s.retireScratch, storeio.FreeExtent{
+			Offset: ref.Offset, Length: uint64(ref.Length), RetiredGeneration: old.root.Generation,
+		})
+	}
+	return nil
 }
 
 func (s *FileStore) appendOverflowRetirements(state *fileStoreState, value storeio.DocumentValue, location storeio.KeyLocation) error {

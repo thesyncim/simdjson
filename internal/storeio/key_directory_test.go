@@ -174,7 +174,7 @@ func TestKeyDirectoryRejectsResealedSemanticCorruption(t *testing.T) {
 		name   string
 		mutate func([]byte)
 	}{
-		{"version", func(p []byte) { binary.LittleEndian.PutUint32(p[PageHeaderSize:], 2) }},
+		{"version", func(p []byte) { binary.LittleEndian.PutUint32(p[PageHeaderSize:], 3) }},
 		{"reserved header", func(p []byte) { p[PageHeaderSize+12] = 1 }},
 		{"slot", func(p []byte) { p[first+8] = 64 }},
 		{"reserved record", func(p []byte) { p[first+9] = 1 }},

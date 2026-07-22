@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/simdjson/internal/storeio"
 )
@@ -302,5 +303,107 @@ func TestFileStorePersistsReusableExtentsAcrossReopen(t *testing.T) {
 	}
 	if got := reopened.Stats().FileEnd; got != plateau {
 		t.Fatalf("reopened allocator did not plateau: %d -> %d", plateau, got)
+	}
+}
+
+func TestFileStoreTTLPersistsAndExpiresThroughSnapshots(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-ttl-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testFileStoreOptions()
+	options.MaxRetiredExtents = 512
+	store, err := CreateFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"a", "b", "c"} {
+		if _, err := store.Put(key, []byte(fmt.Sprintf(`{"key":%q}`, key))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	beforeTTL, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Add(24 * time.Hour).Truncate(time.Millisecond)
+	deadlineA, deadlineB := base.Add(time.Hour), base.Add(2*time.Hour)
+	if ok, err := store.SetDeadline("a", deadlineA); err != nil || !ok {
+		t.Fatalf("SetDeadline(a) = (%v,%v)", ok, err)
+	}
+	if ok, err := store.SetDeadline("b", deadlineB); err != nil || !ok {
+		t.Fatalf("SetDeadline(b) = (%v,%v)", ok, err)
+	}
+	if _, ok, err := beforeTTL.Deadline("a"); err != nil || ok {
+		t.Fatalf("old snapshot deadline = (%v,%v)", ok, err)
+	}
+	if got, ok, err := store.Deadline("a"); err != nil || !ok || !got.Equal(deadlineA) {
+		t.Fatalf("Deadline(a) = (%v,%v,%v), want %v", got, ok, err, deadlineA)
+	}
+	if _, err := store.Put("a", []byte(`{"key":"a","updated":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := store.Deadline("a"); err != nil || !ok || !got.Equal(deadlineA) {
+		t.Fatalf("Put did not preserve deadline = (%v,%v,%v)", got, ok, err)
+	}
+	if ok, err := store.Persist("b"); err != nil || !ok {
+		t.Fatalf("Persist(b) = (%v,%v)", ok, err)
+	}
+	if _, ok, err := store.Deadline("b"); err != nil || ok {
+		t.Fatalf("Deadline persisted b = (%v,%v)", ok, err)
+	}
+	if ok, err := store.SetDeadline("b", deadlineB); err != nil || !ok {
+		t.Fatalf("restore Deadline(b) = (%v,%v)", ok, err)
+	}
+	if err := beforeTTL.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.state.Load().root.TTLCount != 2 || reopened.state.Load().ttlRoot == (storeio.PageRef{}) {
+		t.Fatalf("reopened TTL state = %+v", reopened.state.Load().root)
+	}
+	for key, want := range map[string]time.Time{"a": deadlineA, "b": deadlineB} {
+		got, ok, err := reopened.Deadline(key)
+		if err != nil || !ok || !got.Equal(want) {
+			t.Fatalf("reopened Deadline(%s) = (%v,%v,%v), want %v", key, got, ok, err, want)
+		}
+	}
+	beforeExpiry, err := reopened.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired, err := reopened.ExpireDue(base.Add(90*time.Minute), 0)
+	if err != nil || expired != 1 {
+		t.Fatalf("ExpireDue = (%d,%v), want (1,nil)", expired, err)
+	}
+	if _, ok, err := reopened.AppendRaw(nil, "a"); err != nil || ok {
+		t.Fatalf("current expired a = (%v,%v)", ok, err)
+	}
+	if got, ok, err := beforeExpiry.AppendRaw(nil, "a"); err != nil || !ok || len(got) == 0 {
+		t.Fatalf("old snapshot expired a = (%q,%v,%v)", got, ok, err)
+	}
+	if err := beforeExpiry.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := reopened.Deadline("b"); err != nil || !ok || !got.Equal(deadlineB) {
+		t.Fatalf("unexpired b = (%v,%v,%v)", got, ok, err)
+	}
+	if ok, err := reopened.SetTTL("c", 0); err != nil || !ok {
+		t.Fatalf("SetTTL(c,0) = (%v,%v)", ok, err)
+	}
+	if ok, err := reopened.SetDeadline("missing", deadlineB); err != nil || ok {
+		t.Fatalf("SetDeadline(missing) = (%v,%v)", ok, err)
+	}
+	if ok, err := reopened.SetDeadline("b", time.Date(2500, 1, 1, 0, 0, 0, 0, time.UTC)); !errors.Is(err, ErrFileStoreDeadlineRange) || ok {
+		t.Fatalf("out-of-range deadline = (%v,%v)", ok, err)
 	}
 }
