@@ -19,22 +19,23 @@ func testStatePageRef(kind PageKind, page, logical, generation uint64) PageRef {
 
 func testStateRoot(generation uint64) (StateRoot, uint64) {
 	root := StateRoot{
-		StoreID:        testStoreID,
-		Generation:     generation,
-		PageSize:       testSuperblockPageSize,
-		Options:        StateOptionShapeTapes | StateOptionHashKeys,
-		DocumentCount:  129,
-		TTLCount:       17,
-		NextLogicalID:  10,
-		ChunkHighWater: 4,
-		LiveChunks:     3,
-		ChunkDocuments: 64,
-		IndexCount:     2,
-		IndexMaxDepth:  1024,
-		ChunkDirectory: testStatePageRef(PageChunkDirectory, 3, 2, generation),
-		KeyDirectory:   testStatePageRef(PageKeyDirectory, 4, 3, generation),
-		IndexDirectory: testStatePageRef(PageIndexDirectory, 5, 4, generation),
-		TTLDirectory:   testStatePageRef(PageTTLDirectory, 6, 5, generation),
+		StoreID:          testStoreID,
+		Generation:       generation,
+		PageSize:         testSuperblockPageSize,
+		Options:          StateOptionShapeTapes | StateOptionHashKeys,
+		DocumentCount:    129,
+		TTLCount:         17,
+		NextLogicalID:    10,
+		ChunkHighWater:   4,
+		LiveChunks:       3,
+		ChunkDocuments:   64,
+		IndexCount:       2,
+		IndexMaxDepth:    1024,
+		IndexCatalogHash: 0x123456789abcdef0,
+		ChunkDirectory:   testStatePageRef(PageChunkDirectory, 3, 2, generation),
+		KeyDirectory:     testStatePageRef(PageKeyDirectory, 4, 3, generation),
+		IndexDirectory:   testStatePageRef(PageIndexDirectory, 5, 4, generation),
+		TTLDirectory:     testStatePageRef(PageTTLDirectory, 6, 5, generation),
 	}
 	return root, 7 * uint64(testSuperblockPageSize)
 }
@@ -113,7 +114,7 @@ func TestStateRootRejectsResealedSemanticCorruption(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, offset := range []int{
-		PageHeaderSize + 52,
+		PageHeaderSize + 60,
 		PageHeaderSize + 192,
 		PageHeaderSize + 64 + 30,
 	} {

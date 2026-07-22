@@ -17,7 +17,7 @@ const (
 	// reference.
 	PageRefSize = 32
 
-	stateRootVersion        = uint32(1)
+	stateRootVersion        = uint32(2)
 	stateRootChunkRefOffset = 64
 	stateRootKeyRefOffset   = stateRootChunkRefOffset + PageRefSize
 	stateRootIndexRefOffset = stateRootKeyRefOffset + PageRefSize
@@ -61,22 +61,23 @@ type PageRef struct {
 // secondary indexes, and TTL ordering so a mutation copies only affected
 // paths. The persistent free-page tree remains a separate Superblock root.
 type StateRoot struct {
-	StoreID        [16]byte
-	Generation     uint64
-	PageSize       uint32
-	Options        uint32
-	DocumentCount  uint64
-	TTLCount       uint64
-	NextLogicalID  uint64
-	ChunkHighWater uint32
-	LiveChunks     uint32
-	ChunkDocuments uint32
-	IndexCount     uint32
-	IndexMaxDepth  uint32
-	ChunkDirectory PageRef
-	KeyDirectory   PageRef
-	IndexDirectory PageRef
-	TTLDirectory   PageRef
+	StoreID          [16]byte
+	Generation       uint64
+	PageSize         uint32
+	Options          uint32
+	DocumentCount    uint64
+	TTLCount         uint64
+	NextLogicalID    uint64
+	ChunkHighWater   uint32
+	LiveChunks       uint32
+	ChunkDocuments   uint32
+	IndexCount       uint32
+	IndexMaxDepth    uint32
+	IndexCatalogHash uint64
+	ChunkDirectory   PageRef
+	KeyDirectory     PageRef
+	IndexDirectory   PageRef
+	TTLDirectory     PageRef
 }
 
 // EncodeStateRootPage writes and seals one complete common-format page into
@@ -108,6 +109,7 @@ func EncodeStateRootPage(dst []byte, root StateRoot, fileEnd uint64) ([]byte, er
 	binary.LittleEndian.PutUint32(payload[40:44], root.ChunkDocuments)
 	binary.LittleEndian.PutUint32(payload[44:48], root.IndexCount)
 	binary.LittleEndian.PutUint32(payload[48:52], root.IndexMaxDepth)
+	binary.LittleEndian.PutUint64(payload[52:60], root.IndexCatalogHash)
 	encodePageRef(payload[stateRootChunkRefOffset:stateRootKeyRefOffset], root.ChunkDirectory)
 	encodePageRef(payload[stateRootKeyRefOffset:stateRootIndexRefOffset], root.KeyDirectory)
 	encodePageRef(payload[stateRootIndexRefOffset:stateRootTTLRefOffset], root.IndexDirectory)
@@ -130,7 +132,7 @@ func DecodeStateRootPage(src []byte, fileEnd uint64) (StateRoot, error) {
 	if header.Kind != PageStateRoot || header.LogicalID != StateRootLogicalID ||
 		len(payload) != StateRootPayloadSize ||
 		binary.LittleEndian.Uint32(payload[0:4]) != stateRootVersion ||
-		!allZero(payload[52:stateRootChunkRefOffset]) ||
+		!allZero(payload[60:stateRootChunkRefOffset]) ||
 		!pageRefReservedZero(payload[stateRootChunkRefOffset:stateRootKeyRefOffset]) ||
 		!pageRefReservedZero(payload[stateRootKeyRefOffset:stateRootIndexRefOffset]) ||
 		!pageRefReservedZero(payload[stateRootIndexRefOffset:stateRootTTLRefOffset]) ||
@@ -139,22 +141,23 @@ func DecodeStateRootPage(src []byte, fileEnd uint64) (StateRoot, error) {
 		return StateRoot{}, fmt.Errorf("%w: header, version, or reserved bytes", ErrStateRootCorrupt)
 	}
 	root := StateRoot{
-		StoreID:        header.StoreID,
-		Generation:     header.Generation,
-		PageSize:       header.PageSize,
-		Options:        binary.LittleEndian.Uint32(payload[4:8]),
-		DocumentCount:  binary.LittleEndian.Uint64(payload[8:16]),
-		TTLCount:       binary.LittleEndian.Uint64(payload[16:24]),
-		NextLogicalID:  binary.LittleEndian.Uint64(payload[24:32]),
-		ChunkHighWater: binary.LittleEndian.Uint32(payload[32:36]),
-		LiveChunks:     binary.LittleEndian.Uint32(payload[36:40]),
-		ChunkDocuments: binary.LittleEndian.Uint32(payload[40:44]),
-		IndexCount:     binary.LittleEndian.Uint32(payload[44:48]),
-		IndexMaxDepth:  binary.LittleEndian.Uint32(payload[48:52]),
-		ChunkDirectory: decodePageRef(payload[stateRootChunkRefOffset:stateRootKeyRefOffset]),
-		KeyDirectory:   decodePageRef(payload[stateRootKeyRefOffset:stateRootIndexRefOffset]),
-		IndexDirectory: decodePageRef(payload[stateRootIndexRefOffset:stateRootTTLRefOffset]),
-		TTLDirectory:   decodePageRef(payload[stateRootTTLRefOffset:stateRootRefsEnd]),
+		StoreID:          header.StoreID,
+		Generation:       header.Generation,
+		PageSize:         header.PageSize,
+		Options:          binary.LittleEndian.Uint32(payload[4:8]),
+		DocumentCount:    binary.LittleEndian.Uint64(payload[8:16]),
+		TTLCount:         binary.LittleEndian.Uint64(payload[16:24]),
+		NextLogicalID:    binary.LittleEndian.Uint64(payload[24:32]),
+		ChunkHighWater:   binary.LittleEndian.Uint32(payload[32:36]),
+		LiveChunks:       binary.LittleEndian.Uint32(payload[36:40]),
+		ChunkDocuments:   binary.LittleEndian.Uint32(payload[40:44]),
+		IndexCount:       binary.LittleEndian.Uint32(payload[44:48]),
+		IndexMaxDepth:    binary.LittleEndian.Uint32(payload[48:52]),
+		IndexCatalogHash: binary.LittleEndian.Uint64(payload[52:60]),
+		ChunkDirectory:   decodePageRef(payload[stateRootChunkRefOffset:stateRootKeyRefOffset]),
+		KeyDirectory:     decodePageRef(payload[stateRootKeyRefOffset:stateRootIndexRefOffset]),
+		IndexDirectory:   decodePageRef(payload[stateRootIndexRefOffset:stateRootTTLRefOffset]),
+		TTLDirectory:     decodePageRef(payload[stateRootTTLRefOffset:stateRootRefsEnd]),
 	}
 	if err := validateStateRoot(root, fileEnd); err != nil {
 		return StateRoot{}, fmt.Errorf("%w: %v", ErrStateRootCorrupt, err)
@@ -197,7 +200,8 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 	}
 	if root.ChunkDocuments == 0 || root.ChunkDocuments > 64 ||
 		root.LiveChunks > root.ChunkHighWater || root.TTLCount > root.DocumentCount ||
-		root.NextLogicalID <= StateRootLogicalID {
+		root.NextLogicalID <= StateRootLogicalID ||
+		(root.IndexCount == 0) != (root.IndexCatalogHash == 0) {
 		return fmt.Errorf("%w: state counts", ErrInvalidWrite)
 	}
 	if root.LiveChunks == 0 {
@@ -213,17 +217,18 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 		ref      PageRef
 		kind     PageKind
 		required bool
+		allowed  bool
 	}{
-		{root.ChunkDirectory, PageChunkDirectory, root.LiveChunks != 0},
-		{root.KeyDirectory, PageKeyDirectory, root.DocumentCount != 0},
-		{root.IndexDirectory, PageIndexDirectory, root.IndexCount != 0},
-		{root.TTLDirectory, PageTTLDirectory, root.TTLCount != 0},
+		{root.ChunkDirectory, PageChunkDirectory, root.LiveChunks != 0, root.LiveChunks != 0},
+		{root.KeyDirectory, PageKeyDirectory, root.DocumentCount != 0, root.DocumentCount != 0},
+		{root.IndexDirectory, PageIndexDirectory, false, root.IndexCount != 0},
+		{root.TTLDirectory, PageTTLDirectory, root.TTLCount != 0, root.TTLCount != 0},
 	}
 	for i := range refs {
 		if err := validateStatePageRef(refs[i].ref, refs[i].kind, refs[i].required, root, fileEnd); err != nil {
 			return err
 		}
-		if !refs[i].required && refs[i].ref != (PageRef{}) {
+		if !refs[i].allowed && refs[i].ref != (PageRef{}) {
 			return fmt.Errorf("%w: unneeded %d root", ErrInvalidWrite, refs[i].kind)
 		}
 		if refs[i].ref == (PageRef{}) {

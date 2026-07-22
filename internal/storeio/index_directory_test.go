@@ -119,7 +119,7 @@ func TestIndexDirectoryRejectsInvalidAndCorrupt(t *testing.T) {
 	for _, mutate := range []func([]byte){
 		func(p []byte) { binary.LittleEndian.PutUint32(p[PageHeaderSize:], 2) },
 		func(p []byte) { p[PageHeaderSize+8] = 1 },
-		func(p []byte) { p[first+4] = 1 },
+		func(p []byte) { p[first+46] = 1 },
 		func(p []byte) { binary.LittleEndian.PutUint32(p[first:first+4], 2) },
 		func(p []byte) { p[first+50] = 1 },
 		func(p []byte) { p[first+52] = 1 },

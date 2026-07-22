@@ -24,6 +24,7 @@ var ErrIndexDirectoryCorrupt = errors.New("simdjson: corrupt Store index directo
 type IndexDirectoryKey struct {
 	IndexID   uint32
 	TupleHash uint64
+	Chunk     uint32
 }
 
 // IndexPostingRef selects one segment in an immutable posting page.
@@ -149,6 +150,7 @@ func encodeIndexDirectoryHeader(payload []byte, header IndexDirectoryHeader, cou
 
 func encodeIndexDirectoryKey(dst []byte, key IndexDirectoryKey) {
 	binary.LittleEndian.PutUint32(dst[0:4], key.IndexID)
+	binary.LittleEndian.PutUint32(dst[4:8], key.Chunk)
 	binary.LittleEndian.PutUint64(dst[8:16], key.TupleHash)
 }
 
@@ -156,6 +158,7 @@ func decodeIndexDirectoryKey(src []byte) IndexDirectoryKey {
 	return IndexDirectoryKey{
 		IndexID:   binary.LittleEndian.Uint32(src[0:4]),
 		TupleHash: binary.LittleEndian.Uint64(src[8:16]),
+		Chunk:     binary.LittleEndian.Uint32(src[4:8]),
 	}
 }
 
@@ -192,7 +195,7 @@ func OpenIndexDirectoryPage(src []byte, fileEnd, nextLogicalID uint64, indexHigh
 	for i := 0; i < count; i++ {
 		record := payload[IndexDirectoryPayloadHeaderSize+i*recordSize:]
 		key := decodeIndexDirectoryKey(record)
-		if !allZero(record[4:8]) || key.IndexID >= indexHighWater ||
+		if key.IndexID >= indexHighWater ||
 			i != 0 && compareIndexDirectoryKey(previous, key) >= 0 {
 			return IndexDirectoryView{}, fmt.Errorf("%w: key order, id, or reserved bytes", ErrIndexDirectoryCorrupt)
 		}
@@ -312,6 +315,12 @@ func compareIndexDirectoryKey(a, b IndexDirectoryKey) int {
 		return -1
 	}
 	if a.TupleHash > b.TupleHash {
+		return 1
+	}
+	if a.Chunk < b.Chunk {
+		return -1
+	}
+	if a.Chunk > b.Chunk {
 		return 1
 	}
 	return 0

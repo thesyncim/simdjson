@@ -3,6 +3,7 @@ package simdjson
 import (
 	"errors"
 	"fmt"
+	"math/bits"
 	"os"
 	"strings"
 	"testing"
@@ -405,5 +406,112 @@ func TestFileStoreTTLPersistsAndExpiresThroughSnapshots(t *testing.T) {
 	}
 	if ok, err := reopened.SetDeadline("b", time.Date(2500, 1, 1, 0, 0, 0, 0, time.UTC)); !errors.Is(err, ErrFileStoreDeadlineRange) || ok {
 		t.Fatalf("out-of-range deadline = (%v,%v)", ok, err)
+	}
+}
+
+func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-index-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testFileStoreOptions()
+	options.ResidentBytes = 8 << 20
+	options.BufferCount = 128
+	options.MaxRetiredExtents = 512
+	options.Indexes = []StoreIndexDefinition{
+		{Name: "status", Paths: []string{"/status"}},
+		{Name: "tenant_status", Paths: []string{"/tenant", "/status"}},
+	}
+	store, err := CreateFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 12 {
+		status := "idle"
+		if i%3 == 0 {
+			status = "active"
+		}
+		tenant := "other"
+		if i%2 == 0 {
+			tenant = "acme"
+		}
+		doc := fmt.Sprintf(`{"id":%d,"tenant":%q,"status":%q,"padding":%q}`, i, tenant, status, strings.Repeat("x", i*70))
+		if i == 9 {
+			doc = fmt.Sprintf(`{"id":%d,"tenant":%q,"status":"ac\u0074ive","padding":%q}`, i, tenant, strings.Repeat("x", 900))
+		}
+		if _, err := store.Put(fmt.Sprintf("k%02d", i), []byte(doc)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	needle := func(src string) Index {
+		t.Helper()
+		needed, err := RequiredIndexEntries([]byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		index, err := BuildIndex([]byte(src), make([]IndexEntry, needed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return index
+	}
+	active := needle(`"active"`)
+	acme := needle(`"acme"`)
+	countMasks := func(masks []StoreMask) int {
+		count := 0
+		for _, mask := range masks {
+			count += bits.OnesCount64(mask.Bits)
+		}
+		return count
+	}
+	masks, err := store.AppendIndexMasks(nil, "status", active)
+	if err != nil || countMasks(masks) != 4 {
+		t.Fatalf("active masks = (%+v,%v), count %d", masks, err, countMasks(masks))
+	}
+	compound, err := store.AppendIndexMasks(nil, "tenant_status", acme, active)
+	if err != nil || countMasks(compound) != 2 {
+		t.Fatalf("compound masks = (%+v,%v), count %d", compound, err, countMasks(compound))
+	}
+	old, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("k00", []byte(`{"id":0,"tenant":"acme","status":"idle"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.Delete("k06"); err != nil || !ok {
+		t.Fatalf("Delete indexed row = (%v,%v)", ok, err)
+	}
+	masks, err = store.AppendIndexMasks(masks[:0], "status", active)
+	if err != nil || countMasks(masks) != 2 {
+		t.Fatalf("updated active masks = (%+v,%v), count %d", masks, err, countMasks(masks))
+	}
+	oldMasks, err := old.AppendIndexMasks(nil, "status", active)
+	if err != nil || countMasks(oldMasks) != 4 {
+		t.Fatalf("old snapshot masks = (%+v,%v), count %d", oldMasks, err, countMasks(oldMasks))
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	masks, err = reopened.AppendIndexMasks(nil, "status", active)
+	if err != nil || countMasks(masks) != 2 {
+		t.Fatalf("reopened active masks = (%+v,%v), count %d", masks, err, countMasks(masks))
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wrong := options
+	wrong.Indexes = []StoreIndexDefinition{{Name: "status", Paths: []string{"/tenant"}}, options.Indexes[1]}
+	if _, err := OpenFileStore(file, wrong); err == nil {
+		t.Fatal("OpenFileStore accepted a mismatched index catalog")
 	}
 }
