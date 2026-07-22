@@ -260,14 +260,22 @@ generic `io.Writer` receives it.
 Supporting a corpus around 100 times larger than RAM while keeping a bounded
 hot set needs the next four changes:
 
-1. open chunks as small mapped descriptors and materialize `DocSet` page state
-   only after a keyed read or candidate mask reaches that page;
-2. store a position-independent packed key directory and exact/posting roots
-   in the image, with a small process-seeded persistent overlay for mutations;
-3. cache decoded directory/posting pages under an explicit byte budget and
-   expose faults, bytes touched, prefetches, and evictions; and
+1. address immutable chunks by logical page id and pointer-swizzle resident
+   frames, reducing a hot hit to one predictable state check and a direct
+   pointer;
+2. store packed key, exact-index, posting, and TTL nodes in the same page
+   space, keeping only measured hot upper paths resident;
+3. issue explicit asynchronous page reads and physically ordered prefetch under
+   a Store-owned byte budget, exposing reads, bytes, hits, queue depth, dirty
+   bytes, and evictions; and
 4. publish replacement pages and roots through append-only copy-on-write with
    snapshot-aware extent reclamation and checksummed root selection.
+
+Read-only mapping remains useful for the implemented checkpoint and a hot,
+read-mostly corpus. It is not the automatic 100x transactional scheduler:
+demand faults can block arbitrary goroutines and do not provide Store-level
+admission, eviction, prefetch, or error control. ADR 0005 records the primary
+research basis and the explicit-I/O, swizzled-buffer-manager decision.
 
 The intended attached-file mode is automatic without taxing readers. The
 serialized Store writer is already single-threaded, so it can enqueue a
@@ -279,14 +287,14 @@ option waits on each mutation and necessarily pays storage latency. An async
 `Put` is reader-visible before it is crash-durable; hiding that distinction
 would be an incorrect safety contract.
 
-Packed CHAMP nodes are a good fit for the cold mapped directory because their
+Packed CHAMP nodes are a good fit for the cold page directory because their
 bitmap rank makes external blocks dense. The existing fixed-prefix directory
 remains preferable for the tiny hot overlay and compiled stable-slot reads: a
 measured heap prototype saved 59% directory bytes but made keyed lookup about
 20% slower. The hybrid keeps cold footprint low without taxing every hot hit.
 
-A selective mapped query can beat a heap scan by combining resident 64-slot
-index masks and never faulting rejected JSON pages. A random cold point read
+A selective external query can beat a heap scan by combining resident 64-slot
+index masks and never reading rejected JSON pages. A random cold point read
 cannot be faster than DRAM; it pays storage latency. The 100x target is
 therefore accepted only when the measured hot working set fits the configured
 resident budget and the workload is indexed or locality-friendly.

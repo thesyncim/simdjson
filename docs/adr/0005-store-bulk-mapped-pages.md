@@ -1,9 +1,10 @@
 # ADR 0005: one Store surface, bulk construction, and mapped pages
 
-Status: accepted in stages. Transient construction and the caller-owned
-Store-image boundary are implemented; lazy mapped directories, durable
-copy-on-write pages, and bounded residency remain proposed. Extends ADR 0004
-without changing its borrowed-value lifetime contract.
+Status: accepted in stages. Transient construction, the caller-owned
+Store-image boundary, and the scoped pure-Go Linux ring substrate are
+implemented; the automatic copy-on-write committer, swizzled page manager, and
+bounded residency remain proposed. Extends ADR 0004 without changing its
+borrowed-value lifetime contract.
 
 ## Decision
 
@@ -150,15 +151,26 @@ resident summaries and never faulting their JSON bytes.
 Keep residency controllable by separating four temperature classes:
 
 1. a very small pinned superblock and upper key/index directory;
-2. bounded caches of decoded directory and posting pages;
-3. memory-mapped immutable document micro-pages, admitted on demand; and
+2. bounded swizzled frames for directory, posting, and document pages;
+3. immutable background-storage pages admitted through explicit asynchronous
+   reads and bounded prefetch; and
 4. append-only replacement pages plus reclaimable free extents.
 
-The operating system remains the final page cache, but Store must expose a byte
-budget and counters for resident directory pages, document-page faults,
-prefetch hits, bytes read, and eviction advice. A 100x corpus is accepted only
-when steady hot-set RSS remains within the configured budget; virtual mapping
-size alone does not satisfy the target.
+The Store page manager, rather than virtual mapping size, owns the resident byte
+budget and replacement policy. A resident logical-page reference is pointer-
+swizzled so its hot path is one predictable state check and a direct frame
+pointer, not a hash-table lookup. Cold references retain their physical page
+id and enter the I/O scheduler. The implementation must expose resident bytes,
+page reads, prefetch hits, dirty bytes, evictions, and queue depth. A 100x corpus
+is accepted only when steady hot-set RSS remains within the configured budget.
+
+`OpenStore` may continue to mmap a read-only checkpoint for simple restart and
+hot, read-mostly workloads. It is not the primary 100x transactional backend.
+Relying on demand faults would block arbitrary goroutines, surrender admission
+and eviction control, complicate I/O error propagation, and couple the disk
+encoding to virtual-memory behavior. The automatic writer therefore uses
+explicit append I/O and durability barriers; read-only mmap is an optional
+access mode, never the correctness mechanism.
 
 The proposed mutable mode is page-oriented copy-on-write, not a heap Store
 whose byte slices happen to come from mmap. A logical micro-page contains:
@@ -169,15 +181,17 @@ whose byte slices happen to come from mmap. A logical micro-page contains:
 - page-local exact-index tuple masks; and
 - no pointers, capacities, or runtime-specific object layouts.
 
-A small mapped root names logical pages by immutable physical page id. Point
+A small durable root names logical pages by immutable physical page id. Point
 lookup resolves key to `(logical page, stable slot)`, validates the page header,
 and returns a scoped view. Query planning performs `AND`, `OR`, and `NOT` on
-page masks before touching source pages, so a selective query faults only
-candidate pages. Sequential scans use page order and OS readahead.
+page masks before touching source pages, so a selective query reads only
+candidate pages. Sequential scans submit physically ordered, bounded read
+batches rather than triggering one synchronous fault per page.
 
-Cold directory levels use packed CHAMP-style nodes with offsets rather than Go
-pointers. Hot upper levels may be decoded into the existing fixed fan-out form
-when measurement justifies it. Posting streams are ordered by logical page, so
+Cold directory levels use packed CHAMP-style nodes with page-relative offsets
+rather than Go pointers. Hot upper levels are swizzled into direct frame
+pointers and may use the existing fixed fan-out form when measurement justifies
+it. Posting streams are ordered by logical page, so
 Boolean operators merge compressed page ids and apply one native 64-bit mask
 per page; candidate page ids are then sorted by physical offset and prefetched
 in bounded windows. Projection-only queries may be answered from compact
@@ -216,6 +230,19 @@ One transaction follows a failure-atomic sequence:
 4. copy-on-write the changed key/index directory paths;
 5. persist a new root descriptor; and
 6. atomically select the descriptor through a checksummed double superblock.
+
+The writer does not mutate durable structures through a writable mapping.
+Conventional files use explicit positional/vector writes followed by the
+platform's data-integrity barrier (`fdatasync` where available), then persist
+the alternate superblock. The implemented Linux page-I/O substrate is pure Go
+and uses no cgo; the automatic committer has not been connected to it yet. The
+ring uses one locked writer thread, registered files, anonymous off-heap fixed
+buffers, linked fixed-buffer I/O, runtime opcode probing, and explicit
+completion/overflow checks. Unsupported kernels and sandbox policies will
+fall back to the portable backend. SQ polling and direct I/O remain opt-in
+benchmark decisions because each changes CPU, memory-lock, or alignment
+economics. This cannot change the commit semantics. Read-only checkpoint
+mappings never contain dirty transactional state.
 
 The old root stays valid until the final step. Recovery chooses the newest
 valid superblock and ignores unreferenced partial pages. This follows the
@@ -264,6 +291,42 @@ The copy-out form can be zero-allocation with a sufficient destination but is
 not zero-copy. An owner pointer added to every hot value handle is rejected
 until its size and latency are measured. Finalizers are a leak backstop, never
 the correctness mechanism for unmapping.
+
+The explicit page manager makes this contract load-bearing: an evictable frame
+cannot back an unowned `RawValue`. Attached-file mode must therefore pin frames
+through a `ReadLease`/snapshot lease or require caller-buffered copy-out. A hot
+resident lease may be very cheap, but it is measured separately from the
+existing heap Store's 5 ns compiled-key path.
+
+## Research basis and rejected shortcuts
+
+[LeanStore](https://db.in.tum.de/~leis/papers/leanstore.pdf) demonstrates the
+relevant low-overhead buffer-manager technique: pointer swizzling reduces a
+resident page access to a predictable check while preserving explicit global
+replacement beyond RAM. Store adopts that direction for logical pages, but its
+stable 64-slot masks and immutable publication remain specific to JSON queries.
+
+The CIDR paper
+[Are You Sure You Want to Use MMAP in Your Database Management System?](https://db.cs.cmu.edu/papers/2022/cidr2022-p13-crotty.pdf)
+documents why demand paging is rejected as the automatic transactional I/O
+scheduler: blocking faults, insufficient memory/I/O control, error-handling
+problems, transactional complexity, and poor scaling on fast storage.
+
+[FASTER](https://www.microsoft.com/en-us/research/uploads/prod/2018/03/faster-sigmod18.pdf)
+supports the hot-index/hybrid-log split for larger-than-memory point workloads;
+[LLAMA/Bw-tree](https://www.microsoft.com/en-us/research/publication/llama-a-cachestorage-subsystem-for-modern-hardware/)
+supports separating logical from physical page location while log-structuring
+flushes. Store does not copy their delta-chain read paths: bounded micro-pages
+and copied roots keep a current read free of version-chain consolidation debt.
+
+The Linux
+[`io_uring_setup`](https://man7.org/linux/man-pages/man2/io_uring_setup.2.html),
+[`io_uring_enter`](https://man7.org/linux/man-pages/man2/io_uring_enter.2.html),
+and [registered-buffer](https://man7.org/linux/man-pages/man7/io_uring_registered_buffers.7.html)
+contracts define the ring mappings, submission/completion ordering, runtime
+features, and long-term buffer pins used by the scoped substrate. Ring memory
+mapping is control-plane queue sharing; Store data remains under explicit page
+I/O rather than demand-paged writable mappings.
 
 ## Query and TTL consequences
 

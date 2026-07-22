@@ -154,6 +154,7 @@ store_test.go
 store_builder_test.go
 store_index_exact_test.go
 store_persist_test.go
+internal/storeio/ring_linux_test.go
 value_accessors_contract_test.go
 value_iteration_contract_test.go
 value_spans_contract_test.go
@@ -211,6 +212,7 @@ encoder_sequence_fuzz_test.go
 marshal_hint_test.go
 query/workspace_test.go
 resource_retention_test.go
+internal/storeio/ring_alloc_linux_test.go
 ```
 
 ### `ROUTE`
