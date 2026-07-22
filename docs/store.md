@@ -276,7 +276,9 @@ supports exact in-place Boolean execution. Three-way AND is fused to avoid an
 intermediate write/read pass. Pinned Go 1.27 `GOEXPERIMENT=simd` builds use two
 independent 256-bit vectors per loop on amd64. GOAMD64 v1/v2 performs one
 process-constant AVX2 capability branch per bitmap call and otherwise executes
-the scalar reference; v3+ calls AVX2 directly. Generated-code CI verifies that
+the scalar reference; v3+ calls AVX2 directly. All amd64 levels retain the
+unrolled scalar loop below eight words, where the two-vector body cannot run.
+Generated-code CI verifies that
 the v1/v2 dispatch contains no vector instruction before the guard and that
 the vector bodies retain `VPAND`, `VPOR`, `VPANDN`, and `VZEROUPPER`. M4 Max
 NEON measured only parity with the scalar loop at roughly 75-80 GB/s, so arm64
@@ -284,6 +286,13 @@ deliberately keeps the scalar dispatch. Sparse page-id merges remain scalar
 because converting a selective stream to dense words merely to reach SIMD
 would lose. `BenchmarkStoreDenseBitmapPlan` measures both the fused kernel and
 ordered row decoding through the public Store surface.
+
+On the hosted x64 runner (AMD EPYC 7763), SIMD reduced the fused three-index
+intersection from 815.1-823.4 ns to 174.3-174.8 ns, about 4.7x. Including
+ordered decoding of 4,096 candidate rows measured 8.44-8.51 us portable versus
+7.67-7.77 us SIMD, with zero allocations in both cases. These are directional
+hosted-runner results rather than a cross-machine release gate; the benchmark
+workflow retains the raw per-architecture artifacts.
 
 `WriteTo` streams the same 5.40 MB image in 1.07-1.09 ms (4.96-5.04 GB/s)
 with three allocations total on this fixture. Persistence headers, endian

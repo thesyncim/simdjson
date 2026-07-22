@@ -145,9 +145,12 @@ func TestBooleanSteadyAllocs(t *testing.T) {
 var benchWords []uint64
 
 func BenchmarkBoolean(b *testing.B) {
-	for _, words := range []int{8, 64, 1024, 16384} {
+	// Keep both sides of the amd64 AVX2 crossover visible. Sizes below eight
+	// words cannot fill the two-vector body and must not pay its call overhead.
+	for _, words := range []int{1, 4, 7, 8, 64, 1024, 16384} {
 		a := make([]uint64, words)
 		c := make([]uint64, words)
+		d := make([]uint64, words)
 		dst := make([]uint64, words)
 		b.Run("and/dispatch/words="+itoa(words), func(b *testing.B) {
 			b.SetBytes(int64(words * 8 * 3))
@@ -160,6 +163,20 @@ func BenchmarkBoolean(b *testing.B) {
 			b.SetBytes(int64(words * 8 * 3))
 			for i := 0; i < b.N; i++ {
 				andWordsScalar(dst, a, c)
+			}
+			benchWords = dst
+		})
+		b.Run("and3/dispatch/words="+itoa(words), func(b *testing.B) {
+			b.SetBytes(int64(words * 8 * 4))
+			for i := 0; i < b.N; i++ {
+				and3Words(dst, a, c, d)
+			}
+			benchWords = dst
+		})
+		b.Run("and3/scalar/words="+itoa(words), func(b *testing.B) {
+			b.SetBytes(int64(words * 8 * 4))
+			for i := 0; i < b.N; i++ {
+				and3WordsScalar(dst, a, c, d)
 			}
 			benchWords = dst
 		})

@@ -8,14 +8,16 @@ import "simd/archsimd"
 // process-constant branch at the public kernel boundary avoids an indirect
 // function call, which would make escape analysis conservatively leak caller
 // buffers. GOAMD64=v1/v2 binaries therefore remain safe on pre-AVX2 CPUs while
-// preserving allocation-free calls on AVX2 machines.
+// preserving allocation-free calls on AVX2 machines. Inputs shorter than two
+// 256-bit vectors stay in the unrolled scalar loop; they cannot enter the
+// vector body and would only pay its call and transition overhead.
 var bitsetAVX2Available = archsimd.X86.AVX2()
 
 // Accelerated reports whether this process selected the AVX2 word kernels.
 func Accelerated() bool { return bitsetAVX2Available }
 
 func andWords(dst, a, b []uint64) {
-	if bitsetAVX2Available {
+	if len(dst) >= 8 && bitsetAVX2Available {
 		andWordsAVX2(dst, a, b)
 		return
 	}
@@ -23,7 +25,7 @@ func andWords(dst, a, b []uint64) {
 }
 
 func and3Words(dst, a, b, c []uint64) {
-	if bitsetAVX2Available {
+	if len(dst) >= 8 && bitsetAVX2Available {
 		and3WordsAVX2(dst, a, b, c)
 		return
 	}
@@ -31,7 +33,7 @@ func and3Words(dst, a, b, c []uint64) {
 }
 
 func orWords(dst, a, b []uint64) {
-	if bitsetAVX2Available {
+	if len(dst) >= 8 && bitsetAVX2Available {
 		orWordsAVX2(dst, a, b)
 		return
 	}
@@ -39,7 +41,7 @@ func orWords(dst, a, b []uint64) {
 }
 
 func andNotWords(dst, a, b []uint64) {
-	if bitsetAVX2Available {
+	if len(dst) >= 8 && bitsetAVX2Available {
 		andNotWordsAVX2(dst, a, b)
 		return
 	}

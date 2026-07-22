@@ -300,6 +300,12 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Change an existing TTL | 45 ns, 0 allocations |
 | Dense bitmap Boolean pass on M4 Max | 75-80 GB/s, 0 allocations; NEON did not beat scalar and is not dispatched |
 
+On the hosted AMD EPYC 7763 runner, AVX2 reduced the fused dense Store
+three-predicate kernel from 815-823 ns to 174-175 ns (about 4.7x). The complete
+kernel-plus-ordered-row decode improved from 8.44-8.51 us to 7.67-7.77 us at
+zero allocations. Hosted results are directional; the benchmark artifacts
+retain raw samples for both x64 and arm64.
+
 One caveat belongs next to that table: a one-shot, single-path lookup on a
 document seen once favors non-validating scanners — gjson scans only for the
 queried path and sonic validates only along it, while `BuildIndex` validates

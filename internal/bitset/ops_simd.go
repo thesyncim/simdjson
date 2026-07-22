@@ -14,21 +14,19 @@ import (
 
 func andWordsAVX2(dst, a, b []uint64) {
 	i := 0
-	if len(dst) >= 8 {
-		dp := unsafe.Pointer(unsafe.SliceData(dst))
-		ap := unsafe.Pointer(unsafe.SliceData(a))
-		bp := unsafe.Pointer(unsafe.SliceData(b))
-		for ; i+8 <= len(dst); i += 8 {
-			off := uintptr(i) * 8
-			a0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+0)))
-			a1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+32)))
-			b0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+0)))
-			b1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+32)))
-			a0.And(b0).StoreArray((*[4]uint64)(unsafe.Add(dp, off+0)))
-			a1.And(b1).StoreArray((*[4]uint64)(unsafe.Add(dp, off+32)))
-		}
-		archsimd.ClearAVXUpperBits()
+	dp := unsafe.Pointer(unsafe.SliceData(dst))
+	ap := unsafe.Pointer(unsafe.SliceData(a))
+	bp := unsafe.Pointer(unsafe.SliceData(b))
+	for ; i+8 <= len(dst); i += 8 {
+		off := uintptr(i) * 8
+		a0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+0)))
+		a1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+32)))
+		b0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+0)))
+		b1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+32)))
+		a0.And(b0).StoreArray((*[4]uint64)(unsafe.Add(dp, off+0)))
+		a1.And(b1).StoreArray((*[4]uint64)(unsafe.Add(dp, off+32)))
 	}
+	archsimd.ClearAVXUpperBits()
 	for ; i < len(dst); i++ {
 		dst[i] = a[i] & b[i]
 	}
@@ -36,24 +34,22 @@ func andWordsAVX2(dst, a, b []uint64) {
 
 func and3WordsAVX2(dst, a, b, c []uint64) {
 	i := 0
-	if len(dst) >= 8 {
-		dp := unsafe.Pointer(unsafe.SliceData(dst))
-		ap := unsafe.Pointer(unsafe.SliceData(a))
-		bp := unsafe.Pointer(unsafe.SliceData(b))
-		cp := unsafe.Pointer(unsafe.SliceData(c))
-		for ; i+8 <= len(dst); i += 8 {
-			off := uintptr(i) * 8
-			a0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+0)))
-			a1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+32)))
-			b0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+0)))
-			b1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+32)))
-			c0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(cp, off+0)))
-			c1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(cp, off+32)))
-			a0.And(b0).And(c0).StoreArray((*[4]uint64)(unsafe.Add(dp, off+0)))
-			a1.And(b1).And(c1).StoreArray((*[4]uint64)(unsafe.Add(dp, off+32)))
-		}
-		archsimd.ClearAVXUpperBits()
+	dp := unsafe.Pointer(unsafe.SliceData(dst))
+	ap := unsafe.Pointer(unsafe.SliceData(a))
+	bp := unsafe.Pointer(unsafe.SliceData(b))
+	cp := unsafe.Pointer(unsafe.SliceData(c))
+	for ; i+8 <= len(dst); i += 8 {
+		off := uintptr(i) * 8
+		a0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+0)))
+		a1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+32)))
+		b0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+0)))
+		b1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+32)))
+		c0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(cp, off+0)))
+		c1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(cp, off+32)))
+		a0.And(b0).And(c0).StoreArray((*[4]uint64)(unsafe.Add(dp, off+0)))
+		a1.And(b1).And(c1).StoreArray((*[4]uint64)(unsafe.Add(dp, off+32)))
 	}
+	archsimd.ClearAVXUpperBits()
 	for ; i < len(dst); i++ {
 		dst[i] = a[i] & b[i] & c[i]
 	}
@@ -61,21 +57,19 @@ func and3WordsAVX2(dst, a, b, c []uint64) {
 
 func orWordsAVX2(dst, a, b []uint64) {
 	i := 0
-	if len(dst) >= 8 {
-		dp := unsafe.Pointer(unsafe.SliceData(dst))
-		ap := unsafe.Pointer(unsafe.SliceData(a))
-		bp := unsafe.Pointer(unsafe.SliceData(b))
-		for ; i+8 <= len(dst); i += 8 {
-			off := uintptr(i) * 8
-			a0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+0)))
-			a1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+32)))
-			b0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+0)))
-			b1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+32)))
-			a0.Or(b0).StoreArray((*[4]uint64)(unsafe.Add(dp, off+0)))
-			a1.Or(b1).StoreArray((*[4]uint64)(unsafe.Add(dp, off+32)))
-		}
-		archsimd.ClearAVXUpperBits()
+	dp := unsafe.Pointer(unsafe.SliceData(dst))
+	ap := unsafe.Pointer(unsafe.SliceData(a))
+	bp := unsafe.Pointer(unsafe.SliceData(b))
+	for ; i+8 <= len(dst); i += 8 {
+		off := uintptr(i) * 8
+		a0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+0)))
+		a1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+32)))
+		b0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+0)))
+		b1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+32)))
+		a0.Or(b0).StoreArray((*[4]uint64)(unsafe.Add(dp, off+0)))
+		a1.Or(b1).StoreArray((*[4]uint64)(unsafe.Add(dp, off+32)))
 	}
+	archsimd.ClearAVXUpperBits()
 	for ; i < len(dst); i++ {
 		dst[i] = a[i] | b[i]
 	}
@@ -83,21 +77,19 @@ func orWordsAVX2(dst, a, b []uint64) {
 
 func andNotWordsAVX2(dst, a, b []uint64) {
 	i := 0
-	if len(dst) >= 8 {
-		dp := unsafe.Pointer(unsafe.SliceData(dst))
-		ap := unsafe.Pointer(unsafe.SliceData(a))
-		bp := unsafe.Pointer(unsafe.SliceData(b))
-		for ; i+8 <= len(dst); i += 8 {
-			off := uintptr(i) * 8
-			a0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+0)))
-			a1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+32)))
-			b0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+0)))
-			b1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+32)))
-			a0.AndNot(b0).StoreArray((*[4]uint64)(unsafe.Add(dp, off+0)))
-			a1.AndNot(b1).StoreArray((*[4]uint64)(unsafe.Add(dp, off+32)))
-		}
-		archsimd.ClearAVXUpperBits()
+	dp := unsafe.Pointer(unsafe.SliceData(dst))
+	ap := unsafe.Pointer(unsafe.SliceData(a))
+	bp := unsafe.Pointer(unsafe.SliceData(b))
+	for ; i+8 <= len(dst); i += 8 {
+		off := uintptr(i) * 8
+		a0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+0)))
+		a1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(ap, off+32)))
+		b0 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+0)))
+		b1 := archsimd.LoadUint64x4Array((*[4]uint64)(unsafe.Add(bp, off+32)))
+		a0.AndNot(b0).StoreArray((*[4]uint64)(unsafe.Add(dp, off+0)))
+		a1.AndNot(b1).StoreArray((*[4]uint64)(unsafe.Add(dp, off+32)))
 	}
+	archsimd.ClearAVXUpperBits()
 	for ; i < len(dst); i++ {
 		dst[i] = a[i] &^ b[i]
 	}

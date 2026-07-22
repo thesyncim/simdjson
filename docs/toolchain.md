@@ -27,7 +27,9 @@ capability result through an inlined direct-call branch. `GOAMD64=v3` and newer
 binaries compile both Stage 1 and scanner calls directly to the AVX path, which
 those architecture levels require. Dense bitmap kernels use 256-bit AVX2:
 v1/v2 perform one process-constant runtime capability branch per bitmap call
-and fall back to scalar, while v3+ calls the AVX2 body directly. CI executes the
+and fall back to scalar, while v3+ calls the AVX2 body directly. Buffers below
+eight words use the unrolled scalar loop at every amd64 level because the
+two-vector AVX2 body cannot run. CI executes the
 default amd64 binary and a native v3 binary, rejects AVX instructions in the
 v1/v2 Stage 1 kernel package, and disassembles all bitmap levels to prove the
 v1/v2 guard and retained AVX2 instructions. CI also

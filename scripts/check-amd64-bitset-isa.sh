@@ -1,6 +1,7 @@
 #!/bin/sh
-# Prove that pinned-SIMD amd64 bitmap builds runtime-gate AVX2 for GOAMD64
-# v1/v2 and compile a direct AVX2 path for v3.
+# Prove that pinned-SIMD amd64 bitmap builds keep the sub-eight-word scalar
+# crossover, runtime-gate AVX2 for GOAMD64 v1/v2, and omit that CPU capability
+# branch for v3.
 set -eu
 
 go_bin=${1:-go}
@@ -46,18 +47,36 @@ for level in v1 v2 v3; do
 		fi
 	done
 
-	if test "$level" != v3; then
-		dispatch_assembly="$work/bitset-$level-dispatch.asm"
-		"$go_bin" tool objdump -s "^${package_pattern}\\.andWords$" "$binary" >"$dispatch_assembly"
+	for operation in andWords and3Words orWords andNotWords; do
+		dispatch_assembly="$work/bitset-$level-$operation-dispatch.asm"
+		"$go_bin" tool objdump -s "^${package_pattern}\\.${operation}$" "$binary" >"$dispatch_assembly"
 		if grep -Eq '[[:space:]]V[A-Z0-9]+[[:space:]]' "$dispatch_assembly"; then
-			echo "GOAMD64=$level emitted AVX before bitmap capability dispatch" >&2
+			echo "GOAMD64=$level $operation emitted AVX in its dispatch wrapper" >&2
 			exit 1
 		fi
-		for target in bitsetAVX2Available andWordsAVX2 andWordsScalar; do
+		if ! grep -Eq 'CMPQ .*\$0x8' "$dispatch_assembly"; then
+			echo "GOAMD64=$level $operation omitted the eight-word crossover" >&2
+			exit 1
+		fi
+		for target in "${operation}AVX2" "${operation}Scalar"; do
 			if ! grep -q "$target" "$dispatch_assembly"; then
-				echo "GOAMD64=$level bitmap dispatch omitted $target" >&2
+				echo "GOAMD64=$level $operation dispatch omitted $target" >&2
 				exit 1
 			fi
 		done
-	fi
+		case $level in
+		v1 | v2)
+			if ! grep -q bitsetAVX2Available "$dispatch_assembly"; then
+				echo "GOAMD64=$level $operation omitted runtime AVX2 gating" >&2
+				exit 1
+			fi
+			;;
+		v3)
+			if grep -q bitsetAVX2Available "$dispatch_assembly"; then
+				echo "GOAMD64=v3 $operation retained a redundant capability branch" >&2
+				exit 1
+			fi
+			;;
+		esac
+	done
 done

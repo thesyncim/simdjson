@@ -364,7 +364,8 @@ Declared nested and compound indexes keep the same scalar fingerprint and
 mandatory exact-recheck semantics. Current postings already expose sparse
 page-level masks plus caller-owned dense words with one bit per stable slot.
 Two- and fused three-input Boolean kernels use runtime-gated 256-bit AVX2 on
-amd64 when it wins; selective sparse streams stay scalar. The external physical
+amd64 when it wins; sub-eight-word buffers and selective sparse streams stay
+scalar. The external physical
 posting becomes a hierarchy of the same page masks. That executor must expose
 page-fault and bytes-touched metrics in addition to nanoseconds and result
 counts.
