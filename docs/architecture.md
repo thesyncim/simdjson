@@ -32,6 +32,13 @@ window replaces only the word kernel on ARM64 and AMD64; sparse/dense policy
 stays with the caller so a vector kernel cannot force a losing representation
 conversion.
 
+`internal/storeio` owns the attached-Store durability boundary: bounded commit
+queues and devices, double-superblock recovery, common page framing, packed
+directory/document payloads, and their checksum kernels. Persistent formats
+use byte offsets, fixed-width values, and stable logical ids rather than Go
+pointers or runtime layouts. Store-specific SIMD stays in this internal
+package; the public `simd` package does not acquire database I/O policy.
+
 The pre-v1 `simd` package retains decimal classification, eight-digit parsing,
 fixed-width decimal formatting, JSON float and time formatting, plus effective
 backend reporting. CPU capability checks and selection policy remain internal.
@@ -78,11 +85,12 @@ replace mode deliberately resets absent state.
 ## Mutable Store publication
 
 `Store` is the only root type that combines mutation with concurrent reads.
-Mutation is serialized; readers retain an immutable state pointer. Heap-built
-Stores path-copy a keyed HAMT and the chunk radix vector. `OpenStore` instead
-keeps its immutable base keys in one pointer-free Swiss-style directory and
-uses the HAMT only as a post-open delta; a hit always verifies complete key
-spelling. A changed document chunk is built completely before atomic
+Mutation is serialized; readers retain an immutable state pointer. Bulk-built
+and reopened Stores keep immutable base keys in one pointer-free Swiss-style
+directory and use the keyed HAMT only as a post-publication delta; a hit always
+verifies complete key spelling. Ready bulk/reopened exact indexes likewise use
+packed multi-stream posting pages plus a bounded per-dirty-chunk delta. A
+changed document chunk is built completely before atomic
 publication. A replacement owns new source and tape storage; unchanged rows
 share their already-immutable source and classic tape backing into the new
 chunk. Dense row headers and the chunk-relative narrow-value slab are private

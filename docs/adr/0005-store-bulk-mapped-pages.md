@@ -4,10 +4,10 @@ Status: accepted in stages. Transient construction, the caller-owned
 Store-image boundary with pointer-free base metadata, dense stable-slot Boolean
 workspaces, the scoped pure-Go Linux ring substrate, the bounded internal page
 committer, checksummed double-superblock recovery, the common page envelope,
-and the state-root schema are implemented. Store document and directory page
-encoding and mutation attachment, the swizzled read-page manager, and bounded
-residency remain proposed. Extends ADR 0004 without changing its borrowed-value
-lifetime contract.
+the state-root schema, packed chunk directories, and compact document pages are
+implemented. Mutation attachment, key/index/TTL and large-value overflow page
+schemas, the swizzled read-page manager, and bounded residency remain proposed.
+Extends ADR 0004 without changing its borrowed-value lifetime contract.
 
 ## Decision
 
@@ -198,8 +198,9 @@ page masks before touching source pages, so a selective query reads only
 candidate pages. Sequential scans submit physically ordered, bounded read
 batches rather than triggering one synchronous fault per page.
 
-Cold directory levels use packed CHAMP-style nodes with page-relative offsets
-rather than Go pointers. Hot upper levels are swizzled into direct frame
+Cold chunk-directory levels use implemented 64-way packed CHAMP nodes with one
+occupancy word and densely ranked fixed-width physical references rather than
+Go pointers. Hot upper levels are swizzled into direct frame
 pointers and may use the existing fixed fan-out form when measurement justifies
 it. Posting streams are ordered by logical page, so
 Boolean operators merge compressed page ids and apply one native 64-bit mask
@@ -208,11 +209,17 @@ in bounded windows. Projection-only queries may be answered from compact
 indexed scalar payloads without reading the source page, but every API that
 claims exact JSON spelling still visits and verifies the source.
 
-Large values are stored in separately checksummed overflow extents. This keeps
-ordinary 64-slot metadata pages small enough for useful fault granularity and
-prevents one outlier document from dragging unrelated rows into memory. Page
-size, directory cache size, prefetch depth, and overflow threshold are format
-or Store options with conservative defaults; none may change query semantics.
+The implemented document payload makes slot identity implicit in one 64-bit
+live word and stores only cumulative key and JSON ends: eight directory bytes
+per live row and one canonical packed byte stream. Admitted point reads use one
+bitmap probe and popcount; complete key comparison remains mandatory on a
+fingerprint hit. Metadata nodes use a 4 KiB allocation quantum, while a
+document `PageRef` can name a larger power-of-two extent. This covers ordinary
+variable-size chunks without forcing every sparse node to the maximum size.
+Values beyond the maximum practical contiguous extent still require the
+separately checksummed overflow schema; it is not implemented yet. Directory
+cache size, prefetch depth, and overflow threshold are format or Store options
+with conservative defaults; none may change query semantics.
 
 ## Publication and crash consistency
 
@@ -279,17 +286,20 @@ free-tree root bytes, and falls back to the older generation if the newest
 header or either root page is torn, truncated, or corrupt. Caller-owned page
 scratch bounds recovery memory, and the encode/decode/select hot paths allocate
 zero bytes. The checksum implementation is scoped to `internal/storeio` and
-contains no handwritten assembly: stable builds use Go's hardware-aware
-CRC32C, while SIMD builds runtime-gate pure-Go PMULL on arm64, an eight-stream
-128-bit PCLMUL fold on ordinary amd64, and a wider AVX-512 VPCLMULQDQ tier.
-The amd64 path checks AVX and PCLMUL independently because neither feature
-implies the other; unsupported CPUs fall back to the same standard path. On M4 Max,
-stable Go measured 383.3-387.5 ns per 4 KiB page and 5.924-6.296 us per 64 KiB
-page. The pure-Go nine-stream PMULL fold measured 89.17-91.66 ns and
-1.131-1.146 us respectively: about 4.2x and 5.5x faster, with zero allocations.
-Native CI retains stable and SIMD samples for x64 and arm64 separately. The
-128-bit amd64 tier remains gated on a native end-to-end win; emulation proves
-correctness and instruction coverage, not performance.
+contains no handwritten assembly. Stable builds use Go's hardware-aware
+CRC32C. SIMD builds dispatch pure-Go PMULL on Darwin ARM64, where it wins, and
+retain the standard path on Linux ARM64 and amd64. Native Ubuntu ARM64 measured
+PMULL at 192.3-192.4 ns per 4 KiB versus 154.6-154.8 ns standard. AMD EPYC 7763
+measured the ordinary PCLMUL candidate at 323.0-323.2 ns versus
+170.7-170.8 ns standard. Both losing dispatches are therefore rejected. The
+pure-Go amd64 PCLMUL and AVX-512 bodies remain directly correctness- and
+ISA-tested candidates; feature availability alone is not evidence of a win.
+On M4 Max, stable Go measured 383.3-387.5 ns per 4 KiB page and
+5.924-6.296 us per 64 KiB page. The pure-Go nine-stream PMULL fold measured
+89.17-91.66 ns and 1.131-1.146 us respectively: about 4.2x and 5.5x faster,
+with zero allocations. Native CI retains stable and SIMD samples for x64 and
+arm64 separately. Emulation proves correctness and instruction coverage, not
+performance.
 
 Every attached-Store page now has a deterministic 64-byte pointer-free header
 and an eight-byte CRC32C/complement trailer. The header binds Store id, physical
@@ -307,11 +317,21 @@ directory therefore falls back to the older root. On M4 Max, the complete
 pure-Go SIMD state-root encoder measured 170.0-171.6 ns per 4 KiB page and the
 decoder 152.4-153.3 ns, both at zero allocations.
 
-This is deliberately still internal: Store does not yet encode its changed
-micro-pages and copied key/index/TTL paths into the common page payloads or
-attach them to the committer. Therefore ordinary `Put`, `Delete`, and TTL
-operations are not yet automatically durable. Read-only checkpoint mappings
-never contain dirty transactional state.
+The exact-index payload is implemented and attached as the immutable base of
+bulk-built and reopened Stores. One physical page packs multiple sorted
+stable-slot streams; singleton hits use delta/slot uvarints, dense chunks keep
+native 64-bit masks, and long streams continue by logical page/rank. A bounded
+heap delta wholly shadows each chunk touched after publication, so the first
+write does not rebuild the corpus and retained snapshots preserve their exact
+base/delta pair. At 5M fixture rows, two nested/compound packed index bases use
+20,798,476 bytes (4.16 B/doc) versus the prior 496 MB heap-node estimate. The
+durable state root does not publish these pages yet.
+
+This is deliberately still internal: Store does not yet attach changed
+micro-pages to commit batches or encode copied key/index/TTL paths in their
+common page payloads. Therefore ordinary `Put`, `Delete`, and TTL operations
+are not yet automatically durable. Read-only checkpoint mappings never contain
+dirty transactional state.
 
 The old root stays valid until the final step. Recovery chooses the newest
 valid superblock and ignores unreferenced partial pages. This follows the

@@ -144,14 +144,15 @@ even when multiple logical posting index names share it.
 
 A declared exact index has one to four RFC 6901 paths. Missing paths,
 incompatible traversal steps, and JSON containers are not indexed. Each
-distinct composite fingerprint owns an
-adaptive stable-slot posting: up to four chunk words inline, then a sparse
-persistent radix vector. Each materialized word addresses 64 document slots;
+distinct composite fingerprint owns an adaptive stable-slot posting. A
+bulk-built or reopened immutable base packs multiple compressed streams per
+physical page; later writes wholly shadow touched chunks in an inline/sparse
+persistent-radix delta. Online indexes use that delta representation while
+backfill is incomplete. Each materialized word addresses 64 document slots;
 empty address ranges use no word. Fingerprint collisions can increase candidate
-bits but exact rechecks preserve answers. `Snapshot.IndexStats` reports the
-reachable footprint of a definition; no distribution-independent bytes/key
-bound exists because value cardinality and frequency determine the directory
-and word counts.
+bits but exact rechecks preserve answers. `Snapshot.IndexStats` reports packed
+base and delta footprint separately; no distribution-independent bytes/key
+bound exists because value cardinality and frequency determine both.
 
 Snapshots pin every immutable node, chunk, source arena, tape, declared-index
 root, and physical wildcard-index version reachable from their publication

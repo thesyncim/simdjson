@@ -173,6 +173,8 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `number_float.go` — `scanJSONNumber`
 - `number_float.go` — `tapeFloat64`
 - `number_float_typed.go` — `scanTypedFloat64`
+- `store_index_packed.go` — `newStorePackedIndex`
+- `store_index_packed.go` — `package scope`
 - `store_mapped_docs.go` — `(*DocSet).narrowAt`
 - `store_mapped_docs.go` — `newStoreMappedDocs`
 - `store_mapped_docs.go` — `package scope`

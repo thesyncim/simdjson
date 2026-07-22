@@ -686,7 +686,9 @@ func (m storePersistManifest) openIndexes(r *persistReader, store *Store, state 
 	}
 	if len(exact) != 0 {
 		builder := StoreBuilder{exact: exact}
-		builder.buildExactIndexes(store, state)
+		if err := builder.buildExactIndexes(store, state); err != nil {
+			return err
+		}
 	} else {
 		state.indexes = store.indexInfosLocked()
 		state.secondary = store.indexSnapshotsLocked()

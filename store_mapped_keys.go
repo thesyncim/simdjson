@@ -39,6 +39,9 @@ type storeMappedKeys struct {
 	mask     uint64
 	count    int
 	block    *storemem.Block
+	// sourceBlock is non-nil when StoreBuilder owns packed key spellings.
+	// OpenStore instead borrows its caller-owned image through source.
+	sourceBlock *storemem.Block
 }
 
 func newStoreMappedKeys(source []byte, count int) (*storeMappedKeys, error) {
@@ -87,22 +90,51 @@ func newStoreMappedKeys(source []byte, count int) (*storeMappedKeys, error) {
 	return m, nil
 }
 
+func newStoreOwnedKeys(count, sourceBytes int) (*storeMappedKeys, error) {
+	if sourceBytes < 0 {
+		return nil, ErrStorePersistTooLarge
+	}
+	sourceBlock, err := storemem.Allocate(sourceBytes)
+	if err != nil {
+		return nil, err
+	}
+	m, err := newStoreMappedKeys(sourceBlock.Bytes(), count)
+	if err != nil {
+		_ = sourceBlock.Close()
+		return nil, err
+	}
+	m.sourceBlock = sourceBlock
+	return m, nil
+}
+
 func (m *storeMappedKeys) release() {
 	if m == nil || m.block == nil {
 		return
 	}
 	_ = m.block.Close()
+	if m.sourceBlock != nil {
+		_ = m.sourceBlock.Close()
+		m.sourceBlock = nil
+	}
 	m.block = nil
+	m.source = nil
 	m.refs = nil
 	m.controls = nil
 	m.slots = nil
 }
 
 func (m *storeMappedKeys) externalBytes() uint64 {
-	if m == nil || m.block == nil || !m.block.OutsideHeap() {
+	if m == nil {
 		return 0
 	}
-	return uint64(m.block.Len())
+	var bytes uint64
+	if m.block != nil && m.block.OutsideHeap() {
+		bytes += uint64(m.block.Len())
+	}
+	if m.sourceBlock != nil && m.sourceBlock.OutsideHeap() {
+		bytes += uint64(m.sourceBlock.Len())
+	}
+	return bytes
 }
 
 func (m *storeMappedKeys) key(ref uint64) string {

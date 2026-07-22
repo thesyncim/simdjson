@@ -225,12 +225,14 @@ one 32-byte-per-row record directory live in anonymous pointer-free mappings,
 outside Go `HeapAlloc`; their eight-control-byte group probes use native SWAR
 and every hit still verifies the complete key. A chunk holds only Store-wide
 owners and base ordinals, rather than a string header and two slice pointers
-per row. Post-open changes use the existing immutable HAMT only as a delta.
+per row. Post-build/open changes use the existing immutable HAMT only as a delta.
 TTL locations are packed integers, so the deadline heap and position map retain
-no key strings. Exact-index roots and distinct shape records are still rebuilt
-as Go objects. Later `Put`, `Delete`, TTL, and index operations publish ordinary
-immutable generations. A Store image cannot contain a `Building` index: finish
-or drop the definition before calling `WriteTo`.
+no key strings. Exact-index bases are rebuilt into packed pointer-free posting
+pages; construction still uses transient Go scratch, while the retained base
+lives outside `HeapAlloc` on supported Unix systems. Distinct shape records
+remain Go objects. Later `Put`, `Delete`, TTL, and index operations publish
+ordinary immutable generations. A Store image cannot contain a `Building`
+index: finish or drop the definition before calling `WriteTo`.
 
 For a file-backed image, map it read-only and pass the mapped slice to
 `OpenStore`. The caller owns the mapping and must keep it immutable and mapped
@@ -248,11 +250,12 @@ key-only open takes 1.04-1.05 ms and allocates 234,688-234,689 Go-heap bytes in
 524,288 external row bytes. Compared with the former per-key HAMT/per-row
 `Index` reopen (about 3.36 MiB, 19,206 allocations, and 1.74-1.82 ms), that is
 about 93% less Go-heap metadata, 98.6% fewer allocations, and 40% lower open
-latency. One compound exact index raises open to 2.64-2.67 ms and about 450.6
-KB Go heap because that root is not mapped yet. The exact
-root rebuild can fault document pages. `BenchmarkStorePersistOpenMapped`
-reports `mapped-B`, both external metadata classes, `B/op`, and `allocs/op` so
-the RSS/heap distinction cannot disappear behind one throughput number.
+latency. One compound exact index raises open to 2.65-2.68 ms and about 423.6
+KB of transient allocation while constructing its 45,056-byte external packed
+base; that build can fault document pages. `BenchmarkStorePersistOpenMapped`
+reports `mapped-B`, all three external metadata classes, `B/op`, and
+`allocs/op` so the RSS/heap distinction cannot disappear behind one throughput
+number.
 
 Once open, mapped source bytes add no steady allocation or ownership wrapper:
 ordinary keyed reads measured 9.22-9.29 ns and generation-pinned compiled reads
@@ -342,37 +345,127 @@ not yet a public Store persistence mode. The internal double-superblock codec
 now enforces generation-slot parity, Store identity, CRC32C/complement checks,
 page-aligned bounds, file high-water bounds, and referenced-state verification;
 recovery validates both state and free-tree roots and falls back when the
-newest root or either referenced page is torn. Physical Store page encoding,
-mutation attachment, directory payload schemas, and extent reclamation are the
-remaining correctness boundary. The implemented common page envelope binds a
-64-byte pointer-free header and full-page CRC32C trailer to Store id, kind,
-stable logical id, and generation. Its fixed 256-byte state root separates
-chunk, key, exact-index, and TTL directory references, and recovery verifies
-each referenced top-level page before generation selection. A ready recycle or
-busy-worker notification stays on the atomic fast path; a full budget or an
-idle worker necessarily parks or wakes. Checksums stay scoped to
-`internal/storeio` and use no handwritten assembly: stable builds use Go's
-hardware-aware CRC32C, while SIMD builds runtime-gate pure-Go arm64 PMULL, an
-eight-stream amd64 PCLMUL tier using exact AVX and PCLMUL feature checks, or a
-wider AVX-512 VPCLMULQDQ tier, and retain the standard fallback. On M4 Max,
-stable Go measured 383.3-387.5 ns per 4 KiB
-page and 5.924-6.296 us per 64 KiB page. The pure-Go SIMD path measured
-89.17-91.66 ns and 1.131-1.146 us respectively (about 4.2x and 5.5x faster),
-with zero allocations. The complete 4 KiB state-root page measured
-170.0-171.6 ns to encode and 152.4-153.3 ns to verify/decode, also with zero
-allocations. Native CI records the amd64 result before it is claimed.
+newest root or either referenced page is torn. Mutation attachment, key/TTL
+payload schemas, large-value overflow, and extent reclamation are the remaining
+correctness boundary. The common page envelope binds a 64-byte
+pointer-free header and full-page CRC32C trailer to Store id, kind, stable
+logical id, and generation. Its fixed 256-byte state root separates chunk, key,
+exact-index, and TTL directory references, and recovery verifies each
+referenced top-level page before generation selection.
 
-Packed CHAMP nodes are a good fit for the cold page directory because their
-bitmap rank makes external blocks dense. The existing fixed-prefix directory
-remains preferable for the tiny hot overlay and compiled stable-slot reads: a
-measured heap prototype saved 59% directory bytes but made keyed lookup about
-20% slower. The hybrid keeps cold footprint low without taxing every hot hit.
+Chunk placement now uses 64-way packed CHAMP nodes: one occupancy word plus
+densely ranked 32-byte physical references, with no empty child array or Go
+pointer per chunk. Document leaves use the same stable-slot word and only two
+cumulative `uint32` ends per live row. Slot identity is implicit in bitmap
+rank, so the worst-case row directory is 512 bytes rather than 64 slice/string
+headers. Keys and JSON occupy one canonical packed byte stream; an admitted
+page returns capacity-clipped borrowed views and verifies a complete candidate
+key before returning JSON. Directory nodes use the 4 KiB allocation quantum,
+while a document leaf may use a larger power-of-two extent authenticated by
+`PageRef.Length`. This keeps ordinary 64-row chunks contiguous without
+inflating every sparse metadata node.
+
+Exact indexes now use the posting-page codec as the live immutable base for
+`StoreBuilder` and `OpenStore`, not only as a projection. Each 4 KiB physical
+page packs many sorted value streams. Scattered singleton hits encode
+`(chunk delta, slot)` as a uvarint—normally two bytes—while multi-hit chunks
+retain a native `uint64` word for Boolean operations. A fixed 48-byte segment
+record carries stream bounds, row count, tuple hash, and an optional logical
+page/rank continuation; it contains no Go or physical pointer. Admission
+validates sorted unique stream ids, canonical dense/singleton encodings, exact
+packed offsets, row counts, continuations, and CRC before publication.
+
+Writes never rebuild that immutable corpus base. The first mutation of one
+64-row chunk copies that chunk's complete current postings into a persistent
+delta and marks the chunk shadowed; later writes path-copy only changed delta
+routes. Readers merge base and delta in chunk order and skip every stale base
+word for a shadowed chunk. Old snapshots retain their base/delta pair, so this
+reduces initial GC footprint without weakening update, delete, or snapshot
+semantics. The same pages are not yet connected to the durable state root.
+
+A ready recycle or busy-worker notification stays on the atomic fast path; a
+full budget or an idle worker necessarily parks or wakes. Checksums stay scoped
+to `internal/storeio` and use no handwritten assembly. Stable builds use Go's
+hardware-aware CRC32C. SIMD builds dispatch pure-Go PMULL only on Darwin ARM64,
+where it has a measured win, and use the standard path on Linux ARM64 and
+amd64. Native Ubuntu ARM64 measured the PMULL candidate at 192.3-192.4 ns per
+4 KiB versus 154.6-154.8 ns for the standard path; AMD EPYC 7763 measured the
+ordinary PCLMUL candidate at 323.0-323.2 ns versus 170.7-170.8 ns. Those losing
+kernels are not dispatched. The pure-Go amd64 PCLMUL and AVX-512 candidates
+remain directly correctness-tested and ISA-checked so a future CPU-specific
+tier can be admitted only after a native end-to-end win.
+
+On M4 Max, stable Go CRC32C measured 383.3-387.5 ns per 4 KiB page and
+5.924-6.296 us per 64 KiB page. The Darwin PMULL path measured 89.17-91.66 ns
+and 1.131-1.146 us respectively (about 4.2x and 5.5x faster), with zero
+allocations. The complete 4 KiB state-root page measured 170.0-171.6 ns to
+encode and 152.4-153.3 ns to verify/decode. A full 64-way chunk-directory node
+measured 935.2-948.9 ns to encode, 836.6-843.9 ns to verify/admit, and
+7.17-7.26 ns for an admitted hit. A 64-row document page measured
+747.8-753.5 ns to encode and 459.4-460.1 ns to verify/admit; JSON-only lookup
+measured 2.566-2.576 ns and complete string-key verification plus JSON return
+4.034-4.092 ns. A packed 1,900-singleton posting page measured 7.95-8.03 us to
+encode, 7.38-7.49 us to verify/admit, 24.11-24.32 ns for an admitted stream
+lookup, and 4.05-4.11 ns per decoded posting. Every result is zero-allocation.
+
+Packed CHAMP nodes are the cold chunk-directory format. The existing
+fixed-prefix directory remains preferable for the tiny heap hot overlay and
+compiled stable-slot reads: a measured heap prototype saved 59% directory
+bytes but made keyed lookup about 20% slower. The hybrid keeps cold footprint
+low without taxing every hot hit.
 
 A selective external query can beat a heap scan by combining resident 64-slot
 index masks and never reading rejected JSON pages. A random cold point read
 cannot be faster than DRAM; it pays storage latency. The 100x target is
 therefore accepted only when the measured hot working set fits the configured
 resident budget and the workload is indexed or locality-friendly.
+
+### Scale smoke: 10k to 5M records
+
+`TestStoreScaleSmoke` is an explicit, non-CI ladder:
+
+```sh
+STORE_SCALE_SMOKE=10000,100000,5000000 \
+  go test . -run '^TestStoreScaleSmoke$' -v -count=1
+```
+
+It bulk-loads identical-shape documents with one nested single-column index and
+one nested compound index, forces GC before measuring live heap, then measures
+random keyed reads, a 1/256 compound query, updates, delete/reinsert churn, and
+TTL changes. Apple M4 Max, stable Go, one run:
+
+| Records | Build docs/s | Source B/doc | Live heap B/doc | Heap objects/doc | Packed document extents B/doc | Packed exact indexes B/doc | Point read | Compound query |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 1.42M | 92.9 | 520.5 | 0.256 | 128.2 | 7.27 | 19 ns | 4.15 us / 39 masks |
+| 100,000 | 1.48M | 94.9 | 521.0 | 0.251 | 128.0 | 4.45 | 30 ns | 48.18 us / 390 masks |
+| 5,000,000 | 0.98M | 98.7 | 521.1 | 0.251 | 128.0 | 4.16 | 55 ns | 9.20 ms / 19,531 masks |
+
+At 5M rows, keys plus JSON are 493,480,886 bytes. Packed owned keys and the two
+exact-index bases reduce the current heap from the earlier 3,995,694,760 bytes
+and 13,246,371 objects to 2,605,486,408 bytes and 1,252,619 objects: 65.2% of
+the original heap remains, 90.5% of the objects are gone, and point lookup is
+faster. Actual packed index storage
+is 20,798,476 bytes (4.16 B/doc), within 0.04% of the independent 20,791,296
+byte page projection. The still-unattached variable document extents project
+to 640,000,000 bytes (1.30x source); document plus posting extents are about
+1.34x source before key/value directories, TTL/free-space metadata, roots,
+allocator slack, and retained generations.
+
+The remaining 0.251 objects/doc is not accepted as the endpoint. A diagnostic
+reopen through the existing pointer-free checkpoint reached 0.016 objects/doc
+at 100k rows—more than 100x below the original 2.665—but its legacy tape image
+was 5.45x source and made point/index operations slower. That path is evidence
+that the GC target is feasible, not the selected format. Acceptance requires
+at most 0.027 objects/doc with the new packed extents and no hot-path
+regression; attaching compact document/tape frames is the remaining dominant
+work.
+
+Across the same 5M run, indexed update averaged 4.17 us, delete plus reinsert
+7.95 us, and changing an existing TTL 42 ns. The point-read rise from 19 ns to
+55 ns is a cache-footprint result, not an algorithmic complexity change. Query
+time scales with the number of exact result masks because this smoke
+materializes them; a Boolean consumer can combine those stable-slot words
+without decoding rejected documents.
 
 ### Capacity planning for 1 TiB
 

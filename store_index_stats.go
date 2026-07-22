@@ -27,6 +27,11 @@ type StoreIndexStats struct {
 	// compiled paths, and the published snapshot descriptor. It excludes Go
 	// allocator size classes and Store documents, which the index only borrows.
 	EstimatedBytes uint64
+	// PackedBytes is the immutable base's physical page and hash-directory
+	// footprint. ExternalBytes is the subset outside Go HeapAlloc on the
+	// current platform.
+	PackedBytes   uint64
+	ExternalBytes uint64
 }
 
 // IndexStats returns allocation-free physical statistics for a declared exact
@@ -43,7 +48,16 @@ func (s Snapshot) IndexStats(name string) (StoreIndexStats, error) {
 		stats.EstimatedBytes += uint64(len(index.exact.specs[i]))
 		stats.EstimatedBytes += uint64(len(index.exact.paths[i].tokens)) * uint64(reflect.TypeFor[compiledPointerToken]().Size())
 	}
+	if index.base != nil {
+		stats.Fingerprints += index.base.fingerprints
+		stats.ChunkWords += index.base.chunkWords
+		stats.CandidateRows += index.base.candidateRows
+		stats.PackedBytes = uint64(index.base.block.Len())
+		stats.ExternalBytes = index.base.externalBytes()
+		stats.EstimatedBytes += stats.PackedBytes
+	}
 	storeIndexAccumulatePostingStats(index.root, &stats)
+	storeIndexAccumulateMaskStats(index.dirty.root, &stats)
 	return stats, nil
 }
 

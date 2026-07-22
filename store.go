@@ -99,10 +99,9 @@ type storeState struct {
 	seed       maphash.Seed
 	options    StoreOptions
 	keys       *storeKeyNode
-	// baseKeys is the compact immutable directory of an OpenStore image.
-	// keys is then only the path-copied overlay for post-open insertions and
-	// moved keys. Heap-built Stores leave baseKeys nil and keep the complete
-	// directory in keys, preserving their existing hot path and mutation cost.
+	// baseKeys is the compact immutable directory created by StoreBuilder or
+	// OpenStore. keys is then only the path-copied overlay for later insertions
+	// and moved keys.
 	baseKeys   *storeMappedKeys
 	mappedDocs *storeMappedDocs
 	chunks     storeChunkVector
@@ -118,6 +117,7 @@ type storeState struct {
 type storeChunk struct {
 	docs       DocSet
 	keys       []string
+	keyBytes   []byte
 	mappedKeys *storeMappedKeys
 	mappedBase uint64
 	ord        [storeMaxChunkDocuments]uint8

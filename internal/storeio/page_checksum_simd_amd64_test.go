@@ -28,3 +28,22 @@ func TestPageChecksumPCLMUL8MatchesStandardLibrary(t *testing.T) {
 		}
 	}
 }
+
+func TestPageChecksumAVX512MatchesStandardLibrary(t *testing.T) {
+	if !archsimd.X86.AVX512() || !archsimd.X86.AVX512VPCLMULQDQ() {
+		t.Skip("AVX-512 plus VPCLMULQDQ unavailable")
+	}
+	table := crc32.MakeTable(crc32.Castagnoli)
+	data := make([]byte, (128<<10)+63)
+	for i := range data {
+		data[i] = byte(i*193 + i>>3)
+	}
+	for alignment := 0; alignment < 64; alignment++ {
+		for _, size := range []int{256, 257, 511, 512, 1023, 1024, 4095, 4096, 4097, 64 << 10, 128 << 10} {
+			input := data[alignment : alignment+size]
+			if got, want := pageChecksumAVX512(input), crc32.Checksum(input, table); got != want {
+				t.Fatalf("alignment=%d size=%d: checksum=%08x, want %08x", alignment, size, got, want)
+			}
+		}
+	}
+}

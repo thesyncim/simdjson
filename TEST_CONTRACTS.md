@@ -131,9 +131,12 @@ docset_test.go
 docset_valuedict_test.go
 duplicate_keys_contract_test.go
 internal/storeio/committer_test.go
+internal/storeio/chunk_directory_test.go
 internal/storeio/device_test.go
+internal/storeio/document_page_test.go
 internal/storeio/index_pool_test.go
 internal/storeio/page_test.go
+internal/storeio/posting_page_test.go
 internal/storeio/state_root_test.go
 internal/storeio/superblock_test.go
 field_cursor_test.go
@@ -160,6 +163,7 @@ store_test.go
 store_builder_test.go
 store_bitmap_test.go
 store_index_exact_test.go
+store_index_packed_test.go
 store_persist_test.go
 internal/storeio/ring_linux_test.go
 value_accessors_contract_test.go
@@ -222,8 +226,11 @@ marshal_hint_test.go
 query/workspace_test.go
 resource_retention_test.go
 internal/storeio/committer_alloc_test.go
+internal/storeio/chunk_directory_alloc_test.go
 internal/storeio/ring_alloc_linux_test.go
 internal/storeio/device_alloc_test.go
+internal/storeio/document_page_alloc_test.go
+internal/storeio/posting_page_alloc_test.go
 internal/storeio/state_root_alloc_test.go
 internal/storeio/superblock_alloc_test.go
 ```
@@ -238,6 +245,7 @@ simd/features_simd_test.go
 internal/scanner/scan_policy_amd64_test.go
 internal/scanner/scan_simd_test.go
 internal/storeio/page_checksum_simd_amd64_test.go
+internal/storeio/page_checksum_simd_arm64_test.go
 internal/kernels/stage1_index_portable_test.go
 internal/kernels/stage1_index_test.go
 internal/kernels/stage1_portable_test.go
@@ -278,8 +286,10 @@ query/postings_bench_test.go
 query/query_bench_test.go
 shape_bench_test.go
 shape_column_bench_test.go
+store_scale_smoke_test.go
 shape_column_typed_bench_test.go
 store_bench_test.go
+store_index_packed_bench_test.go
 store_persist_bench_test.go
 store_persist_mmap_unix_test.go
 typed_bench_test.go

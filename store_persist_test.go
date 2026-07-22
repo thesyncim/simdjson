@@ -106,6 +106,11 @@ func TestStorePersistRoundTripIndexesTTLAndMutation(t *testing.T) {
 	afterComparable.MappedImageBytes = 0
 	afterComparable.ExternalKeyBytes = 0
 	afterComparable.ExternalDocumentBytes = 0
+	afterComparable.ExternalIndexBytes = 0
+	beforeStats.MappedImageBytes = 0
+	beforeStats.ExternalKeyBytes = 0
+	beforeStats.ExternalDocumentBytes = 0
+	beforeStats.ExternalIndexBytes = 0
 	if afterComparable != beforeStats {
 		t.Fatalf("Stats = %+v, want operational fields %+v", afterStats, beforeStats)
 	}

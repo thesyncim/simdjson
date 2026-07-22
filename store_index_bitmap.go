@@ -106,6 +106,21 @@ func (m storeIndexMasks) each(fn func(uint32, uint64) bool) {
 	}
 }
 
+func (m storeIndexMasks) next(from uint64) (uint32, uint64, bool) {
+	if from > uint64(^uint32(0)) {
+		return 0, 0, false
+	}
+	if m.wide.root != nil {
+		return m.wide.next(from)
+	}
+	for i := 0; i < int(m.n); i++ {
+		if uint64(m.chunks[i]) >= from {
+			return m.chunks[i], m.masks[i], true
+		}
+	}
+	return 0, 0, false
+}
+
 // storeIndexMasksFromSorted builds one immutable posting without the
 // intermediate path copies used by online single-word updates. entries must be
 // strictly ascending by chunk and contain no zero masks.
@@ -260,6 +275,50 @@ func storeIndexMaskNodeEmpty(node *storeIndexMaskNode, level uint8) bool {
 
 func (v storeIndexMaskVector) each(fn func(uint32, uint64) bool) {
 	storeIndexMaskEach(v.root, v.depth, 0, fn)
+}
+
+func (v storeIndexMaskVector) next(from uint64) (uint32, uint64, bool) {
+	if v.root == nil || from > uint64(^uint32(0)) || from >= storeIndexMaskCapacity(v.depth) {
+		return 0, 0, false
+	}
+	return storeIndexMaskNext(v.root, v.depth, 0, from)
+}
+
+func storeIndexMaskNext(node *storeIndexMaskNode, level uint8, prefix uint64, from uint64) (uint32, uint64, bool) {
+	if node == nil {
+		return 0, 0, false
+	}
+	if level == 0 {
+		start := 0
+		if from > prefix {
+			start = int(from - prefix)
+			if start >= len(node.masks) {
+				return 0, 0, false
+			}
+		}
+		for i := start; i < len(node.masks); i++ {
+			if node.masks[i] != 0 {
+				return uint32(prefix + uint64(i)), node.masks[i], true
+			}
+		}
+		return 0, 0, false
+	}
+	shift := uint(level) * 5
+	start := 0
+	if from > prefix {
+		start = int((from - prefix) >> shift)
+		if start >= len(node.children) {
+			return 0, 0, false
+		}
+	}
+	for i := start; i < len(node.children); i++ {
+		childPrefix := prefix + uint64(i)<<shift
+		childFrom := max(from, childPrefix)
+		if id, mask, ok := storeIndexMaskNext(node.children[i], level-1, childPrefix, childFrom); ok {
+			return id, mask, true
+		}
+	}
+	return 0, 0, false
 }
 
 func storeIndexMaskEach(node *storeIndexMaskNode, level uint8, prefix uint32, fn func(uint32, uint64) bool) bool {

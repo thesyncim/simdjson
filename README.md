@@ -217,6 +217,13 @@ post-open mutations do not update the image. The measured limit and automatic
 append-only 100x-RAM design are in
 [Mutable Store operations](docs/store.md).
 
+The separate attached-file substrate now has crash-safe double roots, a common
+checksummed page envelope, a pointer-free state root, packed 64-way chunk
+directories, and eight-byte-per-live-row document directories with
+variable-size extents. It remains internal until mutation batches and the
+key/index/TTL page schemas are connected end to end; these codecs do not make
+ordinary `Put` durable yet.
+
 An update parses only its replacement. Unchanged source and structural-tape
 storage stays immutable and is shared into the next bounded chunk; deletes copy
 only dense row metadata and remove the last-row chunk directly. There are no
@@ -299,6 +306,9 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Dense Store fused 3-predicate bitmap / ordered 4,096-row decode | 410-416 ns / 4.03-4.08 us, 0 allocations |
 | Change an existing TTL | 45 ns, 0 allocations |
 | Dense bitmap Boolean pass on M4 Max | 75-80 GB/s, 0 allocations; NEON did not beat scalar and is not dispatched |
+| Packed resident document page, JSON-only / full string-key verify | 2.566-2.576 ns / 4.034-4.092 ns, 0 allocations |
+| Packed 64-way chunk-directory hit | 7.17-7.26 ns, 0 allocations |
+| 5M-row indexed Store scale smoke | 0.98M build docs/s, 55 ns point read, 521.1 live-heap B/doc, 0.251 objects/doc, 4.16 packed-index B/doc |
 
 On the hosted AMD EPYC 7763 runner, AVX2 reduced the fused dense Store
 three-predicate kernel from 815-823 ns to 174-175 ns (about 4.7x). The complete

@@ -2,8 +2,9 @@ package simdjson
 
 import "time"
 
-// StoreStats is an O(1), allocation-free operational snapshot. The Chunks field
-// counts materialized immutable chunks; ChunkHighWater is the persistent
+// StoreStats is an allocation-free operational snapshot. It is O(number of
+// index definitions), never O(keys or chunks). The Chunks field counts
+// materialized immutable chunks; ChunkHighWater is the persistent
 // vector's address span and may be larger after deletes. Sparse vector
 // traversal skips absent branches, so that difference is metadata, not scan or
 // compaction debt. ReusableChunks includes both partially filled and empty
@@ -37,6 +38,10 @@ type StoreStats struct {
 	// ExternalDocumentBytes is pointer-free mapped document-descriptor
 	// metadata outside Go HeapAlloc on supported Unix platforms.
 	ExternalDocumentBytes uint64
+	// ExternalIndexBytes is immutable exact-index page/directory storage
+	// outside Go HeapAlloc on supported Unix platforms. Mutation deltas remain
+	// ordinary snapshot-owned heap nodes until folded into a later base.
+	ExternalIndexBytes uint64
 }
 
 // Stats returns current writer and publication counters without traversing
@@ -68,6 +73,9 @@ func (s *Store) Stats() StoreStats {
 	stats.MappedImageBytes = uint64(len(state.source))
 	stats.ExternalKeyBytes = state.baseKeys.externalBytes()
 	stats.ExternalDocumentBytes = state.mappedDocs.externalBytes()
+	for _, index := range state.secondary {
+		stats.ExternalIndexBytes += index.base.externalBytes()
+	}
 	return stats
 }
 

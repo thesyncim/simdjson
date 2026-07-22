@@ -102,6 +102,61 @@ func containsString(values []string, want string) bool {
 	return false
 }
 
+func TestStoreBuilderCompactsKeyDirectory(t *testing.T) {
+	builder, err := NewStoreBuilder(StoreOptions{ChunkDocuments: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct{ key, json string }{
+		{"", `0`},
+		{"alpha", `1`},
+		{"a-key-longer-than-the-first-arena-growth", `2`},
+	} {
+		if err := builder.Append(row.key, []byte(row.json)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := store.state.Load()
+	if state.keys != nil || state.baseKeys == nil || state.baseKeys.count != 3 ||
+		state.baseKeys.sourceBlock == nil {
+		t.Fatalf("published key directory retained builder graph: %+v", state)
+	}
+	state.chunks.each(func(_ uint32, chunk *storeChunk) bool {
+		if chunk.keys != nil || chunk.keyBytes != nil || chunk.mappedKeys != state.baseKeys {
+			t.Fatalf("chunk retained heap key storage: %+v", chunk)
+		}
+		return true
+	})
+	for key, want := range map[string]string{
+		"": `0`, "alpha": `1`, "a-key-longer-than-the-first-arena-growth": `2`,
+	} {
+		if raw, ok := store.GetRaw(key); !ok || string(raw.Bytes()) != want {
+			t.Fatalf("GetRaw(%q) = (%q,%v), want (%q,true)", key, raw.Bytes(), ok, want)
+		}
+	}
+	if state.baseKeys.sourceBlock.OutsideHeap() && store.Stats().ExternalKeyBytes == 0 {
+		t.Fatal("owned external key bytes not reported")
+	}
+
+	before := store.Snapshot()
+	if !store.Delete("alpha") {
+		t.Fatal("Delete(alpha) missed compact base")
+	}
+	if created, err := store.Put("later", []byte(`3`)); err != nil || !created {
+		t.Fatalf("Put(later) = (%v,%v)", created, err)
+	}
+	if raw, ok := before.GetRaw("alpha"); !ok || string(raw.Bytes()) != `1` {
+		t.Fatalf("retained compact snapshot = (%q,%v)", raw.Bytes(), ok)
+	}
+	if _, ok := store.GetRaw("alpha"); ok {
+		t.Fatal("deleted compact-base key remained visible")
+	}
+}
+
 func TestStoreBuilderErrorsAndEmptyStore(t *testing.T) {
 	if _, err := NewStoreBuilder(StoreOptions{ChunkDocuments: 65}); err == nil {
 		t.Fatal("invalid chunk bound accepted")

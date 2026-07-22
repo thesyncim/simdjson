@@ -4,7 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"hash/maphash"
+	"math/bits"
 	"strings"
+
+	"github.com/thesyncim/simdjson/internal/byteview"
 )
 
 var (
@@ -30,14 +33,15 @@ var (
 // same publication. StoreBuilder is intentionally not an update API: online
 // changes belong to Store.Put.
 type StoreBuilder struct {
-	options StoreOptions
-	seed    maphash.Seed
-	keys    *storeKeyNode
-	chunks  storeChunkVector
-	current *storeChunk
-	count   int
-	closed  bool
-	exact   map[string]*storeExactIndex
+	options  StoreOptions
+	seed     maphash.Seed
+	keys     *storeKeyNode
+	chunks   storeChunkVector
+	current  *storeChunk
+	count    int
+	keyBytes int
+	closed   bool
+	exact    map[string]*storeExactIndex
 }
 
 // NewStoreBuilder returns an empty bulk builder. It validates StoreOptions up
@@ -94,6 +98,9 @@ func (b *StoreBuilder) Append(key string, src []byte) error {
 	if b == nil || b.closed {
 		return ErrStoreBuilderClosed
 	}
+	if uint64(len(key)) > uint64(^uint32(0)) || len(key) > maxInt()-b.keyBytes {
+		return ErrStorePersistTooLarge
+	}
 	hash := maphash.String(b.seed, key)
 	if _, exists := storeKeyLookup(b.keys, hash, key); exists {
 		return fmt.Errorf("%w %q", ErrStoreDuplicateKey, key)
@@ -111,7 +118,10 @@ func (b *StoreBuilder) Append(key string, src []byte) error {
 	if err != nil {
 		return err
 	}
-	storedKey := strings.Clone(key)
+	keyStart := len(b.current.keyBytes)
+	b.current.keyBytes = append(b.current.keyBytes, key...)
+	storedKey := byteview.String(b.current.keyBytes[keyStart:])
+	b.keyBytes += len(key)
 	slot := int(b.current.count)
 	b.current.keys[slot] = storedKey
 	b.current.ord[slot] = uint8(ord)
@@ -150,6 +160,10 @@ func (b *StoreBuilder) Build() (*Store, error) {
 	if b.current != nil {
 		b.flush()
 	}
+	baseKeys, err := b.compactBaseKeys()
+	if err != nil {
+		return nil, err
+	}
 	b.closed = true
 
 	state := &storeState{
@@ -157,7 +171,7 @@ func (b *StoreBuilder) Build() (*Store, error) {
 		chunkCount: b.chunks.count,
 		seed:       b.seed,
 		options:    b.options,
-		keys:       b.keys,
+		baseKeys:   baseKeys,
 		chunks:     b.chunks,
 	}
 	if b.count != 0 || len(b.exact) != 0 {
@@ -175,18 +189,78 @@ func (b *StoreBuilder) Build() (*Store, error) {
 			store.postingChunks.add(id)
 		}
 	}
-	b.buildExactIndexes(store, state)
+	if err := b.buildExactIndexes(store, state); err != nil {
+		return nil, err
+	}
 	store.state.Store(state)
+	b.keys = nil
+	b.chunks = storeChunkVector{}
+	b.current = nil
+	b.exact = nil
 	return store, nil
+}
+
+// compactBaseKeys replaces the builder-only HAMT and its leaf objects with one
+// immutable Swiss-style table plus packed key bytes. On common Unix systems
+// both regions are outside the Go heap. The published Store therefore retains
+// neither a string allocation nor a directory leaf per input row.
+func (b *StoreBuilder) compactBaseKeys() (*storeMappedKeys, error) {
+	if b.count == 0 {
+		return nil, nil
+	}
+	base, err := newStoreOwnedKeys(b.count, b.keyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("simdjson: compact StoreBuilder keys: %w", err)
+	}
+	position := 0
+	refBase := uint64(0)
+	valid := true
+	b.chunks.each(func(id uint32, chunk *storeChunk) bool {
+		for live := chunk.live; live != 0; live &= live - 1 {
+			slot := bits.TrailingZeros64(live)
+			key := chunk.keys[slot]
+			start := position
+			position += copy(base.source[position:], key)
+			ref := refBase + uint64(chunk.ord[slot])
+			if ref >= uint64(len(base.refs)) {
+				valid = false
+				return false
+			}
+			base.refs[ref] = storeMappedKeyRef{
+				off: uint64(start), length: uint32(len(key)),
+				loc: storeLocation{chunk: id, slot: uint8(slot)},
+			}
+			if !base.insert(maphash.String(b.seed, key), ref) {
+				valid = false
+				return false
+			}
+		}
+		refBase += uint64(chunk.count)
+		return true
+	})
+	if !valid || position != len(base.source) || refBase != uint64(b.count) {
+		base.release()
+		return nil, errors.New("simdjson: StoreBuilder compact key invariant")
+	}
+	refBase = 0
+	b.chunks.each(func(_ uint32, chunk *storeChunk) bool {
+		chunk.keys = nil
+		chunk.keyBytes = nil
+		chunk.mappedKeys = base
+		chunk.mappedBase = refBase
+		refBase += uint64(chunk.count)
+		return true
+	})
+	return base, nil
 }
 
 // buildExactIndexes constructs complete roots while store and state are still
 // unreachable by readers. storeIndexCollectChunk coalesces equal tuples inside
 // each page; radix traversal supplies ascending chunk ids, so every posting's
-// masks are already in the order required by the one-allocation bulk builders.
-func (b *StoreBuilder) buildExactIndexes(store *Store, state *storeState) {
+// masks are already in the order required by the packed-page builder.
+func (b *StoreBuilder) buildExactIndexes(store *Store, state *storeState) error {
 	if len(b.exact) == 0 {
-		return
+		return nil
 	}
 	if store.indexes == nil {
 		store.indexes = make(map[string]*storeIndexBuild, len(b.exact))
@@ -212,15 +286,20 @@ func (b *StoreBuilder) buildExactIndexes(store *Store, state *storeState) {
 			ColumnCount:   exact.n,
 		}
 		copy(info.Columns[:], exact.specs[:exact.n])
+		base, err := newStorePackedIndex(pending)
+		if err != nil {
+			return fmt.Errorf("simdjson: build packed exact index %q: %w", name, err)
+		}
 		store.indexes[name] = &storeIndexBuild{
 			info:  info,
 			exact: exact,
-			root:  storeIndexBuildBulk(pending),
+			base:  base,
 			all:   true,
 		}
 	}
 	state.indexes = store.indexInfosLocked()
 	state.secondary = store.indexSnapshotsLocked()
+	return nil
 }
 
 // storeKeyInsertTransient is StoreBuilder's uniquely-owned HAMT insertion.

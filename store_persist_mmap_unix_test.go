@@ -84,6 +84,7 @@ func BenchmarkStorePersistOpenMapped(b *testing.B) {
 			b.ReportMetric(float64(size), "mapped-B")
 			b.ReportMetric(float64(stats.ExternalKeyBytes), "external-key-B")
 			b.ReportMetric(float64(stats.ExternalDocumentBytes), "external-doc-B")
+			b.ReportMetric(float64(stats.ExternalIndexBytes), "external-index-B")
 		})
 	}
 }

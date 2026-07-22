@@ -71,6 +71,8 @@ type storeIndexBuild struct {
 	all      bool
 	exact    *storeExactIndex
 	root     *storeIndexPostingNode
+	base     *storePackedIndex
+	dirty    storeIndexMaskVector
 }
 
 type storeIndexReclaim struct{}
@@ -395,8 +397,17 @@ func (s *Store) markIndexesCoveredLocked(id uint32) {
 func (s *Store) noteIndexesForChunkLocked(id uint32, old, next *storeChunk, changed uint64) (catalogChanged, secondaryChanged bool) {
 	oldLive, nextLive := old != nil, next != nil
 	for _, b := range s.indexes {
-		oldInfo, oldRoot := b.info, b.root
+		oldInfo, oldRoot, oldDirty := b.info, b.root, b.dirty.root
 		covered := b.has(id)
+		if b.exact != nil && b.base != nil && b.dirty.get(id) == 0 {
+			// Shadow the whole chunk before changing one slot. Base postings for
+			// every tuple in a dirty chunk are skipped by readers, so seed the
+			// delta with the complete old image exactly once.
+			b.dirty = b.dirty.set(id, 1)
+			if oldLive {
+				b.root = storeIndexSetChunk(b.root, b.exact, id, old, true)
+			}
+		}
 		switch {
 		case !oldLive && nextLive:
 			b.info.TotalChunks++
@@ -429,7 +440,7 @@ func (s *Store) noteIndexesForChunkLocked(id uint32, old, next *storeChunk, chan
 		if b.info != oldInfo {
 			catalogChanged = true
 		}
-		if b.exact != nil && (b.root != oldRoot || b.info != oldInfo) {
+		if b.exact != nil && (b.root != oldRoot || b.dirty.root != oldDirty || b.info != oldInfo) {
 			secondaryChanged = true
 		}
 	}
@@ -443,7 +454,9 @@ func (s *Store) indexSnapshotsLocked() []storeIndexSnapshot {
 	out := make([]storeIndexSnapshot, 0, len(s.indexes))
 	for _, b := range s.indexes {
 		if b.exact != nil {
-			out = append(out, storeIndexSnapshot{info: b.info, exact: b.exact, root: b.root})
+			out = append(out, storeIndexSnapshot{
+				info: b.info, exact: b.exact, root: b.root, base: b.base, dirty: b.dirty,
+			})
 		}
 	}
 	slices.SortFunc(out, func(a, b storeIndexSnapshot) int {

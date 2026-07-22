@@ -52,6 +52,8 @@ type storeIndexSnapshot struct {
 	info  StoreIndexInfo
 	exact *storeExactIndex
 	root  *storeIndexPostingNode
+	base  *storePackedIndex
+	dirty storeIndexMaskVector
 }
 
 // StoreRow is one immutable Snapshot row address. Addresses returned by an
@@ -409,14 +411,10 @@ func (s Snapshot) visitIndexMatches(name string, values []Index, visit func(uint
 		})
 		return nil
 	}
-	masks, found := storeIndexPostingLookup(index.root, hash)
-	if !found {
-		return nil
-	}
-	masks.each(func(chunkID uint32, candidates uint64) bool {
+	storeIndexEachCandidate(index, hash, func(chunkID uint32, candidates uint64) {
 		chunk := s.state.chunks.get(chunkID)
 		if chunk == nil {
-			return true
+			return
 		}
 		for live := candidates & chunk.live; live != 0; live &= live - 1 {
 			slot := bits.TrailingZeros64(live)
@@ -424,9 +422,46 @@ func (s Snapshot) visitIndexMatches(name string, values []Index, visit func(uint
 				visit(chunkID, chunk, slot)
 			}
 		}
-		return true
 	})
 	return nil
+}
+
+// storeIndexEachCandidate merges the immutable packed base with the
+// path-copied mutation delta in chunk order. A dirty chunk is wholly shadowed:
+// its complete current postings live in root, while every old base word for
+// that chunk is skipped. This keeps writes O(one bounded chunk) and avoids a
+// corpus rebuild on the first mutation.
+func storeIndexEachCandidate(index storeIndexSnapshot, hash uint64, visit func(uint32, uint64)) {
+	delta, _ := storeIndexPostingLookup(index.root, hash)
+	deltaChunk, deltaMask, deltaOK := delta.next(0)
+	advanceDelta := func() {
+		if deltaChunk == ^uint32(0) {
+			deltaOK = false
+			return
+		}
+		deltaChunk, deltaMask, deltaOK = delta.next(uint64(deltaChunk) + 1)
+	}
+	if index.base != nil {
+		index.base.each(hash, func(baseChunk uint32, baseMask uint64) bool {
+			for deltaOK && deltaChunk < baseChunk {
+				visit(deltaChunk, deltaMask)
+				advanceDelta()
+			}
+			if deltaOK && deltaChunk == baseChunk {
+				visit(deltaChunk, deltaMask)
+				advanceDelta()
+				return true
+			}
+			if index.dirty.get(baseChunk) == 0 {
+				visit(baseChunk, baseMask)
+			}
+			return true
+		})
+	}
+	for deltaOK {
+		visit(deltaChunk, deltaMask)
+		advanceDelta()
+	}
 }
 
 // AppendIndexRows appends immutable row addresses exactly matching the scalar

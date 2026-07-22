@@ -10,40 +10,41 @@ package_path=$(GOTOOLCHAIN=local "$go_bin" list -f '{{.ImportPath}}' ./internal/
 package_pattern=$(printf '%s\n' "$package_path" | sed 's/\./\\./g')
 
 check_target() {
-	arch=$1
-	body=$2
-	instruction=$3
-	binary="$work/storeio-$arch.test"
-	body_assembly="$work/storeio-$arch-body.asm"
-	dispatch_assembly="$work/storeio-$arch-dispatch.asm"
+	os=$1
+	arch=$2
+	body=$3
+	instruction=$4
+	binary="$work/storeio-$os-$arch.test"
+	body_assembly="$work/storeio-$os-$arch-body.asm"
+	dispatch_assembly="$work/storeio-$os-$arch-dispatch.asm"
 
-	GOOS=linux GOARCH=$arch GOEXPERIMENT=simd GOTOOLCHAIN=local \
+	GOOS=$os GOARCH=$arch GOEXPERIMENT=simd GOTOOLCHAIN=local \
 		"$go_bin" test -c ./internal/storeio -o "$binary"
 	"$go_bin" tool objdump -s "^${package_pattern}\.${body}$" \
 		"$binary" >"$body_assembly"
 	if ! grep -Eq "[[:space:]]${instruction}[[:space:]]" "$body_assembly"; then
-		echo "$arch checksum body did not retain $instruction" >&2
+		echo "$os/$arch checksum body did not retain $instruction" >&2
 		exit 1
 	fi
 	if grep -Eq 'runtime\.(newobject|mallocgc)' "$body_assembly"; then
-		echo "$arch checksum body contains a heap-allocation call" >&2
+		echo "$os/$arch checksum body contains a heap-allocation call" >&2
 		exit 1
 	fi
 
 	"$go_bin" tool objdump -s "^${package_pattern}\.pageChecksum$" \
 		"$binary" >"$dispatch_assembly"
 	if grep -Eq '[[:space:]](VPCLMULQDQ|VPMULL2?)[[:space:]]' "$dispatch_assembly"; then
-		echo "$arch checksum capability wrapper contains SIMD work" >&2
+		echo "$os/$arch checksum capability wrapper contains SIMD work" >&2
 		exit 1
 	fi
 }
 
-check_target amd64 pageChecksumAVX512 VPCLMULQDQ
-check_target arm64 pageChecksumPMULL9 VPMULL
+check_target linux amd64 pageChecksumAVX512 VPCLMULQDQ
+check_target darwin arm64 pageChecksumPMULL9 VPMULL
 
 pclmul_assembly="$work/storeio-amd64-pclmul.asm"
 "$go_bin" tool objdump -s "^${package_pattern}\.pageChecksumPCLMUL8$" \
-	"$work/storeio-amd64.test" >"$pclmul_assembly"
+	"$work/storeio-linux-amd64.test" >"$pclmul_assembly"
 if ! grep -Eq '[[:space:]]VPCLMULQDQ[[:space:]]' "$pclmul_assembly"; then
 	echo 'amd64 128-bit checksum body did not retain VPCLMULQDQ' >&2
 	exit 1
