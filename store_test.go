@@ -84,6 +84,155 @@ func TestStoreHAMTSharedPrefixAndFullHashCollision(t *testing.T) {
 	}
 }
 
+func TestStoreHAMTTailPromotionAndDeleteDemotion(t *testing.T) {
+	var root *storeKeyNode
+	for i := 0; i < storeKeyLeafBucket+1; i++ {
+		hash := uint64(i) << storeKeyFixedBits
+		root = storeKeyInsert(root, hash, fmt.Sprintf("k%d", i), storeLocation{chunk: uint32(i), slot: uint8(i)})
+	}
+	boundary := root.slots[0].child.slots[0].child.slots[0]
+	if boundary.child == nil || boundary.leaf != nil {
+		t.Fatalf("third key did not promote terminal bucket: %+v", boundary)
+	}
+	if _, ok := storeKeyNodeLeafBucket(boundary.child); ok {
+		t.Fatal("promoted tail incorrectly fits the leaf bucket")
+	}
+	old := root
+	last := storeKeyLeafBucket
+	root = storeKeyDelete(root, uint64(last)<<storeKeyFixedBits, fmt.Sprintf("k%d", last))
+	if root.slots[0].child != nil || storeKeyLeafCount(root.slots[0].leaf) != storeKeyLeafBucket {
+		t.Fatalf("tail did not flatten and collapse: %+v", root.slots[0])
+	}
+	for i := 0; i < storeKeyLeafBucket; i++ {
+		if loc, ok := storeKeyLookup(root, uint64(i)<<storeKeyFixedBits, fmt.Sprintf("k%d", i)); !ok || loc.chunk != uint32(i) {
+			t.Fatalf("lookup k%d after demotion = (%+v,%v)", i, loc, ok)
+		}
+	}
+	if _, ok := storeKeyLookup(old, uint64(last)<<storeKeyFixedBits, fmt.Sprintf("k%d", last)); !ok {
+		t.Fatal("delete changed retained promoted root")
+	}
+}
+
+func TestStoreCompiledKeyAcrossSnapshotsAndStores(t *testing.T) {
+	store := NewStore(StoreOptions{ChunkDocuments: 2, ShapeTapes: true})
+	for key, doc := range map[string]string{
+		"":  `{"v":"empty"}`,
+		"a": `{"v":"old"}`,
+		"b": `{"v":"other"}`,
+	} {
+		if _, err := store.Put(key, []byte(doc)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := store.Snapshot()
+	compiled := old.CompileKey("a")
+	empty := old.CompileKey("")
+	absent := old.CompileKey("later")
+	if raw, ok := old.GetRawKey(compiled); !ok || string(raw.Bytes()) != `{"v":"old"}` {
+		t.Fatalf("compiled old read = (%q,%v)", raw.Bytes(), ok)
+	}
+	if raw, ok := old.GetRawKey(empty); !ok || string(raw.Bytes()) != `{"v":"empty"}` {
+		t.Fatalf("compiled empty-key read = (%q,%v)", raw.Bytes(), ok)
+	}
+
+	if _, err := store.Put("a", []byte(`{"v":"new"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if !store.Delete("a") {
+		t.Fatal("delete a")
+	}
+	if _, err := store.Put("filler", []byte(`{"v":"reuses-slot"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("a", []byte(`{"v":"moved"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("later", []byte(`{"v":"appeared"}`)); err != nil {
+		t.Fatal(err)
+	}
+	current := store.Snapshot()
+	if raw, ok := current.GetRawKey(compiled); !ok || string(raw.Bytes()) != `{"v":"moved"}` {
+		t.Fatalf("compiled moved read = (%q,%v)", raw.Bytes(), ok)
+	}
+	if raw, ok := current.GetRawKey(absent); !ok || string(raw.Bytes()) != `{"v":"appeared"}` {
+		t.Fatalf("compiled absent-then-present read = (%q,%v)", raw.Bytes(), ok)
+	}
+	if raw, ok := old.GetRawKey(compiled); !ok || string(raw.Bytes()) != `{"v":"old"}` {
+		t.Fatalf("compiled retained-snapshot read = (%q,%v)", raw.Bytes(), ok)
+	}
+
+	other := NewStore(StoreOptions{})
+	if _, err := other.Put("a", []byte(`{"v":"other-store"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if raw, ok := other.GetRawKey(compiled); !ok || string(raw.Bytes()) != `{"v":"other-store"}` {
+		t.Fatalf("cross-Store fallback = (%q,%v)", raw.Bytes(), ok)
+	}
+}
+
+func TestStoreCompiledKeySteadyAllocs(t *testing.T) {
+	store := NewStore(StoreOptions{ShapeTapes: true})
+	if _, err := store.Put("key", []byte(`{"value":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := store.Snapshot()
+	key := snapshot.CompileKey("key")
+	if allocs := testing.AllocsPerRun(1000, func() {
+		if raw, ok := snapshot.GetRawKey(key); !ok || len(raw.Bytes()) == 0 {
+			panic("compiled key miss")
+		}
+	}); allocs != 0 {
+		t.Fatalf("Snapshot.GetRawKey allocated %.2f times, want 0", allocs)
+	}
+}
+
+func TestStoreCompiledKeyMutationDifferential(t *testing.T) {
+	store := NewStore(StoreOptions{ChunkDocuments: 7, ShapeTapes: true})
+	const keyCount = 96
+	keys := make([]string, keyCount)
+	compiled := make([]StoreKey, keyCount)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("key-%02d", i)
+		if i%3 != 0 {
+			if _, err := store.Put(keys[i], []byte(fmt.Sprintf(`{"step":0,"key":%d}`, i))); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for i := range keys {
+		compiled[i] = store.CompileKey(keys[i])
+	}
+
+	rng := rand.New(rand.NewSource(23))
+	for step := 1; step <= 4000; step++ {
+		i := rng.Intn(keyCount)
+		if rng.Intn(4) == 0 {
+			store.Delete(keys[i])
+		} else {
+			doc := fmt.Sprintf(`{"step":%d,"key":%d}`, step, i)
+			if _, err := store.Put(keys[i], []byte(doc)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if step%37 == 0 {
+			j := rng.Intn(keyCount)
+			compiled[j] = store.CompileKey(keys[j])
+		}
+		if step%19 != 0 {
+			continue
+		}
+		snapshot := store.Snapshot()
+		for j := range keys {
+			plain, plainOK := snapshot.GetRaw(keys[j])
+			fast, fastOK := snapshot.GetRawKey(compiled[j])
+			if fastOK != plainOK || fastOK && string(fast.Bytes()) != string(plain.Bytes()) {
+				t.Fatalf("step %d key %q: GetRawKey=(%q,%v), GetRaw=(%q,%v)",
+					step, keys[j], fast.Bytes(), fastOK, plain.Bytes(), plainOK)
+			}
+		}
+	}
+}
+
 func TestStoreCoverageSparsePagesAndClone(t *testing.T) {
 	ids := []uint32{1, (1 << storeCoveragePageShift) - 1, 1 << 31, ^uint32(0)}
 	var coverage storeCoverage
@@ -229,9 +378,17 @@ func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
 	beforeSources := make([][]byte, 8)
 	for i := range beforeSources {
 		beforeSources[i] = lookupSource(fmt.Sprintf("k%d", i))
-		ref := beforeChunk.docs.shapeTapeRefAt(int(beforeChunk.ord[i]))
+		ord := int(beforeChunk.ord[i])
+		ref := beforeChunk.docs.shapeTapeRefAt(ord)
 		if ref.rec == nil || !ref.narrow {
 			t.Fatalf("slot %d was not promoted to a narrow shape tape", i)
+		}
+		if cap(beforeChunk.docs.docs[ord].entries) != 0 {
+			t.Fatalf("slot %d narrow tape retained %d unused classic entries", i, cap(beforeChunk.docs.docs[ord].entries))
+		}
+		if cap(ref.rec.fields) != len(ref.rec.fields) || cap(ref.rec.table) != len(ref.rec.table) {
+			t.Fatalf("slot %d shape retained oversized fields/table: %d/%d and %d/%d",
+				i, len(ref.rec.fields), cap(ref.rec.fields), len(ref.rec.table), cap(ref.rec.table))
 		}
 	}
 	if got := len(beforeChunk.docs.shapes.shapes); got != 1 {

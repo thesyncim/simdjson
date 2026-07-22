@@ -154,7 +154,17 @@ func initChunkDocSet(docs *DocSet, options StoreOptions, postings bool) {
 		// from pinning stream-sized spare capacity for its whole live tenure.
 		arenaMinSrc:     1,
 		arenaMinEntries: 16,
+		dropEmptySpill:  true,
 	}
+	// ShapeCache's default arenas amortize compilation across an unbounded
+	// DocSet. A Store chunk is capped at 64 documents and is rebuilt by copy;
+	// exact minima prevent one page-local shape from pinning bulk-sized field,
+	// table, record, and spelling slabs. The compiler and read representation
+	// stay identical, so this policy change has no query-path branch.
+	docs.shapes.arenaMinRecords = 1
+	docs.shapes.arenaMinFields = 1
+	docs.shapes.arenaMinSlots = 1
+	docs.shapes.arenaMinBytes = 1
 }
 
 // prepareStoreDocSet reserves the dense per-chunk tables and seeds its shape

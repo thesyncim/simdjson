@@ -11,23 +11,21 @@ package redisbench
 type TargetKind int
 
 const (
-	// TargetSpace compares our retained bytes (DocSet arenas and headers)
-	// against RedisJSON's keyspace plus the RediSearch index, both at rest.
+	// TargetSpace compares the keyed Store's retained heap, including its exact
+	// index, against RedisJSON's keyspace plus the RediSearch index at rest.
 	// Ratio is ours/Redis; lower is better.
 	TargetSpace TargetKind = iota
-	// TargetProject compares single-core point projection: our best full-scan
-	// or shape-column per-document cost against RedisJSON's JSON.GET. Ratio is
-	// Redis/ours; higher is better.
+	// TargetProject compares Store Snapshot.Get plus a compiled pointer against
+	// RedisJSON's JSON.GET. Ratio is Redis/ours; higher is better.
 	TargetProject
-	// TargetFilter compares the filtered scan: our column scan with a scalar
-	// equality against RediSearch FT.SEARCH on a TAG field. Ratio is
-	// Redis/ours; higher is better.
+	// TargetFilter compares a Store query using the declared exact index and an
+	// exact scalar recheck against RediSearch FT.SEARCH on a TAG field.
 	TargetFilter
-	// TargetSum compares the scalar aggregate: our AppendFieldInt64 reduce
+	// TargetSum compares the scalar aggregate: our RunSnapshotInto reduce
 	// against RediSearch FT.AGGREGATE REDUCE SUM. Ratio is Redis/ours; higher
 	// is better.
 	TargetSum
-	// TargetGroup compares the grouped aggregate: our KeyInterner group-by
+	// TargetGroup compares the grouped aggregate: our RunSnapshotInto group-by
 	// against RediSearch FT.AGGREGATE GROUPBY. Ratio is Redis/ours; higher is
 	// better.
 	TargetGroup
@@ -52,7 +50,7 @@ type Target struct {
 var Targets = []Target{
 	{
 		ID: "space-clustered", Kind: TargetSpace, Class: "clustered", Bound: 1.0,
-		Note: "DocSet (shape-deduplicated) vs RedisJSON keyspace + RediSearch index; RedisJSON stores an uncompressed re-encoded object per key and RediSearch a separate inverted index",
+		Note: "keyed Store plus the matching exact index vs RedisJSON keyspace plus RediSearch index; the DocSet shape row is diagnostic only",
 	},
 	{
 		ID: "space-real", Kind: TargetSpace, Class: "real", Bound: 1.0,
@@ -64,18 +62,18 @@ var Targets = []Target{
 	},
 	{
 		ID: "project", Kind: TargetProject, Class: "", Bound: 1.0,
-		Note: "point projection: our Doc+PointerCompiled vs JSON.GET; our whole-corpus AppendField has no single JSON.GET analogue",
+		Note: "point projection: Snapshot.Get plus PointerCompiled vs JSON.GET; the schema-free DocSet corpus projection has no single JSON.GET analogue",
 	},
 	{
 		ID: "filter", Kind: TargetFilter, Class: "", Bound: 1.0,
-		Note: "filtered scan: our column scan + scalar equality (no pre-declared schema) vs FT.SEARCH on a TAG field that FT.CREATE had to declare up front",
+		Note: "our declared nested-capable exact index plus mandatory scalar recheck vs the same field declared as a RediSearch TAG",
 	},
 	{
 		ID: "sum", Kind: TargetSum, Class: "", Bound: 1.0,
-		Note: "scalar aggregate: our AppendFieldInt64 reduce vs FT.AGGREGATE REDUCE SUM",
+		Note: "scalar aggregate: Store RunSnapshotInto SUM vs FT.AGGREGATE REDUCE SUM",
 	},
 	{
 		ID: "group", Kind: TargetGroup, Class: "", Bound: 1.0,
-		Note: "grouped aggregate: our KeyInterner group-by vs FT.AGGREGATE GROUPBY",
+		Note: "grouped aggregate: Store RunSnapshotInto group-by vs FT.AGGREGATE GROUPBY",
 	},
 }

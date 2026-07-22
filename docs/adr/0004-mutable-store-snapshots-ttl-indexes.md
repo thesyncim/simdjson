@@ -32,6 +32,8 @@ online-index build cursors, and reclamation progress. Readers never consult it.
 9. Declared indexes support nested RFC 6901 paths and ordered compound keys.
 10. Buffered exact probes and indexed snapshot queries allocate zero bytes
     after their caller-owned storage reaches its high-water mark.
+11. A compiled Store key may bypass hashing and the HAMT only after verifying
+    its cached stable slot; movement and cross-Store use fall back safely.
 
 ## Publication and ownership
 
@@ -43,6 +45,14 @@ The HAMT and chunk vector path-copy only changed radix nodes. Complete hashes
 and keys are verified at HAMT leaves. The keyed hash seed prevents a remote
 caller from selecting a deterministic collision family; collision chains still
 compare the full key.
+
+The key HAMT uses fixed 32-way nodes for its cache-hot first 15 hash bits. A
+terminal slot keeps two leaves before promoting the rare third collision to
+another node. The two-leaf policy is the measured latency/space knee: it keeps
+the 58-cost lookup small enough for the compiler to inline while
+avoiding most sparse deep nodes. Delete flattens a promoted subtree as soon as
+it fits the terminal bucket again, so churn cannot leave a permanently expanded
+tail.
 
 Document source bytes and structural tapes are independently immutable.
 Updating a row validates and copies only its replacement. Unchanged rows in the
@@ -181,7 +191,8 @@ code as `DocSet` queries.
 ## Allocation contract
 
 After caller-owned capacity is warm, snapshots, `GetRaw`, `Range`, buffered
-exact/posting probes, sparse Snapshot gathers, compiled `query.RunInto` and
+exact/posting probes, sparse Snapshot gathers, compiled Store-key reads,
+compiled `query.RunInto` and
 `query.RunSnapshotInto`, warmed TTL changes, and native dense Boolean operations
 allocate zero bytes.
 
@@ -191,6 +202,22 @@ borrowing caller memory after return, so it is incompatible with this lifetime
 contract. The optimization target is bounded allocation proportional to the
 replacement plus one chunk's small metadata, not an unsafe zero.
 
+## External source-memory decision
+
+Byte arenas are pointer-free and are not scanned by the Go collector, but they
+count toward live heap and its pacing target. A read-only serialized `DocSet`
+can already borrow a caller-owned mmap through `Open`; this moves the image out
+of `HeapAlloc` while leaving total mapped memory unchanged. The mapping must
+outlive the set and every derived borrowed view.
+
+Automatic mmap ownership is rejected for the mutable Store's current API.
+`RawValue.Bytes` is a plain slice and `Index` also borrows its source, so either
+can outlive the Store or Snapshot value that produced it. Finalizer-driven or
+eager unmapping could invalidate such a live handle. A future external-byte
+mode must use an explicit scoped lease/callback and caller-buffered copy-out, or
+owner-bearing read handles whose latency and size are accepted by benchmark.
+No unsafe lifetime shortcut is hidden behind `StoreOptions`.
+
 ## Measured mutation result
 
 On Apple M4 Max, darwin/arm64, Go 1.26, shape tapes enabled, 1,024 resident
@@ -198,23 +225,23 @@ small documents, the median of six 500 ms samples:
 
 | chunk documents | replace | delete + insert | replace bytes |
 | ---: | ---: | ---: | ---: |
-| 1 | 0.856 us | 2.09 us | 2.3 KiB |
-| 8 | 0.813 us | 1.88 us | 3.2 KiB |
-| 64 | 2.36 us | 5.10 us | 9.8 KiB |
+| 1 | 0.81 us | 1.99 us | 2.3 KiB |
+| 8 | 0.90 us | 2.24 us | 3.2 KiB |
+| 64 | 2.24 us | 5.00 us | 9.8 KiB |
 
-At the default chunk size this is about 6.2x faster for replace and 5.8x
-faster for delete-plus-insert than rebuilding and reparsing every surviving
-row, with 82% and 80% less allocation respectively. `Store.GetRaw` remains
-19.6 ns with zero allocations. These are local regression fixtures, not
+`Store.GetRaw` is 21.92-23.88 ns with zero allocations. A compiled stable-slot
+`GetRawKey` is 7.99-8.50 ns with zero allocations and falls back to ordinary
+lookup when its cached location is no longer valid. These are local
+regression fixtures, not
 universal Redis command claims.
 
 Declared-index regression fixtures on the same machine add no allocation when
 the indexed tuple is unchanged: a single or compound definition measures about
-2.64 us, 9.9 KiB, and 12 allocations. Moving the tuple costs about 3.1 us,
+2.46–2.49 us, 9.9 KiB, and 12 allocations. Moving the tuple costs 2.84–3.03 us,
 11.9 KiB, and 18 allocations. A 65,536-document, 16-value enum definition is
 about 4.2 reachable index bytes/document. A warmed 10%-selective Snapshot query
-measures about 12.9 ns/input document versus 67.2 ns/document for the matching
-full scan; a compound point query measures about 3.01 ns/input document.
+measures about 12.44 ns/input document versus 67.2 ns/document for the matching
+full scan; a compound point query measures about 2.82 ns/input document.
 Distribution changes posting density, so `Snapshot.IndexStats` is the
 production sizing authority.
 

@@ -83,6 +83,46 @@ func (c OursCorpus) acceptanceVariant() *OursVariant {
 	return c.variant(true, false)
 }
 
+// comparisonNumbers selects one internally coherent engine row. New results
+// use Store for space, ingest, point reads, and query scenarios; older result
+// artifacts without a Store row retain the historical DocSet fallback so the
+// report format remains readable during rollout.
+type comparisonNumbers struct {
+	retained int64
+	ingest   int64
+	project  int64
+	filter   int64
+	sum      int64
+	group    int64
+	contain  int64
+}
+
+func (c OursCorpus) comparisonNumbers() comparisonNumbers {
+	if s := c.Store; s != nil {
+		return comparisonNumbers{
+			retained: s.RetainedBytes,
+			ingest:   s.IngestNS,
+			project:  s.SingleDocNS,
+			filter:   s.FilterNS,
+			sum:      s.SumNS,
+			group:    s.GroupNS,
+			contain:  s.ContainNS,
+		}
+	}
+	if v := c.acceptanceVariant(); v != nil {
+		return comparisonNumbers{
+			retained: v.RetainedBytes,
+			ingest:   v.IngestNS,
+			project:  v.SingleDocNS,
+			filter:   v.FilterNS,
+			sum:      v.SumNS,
+			group:    v.GroupNS,
+			contain:  v.ContainNS,
+		}
+	}
+	return comparisonNumbers{}
+}
+
 // bestProjectNS is the variant's best whole-corpus projection pass and its
 // label; the point-read cost is SingleDocNS, reported separately.
 func bestProjectNS(v *OursVariant) (int64, string) {
@@ -117,29 +157,29 @@ func redisProjectNS(l RedisLog) float64 {
 
 func deriveRedisRatios(c OursCorpus, l *RedisLog) redisRatios {
 	var r redisRatios
-	v := c.acceptanceVariant()
-	if v == nil || l == nil {
+	v := c.comparisonNumbers()
+	if v.retained == 0 || l == nil {
 		return r
 	}
-	if redisSpace := l.keyspaceBytes() + l.indexBytes(); redisSpace > 0 && v.RetainedBytes > 0 {
-		r.space = float64(v.RetainedBytes) / float64(redisSpace)
+	if redisSpace := l.keyspaceBytes() + l.indexBytes(); redisSpace > 0 {
+		r.space = float64(v.retained) / float64(redisSpace)
 	}
-	if loadNS := l.Values["load_ns"]; loadNS > 0 && v.IngestNS > 0 {
+	if loadNS := l.Values["load_ns"]; loadNS > 0 && v.ingest > 0 {
 		// Throughput ratio over the same source bytes: Redis load time over
 		// ours, so >1 means ours ingests faster.
-		r.ingest = float64(loadNS) / float64(v.IngestNS)
+		r.ingest = float64(loadNS) / float64(v.ingest)
 	}
-	if rp := redisProjectNS(*l); rp > 0 && v.SingleDocNS > 0 {
-		r.project = rp / float64(v.SingleDocNS)
+	if rp := redisProjectNS(*l); rp > 0 && v.project > 0 {
+		r.project = rp / float64(v.project)
 	}
-	if rf, ok := l.QueryNS("filter"); ok && rf > 0 && v.FilterNS > 0 {
-		r.filter = rf / float64(v.FilterNS)
+	if rf, ok := l.QueryNS("filter"); ok && rf > 0 && v.filter > 0 {
+		r.filter = rf / float64(v.filter)
 	}
-	if rs, ok := l.QueryNS("sum"); ok && rs > 0 && v.SumNS > 0 {
-		r.sum = rs / float64(v.SumNS)
+	if rs, ok := l.QueryNS("sum"); ok && rs > 0 && v.sum > 0 {
+		r.sum = rs / float64(v.sum)
 	}
-	if rg, ok := l.QueryNS("groupby"); ok && rg > 0 && v.GroupNS > 0 {
-		r.group = rg / float64(v.GroupNS)
+	if rg, ok := l.QueryNS("groupby"); ok && rg > 0 && v.group > 0 {
+		r.group = rg / float64(v.group)
 	}
 	return r
 }
@@ -205,19 +245,22 @@ func BuildReport(res OursResults, logs map[string]RedisLog) string {
 	w("\n")
 
 	w("## Space at rest\n\n")
-	w("Ours is the measured live-heap delta of the DocSet (arenas, headers, slack)\nunder the shape-tape mode; modeled is source + 16 B/entry (+16 B/header per\nshape-taped document). RedisJSON keyspace is used_memory attributable to the\nloaded keys; the RediSearch index is FT.INFO's reported size. The ratio is\nours vs RedisJSON keyspace + RediSearch index.\n\n")
-	w("| corpus | ours (dedup) | tape cut | dedup docs | modeled | RedisJSON keyspace | RediSearch index | ours/(keyspace+index) |\n")
+	w("The comparison row is the measured live-heap delta of the keyed Store,\nincluding immutable chunks, key HAMT, snapshot metadata, and the declared exact\nindex used by the filter. The DocSet column remains a representation diagnostic,\nnot the numerator. RedisJSON keyspace is used_memory attributable to the loaded\nkeys; RediSearch index is the subsequent used_memory delta.\n\n")
+	w("| corpus | keyed Store + exact index | exact index modeled | DocSet shape-dedup | tape cut | RedisJSON keyspace | RediSearch index | Store/(keyspace+index) |\n")
 	w("|---|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, c := range corpora {
 		m := c.Manifest
 		vh, vd := c.variant(true, false), c.variant(true, true)
 		l := logFor(m.Name)
 		row := deriveRedisRatios(c, l)
-		dedup, cut, dedupDocs, dedupModeled := "n/a", "n/a", "n/a", "n/a"
+		storeBytes, indexBytes := "n/a", "n/a"
+		if c.Store != nil {
+			storeBytes = fmtMiB(c.Store.RetainedBytes)
+			indexBytes = fmtMiB(int64(c.Store.IndexBytes))
+		}
+		dedup, cut := "n/a", "n/a"
 		if vd != nil {
 			dedup = fmtMiB(vd.RetainedBytes)
-			dedupModeled = fmtMiB(vd.ModeledBytes)
-			dedupDocs = fmt.Sprintf("%d%%", 100*vd.ShapeTapedDocs/int64(max(m.Docs, 1)))
 			if vh != nil && vh.Entries > 0 {
 				classicTape := vh.Entries * 16
 				dedupTape := vd.Entries*16 + vd.ShapeTapedDocs*16
@@ -230,21 +273,24 @@ func BuildReport(res OursResults, logs map[string]RedisLog) string {
 			ratio = fmtRatio(row.space)
 		}
 		w("| %s | %s | %s | %s | %s | %s | %s | %s |\n",
-			m.Name, dedup, cut, dedupDocs, dedupModeled, keyspace, index, ratio)
+			m.Name, storeBytes, indexBytes, dedup, cut, keyspace, index, ratio)
 	}
 	w("\n")
 
 	w("## Ingest\n\n")
-	w("Single core both sides. Ours: ReadFrom (validate + index + arena copy) in\nthe shape-tape mode. Redis: redis-cli --pipe mass JSON.SET, then FT.CREATE\nplus the indexing drain. The ratio is Redis load time over ours (>1x means\nours ingests the same bytes faster); Redis also pays the RESP protocol and\nRedisJSON re-encoding that an in-process build does not.\n\n")
-	w("| corpus | ours load | Redis JSON.SET load | ours/Redis | RediSearch index build |\n")
-	w("|---|---:|---:|---:|---:|\n")
+	w("Single core both sides. Ours is a fresh keyed Store Put pass followed by\nCreateIndex plus full BackfillIndex; Redis is redis-cli --pipe JSON.SET followed\nby FT.CREATE and indexing drain. Index-build times are separate. The load ratio\nis Redis load time over Store load (>1x means Store is faster).\n\n")
+	w("| corpus | Store load | Redis JSON.SET load | Store/Redis | Store exact-index build | RediSearch index build |\n")
+	w("|---|---:|---:|---:|---:|---:|\n")
 	for _, c := range corpora {
 		m := c.Manifest
-		v := c.acceptanceVariant()
+		v := c.comparisonNumbers()
 		l := logFor(m.Name)
-		oursLoad := "n/a"
-		if v != nil {
-			oursLoad = fmtMBps(m.SourceBytes, v.IngestNS)
+		oursLoad, oursIndex := "n/a", "n/a"
+		if v.ingest > 0 {
+			oursLoad = fmtMBps(m.SourceBytes, v.ingest)
+		}
+		if c.Store != nil && c.Store.IndexBuildNS > 0 {
+			oursIndex = fmtNS(float64(c.Store.IndexBuildNS))
 		}
 		redisLoad, ratio, indexBuild := "n/a", "n/a", "n/a"
 		if l != nil {
@@ -253,27 +299,27 @@ func BuildReport(res OursResults, logs map[string]RedisLog) string {
 			ratio = fmtRatio(row.ingest)
 			indexBuild = fmtNS(float64(l.Values["index_ns"]))
 		}
-		w("| %s | %s | %s | %s | %s |\n", m.Name, oursLoad, redisLoad, ratio, indexBuild)
+		w("| %s | %s | %s | %s | %s | %s |\n", m.Name, oursLoad, redisLoad, ratio, oursIndex, indexBuild)
 	}
 	w("\n")
 
 	// The scenario matrix: speed and expressiveness, one row per scenario per
 	// corpus. Expressiveness records the competitor's capability, not ours.
 	w("## Scenario matrix\n\n")
-	w("Speed is single-core. The ratio is Redis/ours, so >1x means ours runs the\nscenario in less time. The expressiveness column is RedisJSON/RediSearch's\ncapability: native, native but requiring a pre-declared FT.CREATE schema\n(we declare none), or not-expressible. Point projection compares our\nDoc+PointerCompiled against JSON.GET; the whole-corpus AppendField column\nprojection has no single JSON.GET analogue. Filter, sum, and group-by are\nwhole-corpus. Containment is the object {ContainKey: ContainValue} against\nevery document — RedisJSON and RediSearch have no containment operator.\n\n")
+	w("Speed is single-core. The ratio is Redis/ours, so >1x means Store runs the\nscenario in less time. Point projection is a warmed Snapshot.Get plus compiled\npointer. The filter uses the declared exact index matching RediSearch's declared\nTAG field and still rechecks exact JSON equality. Sum, group, and containment\nrun through RunSnapshotInto; the DocSet corpus projection remains a schema-free\ncapability row.\n\n")
 	w("| corpus | scenario | RedisJSON/RediSearch | ours | ratio (Redis/ours) | competitor expressiveness |\n")
 	w("|---|---|---:|---:|---:|---|\n")
 	for _, c := range corpora {
 		m := c.Manifest
-		v := c.acceptanceVariant()
-		if v == nil {
+		v := c.comparisonNumbers()
+		if v.project == 0 {
 			continue
 		}
 		l := logFor(m.Name)
 		row := deriveRedisRatios(c, l)
 
 		// projection (point read).
-		redisProj, oursProj := "not run", fmtNS(float64(v.SingleDocNS))
+		redisProj, oursProj := "not run", fmtNS(float64(v.project))
 		if l != nil {
 			if rp := redisProjectNS(*l); rp > 0 {
 				redisProj = fmtNS(rp)
@@ -285,27 +331,29 @@ func BuildReport(res OursResults, logs map[string]RedisLog) string {
 			m.Name, redisProj, oursProj, ratioCell(l, row.project))
 
 		// whole-corpus projection (our AppendField; Redis workaround).
-		wcNS, wcLabel := bestProjectNS(v)
-		w("| %s | corpus projection | %s | %s | %s | workaround (FT.SEARCH RETURN, schema) |\n",
-			m.Name, "not-native", fmt.Sprintf("%s (%s)", fmtPerDoc(wcNS, m.Docs), wcLabel), "capability")
+		if dv := c.acceptanceVariant(); dv != nil {
+			wcNS, wcLabel := bestProjectNS(dv)
+			w("| %s | corpus projection | %s | %s | %s | workaround (FT.SEARCH RETURN, schema) |\n",
+				m.Name, "not-native", fmt.Sprintf("%s (%s)", fmtPerDoc(wcNS, m.Docs), wcLabel), "capability")
+		}
 
 		if m.ContainKey != "" {
 			redisFilter := redisScenarioCell(l, "filter")
-			w("| %s | filtered scan | %s | %s | %s | native (FT.SEARCH TAG, schema) |\n",
-				m.Name, redisFilter, fmtNS(float64(v.FilterNS)), ratioCell(l, row.filter))
+			w("| %s | indexed filter | %s | %s | %s | native (FT.SEARCH TAG, schema) |\n",
+				m.Name, redisFilter, fmtNS(float64(v.filter)), ratioCell(l, row.filter))
 
 			redisGroup := redisScenarioCell(l, "groupby")
 			w("| %s | group-by aggregate | %s | %s | %s | native (FT.AGGREGATE GROUPBY, schema) |\n",
-				m.Name, redisGroup, fmtNS(float64(v.GroupNS)), ratioCell(l, row.group))
+				m.Name, redisGroup, fmtNS(float64(v.group)), ratioCell(l, row.group))
 
 			w("| %s | containment @> | %s | %s | %s | **not-expressible** (no operator) |\n",
-				m.Name, "not-expressible", fmtNS(float64(v.ContainNS)), "capability")
+				m.Name, "not-expressible", fmtNS(float64(v.contain)), "capability")
 		}
 
 		if m.SumField != "" {
 			redisSum := redisScenarioCell(l, "sum")
 			w("| %s | scalar aggregate SUM | %s | %s | %s | native (FT.AGGREGATE SUM, schema) |\n",
-				m.Name, redisSum, fmtNS(float64(v.SumNS)), ratioCell(l, row.sum))
+				m.Name, redisSum, fmtNS(float64(v.sum)), ratioCell(l, row.sum))
 		}
 	}
 	w("\n")
@@ -434,9 +482,9 @@ func buildHonesty(w func(string, ...any), corpora []OursCorpus, logs map[string]
 	w("  build, being seconds-scale, are wall-clocked instead.\n")
 	w("- RediSearch needs a pre-declared FT.CREATE schema: every field a scenario\n")
 	w("  touches had to be named and typed before load, and only declared fields are\n")
-	w("  queryable. Our column scans need no schema and reach any path. The schema\n")
-	w("  requirement is why the whole-corpus projection and every filter/aggregate\n")
-	w("  row is marked as needing a declared schema.\n")
+	w("  queryable. The head-to-head filter declares the same field in our exact\n")
+	w("  index, then performs an exact JSON scalar recheck. Our aggregate and DocSet\n")
+	w("  column paths need no declaration and can reach nested RFC 6901 paths.\n")
 	w("- Containment (@>) has no RedisJSON or RediSearch operator. It is reported as a\n")
 	w("  scenario we answer and they cannot, not as a speed ratio.\n")
 	w("- RedisJSON stores an uncompressed re-encoded object per key and RediSearch a\n")

@@ -1,15 +1,24 @@
 package simdjson
 
-// Persistent 32-way hash trie for the mutable store's key directory.
+// Persistent hash trie for the mutable Store key directory.
 //
-// Each mutation path-copies at most thirteen nodes (five hash bits per level
-// over a 64-bit keyed hash); every untouched subtree is shared by old and new
-// snapshots. Full-hash collisions are held in a tiny immutable leaf chain and
-// still compare the complete key, so a collision cannot produce a false hit.
-// The store hashes with a per-instance maphash seed, making attacker-chosen
-// collision chains infeasible without weakening deterministic JSON indexes.
+// The first 15 hash bits use cache-hot fixed 32-way nodes. Their terminal
+// slots keep up to two distinct hashes in a short leaf bucket; only the rarer
+// third collision allocates another node. This preserves the small, inlinable
+// lookup loop while avoiding the mostly empty deep nodes that a conventional
+// fixed HAMT creates around ordinary key counts.
+//
+// Every mutation path-copies its route. Full-hash collisions remain an
+// immutable leaf chain and compare complete keys. A per-Store maphash seed
+// makes attacker-selected collision families infeasible.
 
-const storeTrieBits = 5
+const (
+	storeTrieBits        = 5
+	storeKeyBucketShift  = 10 // The third fixed level consumes bits 10..14.
+	storeKeyFixedBits    = 15
+	storeKeyLeafBucket   = 2
+	storeKeyBranchFactor = 1 << storeTrieBits
+)
 
 type storeLocation struct {
 	chunk uint32
@@ -29,18 +38,20 @@ type storeKeySlot struct {
 }
 
 type storeKeyNode struct {
-	slots [1 << storeTrieBits]storeKeySlot
+	slots [storeKeyBranchFactor]storeKeySlot
 }
 
 func storeKeyLookup(root *storeKeyNode, hash uint64, key string) (storeLocation, bool) {
-	for shift := uint(0); root != nil; shift += storeTrieBits {
-		slot := root.slots[(hash>>shift)&31]
+	remaining := hash
+	for root != nil {
+		slot := &root.slots[remaining&31]
 		for leaf := slot.leaf; leaf != nil; leaf = leaf.next {
 			if leaf.hash == hash && leaf.key == key {
 				return leaf.loc, true
 			}
 		}
 		root = slot.child
+		remaining >>= storeTrieBits
 	}
 	return storeLocation{}, false
 }
@@ -69,22 +80,28 @@ func storeKeyInsertAt(root *storeKeyNode, shift uint, add *storeKeyLeaf) *storeK
 		return &out
 	}
 
-	// A complete hash collision remains a leaf chain. Copy the chain so an
-	// existing key's location can change without mutating an older snapshot.
-	if slot.leaf.hash == add.hash {
+	// Complete-hash collisions stay in one leaf chain. Copying the chain also
+	// permits an existing key's location to change without mutating a snapshot.
+	if storeKeyLeafHasHash(slot.leaf, add.hash) {
 		slot.leaf = storeLeafInsert(slot.leaf, add)
 		out.slots[i] = slot
 		return &out
 	}
 
-	// Two distinct hashes share this prefix. Push the existing chain and the
-	// new leaf into a child; recursion stops at their first differing group.
-	child := (*storeKeyNode)(nil)
+	// After the cache-hot 15-bit prefix, a two-leaf bucket is cheaper in both
+	// bytes and dependent loads than another 512-byte node. Promote only the
+	// third distinct hash. The same policy in rare deeper nodes bounds skewed
+	// tries without adding a branch to lookup.
+	if shift >= storeKeyBucketShift && storeKeyLeafCount(slot.leaf) < storeKeyLeafBucket {
+		slot.leaf = storeLeafInsert(slot.leaf, add)
+		out.slots[i] = slot
+		return &out
+	}
+
+	var child *storeKeyNode
 	for leaf := slot.leaf; leaf != nil; leaf = leaf.next {
 		child = storeKeyInsertAt(child, shift+storeTrieBits, &storeKeyLeaf{
-			hash: leaf.hash,
-			key:  leaf.key,
-			loc:  leaf.loc,
+			hash: leaf.hash, key: leaf.key, loc: leaf.loc,
 		})
 	}
 	child = storeKeyInsertAt(child, shift+storeTrieBits, add)
@@ -100,11 +117,26 @@ func storeLeafInsert(head, add *storeKeyLeaf) *storeKeyLeaf {
 		return &storeKeyLeaf{hash: add.hash, key: add.key, loc: add.loc, next: head.next}
 	}
 	return &storeKeyLeaf{
-		hash: head.hash,
-		key:  head.key,
-		loc:  head.loc,
+		hash: head.hash, key: head.key, loc: head.loc,
 		next: storeLeafInsert(head.next, add),
 	}
+}
+
+func storeKeyLeafHasHash(leaf *storeKeyLeaf, hash uint64) bool {
+	for ; leaf != nil; leaf = leaf.next {
+		if leaf.hash == hash {
+			return true
+		}
+	}
+	return false
+}
+
+func storeKeyLeafCount(leaf *storeKeyLeaf) int {
+	n := 0
+	for ; leaf != nil && n < storeKeyLeafBucket; leaf = leaf.next {
+		n++
+	}
+	return n
 }
 
 func storeKeyDelete(root *storeKeyNode, hash uint64, key string) *storeKeyNode {
@@ -124,7 +156,11 @@ func storeKeyDeleteAt(root *storeKeyNode, shift uint, hash uint64, key string) (
 		if !changed {
 			return root, false
 		}
-		if leaf, ok := storeKeySingleton(slot.child); ok {
+		if shift >= storeKeyBucketShift {
+			if leaf, ok := storeKeyNodeLeafBucket(slot.child); ok {
+				slot = storeKeySlot{leaf: leaf}
+			}
+		} else if leaf, ok := storeKeySingleton(slot.child); ok {
 			slot = storeKeySlot{leaf: leaf}
 		}
 	} else {
@@ -185,4 +221,44 @@ func storeKeySingleton(node *storeKeyNode) (*storeKeyLeaf, bool) {
 		}
 	}
 	return one, one != nil
+}
+
+// storeKeyNodeLeafBucket flattens a promoted subtree as soon as deletion
+// brings it back within the leaf-bucket bound. Counting uses a fixed stack
+// buffer, so failed collapse checks do not allocate during churn.
+func storeKeyNodeLeafBucket(node *storeKeyNode) (*storeKeyLeaf, bool) {
+	if node == nil {
+		return nil, false
+	}
+	var leaves [storeKeyLeafBucket]*storeKeyLeaf
+	n := 0
+	if !storeKeyCollectLeaves(node, &leaves, &n) || n == 0 {
+		return nil, false
+	}
+	var head *storeKeyLeaf
+	for i := n - 1; i >= 0; i-- {
+		leaf := leaves[i]
+		head = &storeKeyLeaf{hash: leaf.hash, key: leaf.key, loc: leaf.loc, next: head}
+	}
+	return head, true
+}
+
+func storeKeyCollectLeaves(node *storeKeyNode, leaves *[storeKeyLeafBucket]*storeKeyLeaf, n *int) bool {
+	if node == nil {
+		return true
+	}
+	for i := range node.slots {
+		slot := node.slots[i]
+		if slot.child != nil && !storeKeyCollectLeaves(slot.child, leaves, n) {
+			return false
+		}
+		for leaf := slot.leaf; leaf != nil; leaf = leaf.next {
+			if *n == len(leaves) {
+				return false
+			}
+			leaves[*n] = leaf
+			(*n)++
+		}
+	}
+	return true
 }

@@ -145,6 +145,14 @@ type ShapeCache struct {
 	recChunk   []shapeRecord
 	fieldChunk []shapeField
 	slotChunk  []uint32
+	// Arena minima are internal construction policy. Zero keeps the amortized
+	// bulk-cache chunks below. Bounded immutable Store micro-pages use one so
+	// each newly discovered page-local shape retains only its actual record,
+	// fields, table, and key bytes rather than four corpus-sized slabs.
+	arenaMinRecords int
+	arenaMinFields  int
+	arenaMinSlots   int
+	arenaMinBytes   int
 	// wide is scratch storage for a narrow value entry a typed accessor must
 	// read through a Node. A narrow document keeps no arena-backed IndexEntry
 	// to point at, and materializing one as a loop local escapes into the
@@ -363,7 +371,11 @@ func (c *ShapeCache) fingerprint(v Node, count int) uint64 {
 // ObjectProbe build, paid once per recurring layout.
 func (c *ShapeCache) compile(v Node, count int, fp uint64) *shapeRecord {
 	if len(c.recChunk) == cap(c.recChunk) {
-		c.recChunk = make([]shapeRecord, 0, shapeRecChunk)
+		size := shapeRecChunk
+		if c.arenaMinRecords > 0 {
+			size = c.arenaMinRecords
+		}
+		c.recChunk = make([]shapeRecord, 0, max(size, 1))
 	}
 	c.recChunk = c.recChunk[:len(c.recChunk)+1]
 	rec := &c.recChunk[len(c.recChunk)-1]
@@ -426,6 +438,9 @@ func (c *ShapeCache) compile(v Node, count int, fp uint64) *shapeRecord {
 func (c *ShapeCache) allocFields(n int) []shapeField {
 	if len(c.fieldChunk)+n > cap(c.fieldChunk) {
 		size := shapeFieldChunk
+		if c.arenaMinFields > 0 {
+			size = c.arenaMinFields
+		}
 		if size < n {
 			size = n
 		}
@@ -441,6 +456,9 @@ func (c *ShapeCache) allocFields(n int) []shapeField {
 func (c *ShapeCache) allocSlots(n int) []uint32 {
 	if len(c.slotChunk)+n > cap(c.slotChunk) {
 		size := shapeSlotChunk
+		if c.arenaMinSlots > 0 {
+			size = c.arenaMinSlots
+		}
 		if size < n {
 			size = n
 		}
@@ -456,8 +474,12 @@ func (c *ShapeCache) allocSlots(n int) []uint32 {
 func (c *ShapeCache) internBytes(b []byte) string {
 	if len(c.chunk)+len(b) > cap(c.chunk) {
 		size := 2 * cap(c.chunk)
-		if size < internMinChunk {
-			size = internMinChunk
+		minimum := internMinChunk
+		if c.arenaMinBytes > 0 {
+			minimum = c.arenaMinBytes
+		}
+		if size < minimum {
+			size = minimum
 		}
 		if size > internMaxChunk {
 			size = internMaxChunk

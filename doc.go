@@ -138,7 +138,13 @@
 //
 // A [Store] adds keyed insert, replace, delete, TTL, immutable [Snapshot]
 // publication, declared single/compound exact indexes, and wildcard postings.
-// Snapshot GetRaw reads are lock-free, clock-free, and allocation-free.
+// [StoreBuilder] bulk-loads unique keyed documents directly into final bounded
+// chunks, bulk-builds declared exact indexes, and publishes one completed
+// Store, avoiding per-row persistent path copies while retaining the same
+// ownership and validation rules.
+// Snapshot GetRaw reads are lock-free, clock-free, and allocation-free;
+// [StoreKey] lets repeated reads verify a cached stable slot and bypass both
+// hashing and the key trie, with a safe full-lookup fallback after movement.
 // Updates parse only their replacement and share unchanged immutable
 // source/tape storage; deletes rebuild bounded dense row metadata without
 // tombstones or later compaction. [Store.CreateIndex] accepts nested RFC 6901

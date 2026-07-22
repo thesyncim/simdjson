@@ -64,6 +64,33 @@ func (v storeChunkVector) append(chunk *storeChunk) (storeChunkVector, uint32) {
 	return v, id
 }
 
+// appendTransient is StoreBuilder's uniquely-owned append. It creates only
+// missing radix nodes and mutates existing ones in place; after Build publishes
+// the vector, ordinary Store updates use the persistent append/set methods.
+func (v *storeChunkVector) appendTransient(chunk *storeChunk) uint32 {
+	id := v.count
+	capacity := uint64(32) << (uint(v.depth) * 5)
+	if uint64(v.count) == capacity {
+		v.root = &storeChunkNode{children: [32]*storeChunkNode{v.root}}
+		v.depth++
+	}
+	v.count++
+	storeChunkSetTransient(&v.root, v.depth, id, chunk)
+	return id
+}
+
+func storeChunkSetTransient(node **storeChunkNode, level uint8, id uint32, chunk *storeChunk) {
+	if *node == nil {
+		*node = &storeChunkNode{}
+	}
+	if level == 0 {
+		(*node).leaves[id&31] = chunk
+		return
+	}
+	i := (id >> (uint(level) * 5)) & 31
+	storeChunkSetTransient(&(*node).children[i], level-1, id, chunk)
+}
+
 func (v storeChunkVector) each(fn func(uint32, *storeChunk) bool) {
 	storeChunkEach(v.root, v.depth, 0, v.count, fn)
 }

@@ -151,6 +151,7 @@ shape_column_test.go
 shape_column_typed_test.go
 shape_test.go
 store_test.go
+store_builder_test.go
 store_index_exact_test.go
 value_accessors_contract_test.go
 value_iteration_contract_test.go
@@ -246,6 +247,7 @@ store_example_test.go
 ```text
 contains_bench_test.go
 docset_persist_bench_test.go
+docset_persist_mmap_unix_test.go
 docset_postings_bench_test.go
 docset_shape_bench_test.go
 docset_stream_bench_test.go

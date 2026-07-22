@@ -333,6 +333,11 @@ func TestBuildReport(t *testing.T) {
 		GoVersion: "gotest", GOARCH: "arm64",
 		Corpora: []OursCorpus{{
 			Manifest: m,
+			Store: &OursStore{
+				IngestNS: 1_250_000, IndexBuildNS: 50_000, RetainedBytes: 2_000_000, IndexBytes: 125_000,
+				SingleDocNS: 250, FilterNS: 100_000, SumNS: 150_000, GroupNS: 150_000, ContainNS: 800_000,
+				DocsObserved: 1000, ExtractHits: 250, FilterCount: 8, SumObserved: 999, GroupCount: 32, ContainCount: 8,
+			},
 			Variants: []OursVariant{
 				{HashKeys: true, ShapeTapes: false, IngestNS: 2e6, RetainedBytes: 2_500_000, Entries: 33000, ModeledBytes: 928_000,
 					ProjectPointerNS: 1e5, SingleDocNS: 500, FilterNS: 200_000, SumNS: 300_000, GroupNS: 300_000, ContainNS: 1e6,
@@ -356,10 +361,10 @@ func TestBuildReport(t *testing.T) {
 	for _, want := range []string{
 		"7.4.2",
 		"| tiny | clustered | 1000 | 4 |",
-		// Space: ours 2400000 / (keyspace 2000000 + index 500000) = 0.96x.
-		"0.96x",
-		// Filter: Redis 400000 ns / ours 200000 ns = 2.00x.
-		"2.00x",
+		// Space: Store 2000000 / (keyspace 2000000 + index 500000) = 0.80x.
+		"0.80x",
+		// Filter: Redis 400000 ns / Store 100000 ns = 4.00x.
+		"4.00x",
 		"not-expressible",
 		"containment @>",
 		"## Scenario matrix",
@@ -397,5 +402,14 @@ func TestSmokeEndToEnd(t *testing.T) {
 		if v.RetainedBytes < c.Manifest.SourceBytes {
 			t.Errorf("hashkeys=%t: retained %d below source bytes %d", v.HashKeys, v.RetainedBytes, c.Manifest.SourceBytes)
 		}
+	}
+	if c.Store == nil {
+		t.Fatal("MeasureDir omitted the keyed Store comparison")
+	}
+	if bad := c.Store.Verify(c.Manifest); len(bad) != 0 {
+		t.Errorf("Store: %v", bad)
+	}
+	if c.Store.RetainedBytes < c.Manifest.SourceBytes {
+		t.Errorf("Store retained %d below source bytes %d", c.Store.RetainedBytes, c.Manifest.SourceBytes)
 	}
 }

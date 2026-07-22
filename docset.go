@@ -114,6 +114,11 @@ type DocSet struct {
 	// read or on an Append that fits the current chunk.
 	arenaMinSrc     int
 	arenaMinEntries int
+	// dropEmptySpill is the bounded-Store policy: if shape compaction removes
+	// every entry from a spill-built document, retain no empty entry arena.
+	// A bulk DocSet keeps that arena for its next Append; one Store rebuild has
+	// exactly one replacement Append, so the capacity has no future consumer.
+	dropEmptySpill bool
 
 	// ValueDict opts the set into the corpus-wide value dictionary, read at
 	// each Append like ShapeTapes: a value span that recurs across the set —
@@ -273,6 +278,9 @@ func (s *DocSet) buildDoc(src []byte) (Index, shapeTapeRef, error) {
 	}
 	index, ref := s.shapeTapeCompact(index)
 	n := len(index.entries)
+	if n == 0 && s.dropEmptySpill {
+		return Index{src: src}, ref, nil
+	}
 	chunk := make([]IndexEntry, n, docSetChunkCap(cap(s.entryChunk), n, s.entryChunkMinimum(), docSetMaxEntryChunk))
 	copy(chunk, index.entries)
 	s.entryChunk = chunk

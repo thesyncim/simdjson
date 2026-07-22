@@ -38,6 +38,97 @@ func BenchmarkStoreGetRaw(b *testing.B) {
 	}
 }
 
+func BenchmarkStoreGetRawKey(b *testing.B) {
+	store := benchmarkStore(b, StoreOptions{ChunkDocuments: 64, ShapeTapes: true}, 1<<16)
+	snapshot := store.Snapshot()
+	keys := make([]StoreKey, 1024)
+	for i := range keys {
+		keys[i] = snapshot.CompileKey(fmt.Sprintf("key-%05d", (i*8191)&((1<<16)-1)))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		storeRawSink, storeBoolSink = snapshot.GetRawKey(keys[i&1023])
+	}
+}
+
+func BenchmarkStoreBulkBuild(b *testing.B) {
+	const documents = 1 << 14
+	keys := make([]string, documents)
+	docs := make([][]byte, documents)
+	bytesPerBuild := int64(0)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("key-%05d", i)
+		docs[i] = []byte(fmt.Sprintf(`{"id":%d,"group":%d,"active":true,"name":"document-%05d"}`, i, i%16, i))
+		bytesPerBuild += int64(len(docs[i]))
+	}
+	options := StoreOptions{ShapeTapes: true}
+
+	b.Run("Put", func(b *testing.B) {
+		b.SetBytes(bytesPerBuild)
+		b.ReportAllocs()
+		for n := 0; n < b.N; n++ {
+			store := NewStore(options)
+			for i := range keys {
+				if _, err := store.Put(keys[i], docs[i]); err != nil {
+					b.Fatal(err)
+				}
+			}
+			if store.Len() != documents {
+				b.Fatal("wrong Store length")
+			}
+		}
+	})
+	b.Run("StoreBuilder", func(b *testing.B) {
+		b.SetBytes(bytesPerBuild)
+		b.ReportAllocs()
+		for n := 0; n < b.N; n++ {
+			builder, err := NewStoreBuilder(options)
+			if err != nil {
+				b.Fatal(err)
+			}
+			for i := range keys {
+				if err := builder.Append(keys[i], docs[i]); err != nil {
+					b.Fatal(err)
+				}
+			}
+			store, err := builder.Build()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if store.Len() != documents {
+				b.Fatal("wrong Store length")
+			}
+		}
+	})
+	b.Run("StoreBuilder+ExactIndex", func(b *testing.B) {
+		b.SetBytes(bytesPerBuild)
+		b.ReportAllocs()
+		for n := 0; n < b.N; n++ {
+			builder, err := NewStoreBuilder(options)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := builder.CreateIndex(StoreIndexDefinition{Name: "group", Paths: []string{"/group"}}); err != nil {
+				b.Fatal(err)
+			}
+			for i := range keys {
+				if err := builder.Append(keys[i], docs[i]); err != nil {
+					b.Fatal(err)
+				}
+			}
+			store, err := builder.Build()
+			if err != nil {
+				b.Fatal(err)
+			}
+			state := store.state.Load()
+			if store.Len() != documents || len(state.indexes) != 1 || state.indexes[0].State != StoreIndexReady {
+				b.Fatal("wrong indexed Store")
+			}
+		}
+	})
+}
+
 func BenchmarkStoreMutation(b *testing.B) {
 	for _, chunkDocuments := range []int{1, 8, 64} {
 		b.Run("update/chunk="+itoaStore(chunkDocuments), func(b *testing.B) {

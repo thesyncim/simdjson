@@ -28,11 +28,14 @@ raw, ok := view.GetRaw("user:42")
 
 | Operation | Result | Complexity |
 | --- | --- | --- |
+| `NewStoreBuilder` + `Append` + `Build` | bulk-validates unique keys into final pages; publishes one Store | O(total input + transient key-radix construction) |
 | `Put(key, json)` | `created=true` on insert; validates and copies input | O(replacement bytes + one chunk's metadata + radix height) |
 | `Delete(key)` | true when the key existed | O(one chunk's metadata + radix height) |
 | `Snapshot()` | immutable current view | O(1) |
 | `GetRaw(key)` / `Snapshot.GetRaw(key)` | borrowed exact JSON bytes | O(keyed-HAMT depth + full-key check) |
 | `Get(key)` / `Snapshot.Get(key)` | borrowed navigable `Index` | same lookup; first compact-tape widening may allocate |
+| `CompileKey(key)` | caches seeded hash and verified stable slot | one ordinary key lookup |
+| `GetRawKey` / `GetKey` | compiled-key read with safe full-lookup fallback | O(chunk radix height) on a stable-slot hit |
 | `Range(fn)` | visits live keys in chunk/slot order | O(materialized radix nodes + live keys) |
 | `SetTTL`, `SetDeadline` | true when the key existed | O(log4 expiring keys) |
 | `Persist` | true when an expiration was removed | O(log4 expiring keys) |
@@ -77,6 +80,55 @@ There is no compaction command or compaction threshold.
 The limit counts documents, not bytes. Measure with the application's document
 sizes and option set.
 
+## Bulk construction
+
+Use `StoreBuilder` when the initial corpus is already keyed and no reader needs
+to observe each individual insertion:
+
+```go
+builder, err := simdjson.NewStoreBuilder(simdjson.StoreOptions{
+	ShapeTapes: true,
+	Postings:  true,
+})
+if err != nil {
+	return err
+}
+if err = builder.CreateIndex(simdjson.StoreIndexDefinition{
+	Name:  "tenant_country",
+	Paths: []string{"/tenant", "/profile/geo/country"},
+}); err != nil {
+	return err
+}
+for next() {
+	if err := builder.Append(key, document); err != nil {
+		return err
+	}
+}
+store, err := builder.Build()
+```
+
+`Append` validates and copies the JSON and clones the key; caller buffers may
+be reused as soon as it returns. Keys must be unique. An invalid document or
+duplicate changes no committed row. The builder belongs to one goroutine and
+closes after `Build`; the returned Store is safe for concurrent use and has the
+same update, delete, TTL, snapshot, and index behavior as any other Store.
+`CreateIndex` may be called before or after appends. Its one-to-four nested or
+compound paths are extracted at `Build`; the returned index is `Ready` in the
+first reader-visible generation, with no scan fallback window.
+
+The builder fills final micro-pages and mutates only unpublished key/chunk
+radix nodes. `Build` freezes that graph and performs one publication instead of
+path-copying it once per row. On the 16,384-document benchmark fixture it
+measured 4.57-4.76 ms (206-214 MB/s) versus 35.8-37.1 ms (26.4-27.3 MB/s) for
+repeated `Put`: about 7.7x the throughput, with 8.9 MiB rather than 143 MiB of
+transient allocation bytes. Including a ready 16-value exact index measured
+5.70-5.86 ms (167-172 MB/s) and 9.2 MiB. Run `BenchmarkStoreBulkBuild` for the
+exact local result.
+
+Index construction reuses the same per-page tuple extraction, fingerprinting,
+exact-recheck contract, stable-slot masks, and immutable bulk radix builders as
+online backfill. It does not maintain a parallel bulk-only index format.
+
 ### Mutation measurements
 
 Apple M4 Max, darwin/arm64, Go 1.26, shape tapes enabled, 1,024 resident small
@@ -84,15 +136,13 @@ documents, the median of six 500 ms samples:
 
 | chunk documents | replace | delete + insert | replace bytes/op |
 | ---: | ---: | ---: | ---: |
-| 1 | 0.856 us | 2.09 us | 2.3 KiB |
-| 8 | 0.813 us | 1.88 us | 3.2 KiB |
-| 64 | 2.36 us | 5.10 us | 9.8 KiB |
+| 1 | 0.81 us | 1.99 us | 2.3 KiB |
+| 8 | 0.90 us | 2.24 us | 3.2 KiB |
+| 64 | 2.24 us | 5.00 us | 9.8 KiB |
 
-At the default size, immutable storage reuse reduced replace time by about 6.2x
-and delete-plus-insert time by about 5.8x versus reparsing every surviving row;
-allocation fell by about 82% and 80%. `BenchmarkStoreMutation` and
-`BenchmarkStoreMutationModes` reproduce the paths. These numbers are local
-regression evidence, not Redis command latency claims.
+`BenchmarkStoreMutation` and `BenchmarkStoreMutationModes` reproduce the
+bounded-copy and full-rebuild control paths. These numbers are local regression
+evidence, not Redis command latency claims.
 
 ## Snapshot and borrowing rules
 
@@ -103,6 +153,7 @@ deletes, expiry, backfill, or reclamation.
 | --- | --- | --- | --- | --- |
 | `Snapshot` | none | none | zero | independent immutable view |
 | `GetRaw` | none | none | zero | borrows the snapshot graph |
+| `GetRawKey` | none | none | zero | compiled stable-slot hit; borrows the snapshot graph |
 | `Range` | none | none | zero | callback key/value borrow the snapshot graph |
 | buffered exact/posting probes | none | none | zero with sufficient `dst` | rows, masks, and keys borrow the snapshot graph |
 | warmed `query.RunSnapshotInto` | none | none | zero | result borrows its result/workspace storage |
@@ -115,7 +166,7 @@ immutable versions; bound snapshot age or count at the application boundary.
 
 ## Zero-allocation boundary
 
-With sufficient caller-owned capacity, `Snapshot`, `GetRaw`, `Range`,
+With sufficient caller-owned capacity, `Snapshot`, `GetRaw`, `GetRawKey`, `Range`,
 `AppendPointer`, `AppendPointerRows`, buffered exact/posting probes, compiled
 `query.RunInto`/`query.RunSnapshotInto`, and warmed TTL deadline changes
 allocate zero bytes.
@@ -125,6 +176,48 @@ mutation would have to borrow caller memory after return or overwrite storage
 that an older snapshot can still read. The API does neither. Supplying an input
 or result buffer removes transient application allocation where documented; it
 does not transfer ownership of published Store memory back to the caller.
+
+For a repeated key, compile once. The handle caches the Store's seeded hash and
+the key's current stable `(chunk, slot)` address:
+
+```go
+key := store.CompileKey("session:7")
+raw, ok := store.Snapshot().GetRawKey(key)
+```
+
+The fast path verifies the live bit and complete key spelling before returning
+bytes. If delete/reinsert moved the key, it was absent at compilation, or the
+handle is accidentally used with another Store, lookup falls back to the full
+seeded HAMT path. A handle stores no chunk pointer, so keeping it does not pin an
+obsolete document page. On the 65,536-key fixture, `GetRawKey` measures
+7.99-8.50 ns versus 21.92-23.88 ns for ordinary `GetRaw`, both at zero
+allocations.
+
+## Go heap and mapped source bytes
+
+Store source arenas are `[]byte` objects. They contain no pointers, so the GC
+does not scan each JSON byte, but they still count as live heap and therefore
+affect the pacer and heap target. Moving payload bytes to an external mapping
+can lower Go `HeapAlloc`; it does not make those bytes disappear from RSS or
+from the Store's total memory footprint, and the key directory, tapes, shapes,
+snapshots, TTL, and index metadata remain ordinary Go objects.
+
+Serialized `DocSet` images already support this mode: memory-map the image
+read-only and pass the mapped slice to `Open`. Reopened sources and native tape
+sections view the mapping directly. The caller must keep it mapped until the
+`DocSet` and every derived `Index`, `Node`, and `RawValue` are dead. On the local
+persistence fixture, `BenchmarkDocSetPersistOpenMapped` reduced per-open Go
+heap allocation from 5.46 MiB to 4.15 MiB by avoiding the 1.31 MiB image copy;
+the remaining allocation is reconstructed metadata and opt-in accelerators.
+
+The mutable Store deliberately does not expose automatic external allocation
+yet. `Snapshot.GetRaw` returns a plain borrowed slice, and `Snapshot.Get`
+returns an `Index`; neither handle carries a mapping owner. A finalizer or
+automatic `munmap` could therefore invalidate a still-live returned view. A
+safe mutable design must make the lifetime explicit—for example a scoped read
+lease plus `AppendRaw(dst, key)` for owned zero-allocation copy-out—or add an
+owner-bearing handle and measure its read-path cost. Until that contract exists,
+keeping Store bytes Go-owned is the safe choice.
 
 ## TTL
 
@@ -245,15 +338,15 @@ documents and 64-document chunks:
 
 | replacement | time | bytes/op | allocs/op |
 | --- | ---: | ---: | ---: |
-| no declared exact index | 2.38 us | 9.8 KiB | 12 |
-| exact single index, tuple unchanged | 2.64 us | 9.9 KiB | 12 |
-| exact compound index, tuple unchanged | 2.64 us | 9.9 KiB | 12 |
-| exact single index, tuple changed | 3.10 us | 11.9 KiB | 18 |
-| exact compound index, tuple changed | 3.12 us | 11.9 KiB | 18 |
+| no declared exact index | 2.24 us | 9.8 KiB | 12 |
+| exact single index, tuple unchanged | 2.46 us | 9.9 KiB | 12 |
+| exact compound index, tuple unchanged | 2.49 us | 9.9 KiB | 12 |
+| exact single index, tuple changed | 2.84 us | 11.9 KiB | 18 |
+| exact compound index, tuple changed | 3.03 us | 11.9 KiB | 18 |
 
 On 4,096 documents, a warmed 10%-selective indexed `RunSnapshotInto` measured
-12.9 ns/input document versus 67.2 ns/document for the same equality-filtered
-`DocSet` scan (about 5.2x). A compound point query measured 3.01 ns/input
+12.44 ns/input document versus 67.2 ns/document for the same equality-filtered
+`DocSet` scan (about 5.4x). A compound point query measured 2.82 ns/input
 document. These local microbenchmarks exclude protocol, durability, and client
 costs and are reproducible with `BenchmarkStoreExactIndex*` and
 `BenchmarkQueryRunSnapshotIndexed`.
@@ -338,7 +431,18 @@ and maintenance limits are in [`contracts/limits.md`](contracts/limits.md).
 
 The Store is in-memory. It has no WAL, crash recovery, replication, eviction,
 cluster protocol, or cross-process snapshot. The RedisJSON/RediSearch harness
-compares the static `DocSet` and query executor over matched corpora. A mutable
-Store comparison must additionally match durability, protocol/client time,
-document distribution, index definitions, and expiry semantics. See
+compares a keyed Store plus a matching declared exact index over identical
+corpora, while retaining DocSet-only rows as representation diagnostics. The
+latest local 65,536-document clustered run measured 62.4 MiB live Store heap
+including its 0.5 MiB exact index, versus 62.0 MiB RedisJSON keyspace plus a
+17.5 MiB RediSearch index: 0.79x as many accounted bytes. Store load was 1.89x
+faster, exact-index build about 415x faster, point projection 112x faster,
+indexed filter 1.92x faster, group-by 24.1x faster, and SUM 47.8x faster.
+
+Those are same-hardware single-core results, not a claim of server equivalence:
+Redis ran in a Linux container, Store ran natively, Redis scenario time came
+from SLOWLOG without client round-trip cost, and Store has none of the services
+listed above. Match durability, protocol/client time, document distribution,
+index definitions, and expiry semantics before applying the ratios. See
+the [frozen run](../benchmarks/results/redis-synth-s4.md) and
 [`benchmarks/redisbench/redis-methodology.md`](../benchmarks/redisbench/redis-methodology.md).

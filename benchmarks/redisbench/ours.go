@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 	"unsafe"
 
@@ -14,19 +15,12 @@ import (
 	"github.com/thesyncim/simdjson/query"
 )
 
-// This file measures our side of the RedisJSON comparison: what it costs, in
-// bytes and single-core nanoseconds, to hold the corpora in a DocSet and run
-// the five scenarios against it. The three query-shaped scenarios — filtered
-// scan, scalar aggregate, and group-by aggregate — run through the query
-// subpackage's compiled executor (ADR 0003), so the scoreboard times the real
-// query engine, not a hand-rolled stand-in; the whole-corpus column projection
-// runs through it too. The point-read and pointer scan stay DocSet primitives
-// (the JSON.GET analogue is a single-document resolve, not a query plan), and
-// containment stays the Node.Contains primitive — the capability edge, kept as
-// its cheapest spelling. The classic variants are the honest pre-optimization
-// DocSet (16-byte-per-entry tape, no dedup); the shape-tape variants measure the
-// space lever on top of it: DocSet.ShapeTapes stores each conforming document as
-// a bare value array with its keys deduplicated into the shape cache.
+// This file measures our side of the RedisJSON comparison. DocSet variants
+// retain the representation experiments and schema-free column baseline. The
+// Store row is the head-to-head engine comparison: keyed documents, immutable
+// snapshots, and a declared exact index matching RediSearch's declared TAG
+// field. Its retained-byte result includes the complete Store and index rather
+// than combining the smallest storage mode with a different query engine.
 //
 // The scenarios mirror ADR 0003 and the RediSearch commands run-redis.sh times:
 //
@@ -98,10 +92,35 @@ type OursVariant struct {
 	ContainCount int   `json:"contain_count,omitempty"`
 }
 
+// OursStore holds the keyed mutable Store result. It is deliberately separate
+// from OursVariant: a Store has key-HAMT, persistent chunk-vector, stable-slot,
+// snapshot, and declared-index costs that a DocSet does not. Comparing the
+// DocSet's space with the Store's indexed query time would hide those costs.
+type OursStore struct {
+	IngestNS      int64  `json:"ingest_ns"`
+	IndexBuildNS  int64  `json:"index_build_ns,omitempty"`
+	RetainedBytes int64  `json:"retained_bytes"`
+	IndexBytes    uint64 `json:"index_bytes,omitempty"`
+
+	SingleDocNS int64 `json:"single_doc_ns"`
+	FilterNS    int64 `json:"filter_ns,omitempty"`
+	SumNS       int64 `json:"sum_ns,omitempty"`
+	GroupNS     int64 `json:"group_ns,omitempty"`
+	ContainNS   int64 `json:"contain_ns,omitempty"`
+
+	DocsObserved int   `json:"docs_observed"`
+	ExtractHits  int   `json:"extract_hits"`
+	FilterCount  int   `json:"filter_count,omitempty"`
+	SumObserved  int64 `json:"sum_observed,omitempty"`
+	GroupCount   int   `json:"group_count,omitempty"`
+	ContainCount int   `json:"contain_count,omitempty"`
+}
+
 // OursCorpus holds one corpus measured under both DocSet configurations.
 type OursCorpus struct {
 	Manifest Manifest      `json:"manifest"`
 	Variants []OursVariant `json:"variants"`
+	Store    *OursStore    `json:"store,omitempty"`
 }
 
 // OursResults is the ours.json artifact.
@@ -370,6 +389,237 @@ func (v OursVariant) Verify(m Manifest) []string {
 	return bad
 }
 
+const redisBenchStoreIndex = "redisbench_filter"
+
+// buildMeasuredStore ingests the already-generated NDJSON without building a
+// second line table. Keys are prepared outside the timed region because corpus
+// generation is outside both engines' load measurements; Store still clones
+// each key and copies each document as part of Put.
+func buildMeasuredStore(buf []byte, keys []string) (*simdjson.Store, error) {
+	store := simdjson.NewStore(simdjson.StoreOptions{ShapeTapes: true})
+	row := 0
+	for len(buf) != 0 {
+		end := bytes.IndexByte(buf, '\n')
+		if end < 0 {
+			end = len(buf)
+		}
+		if end != 0 {
+			if row >= len(keys) {
+				return nil, fmt.Errorf("NDJSON has more than %d documents", len(keys))
+			}
+			if _, err := store.Put(keys[row], buf[:end]); err != nil {
+				return nil, fmt.Errorf("document %d: %w", row, err)
+			}
+			row++
+		}
+		if end == len(buf) {
+			break
+		}
+		buf = buf[end+1:]
+	}
+	if row != len(keys) {
+		return nil, fmt.Errorf("NDJSON has %d documents, manifest says %d", row, len(keys))
+	}
+	return store, nil
+}
+
+func buildMeasuredStoreIndex(store *simdjson.Store, m Manifest) error {
+	if m.ContainKey == "" {
+		return nil
+	}
+	if _, err := store.CreateIndex(simdjson.StoreIndexDefinition{
+		Name:  redisBenchStoreIndex,
+		Paths: []string{"/" + m.ContainKey},
+	}); err != nil {
+		return err
+	}
+	info, err := store.BackfillIndex(redisBenchStoreIndex, 0)
+	if err != nil {
+		return err
+	}
+	if info.State != simdjson.StoreIndexReady || info.CoveredChunks != info.TotalChunks {
+		return fmt.Errorf("index stopped at state=%d coverage=%d/%d", info.State, info.CoveredChunks, info.TotalChunks)
+	}
+	return nil
+}
+
+func runStoreQuery(q *query.Query, snapshot simdjson.Snapshot, reps int) (query.Result, int64, error) {
+	var result query.Result
+	var workspace query.Workspace
+	if err := q.RunSnapshotInto(&result, snapshot, &workspace); err != nil {
+		return query.Result{}, 0, err
+	}
+	var runErr error
+	ns := timeMin(reps, func() {
+		runErr = q.RunSnapshotInto(&result, snapshot, &workspace)
+	})
+	return result, ns, runErr
+}
+
+// MeasureStoreCorpus measures the representation and query path that is
+// mechanically comparable with RedisJSON plus RediSearch: keyed mutable rows
+// and a declared exact index on the same categorical field as the TAG schema.
+// Every repetition builds a fresh Store, then separately times online index
+// creation/backfill; minima cannot mix different configurations.
+func MeasureStoreCorpus(dir string, m Manifest, reps int) (OursStore, error) {
+	var v OursStore
+	base := heapAlloc()
+	buf, err := os.ReadFile(filepath.Join(dir, "docs.ndjson"))
+	if err != nil {
+		return v, err
+	}
+	keys := make([]string, m.Docs)
+	for i := range keys {
+		keys[i] = keyPrefix + strconv.Itoa(i)
+	}
+
+	var store *simdjson.Store
+	for rep := 0; rep < reps; rep++ {
+		start := time.Now()
+		candidate, buildErr := buildMeasuredStore(buf, keys)
+		ingestNS := time.Since(start).Nanoseconds()
+		if buildErr != nil {
+			return v, buildErr
+		}
+		if rep == 0 || ingestNS < v.IngestNS {
+			v.IngestNS = ingestNS
+		}
+
+		start = time.Now()
+		if err := buildMeasuredStoreIndex(candidate, m); err != nil {
+			return v, err
+		}
+		indexNS := time.Since(start).Nanoseconds()
+		if m.ContainKey != "" && (rep == 0 || indexNS < v.IndexBuildNS) {
+			v.IndexBuildNS = indexNS
+		}
+		store = candidate
+	}
+	v.DocsObserved = store.Len()
+
+	// Charge only data the final Store retains. Input, generated caller keys,
+	// and prior repetitions are released before the settled live-heap reading.
+	buf = nil
+	keys = nil
+	if retained := int64(heapAlloc()) - int64(base); retained > 0 {
+		v.RetainedBytes = retained
+	}
+	if m.ContainKey != "" {
+		stats, err := store.IndexStats(redisBenchStoreIndex)
+		if err != nil {
+			return v, err
+		}
+		v.IndexBytes = stats.EstimatedBytes
+	}
+
+	snapshot := store.Snapshot()
+	project, err := simdjson.CompilePointer("/" + m.ExtractField)
+	if err != nil {
+		return v, err
+	}
+	projected, err := snapshot.AppendPointer(nil, project)
+	if err != nil {
+		return v, err
+	}
+	for _, raw := range projected {
+		if raw.Kind() != document.Invalid {
+			v.ExtractHits++
+		}
+	}
+
+	// Warm the sampled shape tapes before timing the Index point-read path.
+	stride := max(m.Docs/1024, 1)
+	probeKeys := make([]string, 0, (m.Docs+stride-1)/stride)
+	for i := 0; i < m.Docs; i += stride {
+		probeKeys = append(probeKeys, keyPrefix+strconv.Itoa(i))
+		if _, ok := snapshot.Get(probeKeys[len(probeKeys)-1]); !ok {
+			return v, fmt.Errorf("point key %q missing", probeKeys[len(probeKeys)-1])
+		}
+	}
+	pointBytes := 0
+	total := timeMin(reps, func() {
+		pointBytes = 0
+		for _, key := range probeKeys {
+			index, _ := snapshot.Get(key)
+			node, ok, pointErr := index.PointerCompiled(project)
+			if pointErr != nil {
+				err = pointErr
+				return
+			}
+			if ok {
+				pointBytes += len(node.Raw().Bytes())
+			}
+		}
+	})
+	if err != nil {
+		return v, err
+	}
+	v.SingleDocNS = total / int64(len(probeKeys))
+	runtime.KeepAlive(pointBytes)
+
+	if m.ContainKey != "" {
+		filter := query.Select(query.Count()).Where(query.Cmp(m.ContainKey, query.Eq, m.ContainValue))
+		result, ns, err := runStoreQuery(filter, snapshot, reps)
+		if err != nil {
+			return v, err
+		}
+		v.FilterNS, v.FilterCount = ns, int(countValue(result))
+
+		group := query.Select(query.Path(m.ContainKey), query.Count()).GroupBy(m.ContainKey)
+		result, v.GroupNS, err = runStoreQuery(group, snapshot, reps)
+		if err != nil {
+			return v, err
+		}
+		v.GroupCount = result.RowCount
+
+		needle := fmt.Sprintf(`{%q:%q}`, m.ContainKey, m.ContainValue)
+		contain := query.Select(query.Count()).Where(query.Contains("", needle))
+		result, v.ContainNS, err = runStoreQuery(contain, snapshot, reps)
+		if err != nil {
+			return v, err
+		}
+		v.ContainCount = int(countValue(result))
+	}
+	if m.SumField != "" {
+		sum := query.Select(query.Sum(m.SumField))
+		result, ns, err := runStoreQuery(sum, snapshot, reps)
+		if err != nil {
+			return v, err
+		}
+		v.SumNS = ns
+		if f, ok := result.Columns[0].Cells[0].Float64(); ok {
+			v.SumObserved = int64(f)
+		}
+	}
+	runtime.KeepAlive(store)
+	return v, nil
+}
+
+func (v OursStore) Verify(m Manifest) []string {
+	var bad []string
+	if v.DocsObserved != m.Docs {
+		bad = append(bad, fmt.Sprintf("documents %d, want %d", v.DocsObserved, m.Docs))
+	}
+	if v.ExtractHits != m.ExtractHits {
+		bad = append(bad, fmt.Sprintf("projection hits %d, want %d", v.ExtractHits, m.ExtractHits))
+	}
+	if m.ContainKey != "" {
+		if v.FilterCount != m.ContainExpected {
+			bad = append(bad, fmt.Sprintf("filter count %d, want %d", v.FilterCount, m.ContainExpected))
+		}
+		if v.GroupCount != m.GroupExpected {
+			bad = append(bad, fmt.Sprintf("group count %d, want %d", v.GroupCount, m.GroupExpected))
+		}
+		if v.ContainCount != m.ContainExpected {
+			bad = append(bad, fmt.Sprintf("contain count %d, want %d", v.ContainCount, m.ContainExpected))
+		}
+	}
+	if m.SumField != "" && v.SumObserved != m.SumExpected {
+		bad = append(bad, fmt.Sprintf("sum %d, want %d", v.SumObserved, m.SumExpected))
+	}
+	return bad
+}
+
 // MeasureDir measures one corpus directory under both HashKeys settings and,
 // on top of the enriched configuration, the shape-tape mode. Every variant
 // must reproduce the manifest's expected results before its numbers mean
@@ -392,5 +642,13 @@ func MeasureDir(dir string, reps int) (OursCorpus, error) {
 		}
 		c.Variants = append(c.Variants, v)
 	}
+	store, err := MeasureStoreCorpus(dir, m, reps)
+	if err != nil {
+		return c, fmt.Errorf("%s Store: %v", m.Name, err)
+	}
+	if bad := store.Verify(m); len(bad) != 0 {
+		return c, fmt.Errorf("%s Store: verification failed: %v", m.Name, bad)
+	}
+	c.Store = &store
 	return c, nil
 }

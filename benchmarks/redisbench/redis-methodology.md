@@ -9,10 +9,9 @@ edit a miss into a win, and misses are printed against their bound.
 The framing is single-core parity on the scenarios RediSearch can express,
 plus one scenario it cannot express at all. Redis executes commands on a single
 thread, so a single instance over a single connection is a fair single-core
-comparison, not an apples-to-oranges one. Our reads are far more expressive:
-containment (`@>`) has no RedisJSON or RediSearch operator, and RediSearch can
-only query fields a `FT.CREATE` schema declared up front, while our column
-scans need no schema and reach any path.
+comparison. The indexed filter declares the same categorical field on both
+sides. Containment (`@>`) has no RedisJSON or RediSearch operator; our aggregate
+and diagnostic column paths need no schema and can reach nested fields.
 
 ## Corpora
 
@@ -85,19 +84,27 @@ empty-tag group, so both sides count the same cardinality.
 
 ## Our side
 
-`ours.go` ingests the identical corpora into a `DocSet` (HashKeys off and on,
-and the shape-tape mode over the enriched build) and reports retained bytes at
-rest. The scenarios use today's public primitives — the same the `query`
-subpackage will compile a plan onto once it lands:
+`ours.go` ingests the identical keyed documents into a shape-taped `Store`, then
+creates and fully backfills a declared exact index on the same categorical
+field RediSearch declares as `TAG`. The comparison numerator includes the
+complete live Store graph and that index. It does not combine a smaller
+`DocSet` representation with Store query times.
 
-- projection: `DocSet.AppendPointer` / `ShapeCache.AppendField`, and a
-  single-document `Doc(i)` + `PointerCompiled` probe (the `JSON.GET` analogue);
-- filtered scan: a full column scan of the filter field with a scalar equality;
-- scalar aggregate: `ShapeCache.AppendFieldInt64` and an int64 reduce;
-- group-by: a `KeyInterner` over the group field's values;
-- containment: `Node.Contains` of `{contain_key: contain_value}` against each
-  document — the many-documents form the `RawContains` doc directs to, the same
-  containment contract, indexing the needle once.
+The head-to-head scenarios are:
+
+- projection: warmed `Snapshot.Get` followed by `PointerCompiled`, the
+  `JSON.GET` analogue;
+- filter: `query.RunSnapshotInto` binds the matching exact index, evaluates
+  stable-slot candidate masks, and rechecks JSON scalar equality;
+- scalar aggregate and group-by: `RunSnapshotInto` over the immutable Store
+  snapshot, with caller-owned result and workspace reused between runs;
+- containment: the same executor evaluates the structural predicate that the
+  Redis side cannot express.
+
+The harness also retains three `DocSet` variants as representation diagnostics:
+classic with and without key hashes, and shape tapes. Their storage and
+schema-free corpus projection columns are printed, but no Store/Redis ratio
+uses them.
 
 Timings use the same single-core, minimum-of-repetitions discipline as every
 benchmark in this repository.
@@ -109,6 +116,9 @@ benchmark in this repository.
 - Speed ratios are Redis/ours (>1x means ours is faster); the space ratio is
   ours/Redis (< 1 means ours is smaller). Both engines must reproduce the
   generator's expected counts and aggregates before any ratio is reported.
+- Store load and exact-index build are timed separately, matching Redis's
+  JSON.SET and FT.CREATE phases. Retained Store bytes include the exact index;
+  Redis bytes include both the JSON keyspace and RediSearch index delta.
 - Losses are reported with causes. The comparison is an embedded library vs a
   networked server: Redis carries a protocol and re-encoding we do not, and the
   SLOWLOG timing already removes its round trip, so the numbers are read the way

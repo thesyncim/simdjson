@@ -1,6 +1,7 @@
 // Package redisbench is the ADR 0003 comparison harness: it generates the
 // shared corpus set, measures this library's side of the query surface
-// (space and single-core scenario costs on a DocSet), parses the
+// (a keyed Store with a matching declared exact index, plus DocSet
+// representation diagnostics), parses the
 // RedisJSON/RediSearch protocol logs produced by run-redis.sh, and emits the
 // scoreboard the query subpackage must keep green as it lands.
 //

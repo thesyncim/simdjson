@@ -21,6 +21,22 @@ func ExampleStore() {
 	// created=false current={"name":"Ada","score":8} old={"name":"Ada","score":7}
 }
 
+func ExampleStoreBuilder() {
+	builder, _ := simdjson.NewStoreBuilder(simdjson.StoreOptions{ShapeTapes: true})
+	_ = builder.CreateIndex(simdjson.StoreIndexDefinition{
+		Name: "country", Paths: []string{"/profile/country"},
+	})
+	_ = builder.Append("user:1", []byte(`{"profile":{"country":"PT"}}`))
+	_ = builder.Append("user:2", []byte(`{"profile":{"country":"US"}}`))
+	store, _ := builder.Build()
+
+	keys, _ := store.Snapshot().AppendIndexRawKeys(nil, "country", []byte(`"PT"`))
+	fmt.Println(store.Generation(), keys)
+
+	// Output:
+	// 1 [user:1]
+}
+
 func ExampleStore_SetDeadline() {
 	var store simdjson.Store
 	_, _ = store.Put("session", []byte(`{"user":42}`))

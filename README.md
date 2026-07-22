@@ -150,6 +150,7 @@ if _, err := store.Put("session:42", []byte(`{"user":42,"state":"open"}`)); err 
 	return err
 }
 before := store.Snapshot()
+sessionKey := before.CompileKey("session:42")
 
 store.SetTTL("session:42", 30*time.Minute)
 store.Put("session:42", []byte(`{"user":42,"state":"active"}`)) // preserves TTL
@@ -157,7 +158,36 @@ store.Delete("session:42")
 
 // The old immutable view remains valid after both mutations.
 raw, ok := before.GetRaw("session:42")
+
+// Repeated reads can bypass hashing and the key trie through a verified stable
+// slot; delete/reinsert movement falls back to the complete lookup.
+raw, ok = before.GetRawKey(sessionKey)
 ```
+
+For an initial keyed corpus, `StoreBuilder` validates and copies rows directly
+into their final micro-pages, constructs the key directory through uniquely
+owned transient nodes, and publishes only the completed Store:
+
+```go
+builder, err := simdjson.NewStoreBuilder(simdjson.StoreOptions{ShapeTapes: true})
+if err != nil {
+	return err
+}
+if err = builder.CreateIndex(simdjson.StoreIndexDefinition{
+	Name: "state", Paths: []string{"/state"},
+}); err != nil {
+	return err
+}
+if err = builder.Append("session:42", []byte(`{"state":"open"}`)); err != nil {
+	return err
+}
+store, err := builder.Build()
+```
+
+The builder is single-goroutine and accepts each key once. It owns both key and
+JSON bytes after `Append`; declared nested or compound indexes are returned
+`Ready`, and the Store immediately supports ordinary mutation, snapshots, TTL,
+and online index changes.
 
 An update parses only its replacement. Unchanged source and structural-tape
 storage stays immutable and is shared into the next bounded chunk; deletes copy
@@ -219,12 +249,14 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Lookup primitives (probe hit, hashed `Get`) | 3.8–6.4 ns |
 | Extract one field across a document set | 8.1 ns/doc |
 | Extract a typed `int64` column | 12 ns/doc |
-| Immutable `Store.GetRaw` point read | 19-21 ns, 0 allocations |
-| Default-chunk Store replace | 2.36 us median, 9.8 KiB/op |
-| Exact-index replace, indexed tuple unchanged | 2.64 us, 9.9 KiB/op, no added allocations |
-| Indexed Snapshot equality at 10% selectivity | 12.9 ns/input doc, 0 allocations |
-| Indexed Snapshot compound point query | 3.01 ns/input doc, 0 allocations |
-| Change an existing TTL | 43 ns, 0 allocations |
+| Immutable `Store.GetRaw` point read | 21.9-23.9 ns, 0 allocations |
+| Compiled stable-slot `Store.GetRawKey` | 8.0-8.5 ns, 0 allocations |
+| Bulk `StoreBuilder` vs repeated `Put` | about 7.7x throughput, 93.7% fewer transient bytes |
+| Default-chunk Store replace | 2.24 us median, 9.8 KiB/op |
+| Exact-index replace, indexed tuple unchanged | 2.46-2.49 us, 9.9 KiB/op, no added allocations |
+| Indexed Snapshot equality at 10% selectivity | 12.44 ns/input doc, 0 allocations |
+| Indexed Snapshot compound point query | 2.82 ns/input doc, 0 allocations |
+| Change an existing TTL | 45 ns, 0 allocations |
 | Native-bitmap SIMD `AND` vs scalar | 2.1-2.6x six-run median, 0 allocations |
 
 One caveat belongs next to that table: a one-shot, single-path lookup on a
@@ -255,7 +287,8 @@ define the methodology, gates, comparison boundaries, and pinned toolchains.
 | Framed JSON input or token output | `Reader`, `Writer` |
 | Compact, indented, or canonical output | `Compact`, `Indent`, `Canonicalize` |
 | Borrowed selection or repeated document navigation | `RawValue`, `Index`/`Node`, or `Parse`/`Value` |
-| Batches of documents, columnar field extraction | `DocSet`, `ShapeCache`, `KeyInterner` |
+| Keyed datasets, including bulk construction | `StoreBuilder`, `Store`, `Snapshot` |
+| Low-level immutable arenas and column extraction | `DocSet`, `ShapeCache`, `KeyInterner` |
 | SQL-shaped projection, filtering, grouping, and aggregation | `query.Query.RunInto`, `query.Result`, `query.Workspace` |
 | Keyed updates, deletes, TTL, snapshots, exact indexes, and wildcard postings | `Store`, `Snapshot`, `StoreIndexDefinition`, `StoreStats` |
 
