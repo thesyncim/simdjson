@@ -1534,7 +1534,6 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 	if err != nil {
 		return false, err
 	}
-	chunkRoot := state.chunkRoot
 	var chunkMutation storeio.ChunkTreeMutation
 	if live == 0 {
 		chunkMutation, err = storeio.DeleteChunkTree(s.cache, tx, state.chunkRoot, location.Chunk, storeio.ChunkTreeBounds{
@@ -1565,7 +1564,7 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 	if err != nil {
 		return false, err
 	}
-	chunkRoot = chunkMutation.Root
+	chunkRoot := chunkMutation.Root
 	keyMutation, err := storeio.DeleteKeyTree(s.cache, tx, state.keyRoot, key, storeio.KeyTreeBounds{
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
 		ChunkHighWater: state.root.ChunkHighWater, ChunkDocuments: uint8(state.root.ChunkDocuments),
