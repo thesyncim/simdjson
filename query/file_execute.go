@@ -126,12 +126,13 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 
 	jobs := make(chan fileBatch, n.workers)
 	partials := make(chan filePartial, n.workers)
+	credits := make(chan struct{}, n.workers*2)
 	scanDone := make(chan fileScanResult, 1)
 	stop := make(chan struct{})
 	var stopOnce sync.Once
 	cancel := func() { stopOnce.Do(func() { close(stop) }) }
 
-	go scanFileBatches(snapshot, n, jobs, scanDone, stop)
+	go scanFileBatches(snapshot, n, jobs, credits, scanDone, stop)
 	var workers sync.WaitGroup
 	workers.Add(n.workers)
 	for range n.workers {
@@ -160,15 +161,15 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 	var groupBytes int64
 	var groupRuns []spillRun
 
-	for part := range partials {
+	consume := func(part filePartial) {
 		if part.err != nil {
 			if firstErr == nil {
 				firstErr = part.err
 			}
-			continue
+			return
 		}
 		if firstErr != nil {
-			continue
+			return
 		}
 		switch {
 		case p.grouped:
@@ -227,6 +228,21 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 		}
 		if rowBytes+groupBytes > stats.BufferedBytes {
 			stats.BufferedBytes = rowBytes + groupBytes
+		}
+	}
+	pending := make(map[uint64]filePartial, n.workers*2)
+	nextSequence := uint64(0)
+	for part := range partials {
+		pending[part.seq] = part
+		for {
+			part, ok := pending[nextSequence]
+			if !ok {
+				break
+			}
+			delete(pending, nextSequence)
+			consume(part)
+			<-credits
+			nextSequence++
 		}
 	}
 	scan := <-scanDone
@@ -327,7 +343,7 @@ type fileScanResult struct {
 	peakBytes int64
 }
 
-func scanFileBatches(snapshot *simdjson.FileSnapshot, opts normalizedFileOptions, jobs chan<- fileBatch, done chan<- fileScanResult, stop <-chan struct{}) {
+func scanFileBatches(snapshot *simdjson.FileSnapshot, opts normalizedFileOptions, jobs chan<- fileBatch, credits chan struct{}, done chan<- fileScanResult, stop <-chan struct{}) {
 	defer close(jobs)
 	var out fileScanResult
 	var batch fileBatch
@@ -336,11 +352,17 @@ func scanFileBatches(snapshot *simdjson.FileSnapshot, opts normalizedFileOptions
 			return nil
 		}
 		select {
+		case credits <- struct{}{}:
+		case <-stop:
+			return errFileExecutionStopped
+		}
+		select {
 		case jobs <- batch:
 			out.batches++
 			batch = fileBatch{seq: batch.seq + 1, base: out.rows}
 			return nil
 		case <-stop:
+			<-credits
 			return errFileExecutionStopped
 		}
 	}
@@ -377,6 +399,7 @@ func scanFileBatches(snapshot *simdjson.FileSnapshot, opts normalizedFileOptions
 }
 
 type filePartial struct {
+	seq    uint64
 	rows   []fileRow
 	groups []fileGroup
 	accs   []aggAcc
@@ -399,7 +422,7 @@ type fileGroup struct {
 }
 
 func (p *plan) makeFilePartial(batch fileBatch) filePartial {
-	var part filePartial
+	part := filePartial{seq: batch.seq}
 	var w Workspace
 	w.candidateUsed = 0
 	candidates := p.candidateRows(batch.docs, &w)

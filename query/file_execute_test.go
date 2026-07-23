@@ -24,8 +24,8 @@ func TestRunFileSnapshotParallelSpillDifferential(t *testing.T) {
 	defer store.Close()
 
 	set := &simdjson.DocSet{ShapeTapes: true, Postings: true}
-	for i := range 256 {
-		label := fmt.Sprintf("group-%03d-%s", i, strings.Repeat(string(rune('a'+i%26)), 384))
+	for i := range 448 {
+		label := fmt.Sprintf("group-%03d-%s", i, strings.Repeat(string(rune('a'+i%26)), 1024))
 		doc := []byte(fmt.Sprintf(`{"id":%d,"bucket":%d,"score":%d,"label":%q,"active":%t}`,
 			i, i%17, i*3, label, i%3 != 0))
 		if _, err := set.Append(doc); err != nil {
@@ -68,8 +68,8 @@ func TestRunFileSnapshotParallelSpillDifferential(t *testing.T) {
 			t.Fatalf("query %d stats = %+v", i, stats)
 		}
 		if i == 0 || i == 3 {
-			if stats.SpillRuns == 0 || stats.SpilledBytes == 0 {
-				t.Fatalf("query %d did not exercise spill: %+v", i, stats)
+			if stats.SpillRuns <= maxSpillFanIn || stats.SpilledBytes == 0 {
+				t.Fatalf("query %d did not exercise bounded fan-in spill: %+v", i, stats)
 			}
 		}
 	}
