@@ -21,6 +21,59 @@ type ChunkTreeMutation struct {
 	Changed      bool
 }
 
+// WalkChunkTree visits live chunk mappings in ascending chunk ID without
+// scanning holes in ChunkHighWater. The callback receives value-only refs;
+// no directory lease remains pinned during the call.
+func WalkChunkTree(cache *PageCache, root PageRef, bounds ChunkTreeBounds, fn func(uint32, PageRef) error) error {
+	if root == (PageRef{}) {
+		return nil
+	}
+	if cache == nil || fn == nil {
+		return fmt.Errorf("%w: chunk-tree walk", ErrInvalidWrite)
+	}
+	return walkChunkTreePage(cache, root, bounds, 30, fn)
+}
+
+func walkChunkTreePage(cache *PageCache, ref PageRef, bounds ChunkTreeBounds, expectedShift uint8, fn func(uint32, PageRef) error) error {
+	lease, err := cache.Acquire(ref)
+	if err != nil {
+		return err
+	}
+	view, err := OpenChunkDirectoryPage(lease.Page(), bounds.FileEnd, bounds.NextLogicalID)
+	if err != nil {
+		lease.Release()
+		return err
+	}
+	header := view.Header()
+	if header.Shift != expectedShift {
+		lease.Release()
+		return ErrChunkDirectoryCorrupt
+	}
+	var refs [64]PageRef
+	var lanes [64]uint8
+	count := view.Len()
+	bitmap := header.Bitmap
+	for i := 0; i < count; i++ {
+		refs[i], _ = view.RefAt(i)
+		lanes[i] = uint8(bits.TrailingZeros64(bitmap))
+		bitmap &= bitmap - 1
+	}
+	prefix := header.Prefix
+	lease.Release()
+	for i := 0; i < count; i++ {
+		if expectedShift == 0 {
+			if err := fn(prefix|uint32(lanes[i]), refs[i]); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := walkChunkTreePage(cache, refs[i], bounds, expectedShift-chunkDirectoryRadixBits, fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (m *ChunkTreeMutation) retire(ref PageRef) error {
 	if int(m.RetiredCount) == len(m.Retired) {
 		return ErrKeyTreeDepth

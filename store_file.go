@@ -840,6 +840,62 @@ func (s *FileStore) AppendIndexMasks(dst []StoreMask, name string, values ...Ind
 	return snapshot.AppendIndexMasks(dst, name, values...)
 }
 
+// RangeRaw visits live rows in ascending chunk/slot order. key and value are
+// borrowed only for the callback; overflow values reuse one bounded buffer.
+// Returning an error stops the scan immediately.
+func (s *FileSnapshot) RangeRaw(fn func(key, value []byte) error) error {
+	if s == nil || s.store == nil || s.state == nil {
+		return ErrFileStoreClosed
+	}
+	if fn == nil {
+		return nil
+	}
+	state := s.state
+	var overflow []byte
+	return storeio.WalkChunkTree(s.store.cache, state.chunkRoot, storeio.ChunkTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+	}, func(chunk uint32, ref storeio.PageRef) error {
+		lease, err := s.store.cache.Acquire(ref)
+		if err != nil {
+			return err
+		}
+		view, err := storeio.OpenDocumentPageWithOverflow(
+			lease.Page(), state.root.ChunkHighWater, state.root.NextLogicalID,
+			state.super.FileEnd, state.root.PageSize,
+		)
+		if err != nil {
+			lease.Release()
+			return err
+		}
+		for live := view.Header().Live; live != 0; live &= live - 1 {
+			slot := uint8(bits.TrailingZeros64(live))
+			record, ok := view.Lookup(slot)
+			if !ok {
+				lease.Release()
+				return storeio.ErrDocumentPageCorrupt
+			}
+			value := record.JSON
+			if record.Overflow != (storeio.PageRef{}) {
+				overflow = overflow[:0]
+				overflow, err = s.store.appendFileValue(overflow, state, storeio.DocumentValue{
+					Overflow: record.Overflow, Length: record.JSONLength,
+				}, storeio.KeyLocation{Chunk: chunk, Slot: slot})
+				if err != nil {
+					lease.Release()
+					return err
+				}
+				value = overflow
+			}
+			if err := fn(record.Key, value); err != nil {
+				lease.Release()
+				return err
+			}
+		}
+		lease.Release()
+		return nil
+	})
+}
+
 // Len returns the current durable-state key count.
 func (s *FileStore) Len() uint64 {
 	if s == nil || s.state.Load() == nil {
