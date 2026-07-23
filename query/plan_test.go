@@ -49,9 +49,9 @@ func TestPreparedPlanUnifiesBuilderAndSQL(t *testing.T) {
 
 	schema := builder.AppendSchema(make([]OutputColumn, 0, 3))
 	want := []OutputColumn{
-		{Header: "bucket", Ordinal: 0, Reduction: ReductionNone},
-		{Header: "count(*)", Ordinal: 1, Reduction: ReductionCount},
-		{Header: "sum(score)", Ordinal: 2, Reduction: ReductionSum},
+		{Header: "bucket", Ordinal: 0, Reduction: ReductionNone, Type: TypeAny},
+		{Header: "count(*)", Ordinal: 1, Reduction: ReductionCount, Type: TypeNumber},
+		{Header: "sum(score)", Ordinal: 2, Reduction: ReductionSum, Type: TypeNumber},
 	}
 	if len(schema) != len(want) {
 		t.Fatalf("schema length = %d, want %d", len(schema), len(want))

@@ -130,6 +130,7 @@ docset_postings_test.go
 docset_test.go
 docset_valuedict_test.go
 duplicate_keys_contract_test.go
+internal/orderedkey/key_test.go
 internal/storeio/committer_test.go
 internal/storeio/chunk_directory_test.go
 internal/storeio/chunk_tree_test.go
@@ -295,6 +296,7 @@ race_off_test.go
 race_on_test.go
 stream_decode_test.go
 store_example_test.go
+query/value_type_test.go
 ```
 
 ### `PERF`

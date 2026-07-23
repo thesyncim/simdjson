@@ -62,7 +62,25 @@ type OutputColumn struct {
 	Header    string
 	Ordinal   uint32
 	Reduction Reduction
+	// Type is TypeAny for a schemaless projection and TypeNumber for the
+	// current aggregate family. Future aggregate or schema-aware output types
+	// extend ValueType without changing column ordinals or instruction opcodes.
+	Type ValueType
+	// Flags control column framing. Unknown required types fail preparation;
+	// an explicitly optional length-delimited column may be skipped by a
+	// negotiated older reader.
+	Flags OutputFlags
 }
+
+// OutputFlags describe schema-level compatibility behavior independently from
+// a value type's physical properties.
+type OutputFlags uint16
+
+const (
+	// OutputOptional permits a reader that does not recognize Type to skip the
+	// complete length-delimited column.
+	OutputOptional OutputFlags = 1 << iota
+)
 
 // AppendSchema appends p's output schema to dst without allocating when dst
 // has enough capacity. Headers borrow immutable plan storage.
@@ -71,10 +89,15 @@ func (p Plan) AppendSchema(dst []OutputColumn) []OutputColumn {
 		return dst
 	}
 	for i, col := range p.compiled.columns {
+		valueType := TypeAny
+		if col.agg != aggNone {
+			valueType = TypeNumber
+		}
 		dst = append(dst, OutputColumn{
 			Header:    p.compiled.headers[i],
 			Ordinal:   uint32(i),
 			Reduction: Reduction(col.agg),
+			Type:      valueType,
 		})
 	}
 	return dst
