@@ -24,6 +24,77 @@ func testFileStoreOptions() FileStoreOptions {
 	}
 }
 
+func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
+	options := testFileStoreOptions()
+	normalized, err := options.normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFixedFrameBound := uint64(normalized.maxTransactionPages * normalized.MaxPageSize)
+	if normalized.maxTransactionBytes >= oldFixedFrameBound {
+		t.Fatalf("packed dirty bound = %d, fixed-frame bound %d", normalized.maxTransactionBytes, oldFixedFrameBound)
+	}
+	options.ResidentBytes = int64(normalized.maxTransactionBytes)
+	if _, err := options.normalized(); err != nil {
+		t.Fatalf("exact dirty budget rejected: %v", err)
+	}
+	options.ResidentBytes--
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("undersized dirty budget accepted")
+	}
+	options = testFileStoreOptions()
+	options.MaxDocumentBytes = int(^uint(0) >> 1)
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("overflowing transaction geometry accepted")
+	}
+	options = testFileStoreOptions()
+	options.ReadMode = FileStoreReadMode(255)
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("invalid direct-read mode accepted")
+	}
+}
+
+func TestFileStoreDirectReadModeAndCallerDescriptorLifetime(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-direct-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testFileStoreOptions()
+	options.ReadMode = FileStoreReadDirectTry
+	store, err := CreateFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("direct:key", []byte(`{"mode":"observable"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := reopened.AppendRaw(make([]byte, 0, 64), "direct:key")
+	if err != nil || !ok || string(got) != `{"mode":"observable"}` {
+		t.Fatalf("direct-mode read = (%q,%v,%v)", got, ok, err)
+	}
+	stats := reopened.Stats()
+	if stats.PageReads == 0 {
+		t.Fatalf("direct-mode reopen performed no cache-miss read: %+v", stats)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// FileStore owns only an independently reopened direct-read descriptor.
+	// Closing it must never close or alter the caller-owned descriptor.
+	var magic [8]byte
+	if _, err := file.ReadAt(magic[:], 0); err != nil {
+		t.Fatalf("caller descriptor after FileStore.Close: %v", err)
+	}
+}
+
 func TestFileStoreCreateOpenAndSnapshotLifetime(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "file-store-*")
 	if err != nil {

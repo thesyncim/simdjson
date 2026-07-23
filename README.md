@@ -232,6 +232,7 @@ if err != nil {
 }
 store, err := simdjson.CreateFileStore(file, simdjson.FileStoreOptions{
 	ResidentBytes: 256 << 20,
+	ReadMode:      simdjson.FileStoreReadDirectTry,
 	Synchronous:   true,
 	Indexes: []simdjson.StoreIndexDefinition{
 		{Name: "tenant", Paths: []string{"/tenant"}},
@@ -252,12 +253,25 @@ raw, ok, err := snapshot.AppendRaw(nil, "event:42")
 ```
 
 `FileStore` opens from bounded root/page scratch instead of walking the corpus.
-Its CLOCK cache, read workers, prefetch queue, commit queue, active snapshots,
-and retired extents all have explicit capacities reported by `Stats`. Async
-writes become reader-visible when queued; `DurableGeneration` and `Flush`
-expose the durability boundary. `Synchronous` waits on each mutation. Snapshot
-leases fence physical reuse, while the previous durable generation remains
+Its CLOCK arena is divided into 4 KiB allocation quanta: a metadata page uses
+one slot and a larger document uses only its exact contiguous span, rather than
+every page paying the maximum extent size. The resident lookup directory and
+one-cache-line frame records are pointer-free, while independent hot pages use
+independent locks. Read workers, prefetch and commit queues, active snapshots,
+and retired extents all have explicit capacities reported by `Stats`.
+`FileStoreReadDirectTry` opens an independent Linux `O_DIRECT` read descriptor
+when supported and reports the actual choice through `Stats.DirectReads`; it
+never changes or closes the caller's write descriptor. Async writes become
+reader-visible when queued; `DurableGeneration` and `Flush` expose the
+durability boundary. `Synchronous` waits on each mutation. Snapshot leases
+fence physical reuse, while the previous durable generation remains
 recoverable if the newest data or root write is torn.
+
+The explicit `SIMDJSON_FILESTORE_100X=1` Linux gate stores 21,347,320 source
+key+JSON bytes behind a 200,704-byte page cache (106.4x), reopens twice, and
+checks distant reads, update, delete, and mutable TTL with direct reads active.
+That is a bounded-residency correctness result, not a claim that cold storage
+has resident-memory latency.
 
 `query.Query.RunFileSnapshot` scans physical chunk leaves in order, builds
 bounded batches in parallel, and externally merges ordered rows or grouped

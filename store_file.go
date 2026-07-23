@@ -42,6 +42,19 @@ const (
 	FileStoreBackendIOUring
 )
 
+// FileStoreReadMode selects how cache misses reach the file. Direct modes are
+// Linux-only and leave the caller's write descriptor untouched.
+type FileStoreReadMode uint8
+
+const (
+	FileStoreReadBuffered FileStoreReadMode = iota
+	// FileStoreReadDirectTry uses O_DIRECT when the platform and filesystem
+	// accept it, otherwise Stats reports the observable buffered fallback.
+	FileStoreReadDirectTry
+	// FileStoreReadDirectRequire fails construction rather than falling back.
+	FileStoreReadDirectRequire
+)
+
 // FileStoreOptions fixes every resident and in-flight memory bound. The zero
 // value selects 4 KiB metadata pages, 64 KiB document/overflow extents, a
 // 64 MiB read cache, and 4 MiB maximum documents.
@@ -51,18 +64,21 @@ type FileStoreOptions struct {
 	// durable generation. Their order assigns stable on-disk index IDs.
 	Indexes []StoreIndexDefinition
 
-	PageSize          int
-	MaxPageSize       int
-	ResidentBytes     int64
-	ReadConcurrency   int
-	PrefetchQueue     int
-	MaxKeyBytes       int
-	InlineValueBytes  int
-	MaxDocumentBytes  int
-	BufferCount       int
-	QueueSlots        int
-	GroupLimit        int
-	Backend           FileStoreBackend
+	PageSize         int
+	MaxPageSize      int
+	ResidentBytes    int64
+	ReadConcurrency  int
+	PrefetchQueue    int
+	MaxKeyBytes      int
+	InlineValueBytes int
+	MaxDocumentBytes int
+	BufferCount      int
+	QueueSlots       int
+	GroupLimit       int
+	Backend          FileStoreBackend
+	// ReadMode controls cache-miss reads independently from durable writes.
+	// DirectTry has observable fallback; DirectRequire fails when unavailable.
+	ReadMode          FileStoreReadMode
 	Synchronous       bool
 	MaxSnapshotLeases int
 	MaxRetiredExtents int
@@ -71,6 +87,7 @@ type FileStoreOptions struct {
 type normalizedFileStoreOptions struct {
 	FileStoreOptions
 	maxTransactionPages int
+	maxTransactionBytes uint64
 	indexes             []*storeExactIndex
 	indexCatalogHash    uint64
 }
@@ -105,7 +122,8 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 	if o.MaxRetiredExtents == 0 {
 		o.MaxRetiredExtents = 1 << 16
 	}
-	if o.Backend > FileStoreBackendIOUring || o.PageSize < 4096 || o.PageSize&(o.PageSize-1) != 0 ||
+	if o.Backend > FileStoreBackendIOUring || o.ReadMode > FileStoreReadDirectRequire ||
+		o.PageSize < 4096 || o.PageSize&(o.PageSize-1) != 0 ||
 		o.MaxPageSize < o.PageSize || o.MaxPageSize&(o.MaxPageSize-1) != 0 || o.MaxPageSize%o.PageSize != 0 ||
 		o.MaxKeyBytes < 1 || o.InlineValueBytes < 1 || o.MaxDocumentBytes < 1 ||
 		o.InlineValueBytes > o.MaxDocumentBytes || uint64(o.MaxPageSize) > uint64(^uint32(0)) {
@@ -151,8 +169,23 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 	if overflowPayload <= 0 {
 		return normalizedFileStoreOptions{}, fmt.Errorf("simdjson: FileStore overflow page has no payload")
 	}
-	overflowPages := (o.MaxDocumentBytes + overflowPayload - 1) / overflowPayload
-	maxTransactionPages := overflowPages + 48 + len(compiled)*24
+	overflowPages := 1 + (o.MaxDocumentBytes-1)/overflowPayload
+	metadataPageLimit := 48 + len(compiled)*24
+	// Buffer indexes are uint16 today and the configured device ceiling is
+	// 32,768. Reject the transaction geometry before int addition or byte
+	// multiplication can wrap on adversarial maximum-document options.
+	if overflowPages >= 32768-metadataPageLimit {
+		return normalizedFileStoreOptions{}, fmt.Errorf("simdjson: FileStore maximum document requires too many transaction pages")
+	}
+	maxTransactionPages := overflowPages + metadataPageLimit
+	// One document and its overflow chain may use maximum-size extents. Every
+	// copied tree/catalog/root page is exactly PageSize. The slot cache can
+	// therefore reserve the actual worst-case dirty bytes instead of charging
+	// MaxPageSize for every metadata page.
+	largePages := overflowPages + 1
+	metadataPages := maxTransactionPages - largePages
+	maxTransactionBytes := uint64(largePages)*uint64(o.MaxPageSize) +
+		uint64(metadataPages)*uint64(o.PageSize)
 	if o.MaxRetiredExtents < maxTransactionPages {
 		return normalizedFileStoreOptions{}, fmt.Errorf("simdjson: FileStore MaxRetiredExtents must retain one worst-case transaction")
 	}
@@ -165,11 +198,11 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 	if o.BufferCount <= maxTransactionPages || o.BufferCount > 32768 {
 		return normalizedFileStoreOptions{}, fmt.Errorf("simdjson: FileStore BufferCount must exceed worst-case %d-page transaction", maxTransactionPages)
 	}
-	if o.ResidentBytes < int64(maxTransactionPages*o.MaxPageSize) {
+	if o.ResidentBytes < 0 || uint64(o.ResidentBytes) < maxTransactionBytes {
 		return normalizedFileStoreOptions{}, fmt.Errorf("simdjson: FileStore ResidentBytes cannot retain one worst-case dirty transaction")
 	}
 	return normalizedFileStoreOptions{
-		FileStoreOptions: o, maxTransactionPages: maxTransactionPages,
+		FileStoreOptions: o, maxTransactionPages: maxTransactionPages, maxTransactionBytes: maxTransactionBytes,
 		indexes: compiled, indexCatalogHash: catalogHash,
 	}, nil
 }
@@ -211,6 +244,8 @@ type FileStore struct {
 
 	committer *storeio.Committer
 	cache     *storeio.PageCache
+	readFile  *os.File
+	direct    bool
 	leases    *storeio.GenerationLeases
 	reclaimer *storeio.ExtentReclaimer
 
@@ -249,6 +284,9 @@ type FileStoreStats struct {
 	CommittedBatches    uint64
 	LargestCommitGroup  uint32
 	Backend             FileStoreBackend
+	// DirectReads reports actual O_DIRECT cache-miss reads, not merely a
+	// requested try-direct policy.
+	DirectReads bool
 
 	SnapshotCapacity         uint64
 	ActiveSnapshots          uint64
@@ -374,18 +412,29 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 	if err != nil {
 		return nil, err
 	}
-	cache, err := storeio.NewPageCache(file, storeio.PageCacheOptions{
+	readFile, direct, err := storeio.OpenPageCacheFile(file, storeio.DirectMode(options.ReadMode))
+	if err != nil {
+		_ = committer.Close()
+		return nil, err
+	}
+	cache, err := storeio.NewPageCache(readFile, storeio.PageCacheOptions{
 		PageSize: options.PageSize, MaxPageSize: options.MaxPageSize,
 		ResidentBytes: options.ResidentBytes, StoreID: storeID,
 		PrefetchQueue: options.PrefetchQueue, ReadConcurrency: options.ReadConcurrency,
 	})
 	if err != nil {
+		if readFile != file {
+			_ = readFile.Close()
+		}
 		_ = committer.Close()
 		return nil, err
 	}
 	leases, err := storeio.NewGenerationLeases(storeio.GenerationLeaseOptions{MaxLeases: options.MaxSnapshotLeases})
 	if err != nil {
 		_ = cache.Close()
+		if readFile != file {
+			_ = readFile.Close()
+		}
 		_ = committer.Close()
 		return nil, err
 	}
@@ -393,11 +442,19 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 	if err != nil {
 		_ = leases.Close()
 		_ = cache.Close()
+		if readFile != file {
+			_ = readFile.Close()
+		}
 		_ = committer.Close()
 		return nil, err
 	}
+	var ownedRead *os.File
+	if readFile != file {
+		ownedRead = readFile
+	}
 	return &FileStore{
 		file: file, options: options, storeID: storeID, committer: committer, cache: cache,
+		readFile: ownedRead, direct: direct,
 		leases: leases, reclaimer: reclaimer,
 		retireScratch: make([]storeio.FreeExtent, 0, options.maxTransactionPages+32),
 		reusable:      make([]storeio.FreeExtent, 0, options.MaxRetiredExtents),
@@ -948,6 +1005,7 @@ func (s *FileStore) Stats() FileStoreStats {
 		CommitQueueDepth: commit.QueuedGenerations, DeviceCommits: commit.DeviceCommits,
 		CommittedBatches: commit.CommittedBatches, LargestCommitGroup: commit.LargestGroup,
 		Backend:          FileStoreBackend(commit.Backend),
+		DirectReads:      s.direct,
 		SnapshotCapacity: leases.Capacity, ActiveSnapshots: leases.Active,
 		OldestSnapshotGeneration: leases.MinimumGeneration,
 		RetiredExtentCapacity:    retired.Capacity, PendingRetiredExtents: retired.Pending,
@@ -1659,7 +1717,7 @@ func (s *FileStore) validateDocument(src []byte) (Index, error) {
 
 func (s *FileStore) ensureDirtyCapacity() error {
 	stats := s.cache.Stats()
-	required := uint64(s.options.maxTransactionPages * s.options.MaxPageSize)
+	required := s.options.maxTransactionBytes
 	if stats.CapacityBytes-stats.DirtyBytes >= required {
 		return nil
 	}
@@ -2414,6 +2472,13 @@ func (s *FileStore) closeResources() error {
 	}
 	if s.cache != nil {
 		if err := s.cache.Close(); err != nil {
+			return err
+		}
+	}
+	if s.readFile != nil {
+		readFile := s.readFile
+		s.readFile = nil
+		if err := readFile.Close(); err != nil {
 			return err
 		}
 	}

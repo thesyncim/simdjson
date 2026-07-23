@@ -203,7 +203,7 @@ objects. The image size is therefore not a resident-memory limit. Applications
 must measure mapped image bytes, external metadata, and reconstructed heap
 metadata separately; `OpenStore` images do not provide an eviction budget or a
 100x-RAM guarantee. `StorePageReader` and `StorePageDB` do provide an explicit
-fixed frame budget, and their 4,096-row smoke keeps a 1,155,072-byte file
+fixed resident budget, and their 4,096-row smoke keeps a 1,155,072-byte file
 correct over an 8,192-byte cache (141.0x). That ratio covers the page cache,
 not process baseline, kernel cache, or equal latency. `StorePageDB` currently
 supports durable insertion, replacement, deletion, stable-slot reuse, key-tree
@@ -224,11 +224,15 @@ slice length.
 ### Attached FileStore
 
 `FileStoreOptions` makes retained and in-flight resources explicit.
-`ResidentBytes` bounds admitted page buffers; `BufferCount` and `QueueSlots`
-bound commit data/descriptors; `ReadConcurrency` and `PrefetchQueue` bound read
-work; `MaxSnapshotLeases` and `MaxRetiredExtents` bound lifetime/reclamation
-metadata. Exhaustion returns an error or applies queue backpressure rather than
-growing without limit. `Stats` reports current use and pressure.
+`ResidentBytes` bounds an arena of `PageSize` quanta. A page consumes exactly
+`Length/PageSize` contiguous slots, so small metadata no longer pays
+`MaxPageSize`; the minimum accepted budget is the exact worst-case dirty
+transaction byte bound. The lookup table and 64-byte slot controls contain no
+Go pointers. `BufferCount` and `QueueSlots` bound commit data/descriptors;
+`ReadConcurrency` and `PrefetchQueue` bound read work; `MaxSnapshotLeases` and
+`MaxRetiredExtents` bound lifetime/reclamation metadata. Exhaustion returns an
+error or applies queue backpressure rather than growing without limit. `Stats`
+reports current use and pressure.
 
 `PageSize` is a power of two at least 4 KiB. `MaxPageSize` is a power-of-two
 multiple of it. Keys and JSON are rejected above `MaxKeyBytes` and
@@ -247,6 +251,20 @@ executor separately bounds raw batches and merge state with `MemoryBytes`;
 one oversized row may exceed the target, and an unbounded projection or group
 result necessarily consumes output-proportional memory. Spill merge opens at
 most 32 runs at once and removes its temporary files on return.
+
+`ReadMode` controls cache misses independently from the commit backend.
+`FileStoreReadBuffered` uses the caller descriptor. On Linux,
+`FileStoreReadDirectTry` and `FileStoreReadDirectRequire` reopen the same inode
+on an independently owned `O_DIRECT` descriptor; neither changes nor closes the
+caller descriptor. Try may fall back and reports the result in
+`Stats.DirectReads`; Require returns `ErrStoreDirectIOUnsupported`. Direct reads
+retain the same alignment, checksum, identity, and bounded-cache validation.
+
+The explicit `SIMDJSON_FILESTORE_100X=1` gate covers 21,347,320 source key+JSON
+bytes with a 200,704-byte cache (106.4x), including cold reopen, eviction,
+update, delete, and mutable TTL. That ratio bounds the page arena only. It does
+not include process baseline, commit buffers, kernel/device memory, or the
+caller's output, and it does not promise that cold reads match resident hits.
 
 The caller owns the `*os.File` and spill directory. `FileStore.Close` does not
 close the file and fails while `FileSnapshot` leases remain. `RangeRaw` callback

@@ -335,9 +335,15 @@ open. The free tree is loaded lazily when a writer first needs it.
 
 Every page carries Store identity, kind, logical id, generation, exact bounds,
 and CRC32C. Metadata uses 4 KiB pages. Document and overflow extents may use
-larger configured power-of-two pages. Key, chunk, exact-index, TTL, and free
-trees are path-copied; unchanged pages remain shared. The commit device writes
-data pages, executes a data-integrity barrier, writes the alternate
+larger configured power-of-two pages. The resident arena is divided into the
+metadata-page quantum, and each page consumes exactly `Length/PageSize`
+contiguous slots. Four 4 KiB directories plus one 16 KiB document therefore
+fit in a 32 KiB budget; the former maximum-frame layout admitted only two such
+logical pages. The lookup table and 64-byte frame controls contain no Go
+pointers. A resident hit locks only its own frame, so independent pages do not
+serialize on the admission/eviction lock. Key, chunk, exact-index, TTL, and
+free trees are path-copied; unchanged pages remain shared. The commit device
+writes data pages, executes a data-integrity barrier, writes the alternate
 superblock, and executes the final barrier. Recovery accepts the newest root
 only after its state and top-level page graph validate, otherwise it uses the
 previous root. Crash-image tests cover partially written data and root prefixes
@@ -350,6 +356,16 @@ or `Close` fences it. Queue and buffer exhaustion applies backpressure. A
 background device error is sticky. The Linux backend can use pure-Go
 `io_uring`; the portable positional-I/O backend is used elsewhere and as the
 fallback.
+
+Cache misses can independently select `FileStoreReadBuffered`,
+`FileStoreReadDirectTry`, or `FileStoreReadDirectRequire`. Direct modes reopen
+the same Linux inode through `/proc/self/fd` with `O_DIRECT`; they do not mutate
+the flags or lifetime of the caller-owned write descriptor. The anonymous
+arena and every admitted offset/length are at least 4 KiB aligned. Try falls
+back only for an unsupported platform/filesystem and `Stats.DirectReads`
+reports what actually happened; Require fails construction instead. Direct
+reads avoid a second kernel page-cache copy, but whether that wins depends on
+device, filesystem, queue depth, and locality.
 
 `FileSnapshot` is an explicit generation lease and must be closed. Point reads
 copy into caller storage because an evictable frame cannot safely back an
@@ -381,7 +397,7 @@ Apple M4 Max, stable Go, 1,024 hot documents:
 
 | Benchmark | Result | Allocation |
 | --- | ---: | ---: |
-| `BenchmarkFileSnapshotAppendRaw` | 5.10 us/op | 0 B/op, 0 allocs/op |
+| `BenchmarkFileSnapshotAppendRaw` | 5.17-5.21 us/op | 0 B/op, 0 allocs/op |
 | `BenchmarkFileSnapshotRangeRaw` | 27.50 us/scan, 1.65 GB/s | 0 B/op, 0 allocs/op |
 | file aggregate, one worker | 745 us, 148 MB/s | 2.42 MB/op, 4,478 allocs/op |
 | file aggregate, four workers | 414 us, 267 MB/s | 2.42 MB/op, 4,481 allocs/op |
@@ -448,13 +464,25 @@ as a 1 TiB-on-64-GiB database.
 `FileStore` decouples corpus size from Go heap: `ResidentBytes` fixes admitted
 page capacity, while queues, buffers, snapshot leases, and retirement records
 have separate finite options. This makes a 1 TiB file structurally possible; it
-does not establish acceptable performance. Directory and posting pages compete
-with documents for the same cache, cold random access pays storage latency, and
-copy-on-write generations, allocator rounding, overflow pages, index
-cardinality, and free-space headroom add disk amplification. Size the resident
-budget from a measured hot set and keep storage headroom. No 1 TiB or 100x-RAM
-operating point is claimed until the above-RAM scale benchmark records RSS,
-faults, read/write amplification, latency percentiles, and fragmentation.
+does not establish acceptable performance. The explicit Linux storage-pressure
+gate now places 21,347,320 source key+JSON bytes behind a 200,704-byte cache
+(106.4x); the physical high-water is 120,057,856 bytes. It reopens twice and
+checks distant reads, update, delete, and a changed TTL under eviction with
+`O_DIRECT` active. On the Docker Linux run used for this phase it completed in
+8.58 seconds. Run it with:
+
+```text
+SIMDJSON_FILESTORE_100X=1 \
+  go test . -run '^TestFileStoreHundredXResidentSmoke$' -v -count=1
+```
+
+This proves bounded-cache correctness for source data above the configured
+resident page budget; it is not total-process-RAM accounting or an equal-latency
+claim. Directory and posting pages compete with documents for the same cache,
+cold random access pays storage latency, and copy-on-write generations,
+allocator rounding, overflow pages, index cardinality, and free-space headroom
+add disk amplification. A 1 TiB deployment still needs workload-specific RSS,
+page-fault, amplification, latency-percentile, and fragmentation measurements.
 
 ## TTL
 

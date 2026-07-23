@@ -155,22 +155,30 @@ bounded by the on-disk ids/offsets and configured maximum key/document sizes.
 This establishes a controllable working set, not a universal 100x-RAM latency
 claim. A cold random read pays device latency. A corpus 100 times the resident
 budget is useful only when the hot key/index/page set fits that budget or the
-workload has scan locality. End-to-end validation above physical RAM remains a
-release benchmark gate rather than an assertion in the API contract.
+workload has scan locality. The explicit correctness gate now covers source
+key+JSON bytes at 106.4x the configured page cache and is described below;
+end-to-end performance above physical RAM remains a release benchmark rather
+than an assertion in the API contract.
 
 Residency separates four temperature classes:
 
 1. two fixed superblocks and the currently selected root metadata;
-2. bounded cache frames for directory, posting, and document pages;
+2. bounded cache-quantum spans for directory, posting, and document pages;
 3. immutable background-storage pages admitted through explicit asynchronous
    reads and bounded prefetch; and
 4. append-only replacement pages plus reclaimable free extents.
 
 The page manager, rather than virtual mapping size, owns a fixed resident-byte
-budget and CLOCK replacement. Cold references retain physical offset, length,
-logical id, and generation and enter bounded read workers. `FileStore.Stats`
-exposes resident/dirty bytes, reads, cache/prefetch hits, evictions, queue
-depths, durable generation, snapshots, retired extents, and reusable extents.
+budget and CLOCK replacement. Its anonymous arena is divided by `PageSize`; a
+4 KiB metadata node occupies one slot while a 16 KiB document occupies four.
+Whole extents are admitted and evicted together. Lookup uses a pointer-free
+atomic table and one pointer-free 64-byte control record per slot. The resident
+hit path locks only the selected frame; the global lock is reserved for misses,
+admission, eviction, and statistics. Cold references retain physical offset,
+length, logical id, and generation and enter bounded read workers.
+`FileStore.Stats` exposes resident/dirty bytes, reads, cache/prefetch hits,
+evictions, queue depths, durable generation, snapshots, retired extents, and
+reusable extents.
 
 `OpenStore` may continue to mmap a read-only checkpoint for simple restart and
 hot, read-mostly workloads. It is not the primary 100x transactional backend.
@@ -266,9 +274,13 @@ files, anonymous off-heap fixed buffers, fixed-buffer I/O, runtime opcode
 probing, and explicit completion/overflow checks. It writes all data pages,
 passes a data barrier, writes only the newest grouped root, and passes the final
 barrier before advancing `DurableGeneration`. Unsupported kernels and sandbox
-policies fall back to the portable device. SQ polling and direct I/O remain
-opt-in benchmark decisions because each changes CPU, memory-lock, or alignment
-economics. This cannot change commit semantics.
+policies fall back to the portable device. SQ polling remains an opt-in
+benchmark decision. Reads independently offer buffered, try-direct, and
+require-direct modes. The Linux direct modes reopen the same inode through
+`/proc/self/fd` with `O_DIRECT`, leaving the caller-owned write descriptor and
+committer flags unchanged. The cache arena and all page offsets and lengths are
+at least 4 KiB aligned. `Stats.DirectReads` makes fallback observable. These
+choices cannot change commit semantics.
 
 The internal root layer now writes a deterministic 128-byte record into one of
 two page-isolated slots selected by generation parity. CRC32C plus stored
@@ -375,8 +387,10 @@ still a copy and is measured separately from heap `Store` reads.
 relevant low-overhead buffer-manager direction: explicit replacement preserves
 control beyond RAM, and pointer swizzling can reduce resident access cost.
 `FileStore` adopts explicit replacement but currently uses a bounded cache
-lookup rather than claiming a swizzled fast path. Its stable 64-slot masks and
-immutable publication remain specific to JSON queries.
+lookup rather than claiming a swizzled fast path. Warm acquire/release remains
+zero-allocation and measured 25.5 ns on the M4 Max; independent resident pages
+no longer share one cache mutex. Its stable 64-slot masks and immutable
+publication remain specific to JSON queries.
 
 The CIDR paper
 [Are You Sure You Want to Use MMAP in Your Database Management System?](https://db.cs.cmu.edu/papers/2022/cidr2022-p13-crotty.pdf)
@@ -429,10 +443,23 @@ The implementation now has deterministic randomized mutation/TTL parity
 against heap `Store`, retained-snapshot and reopen continuation tests, exact
 index update/delete/reopen tests, bounded fan-in spill differentials, async
 flush tests, allocation checks, long-lived-snapshot reclamation/file-growth
-tests, page corruption tests, and crash images that tear data and root writes.
+tests, page corruption tests, crash images that tear data and root writes,
+direct-read descriptor tests, and an explicit greater-than-cache gate. The
+latter stores 21,347,320 source key+JSON bytes behind 200,704 resident page
+bytes (106.4x), reopens twice, probes distant keys, and preserves update,
+delete, and changed TTL. Its Docker Linux run used `O_DIRECT`, reached a
+120,057,856-byte physical high-water, and completed in 8.58 seconds. It runs
+with:
+
+```text
+SIMDJSON_FILESTORE_100X=1 \
+  go test . -run '^TestFileStoreHundredXResidentSmoke$' -v -count=1
+```
+
 The full race suite and portable Linux/Windows compile checks are release gates.
 
-Still required before advertising a numeric 100x-RAM operating point:
+Still required before advertising equal-latency or physical-RAM performance at
+that multiplier:
 
 - resident-set, page-fault, read/write amplification, and fragmentation
   measurements on working sets below, near, and above physical RAM;

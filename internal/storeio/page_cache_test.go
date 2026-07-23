@@ -4,6 +4,10 @@ import (
 	"errors"
 	"io"
 	"os"
+	"reflect"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -252,6 +256,227 @@ func TestPageCacheVariableDocumentExtent(t *testing.T) {
 	}
 }
 
+func TestPageCachePacksMetadataAndVariableExtentByQuantum(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "store-page-cache-packed-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	storeID := [16]byte{4, 2, 8, 1, 6, 3, 7, 5, 9, 10, 11, 12, 13, 14, 15, 16}
+	refs := make([]PageRef, 0, 5)
+	offset := uint64(2 * pageCacheTestPageSize)
+	for pageID := range 5 {
+		length := uint32(pageCacheTestPageSize)
+		kind := PageChunkDirectory
+		if pageID == 4 {
+			length = 4 * pageCacheTestPageSize
+			kind = PageDocument
+		}
+		page := make([]byte, length)
+		payload, initErr := InitPage(page, PageHeader{
+			StoreID: storeID, Generation: 1, LogicalID: uint64(pageID + 2),
+			PageSize: length, PayloadLength: 32, Kind: kind,
+		})
+		if initErr != nil {
+			t.Fatal(initErr)
+		}
+		payload[0] = byte(pageID + 1)
+		if _, sealErr := SealPage(page); sealErr != nil {
+			t.Fatal(sealErr)
+		}
+		if _, writeErr := file.WriteAt(page, int64(offset)); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+		refs = append(refs, PageRef{
+			Offset: offset, LogicalID: uint64(pageID + 2), Generation: 1,
+			Length: length, Kind: kind,
+		})
+		offset += uint64(length)
+	}
+
+	const resident = 8 * pageCacheTestPageSize
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, MaxPageSize: 4 * pageCacheTestPageSize,
+		ResidentBytes: resident, StoreID: storeID, ReadConcurrency: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := cache.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	leases := make([]PageLease, len(refs))
+	for index, ref := range refs {
+		leases[index], err = cache.Acquire(ref)
+		if err != nil || leases[index].Payload()[0] != byte(index+1) {
+			t.Fatalf("Acquire(%d) = (%v,%v)", index, leases[index].Payload(), err)
+		}
+	}
+	stats := cache.Stats()
+	if stats.CapacityBytes != resident || stats.ResidentBytes != resident ||
+		stats.Frames != 8 || stats.ReadyFrames != 5 || stats.PinnedPages != 5 {
+		t.Fatalf("packed stats = %+v", stats)
+	}
+	for index := range leases {
+		leases[index].Release()
+	}
+}
+
+func TestPageCacheFrameControlIsPointerFree(t *testing.T) {
+	frameType := reflect.TypeFor[pageCacheFrame]()
+	var visit func(reflect.Type) bool
+	visit = func(typ reflect.Type) bool {
+		switch typ.Kind() {
+		case reflect.Array:
+			return visit(typ.Elem())
+		case reflect.Struct:
+			for field := range typ.NumField() {
+				if !visit(typ.Field(field).Type) {
+					return false
+				}
+			}
+			return true
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map,
+			reflect.Pointer, reflect.Slice, reflect.String, reflect.UnsafePointer:
+			return false
+		default:
+			return true
+		}
+	}
+	if !visit(frameType) {
+		t.Fatalf("pageCacheFrame contains GC-visible pointer-bearing state: %v", frameType)
+	}
+	if frameType.Size() > 64 {
+		t.Fatalf("pageCacheFrame is %d bytes, want at most one cache line", frameType.Size())
+	}
+}
+
+func TestPageCacheConcurrentHitsAndEvictions(t *testing.T) {
+	file, storeID, refs := newPageCacheFixture(t, 32)
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, ResidentBytes: 4 * pageCacheTestPageSize,
+		StoreID: storeID, ReadConcurrency: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+
+	const workers = 16
+	start := make(chan struct{})
+	errorsByWorker := make(chan error, workers)
+	var group sync.WaitGroup
+	group.Add(workers)
+	for worker := range workers {
+		go func() {
+			defer group.Done()
+			<-start
+			for iteration := range 1000 {
+				index := (worker*17 + iteration*13) & (len(refs) - 1)
+				for {
+					lease, acquireErr := cache.Acquire(refs[index])
+					if errors.Is(acquireErr, ErrPageCachePinned) {
+						runtime.Gosched()
+						continue
+					}
+					if acquireErr != nil {
+						errorsByWorker <- acquireErr
+						return
+					}
+					if lease.Payload()[0] != byte(index+1) {
+						lease.Release()
+						errorsByWorker <- errors.New("wrong concurrent page payload")
+						return
+					}
+					lease.Release()
+					break
+				}
+			}
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(errorsByWorker)
+	for workerErr := range errorsByWorker {
+		t.Fatal(workerErr)
+	}
+	stats := cache.Stats()
+	if stats.ResidentBytes > stats.CapacityBytes || stats.Evictions == 0 || stats.PinnedPages != 0 {
+		t.Fatalf("concurrent stats = %+v", stats)
+	}
+}
+
+func TestPageCacheConcurrentCloseDrainsResidentHits(t *testing.T) {
+	file, storeID, refs := newPageCacheFixture(t, 8)
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, ResidentBytes: 8 * pageCacheTestPageSize,
+		StoreID: storeID, ReadConcurrency: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range refs {
+		lease, acquireErr := cache.Acquire(ref)
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+		lease.Release()
+	}
+	const workers = 16
+	var ready sync.WaitGroup
+	var group sync.WaitGroup
+	ready.Add(workers)
+	group.Add(workers)
+	workerErrors := make(chan error, workers)
+	for worker := range workers {
+		go func() {
+			defer group.Done()
+			announced := false
+			for {
+				lease, acquireErr := cache.Acquire(refs[worker&(len(refs)-1)])
+				if errors.Is(acquireErr, ErrPageCacheClosed) {
+					if !announced {
+						ready.Done()
+					}
+					return
+				}
+				if acquireErr != nil {
+					workerErrors <- acquireErr
+					if !announced {
+						ready.Done()
+					}
+					return
+				}
+				if !announced {
+					announced = true
+					ready.Done()
+				}
+				if lease.Payload()[0] != byte(worker&(len(refs)-1)+1) {
+					lease.Release()
+					workerErrors <- errors.New("wrong page during concurrent close")
+					return
+				}
+				lease.Release()
+			}
+		}()
+	}
+	ready.Wait()
+	closeErr := cache.Close()
+	if closeErr != nil && !errors.Is(closeErr, ErrPageCachePinned) {
+		t.Fatalf("concurrent Close = %v", closeErr)
+	}
+	group.Wait()
+	close(workerErrors)
+	for workerErr := range workerErrors {
+		t.Fatal(workerErr)
+	}
+	if err := cache.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPageCacheDirtyAdmissionWaitsForDurability(t *testing.T) {
 	file, storeID, refs := newPageCacheFixture(t, 2)
 	page := make([]byte, pageCacheTestPageSize)
@@ -300,6 +525,55 @@ func TestPageCacheDirtyAdmissionWaitsForDurability(t *testing.T) {
 	second.Release()
 	if stats := cache.Stats(); stats.DirtyBytes != 0 || stats.PageReads != 1 || stats.Evictions != 1 {
 		t.Fatalf("durable Stats = %+v", stats)
+	}
+}
+
+func TestPageCacheSeparatesReusedOffsetGenerations(t *testing.T) {
+	file, storeID, refs := newPageCacheFixture(t, 1)
+	oldPage := make([]byte, pageCacheTestPageSize)
+	if _, err := file.ReadAt(oldPage, int64(refs[0].Offset)); err != nil {
+		t.Fatal(err)
+	}
+	newRef := refs[0]
+	newRef.Generation++
+	newPage := make([]byte, pageCacheTestPageSize)
+	payload, err := InitPage(newPage, PageHeader{
+		StoreID: storeID, Generation: newRef.Generation, LogicalID: newRef.LogicalID,
+		PageSize: newRef.Length, PayloadLength: 32, Kind: newRef.Kind,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload[0] = 9
+	if _, err := SealPage(newPage); err != nil {
+		t.Fatal(err)
+	}
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, ResidentBytes: 2 * pageCacheTestPageSize,
+		StoreID: storeID, ReadConcurrency: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+	if err := cache.AdmitDirty(refs[0], oldPage, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.AdmitDirty(newRef, newPage, 3); err != nil {
+		t.Fatal(err)
+	}
+	oldLease, err := cache.Acquire(refs[0])
+	if err != nil || oldLease.Payload()[0] != 1 {
+		t.Fatalf("old generation = (%v,%v)", oldLease.Payload(), err)
+	}
+	newLease, err := cache.Acquire(newRef)
+	if err != nil || newLease.Payload()[0] != 9 {
+		t.Fatalf("new generation = (%v,%v)", newLease.Payload(), err)
+	}
+	oldLease.Release()
+	newLease.Release()
+	if stats := cache.Stats(); stats.ReadyFrames != 2 || stats.ResidentBytes != 2*pageCacheTestPageSize {
+		t.Fatalf("generation collision stats = %+v", stats)
 	}
 }
 
@@ -377,4 +651,90 @@ func newPageCacheFixture(t testing.TB, count int) (*os.File, [16]byte, []PageRef
 		}
 	}
 	return file, storeID, refs
+}
+
+func BenchmarkPageCacheResidentAcquire(b *testing.B) {
+	file, storeID, refs := newPageCacheFixture(b, 1)
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, ResidentBytes: pageCacheTestPageSize, StoreID: storeID,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer cache.Close()
+	lease, err := cache.Acquire(refs[0])
+	if err != nil {
+		b.Fatal(err)
+	}
+	lease.Release()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		lease, err = cache.Acquire(refs[0])
+		if err != nil {
+			b.Fatal(err)
+		}
+		lease.Release()
+	}
+}
+
+func BenchmarkPageCacheResidentAcquireParallel(b *testing.B) {
+	file, storeID, refs := newPageCacheFixture(b, 1)
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, ResidentBytes: pageCacheTestPageSize, StoreID: storeID,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer cache.Close()
+	lease, err := cache.Acquire(refs[0])
+	if err != nil {
+		b.Fatal(err)
+	}
+	lease.Release()
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			lease, acquireErr := cache.Acquire(refs[0])
+			if acquireErr != nil {
+				b.Error(acquireErr)
+				return
+			}
+			lease.Release()
+		}
+	})
+}
+
+func BenchmarkPageCacheResidentAcquireParallelSpread(b *testing.B) {
+	const pages = 64
+	file, storeID, refs := newPageCacheFixture(b, pages)
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, ResidentBytes: pages * pageCacheTestPageSize, StoreID: storeID,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer cache.Close()
+	for _, ref := range refs {
+		lease, acquireErr := cache.Acquire(ref)
+		if acquireErr != nil {
+			b.Fatal(acquireErr)
+		}
+		lease.Release()
+	}
+	var next atomic.Uint32
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		ref := refs[(next.Add(1)-1)%pages]
+		for pb.Next() {
+			lease, acquireErr := cache.Acquire(ref)
+			if acquireErr != nil {
+				b.Error(acquireErr)
+				return
+			}
+			lease.Release()
+		}
+	})
 }

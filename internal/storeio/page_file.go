@@ -28,6 +28,21 @@ type PageFileOptions struct {
 	Direct DirectMode
 }
 
+// OpenPageCacheFile returns a descriptor suitable for PageCache reads. Off
+// preserves the caller-owned descriptor. On Linux, Try and Require reopen the
+// same inode through /proc/self/fd with O_DIRECT, producing an independent open
+// file description so read policy cannot alter the writer's flags. The caller
+// owns and must close a returned descriptor only when it differs from file.
+func OpenPageCacheFile(file *os.File, mode DirectMode) (*os.File, bool, error) {
+	if file == nil {
+		return nil, false, fmt.Errorf("%w: nil file", ErrPageReference)
+	}
+	if mode > DirectRequire {
+		return nil, false, fmt.Errorf("%w: direct mode %d", ErrPageReference, mode)
+	}
+	return openPageCacheFile(file, mode)
+}
+
 // PageFile owns a read-only file and its PageCache. Direct reports whether the
 // file was actually opened with explicit direct-I/O semantics.
 type PageFile struct {

@@ -15,13 +15,8 @@ func openPageFile(path string, mode DirectMode) (*os.File, bool, error) {
 		file, err := os.Open(path)
 		return file, false, err
 	}
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECT, 0)
+	file, err := openDirectReadFile(path, path)
 	if err == nil {
-		file := os.NewFile(uintptr(fd), path)
-		if file == nil {
-			_ = unix.Close(fd)
-			return nil, false, fmt.Errorf("open direct Store page file %q", path)
-		}
 		return file, true, nil
 	}
 	if mode == DirectRequire && directIOUnsupported(err) {
@@ -32,6 +27,42 @@ func openPageFile(path string, mode DirectMode) (*os.File, bool, error) {
 	}
 	file, fallbackErr := os.Open(path)
 	return file, false, fallbackErr
+}
+
+func openPageCacheFile(file *os.File, mode DirectMode) (*os.File, bool, error) {
+	if mode == DirectOff {
+		return file, false, nil
+	}
+	path := fmt.Sprintf("/proc/self/fd/%d", file.Fd())
+	direct, err := openDirectReadFile(path, file.Name()+" (direct reads)")
+	if err == nil {
+		return direct, true, nil
+	}
+	if mode == DirectRequire && directDescriptorUnsupported(err) {
+		return nil, false, fmt.Errorf("%w: %w", ErrDirectIOUnsupported, err)
+	}
+	if !directDescriptorUnsupported(err) {
+		return nil, false, fmt.Errorf("open direct Store page descriptor: %w", err)
+	}
+	return file, false, nil
+}
+
+func openDirectReadFile(path, name string) (*os.File, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECT, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, fmt.Errorf("open direct Store page descriptor")
+	}
+	return file, nil
+}
+
+func directDescriptorUnsupported(err error) bool {
+	return directIOUnsupported(err) || errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOSYS) ||
+		errors.Is(err, unix.ENODEV) || errors.Is(err, unix.ENXIO)
 }
 
 func directIOUnsupported(err error) bool {

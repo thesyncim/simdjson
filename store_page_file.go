@@ -36,8 +36,8 @@ var (
 	ErrStorePageCacheFull = storeio.ErrPageCacheFull
 	// ErrStorePageClosed reports a read started after StorePageReader.Close.
 	ErrStorePageClosed = storeio.ErrPageCacheClosed
-	// ErrStoreDirectIOUnsupported reports that StoreDirectRequire cannot be
-	// honored by the current platform or filesystem.
+	// ErrStoreDirectIOUnsupported reports that StoreDirectRequire or
+	// FileStoreReadDirectRequire cannot be honored by the platform/filesystem.
 	ErrStoreDirectIOUnsupported = storeio.ErrDirectIOUnsupported
 	// ErrStorePageCorrupt reports a checksum, identity, schema, or durable
 	// graph violation while opening or reading a page file.
