@@ -136,7 +136,9 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `internal/storeio/ring_linux.go` — `(*Ring).RegisterFiles`
 - `internal/storeio/ring_linux.go` — `(*Ring).mapQueues`
 - `internal/storeio/ring_linux.go` — `(*Ring).prepareFixed`
+- `internal/storeio/ring_linux.go` — `(*Ring).prepareReadArena`
 - `internal/storeio/ring_linux.go` — `(*Ring).requireOperations`
+- `internal/storeio/ring_linux.go` — `(*Ring).useReadArena`
 - `internal/storeio/ring_linux.go` — `ioUringRegister`
 - `internal/storeio/ring_linux.go` — `ioUringSetup`
 - `internal/storeio/ring_linux.go` — `package scope`
