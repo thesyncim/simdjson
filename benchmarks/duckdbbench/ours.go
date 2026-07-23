@@ -69,8 +69,9 @@ func (v OursStore) AccountedResidentBytes() int64 {
 
 // OursCorpus binds one Store measurement to the exact generated manifest.
 type OursCorpus struct {
-	Manifest Manifest  `json:"manifest"`
-	Store    OursStore `json:"store"`
+	Manifest  Manifest       `json:"manifest"`
+	Store     OursStore      `json:"store"`
+	FileStore *OursFileStore `json:"file_store,omitempty"`
 }
 
 // OursResults is the deterministic JSON artifact consumed by the report step.
@@ -118,14 +119,11 @@ func countValue(r query.Result) int64 {
 
 const duckDBBenchStoreIndex = "duckdbbench_filter"
 
-// buildMeasuredStore consumes NDJSON through StoreBuilder so both engines use
-// their intended bulk-load path. Append still copies every key and document;
-// Build compacts immutable keys before returning the mutable Store.
-func buildMeasuredStore(buf []byte, keys []string) (*simdjson.Store, error) {
-	builder, err := simdjson.NewStoreBuilder(simdjson.StoreOptions{ShapeTapes: true})
-	if err != nil {
-		return nil, err
-	}
+// forEachNDJSON visits the exact non-empty records in one generated transport
+// without allocating or normalizing their bytes. Both Store implementations
+// use this iterator so the benchmark cannot drift into engine-specific input
+// parsing.
+func forEachNDJSON(buf []byte, docs int, visit func(row int, document []byte) error) error {
 	row := 0
 	for len(buf) != 0 {
 		end := bytes.IndexByte(buf, '\n')
@@ -133,11 +131,11 @@ func buildMeasuredStore(buf []byte, keys []string) (*simdjson.Store, error) {
 			end = len(buf)
 		}
 		if end != 0 {
-			if row >= len(keys) {
-				return nil, fmt.Errorf("NDJSON has more than %d documents", len(keys))
+			if row >= docs {
+				return fmt.Errorf("NDJSON has more than %d documents", docs)
 			}
-			if err := builder.Append(keys[row], buf[:end]); err != nil {
-				return nil, fmt.Errorf("document %d: %w", row, err)
+			if err := visit(row, buf[:end]); err != nil {
+				return err
 			}
 			row++
 		}
@@ -146,8 +144,27 @@ func buildMeasuredStore(buf []byte, keys []string) (*simdjson.Store, error) {
 		}
 		buf = buf[end+1:]
 	}
-	if row != len(keys) {
-		return nil, fmt.Errorf("NDJSON has %d documents, manifest says %d", row, len(keys))
+	if row != docs {
+		return fmt.Errorf("NDJSON has %d documents, manifest says %d", row, docs)
+	}
+	return nil
+}
+
+// buildMeasuredStore consumes NDJSON through StoreBuilder so both engines use
+// their intended bulk-load path. Append still copies every key and document;
+// Build compacts immutable keys before returning the mutable Store.
+func buildMeasuredStore(buf []byte, keys []string) (*simdjson.Store, error) {
+	builder, err := simdjson.NewStoreBuilder(simdjson.StoreOptions{ShapeTapes: true})
+	if err != nil {
+		return nil, err
+	}
+	if err := forEachNDJSON(buf, len(keys), func(row int, document []byte) error {
+		if err := builder.Append(keys[row], document); err != nil {
+			return fmt.Errorf("document %d: %w", row, err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return builder.Build()
 }
@@ -392,7 +409,8 @@ func (v OursStore) Verify(m Manifest) []string {
 	return bad
 }
 
-// MeasureDir loads the manifest, measures Store, and enforces generator truth.
+// MeasureDir loads the manifest, measures the heap and durable Stores, and
+// enforces generator truth before either result reaches a report.
 func MeasureDir(dir string, reps int) (OursCorpus, error) {
 	m, err := ReadManifest(dir)
 	if err != nil {
@@ -405,5 +423,12 @@ func MeasureDir(dir string, reps int) (OursCorpus, error) {
 	if bad := v.Verify(m); len(bad) != 0 {
 		return OursCorpus{}, fmt.Errorf("%s: verification failed: %v", m.Name, bad)
 	}
-	return OursCorpus{Manifest: m, Store: v}, nil
+	fileStore, err := MeasureFileStoreCorpus(dir, m, reps)
+	if err != nil {
+		return OursCorpus{}, err
+	}
+	if bad := fileStore.Verify(m); len(bad) != 0 {
+		return OursCorpus{}, fmt.Errorf("%s: durable verification failed: %v", m.Name, bad)
+	}
+	return OursCorpus{Manifest: m, Store: v, FileStore: &fileStore}, nil
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/thesyncim/simdjson/internal/storeio"
 )
@@ -72,6 +73,11 @@ func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
 	if _, err := options.normalized(); err == nil {
 		t.Fatal("invalid prefetch queue accepted")
 	}
+	options = testFileStoreOptions()
+	options.CommitCoalesce = time.Second + 1
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("invalid commit coalescing window accepted")
+	}
 }
 
 func TestFileStoreDirectReadModeAndCallerDescriptorLifetime(t *testing.T) {
@@ -127,6 +133,12 @@ func TestFileStoreCreateOpenAndSnapshotLifetime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if got, want := store.Stats().CommitCapacityBytes, uint64(options.BufferCount*options.MaxPageSize); got != want {
+		t.Fatalf("commit capacity = %d, want %d", got, want)
+	}
+	if got, want := store.Stats().ReusableCapacityBytes, uint64(options.MaxRetiredExtents)*uint64(unsafe.Sizeof(storeio.FreeExtent{})); got != want {
+		t.Fatalf("reusable capacity = %d, want %d", got, want)
+	}
 	if store.Len() != 0 || store.Generation() != 1 || store.DurableGeneration() != 1 {
 		t.Fatalf("created state = len %d generation %d durable %d", store.Len(), store.Generation(), store.DurableGeneration())
 	}
@@ -160,6 +172,61 @@ func TestFileStoreCreateOpenAndSnapshotLifetime(t *testing.T) {
 	defer reopened.Close()
 	if reopened.Len() != 0 || reopened.Generation() != 1 || reopened.DurableGeneration() != 1 {
 		t.Fatalf("reopened state = len %d generation %d durable %d", reopened.Len(), reopened.Generation(), reopened.DurableGeneration())
+	}
+}
+
+func TestFileStoreSynchronousWritersShareDurabilityFence(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-sync-group-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testFileStoreOptions()
+	options.Store.ChunkDocuments = 1
+	options.BufferCount = 128
+	options.QueueSlots = 32
+	options.GroupLimit = 16
+	options.CommitCoalesce = 10 * time.Millisecond
+	store, err := CreateFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const writers = 16
+	start := make(chan struct{})
+	errs := make(chan error, writers)
+	for writer := range writers {
+		go func() {
+			<-start
+			key := fmt.Sprintf("writer:%02d", writer)
+			created, putErr := store.Put(key, []byte(fmt.Sprintf(`{"writer":%d}`, writer)))
+			if putErr != nil || !created {
+				errs <- fmt.Errorf("Put(%s) = (%v,%v)", key, created, putErr)
+				return
+			}
+			errs <- nil
+		}()
+	}
+	close(start)
+	for range writers {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	stats := store.Stats()
+	if stats.DocumentCount != writers || stats.CommittedBatches != writers+1 ||
+		stats.LargestCommitGroup < 2 || stats.DurableGeneration != stats.PublishedGeneration {
+		t.Fatalf("synchronous group commit did not converge: %+v", stats)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.Len() != writers {
+		t.Fatalf("reopened documents = %d, want %d", reopened.Len(), writers)
 	}
 }
 

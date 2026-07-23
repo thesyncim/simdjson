@@ -211,7 +211,7 @@ func (s *Store) WritePageFile(file *os.File, options StorePageWriteOptions) (int
 		chunkItems = append(chunkItems, storeChunkDirectoryItem{id: chunkID, ref: ref})
 	}
 
-	chunkPlans, chunkRoot := planStoreChunkDirectories(chunkItems, generation, &nextLogical, &offset)
+	chunkPlans, chunkRoot := planStoreChunkDirectories(chunkItems, generation, storePageQuantum, &nextLogical, &offset)
 	slices.SortFunc(keyEntries, func(a, b storeio.PageKeyLocation) int {
 		if a.Hash < b.Hash {
 			return -1

@@ -4,6 +4,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"time"
 )
 
 func (c *Committer) stopAccepting() {
@@ -61,10 +62,27 @@ func (c *Committer) run(file *os.File, initialized chan<- committerInit, open de
 		c.broadcast()
 	}()
 
+	var coalesce *time.Timer
+	if c.options.CoalesceDelay != 0 {
+		coalesce = time.NewTimer(time.Hour)
+		coalesce.Stop()
+		defer coalesce.Stop()
+	}
 	for {
 		batch, ok := c.nextBatch(true)
 		if !ok {
 			return
+		}
+		// The first publication has already returned to an asynchronous
+		// producer. A short bounded window lets nearby generations share both
+		// durability barriers; Close interrupts it and drains immediately.
+		if coalesce != nil && !c.closing.Load() {
+			coalesce.Reset(c.options.CoalesceDelay)
+			select {
+			case <-coalesce.C:
+			case <-c.stop:
+				coalesce.Stop()
+			}
 		}
 		c.groupScratch = c.groupScratch[:1]
 		c.groupScratch[0] = batch

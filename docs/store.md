@@ -64,6 +64,7 @@ raw, ok := view.GetRaw("user:42")
 | `Store.WritePageFile` / `OpenStorePageReader` | write/open the specialized fixed-cache checkpoint | full export / bounded page-cache open |
 | `StorePageDB.Put` / `Delete` | durably insert, replace, or delete a checkpoint key | copied page paths + synchronous barriers |
 | `CreateFileStore` / `OpenFileStore` | create or lazily recover a durable page graph | bounded root/page scratch; no corpus walk on open |
+| `Store.WriteFileStore` | create one compact mutable FileStore generation | one pass over live rows + bottom-up directories + two durability fences |
 | `FileStore.Put` / `Delete` | publish a copy-on-write durable generation | changed document plus copied metadata paths |
 | `FileStore.SetDeadline` / `Persist` / `ExpireDue` | mutate the persistent deadline tree | copied key/TTL paths; due work is caller-bounded by `limit` |
 | `FileStore.Snapshot` / `FileSnapshot.Close` | acquire/release a generation lease | O(1); the lease fences physical extent reuse |
@@ -337,6 +338,18 @@ superblocks and referenced root pages. It does not enumerate keys, chunks,
 postings, TTL records, or free extents during open. The free tree is loaded
 lazily when a writer first needs it.
 
+`Store.WriteFileStore` is the bulk path. It borrows one immutable Store state,
+repacks live rows into the target `ChunkDocuments` geometry, writes exact JSON
+and overflow chains once, and builds key, chunk, nested/compound exact-index,
+and TTL trees bottom-up. One data/tree fence precedes one alternate-root fence;
+there is no per-row durable generation, load commit arena, retired history, or
+mandatory compaction pass. Index postings from this generation dense-pack
+multiple streams per page and carry an immutable-base flag. A later mutation
+redirects only the changed stream to an isolated page and never retires the
+shared base. Regression tests churn those streams and corrupt the newest
+online state root to verify both non-overlap and fallback to the compact
+generation.
+
 Every page carries Store identity, kind, logical id, generation, exact bounds,
 and CRC32C. Metadata uses 4 KiB pages. Document and overflow extents may use
 larger configured power-of-two pages. The resident arena is divided into the
@@ -361,13 +374,21 @@ recovery to return one whole generation, never a mixture.
 16-quantum spans. M4 Max measured 3.73-3.77 ns/op and zero allocations. This
 isolates span control from CLOCK victim selection and device latency.
 
-Mutation is single-writer. With `Synchronous`, `Put`, `Delete`, TTL changes,
-and expiry wait for durability. Without it they return after the bounded
-committer accepts the reader-visible generation; `DurableGeneration` can lag
-and `Flush` or `Close` fences it. Queue and buffer exhaustion applies
-backpressure. A background device error is sticky. On Linux the native backend
-uses the scoped pure-Go `io_uring` substrate for both durable commits and
-speculative reads; portable positional I/O remains the fallback.
+Page construction is serialized. With `Synchronous`, `Put`, `Delete`, TTL
+changes, and expiry return only after durability, but the caller waits outside
+the construction lock: concurrent synchronous writers can build their
+generations in order and then share one device fence. `Close` first prevents
+new publications, waits for those durability waiters, and only then releases
+the committer and cache. Without `Synchronous`, mutations return after the
+bounded committer accepts the reader-visible generation; `DurableGeneration`
+can lag and `Flush` or `Close` fences it. `CommitCoalesce` optionally gives the
+background worker a bounded window to combine adjacent generations under the
+latest root. Publication does not wait for that window; a synchronous caller
+does, so latency-sensitive single-operation durability should leave it zero.
+Queue and buffer exhaustion applies backpressure. A background device error is
+sticky. On Linux the native backend uses the scoped pure-Go `io_uring`
+substrate for both durable commits and speculative reads; portable positional
+I/O remains the fallback.
 
 Cache misses can independently select `FileStoreReadBuffered`,
 `FileStoreReadDirectTry`, or `FileStoreReadDirectRequire`. Direct modes reopen
@@ -822,8 +843,9 @@ snapshots, or an event loop that leaves expired deadlines unpublished.
 `ChunkDocuments` is in `[1,64]`. Chunk ids are `uint32`; mutation returns
 `ErrStoreTooLarge` before wraparound. `FileStore` additionally fixes maximum
 key/document bytes, page sizes, resident bytes, I/O and commit queue slots,
-snapshot leases, retired extents, and at most 64 frozen exact indexes. Detailed
-source, tape, depth, retention, and maintenance limits are in
+commit staging bytes and the optional coalescing window, snapshot leases,
+retired extents, and at most 64 frozen exact indexes. Detailed source, tape,
+depth, retention, and maintenance limits are in
 [`contracts/limits.md`](contracts/limits.md).
 
 Heap `Store` is in-memory; `FileStore` adds one-file crash recovery, explicit
@@ -831,24 +853,44 @@ eviction, and durability. Neither is a distributed database. There is no
 replication, consensus, cluster protocol, server/client transport, access
 control, cross-Store transaction, join, secondary range index, online
 `FileStore` index DDL, or cross-process snapshot. A `FileStore` is single-node
-and single-writer, though snapshots and compiled queries may be read
-concurrently. Its copy-on-write protocol is the durability mechanism; it is not
-a user-visible WAL and does not provide log shipping or point-in-time restore.
+and single-process-writer; concurrent goroutines may submit mutations, and
+snapshots and compiled queries may be read concurrently. Its copy-on-write
+protocol is the durability mechanism; it is not a user-visible WAL and does
+not provide log shipping or point-in-time restore.
 
-The DuckDB harness compares keyed heap `Store` operations with DuckDB's
-embedded JSON, materialized scalar columns, and eligible single-column ART
-indexes over one deterministic NDJSON corpus. Both sides are correctness-gated
-and use one execution lane. The frozen 10,000-document M4 Max run measured
-4.85 MiB of Store-accounted resident state (1.25x logical key+JSON bytes), a
-5.01 MiB checkpointed DuckDB file (1.29x), and 5.75 MiB of warm DuckDB-managed
-buffers. Store bulk load was 2.23x faster in that run; read and mutation ratios
-varied substantially by operation and are reported individually.
+The DuckDB harness compares keyed heap `Store`, recovered bounded-cache
+`FileStore`, and DuckDB's embedded JSON, materialized scalar columns, and
+eligible single-column ART indexes over one deterministic NDJSON corpus. Every
+lane is correctness-gated. The frozen 10,000-document M4 Max run measured
+4.85 MiB of heap-Store-accounted resident state (1.25x logical key+JSON), a
+3.26 MiB checkpointed DuckDB file (0.84x), and 4.00 MiB of warm
+DuckDB-managed buffers. The current durable path writes the same data and one
+exact index as a 5.58 MiB
+FileStore (1.43x payload), 71% larger than DuckDB's 3.26 MiB checkpoint. Its
+conservatively accounted warm state is about 5.85 MiB, roughly 46% above
+DuckDB's engine-managed warm buffers, though those accounting domains are not
+process-RSS equivalents. Compact creation takes 28.89 ms including StoreBuilder
+work and both FileStore durability fences. DuckDB reports 18.77 ms load plus
+7.07 ms index construction but does not retain checkpoint latency,
+so the report does not manufacture a durable-load ratio.
+
+Recovered FileStore point lookup is 12.6x faster and structural containment
+5.8x faster than the frozen DuckDB run. FileStore's indexed/rechecked filter
+is still about 4.4x slower, numeric scan reduction about 39x slower, grouping
+about 21x slower, and individually double-fenced update/delete about 9.4x/18.6x
+slower. Predicate-free file queries no longer build transient postings or
+shape tapes, and already index-bounded predicates do not build a second
+per-batch index; that reduced the measured aggregate/group path by roughly 3x.
+The remaining analytical gap requires persistent typed covering columns rather
+than another JSON rescan, while the mutation gap is dominated by intentionally
+strict per-operation durability and copy-on-write metadata. The report gives
+each ratio instead of averaging unlike operations into one score.
 
 These are mechanism measurements, not a claim that the systems are equivalent.
 Store timings are direct in-process calls. DuckDB latency includes SQL parsing,
-binding, optimization, and execution; DuckDB also supplies ACID transactions,
-WAL/checkpoints, SQL, vectorized execution, and snapshot isolation that the
-heap Store does not. Store resident bytes, DuckDB durable file bytes, and
-DuckDB buffer memory are deliberately separate accounting domains. See the
+binding, optimization, and execution; DuckDB also supplies a broader ACID/SQL,
+checkpoint, vectorized-execution, and snapshot-isolation envelope. Heap Store
+memory, FileStore file/cache/staging bytes, DuckDB files, and DuckDB buffer
+memory remain explicitly labelled accounting domains. See the
 [frozen run](../benchmarks/results/duckdb-synth-s4.md) and
 [`benchmarks/duckdbbench/duckdb-methodology.md`](../benchmarks/duckdbbench/duckdb-methodology.md).

@@ -231,7 +231,14 @@ transaction byte bound. The lookup table and 64-byte slot controls contain no
 Go pointers. The buddy free-span directory is also pointer-free and bounded by
 cache quanta plus maximum page size; allocation splits or coalesces one
 power-of-two span without an arena scan. `BufferCount` and `QueueSlots` bound
-commit data/descriptors; `ReadConcurrency` bounds portable workers,
+commit data/descriptors, and `Stats.CommitCapacityBytes` exposes the complete
+fixed staging arena even when it is mmap-backed and invisible to Go heap
+accounting. The reusable-extent directory is another fixed pointer-free arena
+sized by `MaxRetiredExtents`; `Stats.ReusableCapacityBytes` and
+`ReusableExternalBytes` distinguish its capacity from Go heap.
+`CommitCoalesce` is either zero or a bounded duration no greater than one
+second; it changes durability grouping, not publication ordering.
+`ReadConcurrency` bounds portable workers,
 `ReadQueueDepth` bounds one native batch, and `PrefetchQueue` bounds waiting
 references. `MaxSnapshotLeases` and `MaxRetiredExtents` bound
 lifetime/reclamation metadata. Exhaustion returns an error or applies queue

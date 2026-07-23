@@ -254,6 +254,14 @@ defer snapshot.Close()
 raw, ok, err := snapshot.AppendRaw(nil, "event:42")
 ```
 
+For bulk creation, finish an in-memory `Store` and call
+`Store.WriteFileStore(file, options)` instead of replaying `Put`. It repacks
+live rows into the requested micro-page geometry, builds nested and compound
+exact indexes plus TTL directories bottom-up, and publishes one mutable
+generation with two durability fences. Packed posting pages are immutable
+bases; the first update to one stream redirects that stream to an isolated
+copy-on-write page, so unrelated streams sharing the base cannot be retired.
+
 `FileStore` opens from bounded root/page scratch instead of walking the corpus.
 Its CLOCK arena is divided into 4 KiB allocation quanta: a metadata page uses
 one slot and a larger document uses only its exact contiguous span, rather than
@@ -278,7 +286,16 @@ native setup fails construction. Direct writes likewise keep sustained
 ingestion from filling the kernel page cache and work with either commit
 backend.
 Async writes become reader-visible when queued; `DurableGeneration` and
-`Flush` expose the durability boundary. `Synchronous` waits on each mutation.
+`Flush` expose the durability boundary. `CommitCoalesce` can bound a
+background group-commit window without delaying async publication.
+`Synchronous` waits on each mutation, but waits outside serialized page
+construction so concurrent durable writers can share a fence. Close blocks
+new construction and drains those waiters before releasing I/O resources.
+`Stats.CommitCapacityBytes` reports the complete fixed staging arena, including
+mmap-backed bytes outside Go heap accounting.
+The reusable-extent directory is likewise a fixed pointer-free arena and lives
+outside the Go heap on supported Unix systems; `ReusableCapacityBytes` and
+`ReusableExternalBytes` keep that capacity visible.
 Snapshot leases fence physical reuse, while the previous durable generation
 remains recoverable if the newest data or root write is torn.
 
@@ -318,8 +335,10 @@ Execution builds bounded batches in parallel and externally merges ordered
 rows or grouped state through temporary spill files with a 32-run fan-in.
 `MemoryBytes` bounds working state, not the caller-owned final result or one
 document larger than the target. The Store is deliberately single-file and
-single-writer: there is no replication, distributed execution, cross-Store
-transaction, SQL parser, join engine, or server protocol. Exact-index
+single-process-writer: there is no replication, distributed execution,
+cross-Store transaction, join engine, or server protocol. The `query` package's
+SQL subset is only a compile-time adapter to the same typed plan used by the Go
+builder; execution does not retain or interpret SQL strings. Exact-index
 definitions are frozen when the file is created. The complete contract and
 measured limits are in [Mutable Store operations](docs/store.md).
 
@@ -480,10 +499,11 @@ storage: keep the source alive and unmodified, and observe each API's
 invalidation rule. `Index` and its nodes also borrow caller-provided entry
 storage; a node obtained from an owning `Value` keeps that value's backing
 arrays alive itself. `DocSet`, `ShapeCache`, and `KeyInterner` own their arena
-storage and are single-writer: values they hand out stay valid as they grow,
-and concurrent reads are safe once writing stops. `Store` serializes mutations
-and publishes immutable snapshots; snapshot reads are concurrent-safe and never
-block a writer. Values returned by a snapshot borrow that snapshot's storage.
+storage and serialize construction: values they hand out stay valid as they
+grow, and concurrent reads are safe once writing stops. `Store` serializes
+mutations and publishes immutable snapshots; snapshot reads are concurrent-safe
+and never block a writer. Values returned by a snapshot borrow that snapshot's
+storage.
 
 Compiled encoders, decoders, keys, and pointers are immutable and safe for
 concurrent use. Destinations and source buffers remain caller-owned; each

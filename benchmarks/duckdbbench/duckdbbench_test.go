@@ -144,10 +144,23 @@ func TestBuildReportKeepsAccountingDomainsSeparate(t *testing.T) {
 		DocsObserved: 10, ExtractHits: 10, FilterCount: 2, SumObserved: 55,
 		GroupCount: 3, ContainCount: 2,
 	}
-	report := BuildReport(OursResults{GoVersion: "go-test", GOARCH: "test", Corpora: []OursCorpus{{Manifest: m, Store: store}}}, map[string]DuckDBLog{"tiny": log})
+	fileStore := &OursFileStore{
+		LoadNS: 400_000, ReopenNS: 40_000, FileBytes: 2048, HeapBytes: 512,
+		CacheResidentBytes: 1024, CacheCapacityBytes: 4096, CommitCapacityBytes: 2048,
+		QueryBufferedBytes: 768, PointNS: 200, FilterNS: 2000, SumNS: 3000,
+		GroupNS: 4000, ContainNS: 5000, MutationOps: 2, UpdateNSOp: 800,
+		DeleteNSOp: 600, AfterDeletes: 8, PostMutationFileBytes: 3072,
+		ReusableBytes: 512, MutationReopenNS: 50_000, DocsObserved: 10,
+		ExtractHits: 10, FilterCount: 2, SumObserved: 55, GroupCount: 3,
+		ContainCount: 2,
+	}
+	report := BuildReport(OursResults{GoVersion: "go-test", GOARCH: "test", Corpora: []OursCorpus{{
+		Manifest: m, Store: store, FileStore: fileStore,
+	}}}, map[string]DuckDBLog{"tiny": log})
 	for _, want := range []string{
-		"Store and DuckDB comparison", "Correctness gate", "Store live heap",
-		"Store accounted resident", "warm buffers", "DuckDB file", "there is no heap/disk cross-ratio", "Per-key mutations", "verified",
+		"Store and DuckDB comparison", "Correctness gate", "Heap Store memory",
+		"Durable storage", "disk ratio", "Durable bounded memory", "admitted cache",
+		"Durable warm reads", "Per-key mutations", "mutation reopen", "verified",
 	} {
 		if !strings.Contains(report, want) {
 			t.Fatalf("report missing %q:\n%s", want, report)
@@ -179,6 +192,27 @@ func TestMeasureStoreCorpusSmoke(t *testing.T) {
 	}
 	if result.HeapBytes <= 0 || result.AccountedResidentBytes() <= result.HeapBytes || result.PointNS <= 0 || result.UpdateNSOp <= 0 || result.DeleteNSOp <= 0 {
 		t.Fatalf("missing measurements: %+v", result)
+	}
+}
+
+func TestMeasureFileStoreCorpusSmoke(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "tiny")
+	m, err := GenerateSynthetic(dir, SynthSpec{Name: "tiny", Docs: 32, Shapes: 4, DocBytes: 256, Seed: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := MeasureFileStoreCorpus(dir, m, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bad := result.Verify(m); len(bad) != 0 {
+		t.Fatalf("verification: %v; result: %+v", bad, result)
+	}
+	if result.FileBytes <= 0 || result.AccountedResidentBytes() <= result.HeapBytes ||
+		result.CacheCapacityBytes == 0 || result.CommitCapacityBytes == 0 ||
+		result.PointNS <= 0 || result.UpdateNSOp <= 0 || result.DeleteNSOp <= 0 ||
+		result.MutationReopenNS <= 0 {
+		t.Fatalf("missing durable measurements: %+v", result)
 	}
 }
 

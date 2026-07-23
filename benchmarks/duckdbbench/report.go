@@ -123,7 +123,7 @@ func BuildReport(res OursResults, logs map[string]DuckDBLog) string {
 	w("Every result is tied to one deterministic manifest and rejected when either engine disagrees with its expected counts.\n\n")
 
 	w("## Environment\n\n")
-	w("- Store: %s, %s/%s, one goroutine", res.GoVersion, res.GOOS, res.GOARCH)
+	w("- Store: %s, %s/%s; query execution uses one worker", res.GoVersion, res.GOOS, res.GOARCH)
 	if res.Host != "" {
 		w(", host: %s", res.Host)
 	}
@@ -147,14 +147,18 @@ func BuildReport(res OursResults, logs map[string]DuckDBLog) string {
 	w("\n")
 
 	w("## Correctness gate\n\n")
-	w("| corpus | Store | DuckDB |\n|---|---|---|\n")
+	w("| corpus | heap Store | durable FileStore | DuckDB |\n|---|---|---|---|\n")
 	for _, corpus := range corpora {
 		storeStatus := verificationStatus(corpus.Store.Verify(corpus.Manifest))
+		fileStatus := "not run"
+		if corpus.FileStore != nil {
+			fileStatus = verificationStatus(corpus.FileStore.Verify(corpus.Manifest))
+		}
 		duckStatus := "not run"
 		if log := logFor(corpus.Manifest.Name); log != nil {
 			duckStatus = verificationStatus(log.Verify(corpus.Manifest))
 		}
-		w("| %s | %s | %s |\n", corpus.Manifest.Name, storeStatus, duckStatus)
+		w("| %s | %s | %s | %s |\n", corpus.Manifest.Name, storeStatus, fileStatus, duckStatus)
 	}
 	w("\n")
 
@@ -169,26 +173,76 @@ func BuildReport(res OursResults, logs map[string]DuckDBLog) string {
 	}
 	w("\n")
 
-	w("## Storage and memory\n\n")
-	w("These are deliberately separate accounting domains. Store reports settled live Go heap plus Store-owned external blocks; their sum is the accounted resident state, not process RSS. DuckDB file bytes are measured after `CHECKPOINT`; WAL is listed separately. `warm buffers` is current engine-managed memory after one representative warm query sequence, while peak buffers and temporary bytes come from the profiler. Ratios in the two `payload` columns are each engine's own storage bytes divided by logical key+JSON bytes; there is no heap/disk cross-ratio.\n\n")
-	w("| corpus | Store live heap | Store external | Store accounted resident | Store/payload | exact index model | DuckDB file | DuckDB/payload | WAL | warm buffers | peak buffers | peak temp |\n")
-	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	w("## Heap Store memory\n\n")
+	w("The heap Store reports settled live Go heap plus Store-owned pointer-free external blocks. Their sum is an engine-accounted resident view, not process RSS. It describes the latency-first in-memory representation and must not be compared with durable file bytes.\n\n")
+	w("| corpus | live Go heap | external blocks | accounted resident | Store/payload | exact index model |\n")
+	w("|---|---:|---:|---:|---:|---:|\n")
 	for _, corpus := range corpora {
 		m, store := corpus.Manifest, corpus.Store
-		duckFile, wal, current, buffer, temp := int64(-1), int64(-1), int64(-1), int64(-1), int64(-1)
+		external := int64(store.ExternalKeyBytes + store.ExternalDocumentBytes + store.ExternalIndexBytes)
+		resident := store.AccountedResidentBytes()
+		w("| %s | %s | %s | %s | %s | %s |\n",
+			m.Name, fmtBytes(store.HeapBytes), fmtMeasuredBytes(external), fmtBytes(resident), fmtPayloadRatio(resident, m.LogicalBytes()),
+			fmtBytes(int64(store.IndexBytes)))
+	}
+	w("\n")
+
+	w("## Durable storage\n\n")
+	w("FileStore and DuckDB consume the same logical key+JSON payload and both columns are crash-recoverable file bytes. FileStore bytes come from one compact generation that writes live documents, directories, the frozen exact index, and both durability barriers without retaining ingestion history. DuckDB bytes are measured after both ART indexes and `CHECKPOINT`. The disk ratio is DuckDB/FileStore, so greater than 1 means FileStore used fewer bytes. Post-mutation bytes expose copy-on-write high water, while reusable bytes are already tracked free extents—not live data.\n\n")
+	w("| corpus | FileStore file | FileStore/payload | DuckDB file | DuckDB/payload | disk ratio | FileStore after mutations | reusable extents | DuckDB WAL |\n")
+	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	for _, corpus := range corpora {
+		m := corpus.Manifest
+		fileBytes, postMutation, reusable := int64(-1), int64(-1), int64(-1)
+		if store := corpus.FileStore; store != nil {
+			fileBytes = store.FileBytes
+			postMutation = store.PostMutationFileBytes
+			reusable = int64(store.ReusableBytes)
+		}
+		duckFile, wal := int64(-1), int64(-1)
 		if log := logFor(m.Name); log != nil {
 			duckFile = log.Values["database_bytes"]
 			wal = log.Values["wal_bytes"]
+		}
+		w("| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
+			m.Name, fmtMeasuredBytes(fileBytes), fmtPayloadRatio(fileBytes, m.LogicalBytes()),
+			fmtMeasuredBytes(duckFile), fmtPayloadRatio(duckFile, m.LogicalBytes()),
+			fmtRatio(float64(duckFile), float64(fileBytes)), fmtMeasuredBytes(postMutation),
+			fmtMeasuredBytes(reusable), fmtMeasuredBytes(wal))
+	}
+	w("\n")
+
+	w("## Durable bounded memory\n\n")
+	w("FileStore reports settled Go heap, currently admitted read-cache extents, fixed read-cache capacity, its mmap-backed commit staging capacity, and its pointer-free reusable-extent arena independently. `accounted warm` is heap + admitted cache + the complete commit arena + any reusable arena outside the Go heap, a conservative engine-owned view rather than RSS. Query buffered bytes are the largest measured batch or merge frontier and are caller execution state, so they are not folded into the warm total. DuckDB buffer-manager values remain separate because neither engine-level view includes identical runtime and process overhead.\n\n")
+	w("| corpus | FileStore heap | admitted cache | cache capacity | commit capacity | reusable arena | accounted warm | FileStore/payload | query buffered | DuckDB warm buffers | DuckDB peak buffers | DuckDB peak temp |\n")
+	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	for _, corpus := range corpora {
+		m := corpus.Manifest
+		heapBytes, cacheResident, cacheCapacity := int64(-1), int64(-1), int64(-1)
+		commitCapacity, reusableCapacity := int64(-1), int64(-1)
+		accounted, queryBuffered := int64(-1), int64(-1)
+		if store := corpus.FileStore; store != nil {
+			heapBytes = store.HeapBytes
+			cacheResident = int64(store.CacheResidentBytes)
+			cacheCapacity = int64(store.CacheCapacityBytes)
+			commitCapacity = int64(store.CommitCapacityBytes)
+			reusableCapacity = int64(store.ReusableCapacityBytes)
+			accounted = store.AccountedResidentBytes()
+			queryBuffered = store.QueryBufferedBytes
+		}
+		current, peak, temp := int64(-1), int64(-1), int64(-1)
+		if log := logFor(m.Name); log != nil {
 			current = log.Values["current_buffer_bytes"]
-			buffer = log.PeakBufferBytes()
+			peak = log.PeakBufferBytes()
 			temp = log.PeakTempBytes()
 		}
-		external := int64(store.ExternalKeyBytes + store.ExternalDocumentBytes + store.ExternalIndexBytes)
-		resident := store.AccountedResidentBytes()
 		w("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
-			m.Name, fmtBytes(store.HeapBytes), fmtMeasuredBytes(external), fmtBytes(resident), fmtPayloadRatio(resident, m.LogicalBytes()),
-			fmtBytes(int64(store.IndexBytes)), fmtMeasuredBytes(duckFile), fmtPayloadRatio(duckFile, m.LogicalBytes()),
-			fmtMeasuredBytes(wal), fmtMeasuredBytes(current), fmtMeasuredBytes(buffer), fmtMeasuredBytes(temp))
+			m.Name, fmtMeasuredBytes(heapBytes), fmtMeasuredBytes(cacheResident),
+			fmtMeasuredBytes(cacheCapacity), fmtMeasuredBytes(commitCapacity),
+			fmtMeasuredBytes(reusableCapacity), fmtMeasuredBytes(accounted),
+			fmtPayloadRatio(accounted, m.LogicalBytes()),
+			fmtMeasuredBytes(queryBuffered), fmtMeasuredBytes(current),
+			fmtMeasuredBytes(peak), fmtMeasuredBytes(temp))
 	}
 	w("\n")
 
@@ -207,6 +261,34 @@ func BuildReport(res OursResults, logs map[string]DuckDBLog) string {
 			fmtNS(float64(store.LoadNS)), fmtMBps(m.LogicalBytes(), float64(store.LoadNS)),
 			fmtNS(duckLoad), fmtMBps(m.LogicalBytes(), duckLoad), fmtRatio(duckLoad, float64(store.LoadNS)),
 			fmtNS(float64(store.IndexBuildNS)), fmtNS(duckIndex), fmtRatio(duckIndex, float64(store.IndexBuildNS)))
+	}
+	w("\n")
+
+	w("## Durable load and recovery\n\n")
+	w("FileStore load includes StoreBuilder ingestion plus direct construction of one mutable compact generation. It writes every live object and directory once, performs one data/tree fence and one root fence, and creates no retired generations or persistent load commit arena. DuckDB lists bulk load and later ART construction separately; its retained artifact does not time `CHECKPOINT`, so no synthetic durable-load ratio is rendered. Recovery opens bounded top-level metadata and does not scan the key, document, posting, or TTL trees.\n\n")
+	w("| corpus | FileStore durable load | rate | durability fences | committed batches | retired bytes after load | reusable bytes after load | FileStore reopen | DuckDB load | DuckDB indexes |\n")
+	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	for _, corpus := range corpora {
+		m := corpus.Manifest
+		var fileLoad, reopen int64
+		var deviceCommits, committedBatches, retiredBytes, reusableBytes uint64
+		if store := corpus.FileStore; store != nil {
+			fileLoad, reopen = store.LoadNS, store.ReopenNS
+			deviceCommits = store.LoadDeviceCommits
+			committedBatches = store.LoadCommittedBatches
+			retiredBytes = store.LoadPendingRetiredBytes
+			reusableBytes = store.LoadReusableBytes
+		}
+		var duckLoad, duckIndex float64
+		if log := logFor(m.Name); log != nil {
+			duckLoad, _ = log.QueryNS("load")
+			duckIndex = log.IndexNS()
+		}
+		w("| %s | %s | %s | %d | %d | %s | %s | %s | %s | %s |\n", m.Name,
+			fmtNS(float64(fileLoad)), fmtMBps(m.LogicalBytes(), float64(fileLoad)),
+			deviceCommits, committedBatches, fmtMeasuredBytes(int64(retiredBytes)),
+			fmtMeasuredBytes(int64(reusableBytes)),
+			fmtNS(float64(reopen)), fmtNS(duckLoad), fmtNS(duckIndex))
 	}
 	w("\n")
 
@@ -241,31 +323,74 @@ func BuildReport(res OursResults, logs map[string]DuckDBLog) string {
 	}
 	w("\n")
 
+	w("## Durable warm reads\n\n")
+	w("These FileStore reads come from a recovered bounded-cache snapshot. Point includes key lookup, exact JSON copy-out, structural indexing, and nested projection. Whole-corpus queries use one worker and persistent exact-index pushdown when applicable; an already bounded predicate and a predicate-free aggregate do not rebuild transient per-batch postings. Ratio is DuckDB/FileStore latency; greater than 1 means FileStore completed sooner.\n\n")
+	w("| corpus | scenario | FileStore | DuckDB | ratio | DuckDB rows scanned |\n")
+	w("|---|---|---:|---:|---:|---:|\n")
+	for _, corpus := range corpora {
+		m, store, log := corpus.Manifest, corpus.FileStore, logFor(corpus.Manifest.Name)
+		if store == nil {
+			continue
+		}
+		rows := []struct {
+			label string
+			ours  int64
+			run   bool
+		}{
+			{"point", store.PointNS, true},
+			{"filter", store.FilterNS, m.ContainKey != ""},
+			{"sum", store.SumNS, m.SumField != ""},
+			{"group", store.GroupNS, m.ContainKey != ""},
+			{"contain", store.ContainNS, m.ContainKey != ""},
+		}
+		for _, row := range rows {
+			if !row.run {
+				continue
+			}
+			var duckNS float64
+			if log != nil {
+				duckNS, _ = log.QueryNS(row.label)
+			}
+			w("| %s | %s | %s | %s | %s | %s |\n", m.Name, row.label,
+				fmtNS(float64(row.ours)), fmtNS(duckNS),
+				fmtRatio(duckNS, float64(row.ours)), profileRows(log, row.label))
+		}
+	}
+	w("\n")
+
 	w("## Per-key mutations\n\n")
-	w("Each operation is an independent publication/transaction commit. The deterministic smoke updates up to 256 keys to the same valid JSON object while clearing the indexed scalar, then deletes those keys. This is intentionally not a bulk SQL-vs-loop comparison.\n\n")
-	w("| corpus | operations | Store update/op | DuckDB update/op | ratio | Store delete/op | DuckDB delete/op | ratio |\n")
-	w("|---|---:|---:|---:|---:|---:|---:|---:|\n")
+	w("Each operation is an independent publication/transaction commit. The deterministic smoke updates up to 256 keys to the same valid JSON object while clearing the indexed scalar, then deletes those keys. Heap Store is retained as an in-memory publication diagnostic. FileStore waits for its double-root durability fence on every operation; DuckDB uses one explicit transaction per operation, making the durable ratio semantically aligned. FileStore cardinality is verified only after close and recovery.\n\n")
+	w("| corpus | operations | heap update/op | durable FileStore update/op | DuckDB update/op | durable ratio | heap delete/op | durable FileStore delete/op | DuckDB delete/op | durable ratio | mutation reopen |\n")
+	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, corpus := range corpora {
 		store, log := corpus.Store, logFor(corpus.Manifest.Name)
+		var fileUpdate, fileDelete, mutationReopen int64
+		if fileStore := corpus.FileStore; fileStore != nil {
+			fileUpdate, fileDelete = fileStore.UpdateNSOp, fileStore.DeleteNSOp
+			mutationReopen = fileStore.MutationReopenNS
+		}
 		var updateNS, deleteNS float64
 		if log != nil {
 			updateNS, _ = log.MeanNS("update")
 			deleteNS, _ = log.MeanNS("delete")
 		}
-		w("| %s | %d | %s | %s | %s | %s | %s | %s |\n", corpus.Manifest.Name, store.MutationOps,
-			fmtNS(float64(store.UpdateNSOp)), fmtNS(updateNS), fmtRatio(updateNS, float64(store.UpdateNSOp)),
-			fmtNS(float64(store.DeleteNSOp)), fmtNS(deleteNS), fmtRatio(deleteNS, float64(store.DeleteNSOp)))
+		w("| %s | %d | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
+			corpus.Manifest.Name, store.MutationOps,
+			fmtNS(float64(store.UpdateNSOp)), fmtNS(float64(fileUpdate)), fmtNS(updateNS),
+			fmtRatio(updateNS, float64(fileUpdate)), fmtNS(float64(store.DeleteNSOp)),
+			fmtNS(float64(fileDelete)), fmtNS(deleteNS),
+			fmtRatio(deleteNS, float64(fileDelete)), fmtNS(float64(mutationReopen)))
 	}
 	w("\n")
 
 	w("## Interpretation boundaries\n\n")
 	w("- Store timings are in-process Go calls. DuckDB timings are the engine-reported `latency` field and include SQL parsing, binding, optimization, and execution, but exclude container startup and result formatting.\n")
 	w("- Both engines use one execution thread. Warmups precede profiled queries; reports use the minimum repetition on both read paths. Raw profile streams remain the audit artifact.\n")
-	w("- DuckDB stores exact JSON physically as its `JSON`/`VARCHAR` representation and also materializes the filter and numeric fields. Store retains exact JSON plus its structural representation and exact index.\n")
+	w("- DuckDB stores exact JSON physically as its `JSON`/`VARCHAR` representation and also materializes the filter and numeric fields. Heap Store retains exact JSON plus its structural representation and exact index; FileStore retains exact JSON and persistent exact postings but currently reconstructs transient columns for scans.\n")
 	w("- DuckDB's ART index scan is eligible only for a single plain column and is intended for point or very selective predicates. A low-cardinality filter can remain a vectorized scan; the report exposes rows scanned instead of pretending the ART served it.\n")
 	w("- DuckDB's compound and expression indexes are valid storage objects but are not eligible for ART index scans today, so this harness does not create a decorative compound index.\n")
-	w("- DuckDB is an embedded analytical database with ACID transactions, checkpoint/WAL persistence, vectorized SQL, and snapshot isolation. Store has a narrower embedded JSON API and different durability/concurrency semantics. Results apply only to the listed operations.\n")
-	w("- A checkpointed database file is not resident memory, and settled Store memory is not durable storage. Store accounted resident bytes and DuckDB warm buffer bytes are useful engine-level views but still are not process RSS; do not turn them into a universal capacity ratio.\n")
+	w("- DuckDB is an embedded analytical database with ACID transactions, checkpoint/WAL persistence, vectorized SQL, and snapshot isolation. FileStore provides automatic checksummed copy-on-write persistence and immutable reader generations, but has a narrower embedded JSON API and different transaction semantics. Results apply only to the listed operations.\n")
+	w("- Durable file ratios are valid within this exact corpus and index contract. Heap Store, FileStore bounded memory, and DuckDB buffers remain different resident-accounting views and are not process RSS; do not turn them into a universal capacity ratio.\n")
 
 	return b.String()
 }

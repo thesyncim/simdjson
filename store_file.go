@@ -12,9 +12,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/thesyncim/simdjson/document"
 	"github.com/thesyncim/simdjson/internal/storeio"
+	"github.com/thesyncim/simdjson/internal/storemem"
 )
 
 var (
@@ -93,6 +95,11 @@ type FileStoreOptions struct {
 	BufferCount      int
 	QueueSlots       int
 	GroupLimit       int
+	// CommitCoalesce bounds the background durability worker's group-commit
+	// window. Async Put/Delete publication remains immediate. Synchronous
+	// operations also wait through this window, so latency-sensitive durable
+	// callers should leave it zero.
+	CommitCoalesce time.Duration
 	// Backend selects both engines; Stats reports the actual read and write
 	// choices independently after Auto fallback.
 	Backend FileStoreBackend
@@ -157,6 +164,7 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 	}
 	if o.Backend > FileStoreBackendIOUring || o.ReadMode > FileStoreReadDirectRequire ||
 		o.WriteMode > FileStoreWriteDirectRequire ||
+		o.CommitCoalesce < 0 || o.CommitCoalesce > time.Second ||
 		o.PageSize < 4096 || o.PageSize&(o.PageSize-1) != 0 ||
 		o.MaxPageSize < o.PageSize || o.MaxPageSize&(o.MaxPageSize-1) != 0 || o.MaxPageSize%o.PageSize != 0 ||
 		o.MaxKeyBytes < 1 || o.InlineValueBytes < 1 || o.MaxDocumentBytes < 1 ||
@@ -273,11 +281,12 @@ type FileStore struct {
 	options normalizedFileStoreOptions
 	storeID [16]byte
 
-	writer       sync.Mutex
-	snapshotGate sync.RWMutex
-	closed       bool
-	closeDone    bool
-	state        atomic.Pointer[fileStoreState]
+	writer         sync.Mutex
+	durabilityWait sync.WaitGroup
+	snapshotGate   sync.RWMutex
+	closed         bool
+	closeDone      bool
+	state          atomic.Pointer[fileStoreState]
 
 	committer   *storeio.Committer
 	cache       *storeio.PageCache
@@ -294,6 +303,7 @@ type FileStore struct {
 	retireScratch     []storeio.FreeExtent
 	reusable          []storeio.FreeExtent
 	reuseJournal      []storeio.ReuseEdit
+	reusableBlock     *storemem.Block
 	freeLoaded        bool
 	unpersisted       int
 	appendChunk       uint32
@@ -303,20 +313,24 @@ type FileStore struct {
 // FileStoreStats is a point-in-time resource and I/O accounting snapshot.
 // Every byte and queue counter corresponds to a configured finite budget.
 type FileStoreStats struct {
-	CapacityBytes   uint64
-	ResidentBytes   uint64
-	PinnedPages     uint64
-	DirtyBytes      uint64
-	PageReads       uint64
-	ReadBytes       uint64
-	CacheHits       uint64
-	CacheMisses     uint64
-	CoalescedReads  uint64
-	ReadErrors      uint64
-	PrefetchHits    uint64
-	Evictions       uint64
-	PrefetchQueued  uint64
-	PrefetchDropped uint64
+	CapacityBytes uint64
+	ResidentBytes uint64
+	// CommitCapacityBytes is the fixed reusable staging arena owned by the
+	// durability device. On supported systems it is mmap-backed and invisible
+	// to the Go heap; it is capacity, not a claim that every page is resident.
+	CommitCapacityBytes uint64
+	PinnedPages         uint64
+	DirtyBytes          uint64
+	PageReads           uint64
+	ReadBytes           uint64
+	CacheHits           uint64
+	CacheMisses         uint64
+	CoalescedReads      uint64
+	ReadErrors          uint64
+	PrefetchHits        uint64
+	Evictions           uint64
+	PrefetchQueued      uint64
+	PrefetchDropped     uint64
 	// PrefetchQueueDepth samples references waiting for either read engine.
 	PrefetchQueueDepth uint64
 	// ReadQueueDepth is the configured native submission bound.
@@ -348,13 +362,19 @@ type FileStoreStats struct {
 	ActiveSnapshots          uint64
 	OldestSnapshotGeneration uint64
 	RetiredExtentCapacity    uint64
-	PendingRetiredExtents    uint64
-	PendingRetiredBytes      uint64
-	ReusableExtents          uint64
-	ReusableBytes            uint64
-	DocumentCount            uint64
-	LiveChunks               uint32
-	FileEnd                  uint64
+	// ReusableCapacityBytes is the fixed pointer-free extent arena. Common
+	// Unix platforms keep it outside the Go heap.
+	ReusableCapacityBytes uint64
+	// ReusableExternalBytes is the portion of ReusableCapacityBytes outside
+	// the Go heap on this platform.
+	ReusableExternalBytes uint64
+	PendingRetiredExtents uint64
+	PendingRetiredBytes   uint64
+	ReusableExtents       uint64
+	ReusableBytes         uint64
+	DocumentCount         uint64
+	LiveChunks            uint32
+	FileEnd               uint64
 }
 
 // CreateFileStore initializes an empty durable Store in file and fences its
@@ -467,7 +487,7 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 		BufferSize: max(options.MaxPageSize, os.Getpagesize()), QueueDepth: options.BufferCount,
 	}, storeio.CommitterOptions{
 		QueueSlots: options.QueueSlots, MaxPagesPerBatch: options.maxTransactionPages,
-		GroupLimit: options.GroupLimit,
+		GroupLimit: options.GroupLimit, CoalesceDelay: options.CommitCoalesce,
 	})
 	if err != nil {
 		if writeFile != file {
@@ -525,6 +545,36 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 		}
 		return nil, err
 	}
+	extentSize := int(unsafe.Sizeof(storeio.FreeExtent{}))
+	if options.MaxRetiredExtents > maxInt()/extentSize {
+		_ = leases.Close()
+		_ = cache.Close()
+		if readFile != file {
+			_ = readFile.Close()
+		}
+		_ = committer.Close()
+		if writeFile != file {
+			_ = writeFile.Close()
+		}
+		return nil, ErrStorePersistTooLarge
+	}
+	reusableBlock, err := storemem.Allocate(options.MaxRetiredExtents * extentSize)
+	if err != nil {
+		_ = leases.Close()
+		_ = cache.Close()
+		if readFile != file {
+			_ = readFile.Close()
+		}
+		_ = committer.Close()
+		if writeFile != file {
+			_ = writeFile.Close()
+		}
+		return nil, err
+	}
+	reusableArena := unsafe.Slice(
+		(*storeio.FreeExtent)(unsafe.Pointer(unsafe.SliceData(reusableBlock.Bytes()))),
+		options.MaxRetiredExtents,
+	)
 	var ownedRead *os.File
 	if readFile != file {
 		ownedRead = readFile
@@ -539,8 +589,9 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 		directRead: directRead, directWrite: directWrite,
 		leases: leases, reclaimer: reclaimer,
 		retireScratch: make([]storeio.FreeExtent, 0, options.maxTransactionPages+32),
-		reusable:      make([]storeio.FreeExtent, 0, options.MaxRetiredExtents),
+		reusable:      reusableArena[:0],
 		reuseJournal:  make([]storeio.ReuseEdit, 0, options.maxTransactionPages),
+		reusableBlock: reusableBlock,
 	}, nil
 }
 
@@ -892,7 +943,8 @@ func (s *FileStore) Stats() FileStoreStats {
 	retired := s.reclaimer.Stats()
 	stats := FileStoreStats{
 		CapacityBytes: cache.CapacityBytes, ResidentBytes: cache.ResidentBytes,
-		PinnedPages: cache.PinnedPages, DirtyBytes: cache.DirtyBytes,
+		CommitCapacityBytes: uint64(s.options.BufferCount) * uint64(s.options.MaxPageSize),
+		PinnedPages:         cache.PinnedPages, DirtyBytes: cache.DirtyBytes,
 		PageReads: cache.PageReads, ReadBytes: cache.ReadBytes, CacheHits: cache.CacheHits,
 		CacheMisses: cache.Misses, CoalescedReads: cache.Coalesced, ReadErrors: cache.ReadErrors,
 		PrefetchHits: cache.PrefetchHits, Evictions: cache.Evictions,
@@ -910,6 +962,12 @@ func (s *FileStore) Stats() FileStoreStats {
 		OldestSnapshotGeneration: leases.MinimumGeneration,
 		RetiredExtentCapacity:    retired.Capacity, PendingRetiredExtents: retired.Pending,
 		PendingRetiredBytes: retired.PendingBytes, ReusableExtents: uint64(len(s.reusable)),
+	}
+	if s.reusableBlock != nil {
+		stats.ReusableCapacityBytes = uint64(s.reusableBlock.Len())
+		if s.reusableBlock.OutsideHeap() {
+			stats.ReusableExternalBytes = stats.ReusableCapacityBytes
+		}
 	}
 	for _, extent := range s.reusable {
 		stats.ReusableBytes += extent.Length
@@ -931,7 +989,18 @@ func (s *FileStore) Put(key string, src []byte) (created bool, err error) {
 		return false, ErrFileStoreClosed
 	}
 	s.writer.Lock()
-	defer s.writer.Unlock()
+	var generation uint64
+	defer func() {
+		wait := generation != 0 && s.options.Synchronous
+		if wait {
+			s.durabilityWait.Add(1)
+		}
+		s.writer.Unlock()
+		if wait {
+			err = errors.Join(err, s.waitPublished(generation))
+			s.durabilityWait.Done()
+		}
+	}()
 	if s.closed {
 		return false, ErrFileStoreClosed
 	}
@@ -981,7 +1050,11 @@ func (s *FileStore) Put(key string, src []byte) (created bool, err error) {
 	if err := s.ensureDirtyCapacity(); err != nil {
 		return false, err
 	}
-	return s.putLocked(state, keyBytes, src, index, location, created, prospectiveHighWater)
+	created, err = s.putLocked(state, keyBytes, src, index, location, created, prospectiveHighWater)
+	if err == nil {
+		generation = state.root.Generation + 1
+	}
+	return created, err
 }
 
 func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex Index, location storeio.KeyLocation, created bool, prospectiveHighWater uint32) (bool, error) {
@@ -1145,22 +1218,27 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 		s.appendChunk = prospectiveHighWater
 		s.appendLive = 0
 	}
-	if s.options.Synchronous {
-		if err := s.committer.Wait(generation); err != nil {
-			return created, err
-		}
-		s.cache.MarkDurable(generation)
-	}
 	return created, nil
 }
 
 // Delete removes key through the same failure-atomic page publication.
-func (s *FileStore) Delete(key string) (bool, error) {
+func (s *FileStore) Delete(key string) (deleted bool, err error) {
 	if s == nil {
 		return false, ErrFileStoreClosed
 	}
 	s.writer.Lock()
-	defer s.writer.Unlock()
+	var generation uint64
+	defer func() {
+		wait := generation != 0 && s.options.Synchronous
+		if wait {
+			s.durabilityWait.Add(1)
+		}
+		s.writer.Unlock()
+		if wait {
+			err = errors.Join(err, s.waitPublished(generation))
+			s.durabilityWait.Done()
+		}
+	}()
 	if s.closed {
 		return false, ErrFileStoreClosed
 	}
@@ -1178,7 +1256,11 @@ func (s *FileStore) Delete(key string) (bool, error) {
 	if err := s.ensureDirtyCapacity(); err != nil {
 		return false, err
 	}
-	return s.deleteLocked(state, []byte(key), location)
+	deleted, err = s.deleteLocked(state, []byte(key), location)
+	if err == nil && deleted {
+		generation = state.root.Generation + 1
+	}
+	return deleted, err
 }
 
 // SetTTL assigns a deadline relative to the current clock. A non-positive TTL
@@ -1193,7 +1275,7 @@ func (s *FileStore) SetTTL(key string, ttl time.Duration) (bool, error) {
 // SetDeadline durably assigns an absolute expiration. Ordinary reads never
 // consult the clock; ExpireDue makes a due key invisible through a normal
 // copy-on-write delete.
-func (s *FileStore) SetDeadline(key string, deadline time.Time) (bool, error) {
+func (s *FileStore) SetDeadline(key string, deadline time.Time) (updated bool, err error) {
 	if !deadline.After(time.Now()) {
 		return s.Delete(key)
 	}
@@ -1205,7 +1287,18 @@ func (s *FileStore) SetDeadline(key string, deadline time.Time) (bool, error) {
 		return false, ErrFileStoreClosed
 	}
 	s.writer.Lock()
-	defer s.writer.Unlock()
+	var generation uint64
+	defer func() {
+		wait := generation != 0 && s.options.Synchronous
+		if wait {
+			s.durabilityWait.Add(1)
+		}
+		s.writer.Unlock()
+		if wait {
+			err = errors.Join(err, s.waitPublished(generation))
+			s.durabilityWait.Done()
+		}
+	}()
 	if s.closed {
 		return false, ErrFileStoreClosed
 	}
@@ -1226,16 +1319,31 @@ func (s *FileStore) SetDeadline(key string, deadline time.Time) (bool, error) {
 	if err := s.ensureDirtyCapacity(); err != nil {
 		return false, err
 	}
-	return s.setDeadlineLocked(state, []byte(key), location, nanos)
+	updated, err = s.setDeadlineLocked(state, []byte(key), location, nanos)
+	if err == nil && updated {
+		generation = state.root.Generation + 1
+	}
+	return updated, err
 }
 
 // Persist removes key's expiration without changing the document.
-func (s *FileStore) Persist(key string) (bool, error) {
+func (s *FileStore) Persist(key string) (updated bool, err error) {
 	if s == nil {
 		return false, ErrFileStoreClosed
 	}
 	s.writer.Lock()
-	defer s.writer.Unlock()
+	var generation uint64
+	defer func() {
+		wait := generation != 0 && s.options.Synchronous
+		if wait {
+			s.durabilityWait.Add(1)
+		}
+		s.writer.Unlock()
+		if wait {
+			err = errors.Join(err, s.waitPublished(generation))
+			s.durabilityWait.Done()
+		}
+	}()
 	if s.closed {
 		return false, ErrFileStoreClosed
 	}
@@ -1253,7 +1361,11 @@ func (s *FileStore) Persist(key string) (bool, error) {
 	if err := s.ensureDirtyCapacity(); err != nil {
 		return false, err
 	}
-	return s.setDeadlineLocked(state, []byte(key), location, 0)
+	updated, err = s.setDeadlineLocked(state, []byte(key), location, 0)
+	if err == nil && updated {
+		generation = state.root.Generation + 1
+	}
+	return updated, err
 }
 
 func (s *FileStore) setDeadlineLocked(state *fileStoreState, key []byte, location storeio.KeyLocation, deadline int64) (bool, error) {
@@ -1347,12 +1459,6 @@ func (s *FileStore) setDeadlineLocked(state *fileStoreState, key []byte, locatio
 	s.snapshotGate.Lock()
 	s.state.Store(nextState)
 	s.snapshotGate.Unlock()
-	if s.options.Synchronous {
-		if err := s.committer.Wait(generation); err != nil {
-			return true, err
-		}
-		s.cache.MarkDurable(generation)
-	}
 	return true, nil
 }
 
@@ -1391,12 +1497,23 @@ func (s *FileStore) TTLAt(key string, now time.Time) (time.Duration, bool, error
 
 // ExpireDue publishes up to limit normal deletes ordered by deadline. A
 // non-positive limit drains every deadline due at now with bounded memory.
-func (s *FileStore) ExpireDue(now time.Time, limit int) (int, error) {
+func (s *FileStore) ExpireDue(now time.Time, limit int) (expired int, err error) {
 	if s == nil {
 		return 0, ErrFileStoreClosed
 	}
 	s.writer.Lock()
-	defer s.writer.Unlock()
+	var generation uint64
+	defer func() {
+		wait := generation != 0 && s.options.Synchronous
+		if wait {
+			s.durabilityWait.Add(1)
+		}
+		s.writer.Unlock()
+		if wait {
+			err = errors.Join(err, s.waitPublished(generation))
+			s.durabilityWait.Done()
+		}
+	}()
 	if s.closed {
 		return 0, ErrFileStoreClosed
 	}
@@ -1404,7 +1521,6 @@ func (s *FileStore) ExpireDue(now time.Time, limit int) (int, error) {
 	if !time.Unix(0, nowNanos).Equal(now) {
 		return 0, ErrFileStoreDeadlineRange
 	}
-	expired := 0
 	for limit <= 0 || expired < limit {
 		state := s.state.Load()
 		if state == nil || state.ttlRoot == (storeio.PageRef{}) {
@@ -1436,6 +1552,7 @@ func (s *FileStore) ExpireDue(now time.Time, limit int) (int, error) {
 			return expired, err
 		}
 		expired++
+		generation = state.root.Generation + 1
 	}
 	return expired, nil
 }
@@ -1585,12 +1702,6 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 	s.snapshotGate.Unlock()
 	if location.Chunk == s.appendChunk {
 		s.appendLive = live
-	}
-	if s.options.Synchronous {
-		if err := s.committer.Wait(generation); err != nil {
-			return true, err
-		}
-		s.cache.MarkDurable(generation)
 	}
 	return true, nil
 }
@@ -2216,8 +2327,10 @@ func (s *FileStore) mutateFilePosting(tx *storeio.WriteTransaction, state *fileS
 		mask &^= bit
 	}
 	if found {
-		if err := s.appendIndexRetiredRef(state, posting.Page); err != nil {
-			return storeio.PageRef{}, err
+		if posting.Flags&storeio.IndexPostingImmutableBase == 0 {
+			if err := s.appendIndexRetiredRef(state, posting.Page); err != nil {
+				return storeio.PageRef{}, err
+			}
 		}
 	}
 	if mask == 0 {
@@ -2325,6 +2438,14 @@ func (s *FileStore) restoreAppendChunk(state *fileStoreState) error {
 	return nil
 }
 
+func (s *FileStore) waitPublished(generation uint64) error {
+	if err := s.committer.Wait(generation); err != nil {
+		return err
+	}
+	s.cache.MarkDurable(generation)
+	return nil
+}
+
 // Flush waits until the current reader-visible generation is crash-safe.
 func (s *FileStore) Flush() error {
 	if s == nil || s.committer == nil {
@@ -2351,6 +2472,10 @@ func (s *FileStore) Close() error {
 	}
 	s.closed = true
 	s.writer.Unlock()
+	// Synchronous publishers release the construction lock before their
+	// durability wait so independent writers can share one device commit.
+	// Closed prevents any new waiter from registering before this drain.
+	s.durabilityWait.Wait()
 	if err := s.leases.Close(); err != nil {
 		return err
 	}
@@ -2389,6 +2514,13 @@ func (s *FileStore) closeResources() error {
 		if err := writeFile.Close(); err != nil {
 			result = errors.Join(result, err)
 		}
+	}
+	if s.reusableBlock != nil {
+		if err := s.reusableBlock.Close(); err != nil {
+			result = errors.Join(result, err)
+		}
+		s.reusableBlock = nil
+		s.reusable = nil
 	}
 	return result
 }

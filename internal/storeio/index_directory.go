@@ -12,7 +12,7 @@ const (
 	IndexDirectoryBranchRecordSize  = 48
 	indexDirectoryVersion           = uint32(1)
 	indexDirectoryKnownFlags        = uint8(0)
-	indexPostingRefKnownFlags       = uint16(0)
+	indexPostingRefKnownFlags       = IndexPostingImmutableBase
 )
 
 // ErrIndexDirectoryCorrupt reports malformed durable secondary-index routing
@@ -33,6 +33,15 @@ type IndexPostingRef struct {
 	Segment uint16
 	Flags   uint16
 }
+
+const (
+	// IndexPostingImmutableBase marks a posting page shared by several compact
+	// directory entries. Online mutation redirects the changed entry to an
+	// isolated delta page but retains the immutable base extent. Base space is
+	// therefore bounded by the last bulk generation instead of becoming
+	// untracked or requiring page-level reference counts.
+	IndexPostingImmutableBase uint16 = 1 << iota
+)
 
 // IndexDirectoryEntry is one leaf mapping.
 type IndexDirectoryEntry struct {

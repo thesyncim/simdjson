@@ -6,12 +6,14 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
 	defaultCommitQueueSlots = 64
 	defaultCommitGroupLimit = 32
 	maxCommitDescriptors    = 1 << 20
+	maxCommitCoalesce       = time.Second
 )
 
 var (
@@ -38,6 +40,10 @@ type CommitterOptions struct {
 	// GroupLimit bounds adjacent generations collapsed into one durable root.
 	// Zero selects 32. Grouping never crosses the available buffer/page scratch.
 	GroupLimit int
+	// CoalesceDelay is the maximum time the background worker waits after the
+	// first queued generation for adjacent publications to arrive. Publication
+	// itself remains immediate; zero preserves eager durability.
+	CoalesceDelay time.Duration
 }
 
 func (o CommitterOptions) normalized(bufferCount int) (CommitterOptions, error) {
@@ -62,6 +68,9 @@ func (o CommitterOptions) normalized(bufferCount int) (CommitterOptions, error) 
 	}
 	if o.GroupLimit < 1 || o.GroupLimit > o.QueueSlots {
 		return CommitterOptions{}, fmt.Errorf("%w: group limit %d", ErrInvalidWrite, o.GroupLimit)
+	}
+	if o.CoalesceDelay < 0 || o.CoalesceDelay > maxCommitCoalesce {
+		return CommitterOptions{}, fmt.Errorf("%w: coalesce delay %s", ErrInvalidWrite, o.CoalesceDelay)
 	}
 	return o, nil
 }

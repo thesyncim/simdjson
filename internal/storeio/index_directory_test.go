@@ -17,8 +17,8 @@ func TestIndexDirectoryLeafRoundTripAndLookup(t *testing.T) {
 	header := testIndexDirectoryHeader(0, 30)
 	shared := testIndexPageRef(PageIndexPosting, 12, 12, 10)
 	entries := []IndexDirectoryEntry{
-		{Key: IndexDirectoryKey{IndexID: 0, TupleHash: 1}, Posting: IndexPostingRef{Page: shared, Segment: 0}},
-		{Key: IndexDirectoryKey{IndexID: 0, TupleHash: 5}, Posting: IndexPostingRef{Page: shared, Segment: 1}},
+		{Key: IndexDirectoryKey{IndexID: 0, TupleHash: 1}, Posting: IndexPostingRef{Page: shared, Segment: 0, Flags: IndexPostingImmutableBase}},
+		{Key: IndexDirectoryKey{IndexID: 0, TupleHash: 5}, Posting: IndexPostingRef{Page: shared, Segment: 1, Flags: IndexPostingImmutableBase}},
 		{Key: IndexDirectoryKey{IndexID: 2, TupleHash: 0}, Posting: IndexPostingRef{Page: testIndexPageRef(PageIndexPosting, 13, 13, 11), Segment: 7}},
 	}
 	page := make([]byte, testSuperblockPageSize)
@@ -103,7 +103,7 @@ func TestIndexDirectoryRejectsInvalidAndCorrupt(t *testing.T) {
 		{valid[1], valid[0]},
 		{{Key: IndexDirectoryKey{IndexID: 2}, Posting: IndexPostingRef{Page: ref}}},
 		{{Key: IndexDirectoryKey{}, Posting: IndexPostingRef{Page: testIndexPageRef(PageKeyDirectory, 12, 12, 11)}}},
-		{{Key: IndexDirectoryKey{}, Posting: IndexPostingRef{Page: ref, Flags: 1}}},
+		{{Key: IndexDirectoryKey{}, Posting: IndexPostingRef{Page: ref, Flags: 2}}},
 	} {
 		page := make([]byte, testSuperblockPageSize)
 		if _, err := EncodeIndexDirectoryLeaf(page, header, entries, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID, 2); !errors.Is(err, ErrInvalidWrite) {
@@ -121,7 +121,7 @@ func TestIndexDirectoryRejectsInvalidAndCorrupt(t *testing.T) {
 		func(p []byte) { p[PageHeaderSize+8] = 1 },
 		func(p []byte) { p[first+46] = 1 },
 		func(p []byte) { binary.LittleEndian.PutUint32(p[first:first+4], 2) },
-		func(p []byte) { p[first+50] = 1 },
+		func(p []byte) { p[first+50] = 2 },
 		func(p []byte) { p[first+52] = 1 },
 	} {
 		corrupt := append([]byte(nil), page...)

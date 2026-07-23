@@ -191,7 +191,7 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 		go func() {
 			defer workers.Done()
 			for batch := range jobs {
-				part := p.makeFilePartial(batch)
+				part := p.makeFilePartial(batch, stats.IndexBounded)
 				if part.err != nil {
 					cancel()
 				}
@@ -481,9 +481,13 @@ type fileGroup struct {
 	bytes   int64
 }
 
-func (p *plan) makeFilePartial(batch fileBatch) filePartial {
+func (p *plan) makeFilePartial(batch fileBatch, indexBounded bool) filePartial {
 	part := filePartial{seq: batch.seq}
-	docs := &simdjson.DocSet{ShapeTapes: true, Postings: true}
+	// Predicate-free work cannot consume postings, while an index-bounded file
+	// scan has already admitted only the persistent index's candidate rows.
+	// Both cases still evaluate the complete predicate where present, including
+	// collision rechecks, without rebuilding a transient per-batch index.
+	docs := &simdjson.DocSet{Postings: p.where != nil && !indexBounded}
 	start := 0
 	for _, end := range batch.ends {
 		if _, err := docs.Append(batch.data[start:end]); err != nil {

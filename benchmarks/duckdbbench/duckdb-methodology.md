@@ -1,8 +1,9 @@
 # Methodology: Store and DuckDB
 
-This harness compares the keyed mutable `Store` with DuckDB as two embedded
-engines over the same deterministic JSON rows. It is a scoped comparison, not
-a claim that the systems have identical APIs or operational envelopes.
+This harness compares the keyed mutable heap `Store`, the durable bounded-cache
+`FileStore`, and DuckDB as embedded engines over the same deterministic JSON
+rows. It is a scoped comparison, not a claim that the systems have identical
+APIs or operational envelopes.
 
 The comparison has four non-negotiable rules:
 
@@ -10,7 +11,8 @@ The comparison has four non-negotiable rules:
 2. both materialize the same nested scalar used by the exact filter;
 3. every observed count and aggregate must match the generator before ratios
    are rendered; and
-4. live heap, durable file bytes, WAL bytes, and working buffers stay in
+4. heap state, admitted cache, fixed off-heap capacity, durable file bytes, WAL
+   bytes, and working buffers stay in
    separate columns.
 
 ## Reproducible engine
@@ -79,6 +81,26 @@ folds the transient posting tree into packed pointer-free posting pages. This
 keeps load and index construction separately timed while exercising the same
 mutable Store returned to applications.
 
+FileStore starts from the same completed heap Store and writes one compact
+mutable generation with `Store.WriteFileStore`. The creator repacks source
+chunks into eight stable slots per document micro-page, writes exact JSON once,
+packs many exact-posting streams per physical page, builds key/chunk/index/TTL
+directories bottom-up, and then performs one data/tree fence plus one
+superblock fence. It creates no per-row durable generations, free-tree history,
+or persistent load commit arena. The timer includes NDJSON ingestion,
+StoreBuilder completion, all page construction, both fences, and file close.
+
+Packed posting pages are immutable bases. An online mutation redirects only
+the affected stream to an isolated copy-on-write posting page and does not
+retire shared base storage. This is a format invariant, not a benchmark-only
+shortcut.
+
+The measured file is reopened with synchronous mutations, an 8 MiB read-cache
+capacity, a workload-sized 512-entry reusable-extent arena, and the smallest
+power-of-two maximum document page that fits the corpus geometry. The latter
+also bounds commit staging: the harness does not charge every 4 KiB document
+page as though it required a 64 KiB buffer.
+
 DuckDB bulk-loads this table:
 
 ```sql
@@ -116,13 +138,13 @@ All read scenarios execute twice as unprofiled warmups, then `REPS` times with
 JSON profiling enabled. Store also warms its lookup/query state and uses the
 minimum repetition. The report uses DuckDB's `latency`, not shell wall time.
 
-| label | Store | DuckDB |
-|---|---|---|
-| point | `Snapshot.Get` plus compiled pointer | key ART lookup plus `json_extract_string` |
-| filter | exact bitmap candidates plus scalar recheck | `count(*) where filter_value = ?` |
-| sum | compiled numeric column reduction | `sum(metric)` |
-| group | compiled grouped count | SQL `group by filter_value` |
-| contain | structural JSON containment | `json_contains(doc, ?::JSON)` |
+| label | heap Store | durable FileStore | DuckDB |
+|---|---|---|---|
+| point | `Snapshot.Get` plus compiled pointer | copied JSON plus structural index and compiled pointer | key ART lookup plus `json_extract_string` |
+| filter | exact bitmap candidates plus scalar recheck | persistent exact candidates plus scalar recheck | `count(*) where filter_value = ?` |
+| sum | compiled numeric column reduction | bounded page scan and numeric reduction | `sum(metric)` |
+| group | compiled grouped count | bounded page scan and grouped count | SQL `group by filter_value` |
+| contain | structural JSON containment | persistent exact candidates plus structural recheck | `json_contains(doc, ?::JSON)` |
 
 The filter is deliberately low cardinality in clustered synthetic data. DuckDB
 documents ART as a point/high-selectivity structure and may choose a vectorized
@@ -136,15 +158,14 @@ The mutation smoke chooses the first `min(rows, 256)` keys. Each key is updated
 to the valid object `{"bench_mutation":true}`, clearing the indexed scalar and
 metric, and is then deleted.
 
-Each Store call publishes independently. DuckDB wraps each individual SQL
+Each heap Store call publishes independently and remains an in-memory latency
+diagnostic. Each FileStore mutation uses `Synchronous` and waits for its
+checksummed data/root durability fence. DuckDB wraps each individual SQL
 statement in its own explicit `BEGIN`/`COMMIT`; the reported per-operation
-latency sums transaction start, mutation, and commit profiles. This preserves
-the per-key commit boundary instead of comparing one SQL batch with a Go loop.
-
-There is still an important semantic difference: DuckDB commits to a durable
-database/WAL, while the measured Store API is the current in-memory publication
-path. The mutation ratio is diagnostic until Store's durable commit path is the
-measured API.
+latency sums transaction start, mutation, and commit profiles. The durable
+ratio is therefore FileStore versus one DuckDB transaction per key, not a SQL
+batch versus a Go loop. FileStore closes and reopens after the mutation sequence
+and accepts cardinality only from the recovered root.
 
 ## Verification
 
@@ -178,6 +199,21 @@ snapshots, and the exact index, but remains an engine-accounted resident view
 rather than process RSS. The index model is also reported as a diagnostic
 subset.
 
+FileStore records four distinct steady-state categories after recovery and
+warm reads: settled Go heap, currently admitted cache extents, fixed
+mmap-backed commit capacity, and the fixed pointer-free reusable-extent arena.
+`accounted warm` adds heap, admitted—not configured—cache bytes, the complete
+commit arena, and any reusable arena bytes outside the Go heap. The full
+read-cache capacity remains separate. Query batch/merge high-water is caller
+execution state and is not folded into the retained total. These are bounded
+engine-accounting views, not process RSS.
+
+FileStore file length is recorded after flushed close and compared directly
+with DuckDB's checkpointed database length over the same logical payload and
+index contract. Copy-on-write high water after mutations and already reusable
+extent bytes are also reported. A reusable extent remains allocated file space,
+so it is not subtracted from disk usage.
+
 After the checkpoint, DuckDB runs the representative point, filter, aggregate,
 group, and containment working set in one process and records the current
 `duckdb_memory()` total plus its `ART_INDEX` subset. This is shown separately
@@ -203,12 +239,16 @@ retained-generation policy.
 
 ## Timing boundaries
 
-- Store timings are direct in-process Go calls.
+- Store and FileStore timings are direct in-process Go calls.
 - DuckDB `latency` includes parsing, binding, planning, optimization, and
   execution inside the engine; it excludes container startup and CLI output.
 - Both sides use one CPU execution lane.
 - Load consumes the same NDJSON through each engine's intended bulk path.
 - Index build is separate from load.
+- FileStore bulk creation writes one generation, including its frozen index,
+  and completes two durability fences before the load timer stops.
+- FileStore recovery and synchronous mutation timings are separate from the
+  compact creation timing.
 - Read ratios are `DuckDB / Store`; greater than 1 means Store took less time.
 - Storage ratios are each engine's bytes divided by logical key+JSON, never an
   engine-to-engine heap/disk ratio.
@@ -237,12 +277,14 @@ go run ./duckdbbench/cmd/duckdbbench report \
   -out "$root/report.md"
 ```
 
-The 5M run is intentionally not an ordinary test: 400-byte JSON rows plus both
-engines' indexes, durable state, working buffers, and retained artifacts can
-consume several gigabytes. Record machine model, available RAM, operating
-system, image digest, Go version, and a clean working tree alongside any
-published run. A killed or swapping run is a capacity result, not a latency
-result.
+The 5M run is intentionally not an ordinary test: `ours` now measures both the
+heap Store and the durable FileStore, and `-reps 3` creates three complete
+durable candidates before retaining the fastest. Use `-reps 1` for a capacity
+smoke. Four-hundred-byte JSON rows plus both engines' indexes, durable state,
+working buffers, and retained artifacts can consume several gigabytes. Record
+machine model, available RAM, operating system, image digest, Go version, and a
+clean working tree alongside any published run. A killed or swapping run is a
+capacity result, not a latency result.
 
 Ordinary plumbing validation is fast:
 
@@ -254,6 +296,11 @@ For retained-heap attribution of one Store corpus, set
 `DUCKDBBENCH_HEAP_PROFILE=/absolute/path/heap.pprof` on the `ours` command and
 inspect it with `go tool pprof`. Profiling forces an additional GC and is a
 diagnostic run, not timing evidence.
+
+For the recovered FileStore side, use
+`DUCKDBBENCH_FILE_HEAP_PROFILE=/absolute/path/filestore.pprof`. The fixed cache,
+commit, and reusable-extent arenas can live outside Go heap accounting and are
+reported separately, so a heap profile alone is not a resident-memory total.
 
 The pinned container smoke is opt-in:
 

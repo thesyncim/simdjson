@@ -2,6 +2,7 @@ package storeio
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
@@ -368,6 +369,40 @@ func TestCommitterGroupsQueuedGenerationsUnderLatestRoot(t *testing.T) {
 	stats := committer.Stats()
 	if stats.DeviceCommits != 2 || stats.CommittedBatches != 3 || stats.LargestGroup != 2 {
 		t.Fatalf("unexpected grouped stats: %+v", stats)
+	}
+}
+
+func TestCommitterCoalesceWindowGroupsActiveProducer(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "coalesce-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	pageSize := os.Getpagesize()
+	device := newRecordingDevice(8, pageSize)
+	close(device.releaseFirst)
+	committer, err := newCommitter(file, DeviceOptions{
+		Backend: BackendPortable, BufferCount: 8, BufferSize: pageSize,
+	}, CommitterOptions{
+		QueueSlots: 8, MaxPagesPerBatch: 1, GroupLimit: 4,
+		CoalesceDelay: 10 * time.Millisecond,
+	}, func(*os.File, DeviceOptions) (Device, error) { return device, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer committer.Close()
+
+	for generation := uint64(1); generation <= 3; generation++ {
+		publishTestGeneration(t, committer, generation,
+			[]testPage{{offset: int64(generation+1) * int64(pageSize), data: []byte{byte(generation)}}},
+			0, []byte(fmt.Sprintf("root-%d", generation)))
+	}
+	if err := committer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	commits := device.snapshot()
+	if len(commits) != 1 || commits[0].root != "root-3" || len(commits[0].pages) != 3 {
+		t.Fatalf("coalesced commits = %+v, want one three-generation commit", commits)
 	}
 }
 

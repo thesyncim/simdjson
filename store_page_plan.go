@@ -50,7 +50,7 @@ func storePageExtent(required uint64, maximum uint32) (uint32, bool) {
 	return uint32(size), size <= uint64(maximum)
 }
 
-func planStoreChunkDirectories(items []storeChunkDirectoryItem, generation uint64, nextLogical, offset *uint64) ([]storeChunkDirectoryPlan, storeio.PageRef) {
+func planStoreChunkDirectories(items []storeChunkDirectoryItem, generation uint64, pageSize uint32, nextLogical, offset *uint64) ([]storeChunkDirectoryPlan, storeio.PageRef) {
 	if len(items) == 0 {
 		return nil, storeio.PageRef{}
 	}
@@ -93,9 +93,9 @@ func planStoreChunkDirectories(items []storeChunkDirectoryItem, generation uint6
 			}
 			ref := storeio.PageRef{
 				Offset: *offset, LogicalID: *nextLogical, Generation: generation,
-				Length: storePageQuantum, Kind: storeio.PageChunkDirectory,
+				Length: pageSize, Kind: storeio.PageChunkDirectory,
 			}
-			*offset += uint64(storePageQuantum)
+			*offset += uint64(pageSize)
 			*nextLogical++
 			all = append(all, storeChunkDirectoryPlan{
 				prefix: prefix, shift: shift, bitmap: bitmap, children: children, ref: ref,
