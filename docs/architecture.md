@@ -37,9 +37,11 @@ queues and devices, double-superblock recovery, common page framing, packed
 key/chunk/index/TTL/free/document/overflow payloads, copy-on-write tree
 mutations, generation leases, extent reclamation, the quantum-slot CLOCK page
 cache, its pointer-free buddy span allocator, independent Linux
-direct-read/direct-write descriptors, and checksum kernels. Cache bytes live
-in one anonymous arena; lookup entries, free-span links, and one-cache-line
-slot controls are pointer-free, and resident pages synchronize per frame.
+direct-read/direct-write descriptors, one pure-Go native read/commit substrate,
+and checksum kernels. Cache bytes live in one anonymous arena; the native read
+issuer targets reserved spans in that arena directly. Lookup entries,
+free-span links, and one-cache-line slot controls are pointer-free, and
+resident pages synchronize per frame.
 Persistent formats use byte offsets, fixed-width values, and stable logical ids
 rather than Go pointers or runtime layouts. The public `FileStore` composes
 those mechanisms without exposing physical references. Store-specific SIMD

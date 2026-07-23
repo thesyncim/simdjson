@@ -43,6 +43,61 @@ func TestFixedWriteSteadyAllocation(t *testing.T) {
 	}
 }
 
+func TestArenaReadSteadyAllocation(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	ring, file := newFixedTestRing(t)
+	defer func() {
+		if err := ring.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+	if !ring.Features().AsyncRead {
+		t.Skip("kernel does not support IORING_OP_READ")
+	}
+	pageSize := os.Getpagesize()
+	const value = "zero-copy-arena-read"
+	if _, err := file.WriteAt([]byte(value), int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	arena, err := allocateArena(pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := ring.Close(); err != nil {
+			t.Errorf("Close before arena release: %v", err)
+		}
+		if err := releaseArena(arena); err != nil {
+			t.Errorf("release arena: %v", err)
+		}
+	}()
+	if err := ring.useReadArena(arena); err != nil {
+		t.Fatal(err)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		if err := ring.prepareReadArena(0, 0, len(value), int64(pageSize), 43); err != nil {
+			panic(err)
+		}
+		if err := ring.SubmitAndWait(1); err != nil {
+			panic(err)
+		}
+		completion, ok, err := ring.Pop()
+		if err != nil {
+			panic(err)
+		}
+		if !ok || completion.UserData != 43 || completion.Result != int32(len(value)) {
+			panic("unexpected completion")
+		}
+	}); allocs != 0 {
+		t.Fatalf("arena read allocations = %g, want 0", allocs)
+	}
+	if string(arena[:len(value)]) != value {
+		t.Fatalf("arena read = %q, want %q", arena[:len(value)], value)
+	}
+}
+
 func TestRingDeviceCommitSteadyAllocation(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

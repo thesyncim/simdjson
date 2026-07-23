@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -106,6 +107,45 @@ func TestPageCachePrefetchOrderingAndHit(t *testing.T) {
 	}
 }
 
+func TestPageCacheIOUringPrefetchBatch(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("io_uring requires Linux")
+	}
+	file, storeID, refs := newPageCacheFixture(t, 8)
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, ResidentBytes: 8 * pageCacheTestPageSize,
+		StoreID: storeID, PrefetchQueue: 8, ReadConcurrency: 4,
+		Backend: BackendIOUring,
+	})
+	if errors.Is(err, ErrUnavailable) || errors.Is(err, ErrUnsupported) ||
+		errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.ENOMEM) {
+		t.Skip(err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+	if queued, err := cache.Prefetch(refs); err != nil || queued != len(refs) {
+		t.Fatalf("Prefetch = (%d,%v), want (%d,nil)", queued, err, len(refs))
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for cache.Stats().PageReads < uint64(len(refs)) && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	stats := cache.Stats()
+	if stats.ReadBackend != BackendIOUring || stats.PageReads != uint64(len(refs)) ||
+		stats.AsyncReadBatches == 0 || stats.LargestReadBatch < 2 || stats.ReadErrors != 0 {
+		t.Fatalf("io_uring prefetch stats = %+v", stats)
+	}
+	for index, ref := range refs {
+		lease, err := cache.Acquire(ref)
+		if err != nil || lease.Payload()[0] != byte(index+1) {
+			t.Fatalf("Acquire(%d) = (%v,%v)", index, lease.Payload(), err)
+		}
+		lease.Release()
+	}
+}
+
 func TestPageCacheRejectsCorruptionAndShortRead(t *testing.T) {
 	file, storeID, refs := newPageCacheFixture(t, 2)
 	cache, err := NewPageCache(file, PageCacheOptions{
@@ -190,6 +230,68 @@ func TestPageCacheWarmAcquireSteadyAllocation(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("warm Acquire/Release allocations = %v, want 0", allocs)
+	}
+}
+
+func TestPageCacheDemandWaitsForSpeculativeAdmission(t *testing.T) {
+	file, storeID, refs := newPageCacheFixture(t, 2)
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, ResidentBytes: pageCacheTestPageSize,
+		StoreID: storeID, Backend: BackendPortable,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+
+	key, err := cache.validateRef(refs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.mu.Lock()
+	frameIndex, ok := cache.reserveLocked(1)
+	if !ok {
+		t.Fatal("reserve speculative frame")
+	}
+	frame := &cache.frames[frameIndex]
+	frame.lock.Lock()
+	cache.beginExtentLocked(frameIndex, 1, key, cacheKeyHash(key))
+	frame.prefetched = true
+	cache.activeLoads++
+	frame.lock.Unlock()
+	page := cache.extentBytes(frameIndex, refs[0].Length)
+	cache.mu.Unlock()
+	n, err := file.ReadAt(page, int64(refs[0].Offset))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		lease PageLease
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		lease, acquireErr := cache.Acquire(refs[1])
+		done <- result{lease: lease, err: acquireErr}
+	}()
+	select {
+	case got := <-done:
+		got.lease.Release()
+		t.Fatalf("demand returned before speculative completion: %v", got.err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	cache.completePrefetch(pageCacheRingLoad{
+		ref: refs[0], key: key, frame: frameIndex,
+	}, n, nil)
+	select {
+	case got := <-done:
+		if got.err != nil || got.lease.Payload()[0] != 2 {
+			t.Fatalf("demand after speculative completion = (%v,%v)", got.lease.Payload(), got.err)
+		}
+		got.lease.Release()
+	case <-time.After(2 * time.Second):
+		t.Fatal("demand did not resume after speculative completion")
 	}
 }
 
@@ -350,6 +452,10 @@ func TestPageCacheFrameControlIsPointerFree(t *testing.T) {
 	}
 	if frameType.Size() > 64 {
 		t.Fatalf("pageCacheFrame is %d bytes, want at most one cache line", frameType.Size())
+	}
+	loadType := reflect.TypeFor[pageCacheRingLoad]()
+	if !visit(loadType) {
+		t.Fatalf("pageCacheRingLoad contains GC-visible pointer-bearing state: %v", loadType)
 	}
 	linkType := reflect.TypeFor[pageCacheBlockLink]()
 	if !visit(linkType) {

@@ -361,13 +361,13 @@ recovery to return one whole generation, never a mixture.
 16-quantum spans. M4 Max measured 3.73-3.77 ns/op and zero allocations. This
 isolates span control from CLOCK victim selection and device latency.
 
-Mutation is single-writer. With `Synchronous`, `Put`, `Delete`, TTL changes, and
-expiry wait for durability. Without it they return after the bounded committer
-accepts the reader-visible generation; `DurableGeneration` can lag and `Flush`
-or `Close` fences it. Queue and buffer exhaustion applies backpressure. A
-background device error is sticky. The Linux backend can use pure-Go
-`io_uring`; the portable positional-I/O backend is used elsewhere and as the
-fallback.
+Mutation is single-writer. With `Synchronous`, `Put`, `Delete`, TTL changes,
+and expiry wait for durability. Without it they return after the bounded
+committer accepts the reader-visible generation; `DurableGeneration` can lag
+and `Flush` or `Close` fences it. Queue and buffer exhaustion applies
+backpressure. A background device error is sticky. On Linux the native backend
+uses the scoped pure-Go `io_uring` substrate for both durable commits and
+speculative reads; portable positional I/O remains the fallback.
 
 Cache misses can independently select `FileStoreReadBuffered`,
 `FileStoreReadDirectTry`, or `FileStoreReadDirectRequire`. Direct modes reopen
@@ -386,6 +386,21 @@ for an unsupported platform/filesystem; `Stats.DirectReads` and
 construction instead. Direct I/O is a residency control; whether it wins
 latency depends on device, filesystem, queue depth, grouping, and locality.
 
+Native speculative reads use one OS-thread-owned ring. `ReadQueueDepth` fixes
+its maximum SQ/CQ batch independently from `ReadConcurrency`, which bounds the
+portable fallback worker set. `IORING_OP_READ` targets already reserved bytes
+inside the page cache's stable mmap arena, so it adds neither a staging copy nor
+long-term registered-buffer pins. The ring retains no Go-heap pointer. Cache
+identity, CRC32C, and optional typed validation run before a completion changes
+a frame from loading to ready. Duplicate demand misses wait on that same frame.
+If speculative loads temporarily occupy every victim, demand and dirty
+publication wait for one in-flight completion and retry; genuinely leased or
+dirty exhaustion still returns `ErrPageCachePinned`. `Stats.ReadBackend`,
+`AsyncReadBatches`, and `LargestReadBatch` distinguish the actual engine and
+submission geometry. Auto falls back when ring setup is unavailable; a required
+native setup fails construction. A later ring-accounting failure resets every
+affected loading frame before the worker switches to positional reads.
+
 `FileSnapshot` is an explicit generation lease and must be closed. Point reads
 copy into caller storage because an evictable frame cannot safely back an
 unowned `RawValue`. `AppendRaw` is zero-allocation on a resident inline hit
@@ -395,11 +410,12 @@ reusable overflow buffer, making warmed overflow scans allocation-free.
 `RangeRawReadAheadBuffer` is the cold `O_DIRECT` scan lane: it discovers a
 bounded chunk-ordered window, submits those extents in physical order, and
 still invokes callbacks in exact chunk/slot order. The window consumes at most
-one quarter of the resident budget, four requests per read worker, 64 extents,
-and the configured prefetch queue. Buffered files stay on the serial lane so
-user-space scheduling does not fight kernel readahead. The prefetch worker
-queue closes under the same admission lock as nonblocking submission, avoiding
-per-wakeup heap objects while making shutdown race-free.
+one half of the resident budget, 64 extents, and the configured prefetch queue.
+Its parallel cap is `ReadQueueDepth` for the native issuer or four requests per
+portable worker. Buffered files stay on the serial lane so user-space
+scheduling does not fight kernel readahead. The prefetch queue closes under the
+same admission lock as nonblocking submission, avoiding per-wakeup heap objects
+while making shutdown race-free.
 `RangeMasksRawBuffer` applies strictly ordered sparse stable-slot masks and
 preserves exactly the order a filtered full scan would have produced. Dead and
 zero bits cannot invent rows; a non-zero unknown chunk fails closed instead of
@@ -490,45 +506,46 @@ one nested compound index, forces GC before measuring live heap, then measures
 random keyed reads, a 1/256 compound query, updates, delete/reinsert churn, and
 TTL changes. Apple M4 Max, stable Go, one run:
 
-| Records | Build docs/s | Source B/doc | Live heap B/doc | Heap objects/doc | Packed document extents B/doc | Packed exact indexes B/doc | Point read | Compound query |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | 1.42M | 92.9 | 520.5 | 0.256 | 128.2 | 7.27 | 19 ns | 4.15 us / 39 masks |
-| 100,000 | 1.48M | 94.9 | 521.0 | 0.251 | 128.0 | 4.45 | 30 ns | 48.18 us / 390 masks |
-| 5,000,000 | 0.98M | 98.7 | 521.1 | 0.251 | 128.0 | 4.16 | 55 ns | 9.20 ms / 19,531 masks |
+| Records | Build docs/s | Source B/doc | Go heap B/doc | External B/doc | Accounted/source | Heap objects/doc | Packed document extents B/doc | Packed exact indexes B/doc | Point read | Compound query |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 1.22M | 92.9 | 15.5 | 147.2 | 1.75x | 0.021 | 128.2 | 7.27 | 19 ns | 3.81 us / 39 masks |
+| 100,000 | 1.33M | 94.9 | 14.5 | 150.4 | 1.74x | 0.016 | 128.0 | 4.45 | 28 ns | 42.03 us / 390 masks |
+| 5,000,000 | 0.93M | 98.7 | 14.3 | 148.7 | 1.65x | 0.016 | 128.0 | 4.16 | 48 ns | 7.84 ms / 19,531 masks |
 
-At 5M rows, keys plus JSON are 493,480,886 bytes. Packed owned keys and the two
-exact-index bases reduce the current heap from the earlier 3,995,694,760 bytes
-and 13,246,371 objects to 2,605,486,408 bytes and 1,252,619 objects: 65.2% of
-the original heap remains, 90.5% of the objects are gone, and point lookup is
-faster. Actual packed index storage
-is 20,798,476 bytes (4.16 B/doc), within 0.04% of the independent 20,791,296
-byte page projection. The variable document extent model projects to
-640,000,000 bytes (1.30x source); document plus posting extents are about
-1.34x source before key/value directories, TTL/free-space metadata, roots,
-allocator slack, and retained generations.
+At 5M rows, keys plus JSON are 493,480,886 bytes. The complete Store-accounted
+state is 815,323,370 bytes (1.65x source): 71,693,992 bytes of Go live heap plus
+743,629,378 bytes in pointer-free external arenas. External memory avoids GC
+scan and pacing costs; it remains real process memory and is therefore never
+reported as a space saving by itself. Relative to the earlier
+3,995,694,760-byte, 13,246,371-object layout, the current accounted bytes are
+20.4% as large and its 80,674 Go heap objects are 0.61% as numerous.
 
-The remaining 0.251 objects/doc is not accepted as the endpoint. A diagnostic
-reopen through the existing pointer-free checkpoint reached 0.016 objects/doc
-at 100k rows—more than 100x below the original 2.665—but its legacy tape image
-was 5.45x source and made point/index operations slower. That path is evidence
-that the GC target is feasible, not the selected heap format. `FileStore`
-instead keeps corpus metadata in evictable pages, so this heap object target is
-not its residency metric.
+Actual packed index storage is 20,798,476 bytes (4.16 B/doc), within 0.04% of
+the independent 20,791,296-byte page projection. The variable document extent
+model projects to 640,000,000 bytes (1.30x source); document plus posting
+extents are about 1.34x source before key/value directories, TTL/free-space
+metadata, roots, allocator slack, and retained generations. The measured
+0.016 heap objects/doc is about 165x below the original 2.665; corpus bytes and
+base index postings no longer create one GC-visible object per row. `FileStore`
+instead keeps corpus metadata in evictable pages, so heap objects/doc is not its
+residency metric.
 
-Across the same 5M run, indexed update averaged 4.17 us, delete plus reinsert
-7.95 us, and changing an existing TTL 42 ns. The point-read rise from 19 ns to
-55 ns is a cache-footprint result, not an algorithmic complexity change. Query
+Across the same 5M run, indexed update averaged 5.27 us, delete plus reinsert
+9.80 us, and changing an existing TTL 46 ns. The point-read rise from 19 ns to
+48 ns is a cache-footprint result, not an algorithmic complexity change. Query
 time scales with the number of exact result masks because this smoke
 materializes them; a Boolean consumer can combine those stable-slot words
 without decoding rejected documents.
 
 ### Capacity planning for 1 TiB
 
-Heap `Store` measured 62.4 MiB for 25.0 MiB of clustered source JSON with one
-low-cardinality exact index: 2.50 live heap bytes per source byte. A linear
-1 TiB extrapolation would require about 2.50 TiB of live heap. That is workload
-evidence, not a universal multiplier, and is why heap `Store` is not presented
-as a 1 TiB-on-64-GiB database.
+On the current 5M-row, two-index fixture, heap `Store` accounts for 1.65 bytes
+per source key+JSON byte: 0.15 bytes of Go live heap and 1.51 bytes in
+pointer-free external arenas. A linear 1 TiB extrapolation of that exact
+workload is therefore about 1.65 TiB of process-owned memory, including roughly
+0.15 TiB visible to the Go heap. This is workload evidence, not a universal
+multiplier, and external allocation changes GC cost rather than capacity. Heap
+`Store` is not presented as a 1 TiB-on-64-GiB database.
 
 `FileStore` decouples corpus size from Go heap: `ResidentBytes` fixes admitted
 page capacity, while queues, buffers, snapshot leases, and retirement records
@@ -559,11 +576,11 @@ scripts/run-filestore-physical-scale.sh
 
 The measured Linux/ARM64 Docker run stored 2,137 large documents with one
 nested exact index: 6,713,852,053 live key+JSON bytes and 6,920,364,032
-allocated file bytes under a 55,414,784-byte complete cgroup peak, or 121.2x
-and 124.9x peak. File high-water was 6,923,669,504 bytes. Required direct
+allocated file bytes under a 52,576,256-byte complete cgroup peak, or 127.7x
+and 131.6x peak. File high-water was 6,923,669,504 bytes. Required direct
 reads and writes remained active through reopen, distant and nested-index
-probes, update, delete, and changed TTL; the complete run took 12.17 seconds
-and recorded 2,211 page reads and 2,161 evictions. The synthetic 3 MiB-value
+probes, update, delete, and changed TTL; the complete run took 14.79 seconds
+and recorded 2,214 page reads and 2,164 evictions. The synthetic 3 MiB-value
 fixture deliberately keeps row count manageable, so it is a residency and
 correctness proof rather than a small-row latency result.
 
@@ -581,12 +598,15 @@ grouped up to roughly 32 generations. Direct writes are intentionally optional:
 their value is preventing write traffic from displacing the read working set,
 not making small commits universally faster.
 
-The same Linux/ARM64 container, 2,048 inline documents and a 200,704-byte cache
-measured serial direct scans at 61.3-68.4 MiB/s and bounded read-ahead at
-72.3-76.0 MiB/s, with median throughput about 16% higher across three runs.
-Both paths measured 0 B/op and 0 allocs/op after warmup. This is directional
-local evidence, not a portable latency guarantee; the benchmark skips the
-read-ahead sample when direct I/O is not actually active.
+The same Linux/ARM64 container, 2,048 inline documents, and a cache smaller
+than the corpus measured one-second medians of 60.18 MiB/s for serial direct
+reads, 75.03 MiB/s for four portable read-ahead workers, and 182.16 MiB/s for
+the zero-copy native lane at depth 64. Native read-ahead was 2.43x the portable
+median and 3.03x serial. Every path measured 0 B/op and 0 allocs/op after
+warmup. Depth is explicitly tunable: the sweep covered 4, 8, 16, 32, and 64,
+and shorter samples showed greater device variance at wider depths. These are
+directional local measurements, not a portable latency guarantee; direct or
+native samples skip when the host cannot provide the requested feature.
 
 ## TTL
 

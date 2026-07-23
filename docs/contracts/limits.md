@@ -231,10 +231,14 @@ transaction byte bound. The lookup table and 64-byte slot controls contain no
 Go pointers. The buddy free-span directory is also pointer-free and bounded by
 cache quanta plus maximum page size; allocation splits or coalesces one
 power-of-two span without an arena scan. `BufferCount` and `QueueSlots` bound
-commit data/descriptors; `ReadConcurrency` and `PrefetchQueue` bound read work;
-`MaxSnapshotLeases` and `MaxRetiredExtents` bound lifetime/reclamation
-metadata. Exhaustion returns an error or applies queue backpressure rather than
-growing without limit. `Stats` reports current use and pressure.
+commit data/descriptors; `ReadConcurrency` bounds portable workers,
+`ReadQueueDepth` bounds one native batch, and `PrefetchQueue` bounds waiting
+references. `MaxSnapshotLeases` and `MaxRetiredExtents` bound
+lifetime/reclamation metadata. Exhaustion returns an error or applies queue
+backpressure rather than growing without limit. `Stats` reports current use and
+pressure. Native SQ/CQ mappings, pointer-free in-flight descriptors, and
+runtime stacks are bounded by these counts but remain process overhead outside
+`ResidentBytes`.
 
 `PageSize` is a power of two at least 4 KiB. `MaxPageSize` is a power-of-two
 multiple of it. Keys and JSON are rejected above `MaxKeyBytes` and
@@ -277,11 +281,15 @@ page-aligned; durability ordering and caller descriptor ownership are
 unchanged. This prevents sustained writes from populating the kernel page
 cache, but can increase latency for small commit groups.
 `RangeRawReadAheadBuffer` uses this lane to overlap direct document misses. Its
-window is the minimum of one quarter of `ResidentBytes`, `PrefetchQueue`, four
-requests per read worker, and 64 extents. Buffered files retain the serial scan
-and kernel readahead. `Stats.CacheMisses`, `Stats.CoalescedReads`,
-`Stats.ReadErrors`, `Stats.PrefetchHits`, and the queue counters make the
-choice and pressure observable.
+window is the minimum of one half of `ResidentBytes`, `PrefetchQueue`, 64
+extents, and either `ReadQueueDepth` for the native issuer or four requests per
+portable worker. Buffered files retain the serial scan and kernel readahead.
+The native issuer submits `IORING_OP_READ` directly into reserved mmap cache
+spans; it uses no staging copy or registered data buffer. Demand and dirty
+admission wait through transient all-loading pressure, but leased/dirty
+exhaustion still fails closed. `Stats.ReadBackend`, `AsyncReadBatches`,
+`LargestReadBatch`, `CacheMisses`, `CoalescedReads`, `ReadErrors`,
+`PrefetchHits`, and the queue counters make the choice and pressure observable.
 
 The explicit `SIMDJSON_FILESTORE_100X=1` gate covers 21,347,320 source key+JSON
 bytes with a 200,704-byte cache (106.4x), including cold reopen, eviction,
@@ -296,7 +304,7 @@ It compiles before entering a 64 MiB cgroup, requires Linux direct reads and
 writes, checks allocated filesystem blocks rather than logical sparse size,
 and defaults to a 100x ratio. The measured ARM64 Docker run stored
 6,713,852,053 live source bytes and 6,920,364,032 allocated file bytes while
-the complete cgroup peak was 55,414,784 bytes: 121.2x and 124.9x respectively.
+the complete cgroup peak was 52,576,256 bytes: 127.7x and 131.6x respectively.
 It also reopened, probed a nested exact index, updated, deleted,
 and changed TTL under eviction. This proves that corpus residency is bounded;
 one maximum document, caller copy-out, fixed staging buffers, runtime state,

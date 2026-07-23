@@ -16,6 +16,8 @@ func (*Ring) RegisterBuffers(int, int) error { return ErrUnavailable }
 
 func (*Ring) Buffer(int) ([]byte, error) { return nil, ErrUnavailable }
 
+func (*Ring) useReadArena([]byte) error { return ErrUnavailable }
+
 func (*Ring) PrepareWriteFixed(int, int, int, int64, uint64, bool) error {
 	return ErrUnavailable
 }
@@ -23,6 +25,8 @@ func (*Ring) PrepareWriteFixed(int, int, int, int64, uint64, bool) error {
 func (*Ring) PrepareReadFixed(int, int, int, int64, uint64, bool) error {
 	return ErrUnavailable
 }
+
+func (*Ring) prepareReadArena(int, int, int, int64, uint64) error { return ErrUnavailable }
 
 func (*Ring) PrepareDataSync(int, uint64, bool) error { return ErrUnavailable }
 

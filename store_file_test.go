@@ -63,6 +63,11 @@ func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
 		t.Fatal("invalid read concurrency accepted")
 	}
 	options = testFileStoreOptions()
+	options.ReadQueueDepth = -1
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("invalid read queue depth accepted")
+	}
+	options = testFileStoreOptions()
 	options.PrefetchQueue = 32769
 	if _, err := options.normalized(); err == nil {
 		t.Fatal("invalid prefetch queue accepted")

@@ -45,6 +45,10 @@ type Features struct {
 	SingleIssuer bool
 	SingleMmap   bool
 	NoDrop       bool
+	// AsyncRead reports support for IORING_OP_READ into caller-owned stable
+	// memory. PageCache uses it to read directly into its mmap arena without
+	// registered-buffer pinning or a staging copy.
+	AsyncRead bool
 }
 
 // Completion is one consumed completion queue entry. UserData is the opaque

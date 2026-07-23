@@ -1,10 +1,13 @@
 package simdjson
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/thesyncim/simdjson/internal/storeio"
 )
 
 var fileStoreBytesSink []byte
@@ -203,15 +206,34 @@ func BenchmarkFileSnapshotRangeRawPressure(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	for _, readAhead := range []bool{false, true} {
-		name := "serial"
-		if readAhead {
-			name = "read_ahead"
-		}
-		b.Run(name, func(b *testing.B) {
-			store, err := OpenFileStore(file, options)
+	cases := []struct {
+		name           string
+		backend        FileStoreBackend
+		readQueueDepth int
+		readAhead      bool
+	}{
+		{name: "serial", backend: FileStoreBackendPortable},
+		{name: "read_ahead/portable/4", backend: FileStoreBackendPortable, readQueueDepth: 4, readAhead: true},
+		{name: "read_ahead/io_uring/4", backend: FileStoreBackendIOUring, readQueueDepth: 4, readAhead: true},
+		{name: "read_ahead/io_uring/8", backend: FileStoreBackendIOUring, readQueueDepth: 8, readAhead: true},
+		{name: "read_ahead/io_uring/16", backend: FileStoreBackendIOUring, readQueueDepth: 16, readAhead: true},
+		{name: "read_ahead/io_uring/32", backend: FileStoreBackendIOUring, readQueueDepth: 32, readAhead: true},
+		{name: "read_ahead/io_uring/64", backend: FileStoreBackendIOUring, readQueueDepth: 64, readAhead: true},
+	}
+	for _, test := range cases {
+		b.Run(test.name, func(b *testing.B) {
+			openOptions := options
+			openOptions.Backend = test.backend
+			if test.readQueueDepth != 0 {
+				openOptions.ReadQueueDepth = test.readQueueDepth
+			}
+			store, err := OpenFileStore(file, openOptions)
+			if test.backend == FileStoreBackendIOUring &&
+				(errors.Is(err, storeio.ErrUnavailable) || errors.Is(err, storeio.ErrUnsupported)) {
+				b.Skip(err)
+			}
 			if err != nil {
-				b.Fatal(err)
+				b.Fatalf("%v: stats=%+v", err, store.Stats())
 			}
 			defer store.Close()
 			snapshot, err := store.Snapshot()
@@ -219,15 +241,19 @@ func BenchmarkFileSnapshotRangeRawPressure(b *testing.B) {
 				b.Fatal(err)
 			}
 			defer snapshot.Close()
-			if readAhead && !store.Stats().DirectReads {
+			stats := store.Stats()
+			if test.readAhead && !stats.DirectReads {
 				b.Skip("read-ahead pressure benchmark requires active O_DIRECT")
+			}
+			if stats.ReadBackend != test.backend {
+				b.Fatalf("read backend = %v, want %v", stats.ReadBackend, test.backend)
 			}
 			visit := func(_, value []byte) error {
 				fileStoreBytesSink = value
 				return nil
 			}
 			var scratch []byte
-			if readAhead {
+			if test.readAhead {
 				scratch, err = snapshot.RangeRawReadAheadBuffer(scratch[:0], visit)
 			} else {
 				scratch, err = snapshot.RangeRawBuffer(scratch[:0], visit)
@@ -239,14 +265,19 @@ func BenchmarkFileSnapshotRangeRawPressure(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
-				if readAhead {
+				if test.readAhead {
 					scratch, err = snapshot.RangeRawReadAheadBuffer(scratch[:0], visit)
 				} else {
 					scratch, err = snapshot.RangeRawBuffer(scratch[:0], visit)
 				}
 				if err != nil {
-					b.Fatal(err)
+					b.Fatalf("%v: stats=%+v", err, store.Stats())
 				}
+			}
+			b.StopTimer()
+			stats = store.Stats()
+			if test.backend == FileStoreBackendIOUring {
+				b.ReportMetric(float64(stats.LargestReadBatch), "max-read-batch")
 			}
 		})
 	}

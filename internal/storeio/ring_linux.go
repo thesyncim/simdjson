@@ -41,6 +41,7 @@ const (
 	ioUringOpFsync            = 3
 	ioUringOpReadFixed        = 4
 	ioUringOpWriteFixed       = 5
+	ioUringOpRead             = 22
 	ioUringFsyncDataSync      = 1 << 0
 	ioSQEFixedFile            = 1 << 0
 	ioSQEIOLink               = 1 << 2
@@ -217,6 +218,7 @@ type Ring struct {
 	bufferSize int
 	buffers    int
 	bufferBusy []bool
+	readArena  []byte
 }
 
 // Open constructs and maps a ring, then probes the exact operations needed by
@@ -425,6 +427,7 @@ func (r *Ring) requireOperations() error {
 	if !supported[ioUringOpReadFixed] || !supported[ioUringOpWriteFixed] || !supported[ioUringOpFsync] {
 		return ErrUnsupported
 	}
+	r.features.AsyncRead = supported[ioUringOpRead]
 	return nil
 }
 
@@ -506,6 +509,22 @@ func (r *Ring) Buffer(index int) ([]byte, error) {
 	return r.bufferMap[start : start+r.bufferSize], nil
 }
 
+// useReadArena binds the PageCache's stable mmap memory for non-fixed
+// asynchronous reads. The ring borrows arena until Close; it never unmaps it.
+// Keeping this package-private prevents arbitrary Go-heap slices from reaching
+// an asynchronous kernel request.
+func (r *Ring) useReadArena(arena []byte) error {
+	if r.closed {
+		return ErrClosed
+	}
+	if len(r.readArena) != 0 || len(arena) == 0 ||
+		uintptr(unsafe.Pointer(&arena[0]))%uintptr(syscall.Getpagesize()) != 0 {
+		return syscall.EINVAL
+	}
+	r.readArena = arena
+	return nil
+}
+
 // PrepareWriteFixed appends one positional write using a registered file and
 // buffer. linked makes failure cancel the immediately following request.
 func (r *Ring) PrepareWriteFixed(file, buffer, length int, offset int64, userData uint64, linked bool) error {
@@ -516,6 +535,33 @@ func (r *Ring) PrepareWriteFixed(file, buffer, length int, offset int64, userDat
 // buffer. linked makes failure cancel the immediately following request.
 func (r *Ring) PrepareReadFixed(file, buffer, length int, offset int64, userData uint64, linked bool) error {
 	return r.prepareFixed(ioUringOpReadFixed, file, buffer, length, offset, userData, linked)
+}
+
+// prepareReadArena appends one positional read directly into the stable arena
+// supplied to useReadArena. The caller owns non-overlap and must not release or
+// reuse the named bytes until Pop returns this request's completion.
+func (r *Ring) prepareReadArena(file, arenaOffset, length int, offset int64, userData uint64) error {
+	if r.closed {
+		return ErrClosed
+	}
+	if !r.features.AsyncRead {
+		return ErrUnsupported
+	}
+	if file < 0 || file >= r.files || arenaOffset < 0 || length <= 0 ||
+		length > math.MaxInt32 || arenaOffset > len(r.readArena)-length || offset < 0 {
+		return syscall.EINVAL
+	}
+	sqe := ioUringSQE{
+		Opcode:  ioUringOpRead,
+		Flags:   ioSQEFixedFile,
+		FD:      int32(file),
+		Offset:  uint64(offset),
+		Address: uint64(uintptr(unsafe.Pointer(&r.readArena[arenaOffset]))),
+		Length:  uint32(length),
+	}
+	err := r.prepare(sqe, userData, -1)
+	runtime.KeepAlive(r.readArena)
+	return err
 }
 
 func (r *Ring) prepareFixed(op uint8, file, buffer, length int, offset int64, userData uint64, linked bool) error {
@@ -745,6 +791,7 @@ func (r *Ring) Close() error {
 	r.unmapQueues()
 	r.closed = true
 	r.bufferMap = nil
+	r.readArena = nil
 	r.requests = nil
 	r.freeRequests = nil
 	return result

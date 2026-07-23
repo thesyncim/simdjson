@@ -108,6 +108,100 @@ func TestFixedWriteAndDataSync(t *testing.T) {
 	}
 }
 
+func TestArenaReadBatch(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	ring, err := Open(Config{Entries: 8, SingleIssuer: true})
+	if errors.Is(err, ErrUnavailable) || errors.Is(err, ErrUnsupported) {
+		t.Skip(err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := ring.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
+	if !ring.Features().AsyncRead {
+		t.Skip("kernel does not support IORING_OP_READ")
+	}
+	file, err := os.CreateTemp(t.TempDir(), "ring-arena-read-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	pageSize := os.Getpagesize()
+	first := []byte("first-arena-page")
+	second := []byte("second-arena-page")
+	if _, err := file.WriteAt(first, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(second, int64(2*pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ring.RegisterFiles([]int{int(file.Fd())}); err != nil {
+		if errors.Is(err, syscall.ENOMEM) || errors.Is(err, syscall.EPERM) {
+			t.Skip(err)
+		}
+		t.Fatal(err)
+	}
+	arena, err := allocateArena(2 * pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := ring.Close(); err != nil {
+			t.Errorf("Close before arena release: %v", err)
+		}
+		if err := releaseArena(arena); err != nil {
+			t.Errorf("release arena: %v", err)
+		}
+	}()
+	if err := ring.useReadArena(arena); err != nil {
+		t.Fatal(err)
+	}
+	if err := ring.prepareReadArena(0, 0, len(first), int64(pageSize), 41); err != nil {
+		t.Fatal(err)
+	}
+	if err := ring.prepareReadArena(0, pageSize, len(second), int64(2*pageSize), 42); err != nil {
+		t.Fatal(err)
+	}
+	if err := ring.SubmitAndWait(2); err != nil {
+		t.Fatal(err)
+	}
+	var seen [2]bool
+	for range 2 {
+		completion, ok, err := ring.Pop()
+		if err != nil || !ok {
+			t.Fatalf("Pop = (%+v,%v,%v)", completion, ok, err)
+		}
+		if err := completion.Err(); err != nil {
+			t.Fatal(err)
+		}
+		switch completion.UserData {
+		case 41:
+			seen[0] = true
+			if completion.Result != int32(len(first)) {
+				t.Fatalf("first result = %d", completion.Result)
+			}
+		case 42:
+			seen[1] = true
+			if completion.Result != int32(len(second)) {
+				t.Fatalf("second result = %d", completion.Result)
+			}
+		default:
+			t.Fatalf("unexpected user data %d", completion.UserData)
+		}
+	}
+	if !seen[0] || !seen[1] || string(arena[:len(first)]) != string(first) ||
+		string(arena[pageSize:pageSize+len(second)]) != string(second) {
+		t.Fatalf("arena batch = seen %v, first %q, second %q",
+			seen, arena[:len(first)], arena[pageSize:pageSize+len(second)])
+	}
+}
+
 func TestRingDeviceCommit(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

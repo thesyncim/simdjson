@@ -431,7 +431,12 @@ The Linux
 [`io_uring_enter`](https://man7.org/linux/man-pages/man2/io_uring_enter.2.html),
 and [registered-buffer](https://man7.org/linux/man-pages/man7/io_uring_registered_buffers.7.html)
 contracts define the ring mappings, submission/completion ordering, runtime
-features, and long-term buffer pins used by the scoped substrate. Ring memory
+features, and fixed write buffers used by the scoped substrate. Speculative
+reads deliberately use non-fixed `IORING_OP_READ` into stable, reserved cache
+mmap spans: registering the entire cache would impose unnecessary long-term
+pins, while staging buffers would add a copy. One locked-thread issuer owns the
+ring, batches up to `ReadQueueDepth`, and publishes a frame only after exact
+completion length, identity, CRC32C, and typed validation succeed. Ring memory
 mapping is control-plane queue sharing; Store data remains under explicit page
 I/O rather than demand-paged writable mappings.
 
@@ -467,7 +472,8 @@ index update/delete/reopen tests, bounded fan-in spill differentials, async
 flush tests, allocation checks, long-lived-snapshot reclamation/file-growth
 tests, page corruption tests, crash images that tear data and root writes,
 direct read/write descriptor tests, concurrent direct reader/writer pressure,
-and an explicit greater-than-cache gate. The
+an explicit greater-than-cache gate, direct arena-read completion tests, and
+native/portable queue-depth pressure sweeps. The
 latter stores 21,347,320 source key+JSON bytes behind 200,704 resident page
 bytes (106.4x), reopens twice, performs an ordered full scan, probes distant
 keys, and preserves update, delete, and changed TTL. Its 256 MiB Docker/Linux
@@ -486,21 +492,25 @@ The physical-memory gate builds its Linux test binary before entering a
 sparse logical file cannot pass. The measured ARM64 Docker volume stored 2,137
 large documents and one nested exact index: 6,713,852,053 live source bytes,
 6,923,669,504 bytes at file high-water, and 6,920,364,032 allocated bytes
-under a 55,414,784-byte cgroup peak. The source/peak and allocated/peak ratios
-were 121.2x and 124.9x. Reopen, distant and nested-index probes, update,
-delete, and mutable TTL completed under eviction in 12.17 seconds:
+under a 52,576,256-byte cgroup peak. The source/peak and allocated/peak ratios
+were 127.7x and 131.6x. Reopen, distant and nested-index probes, update,
+delete, and mutable TTL completed under eviction in 14.79 seconds:
 
 ```text
 scripts/run-filestore-physical-scale.sh
 ```
 
-Direct full scans use a chunk-ordered read-ahead window bounded by one quarter
-of cache bytes, the configured queue, four requests per worker, and 64 extents.
-Extents are submitted in physical order while callbacks remain logically
-ordered. Buffered files stay serial and use kernel readahead. On the same
-Linux/ARM64 container, a 2,048-document pressure benchmark improved from
-61.3-68.4 MiB/s to 72.3-76.0 MiB/s, about 16% at the three-run medians, with
-0 B/op and 0 allocs/op on both paths.
+Direct full scans use a chunk-ordered read-ahead window bounded by one half of
+cache bytes, the configured queue, 64 extents, and either native
+`ReadQueueDepth` or four requests per portable worker. Extents are submitted in
+physical order while callbacks remain logically ordered. Buffered files stay
+serial and use kernel readahead. On the same Linux/ARM64 container, a
+2,048-document pressure benchmark measured one-second medians of 60.18 MiB/s
+serial, 75.03 MiB/s with four positional-read workers, and 182.16 MiB/s with
+the zero-copy native issuer at depth 64. The native lane was 2.43x portable
+read-ahead and 3.03x serial; all paths remained 0 B/op and 0 allocs/op.
+`ReadBackend`, `AsyncReadBatches`, and `LargestReadBatch` expose the selected
+engine and actual batch high-water.
 
 The full race suite and portable Linux/Windows compile checks are release gates.
 

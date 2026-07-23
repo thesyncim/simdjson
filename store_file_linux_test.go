@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/thesyncim/simdjson/internal/storeio"
 )
@@ -282,7 +283,7 @@ func TestFileStoreDirectReadWriteUnderCachePressure(t *testing.T) {
 	}
 }
 
-func TestFileStoreDirectWritesIOUring(t *testing.T) {
+func TestFileStoreDirectIOUring(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "file-store-direct-ring-*")
 	if err != nil {
 		t.Fatal(err)
@@ -302,6 +303,7 @@ func TestFileStoreDirectWritesIOUring(t *testing.T) {
 		t.Fatal(err)
 	}
 	if stats := store.Stats(); stats.Backend != FileStoreBackendIOUring ||
+		stats.ReadBackend != FileStoreBackendIOUring ||
 		!stats.DirectReads || !stats.DirectWrites {
 		t.Fatalf("direct io_uring stats = %+v", stats)
 	}
@@ -320,7 +322,37 @@ func TestFileStoreDirectWritesIOUring(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
+	keys := make([]string, 16)
+	for row := range keys {
+		keys[row] = fmt.Sprintf("ring:%02d", row)
+	}
+	if queued, err := reopened.PrefetchKeys(keys); err != nil || queued == 0 {
+		t.Fatalf("direct io_uring prefetch = (%d,%v)", queued, err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for reopened.Stats().AsyncReadBatches == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if got, ok, err := reopened.AppendRaw(nil, "ring:63"); err != nil || !ok || string(got) != `{"v":63}` {
 		t.Fatalf("direct io_uring read = (%q,%v,%v)", got, ok, err)
+	}
+	snapshot, err := reopened.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := 0
+	if _, err := snapshot.RangeRawReadAheadBuffer(nil, func(_, _ []byte) error {
+		rows++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stats := reopened.Stats()
+	if rows != 64 || stats.AsyncReadBatches == 0 || stats.LargestReadBatch < 2 ||
+		stats.ReadBackend != FileStoreBackendIOUring {
+		t.Fatalf("direct io_uring batch read = rows %d stats %+v", rows, stats)
 	}
 }

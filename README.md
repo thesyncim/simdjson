@@ -232,6 +232,7 @@ if err != nil {
 }
 store, err := simdjson.CreateFileStore(file, simdjson.FileStoreOptions{
 	ResidentBytes: 256 << 20,
+	ReadQueueDepth: 64,
 	ReadMode:      simdjson.FileStoreReadDirectTry,
 	WriteMode:     simdjson.FileStoreWriteDirectTry,
 	Synchronous:   true,
@@ -261,13 +262,21 @@ splits and coalesces those power-of-two spans without rescanning the arena on
 each miss; pressure performs at most one CLOCK pass instead of repeated
 whole-cache scans. The resident lookup directory and one-cache-line frame
 records are pointer-free, while independent hot pages use independent locks.
-Read workers, prefetch and commit queues, active snapshots, and retired extents
-all have explicit capacities reported by `Stats`.
+Portable read workers, the native read submission depth, prefetch and commit
+queues, active snapshots, and retired extents all have explicit capacities
+reported by `Stats`.
 Direct read and write modes reopen independent Linux `O_DIRECT` descriptors
 when supported and report the actual choices through `Stats.DirectReads` and
 `Stats.DirectWrites`; neither changes or closes the caller's descriptor.
-Direct writes keep sustained ingestion from filling the kernel page cache and
-work with both portable positional I/O and the pure-Go `io_uring` backend.
+With the native backend, one single-owner pure-Go `io_uring` issuer batches
+speculative reads directly into the off-heap cache arena: there is no staging
+copy, registered-buffer pin, per-request goroutine, or steady-state
+allocation. `Stats.ReadBackend`, `AsyncReadBatches`, and `LargestReadBatch`
+report the actual path. Demand misses remain authoritative positional reads,
+and Auto setup or a later ring-accounting failure falls back safely; a required
+native setup fails construction. Direct writes likewise keep sustained
+ingestion from filling the kernel page cache and work with either commit
+backend.
 Async writes become reader-visible when queued; `DurableGeneration` and
 `Flush` expose the durability boundary. `Synchronous` waits on each mutation.
 Snapshot leases fence physical reuse, while the previous durable generation
@@ -282,13 +291,21 @@ a 128 MiB Go limit sampled 17.0 MiB RSS, 18.1 MiB peak RSS, and 3.50 MiB Go
 heap while scanning at 78.0 MiB/s. That is a bounded-residency correctness
 result, not a claim that cold storage has resident-memory latency.
 
+The Linux/ARM64 pressure benchmark now separates serial direct reads, four
+portable read-ahead workers, and native queue-depth sweeps. With 2,048 inline
+documents behind a cache smaller than the corpus, one-second samples measured
+median 60.18 MiB/s serial, 75.03 MiB/s portable read-ahead, and 182.16 MiB/s
+at native depth 64. The native lane was 2.43x the portable median and 3.03x
+serial, with 0 B/op and 0 allocs/op on every path. This is measured
+container-backed storage evidence, not a portable device guarantee.
+
 The separate physical gate compiles outside a 64 MiB Linux cgroup, requires
 direct reads and writes, and stores one nested exact index with 2,137 large
-documents. Its live key+JSON source was 6,713,852,053 bytes (121.2x the
-55,414,784-byte cgroup peak); allocated filesystem blocks were 6,920,364,032
-bytes (124.9x peak), and the file high-water was 6,923,669,504 bytes. It
+documents. Its live key+JSON source was 6,713,852,053 bytes (127.7x the
+52,576,256-byte cgroup peak); allocated filesystem blocks were 6,920,364,032
+bytes (131.6x peak), and the file high-water was 6,923,669,504 bytes. It
 reopened, probed distant keys and the nested index, then updated, deleted, and
-changed TTL under eviction in 12.17 seconds on the measured Docker/Linux ARM64
+changed TTL under eviction in 14.79 seconds on the measured Docker/Linux ARM64
 volume. Run `scripts/run-filestore-physical-scale.sh`; it needs roughly 10 GiB
 free for the default gate. The large-value fixture makes a physical 100x run
 practical and proves the memory boundary, not equal cold-read latency or a
@@ -399,7 +416,7 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Dense bitmap Boolean pass on M4 Max | 75-80 GB/s, 0 allocations; NEON did not beat scalar and is not dispatched |
 | Packed resident document page, JSON-only / full string-key verify | 2.566-2.576 ns / 4.034-4.092 ns, 0 allocations |
 | Packed 64-way chunk-directory hit | 7.17-7.26 ns, 0 allocations |
-| 5M-row indexed Store scale smoke | 0.98M build docs/s, 55 ns point read, 521.1 live-heap B/doc, 0.251 objects/doc, 4.16 packed-index B/doc |
+| 5M-row indexed Store scale smoke | 0.93M build docs/s, 48 ns point read, 14.3 Go-heap + 148.7 external B/doc, 0.016 heap objects/doc, 4.16 packed-index B/doc |
 
 On the hosted AMD EPYC 7763 runner, AVX2 reduced the fused dense Store
 three-predicate kernel from 815-823 ns to 174-175 ns (about 4.7x). The complete

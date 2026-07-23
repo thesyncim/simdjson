@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 )
@@ -30,8 +31,9 @@ var (
 	ErrPageLeaseClosed = errors.New("simdjson: Store page lease already closed")
 )
 
-// PageCacheOptions fixes the complete resident and prefetch memory of a
-// PageCache. ResidentBytes is rounded down to Store allocation quanta. A page
+// PageCacheOptions fixes cache residency and every explicit prefetch bound.
+// ResidentBytes is rounded down to Store allocation quanta. Native ring/control
+// mappings and worker stacks are separate bounded runtime overhead. A page
 // occupies exactly Length/PageSize contiguous slots, so a 4 KiB directory no
 // longer consumes a 64 KiB document frame. StoreID binds every admitted page
 // to one file.
@@ -57,6 +59,14 @@ type PageCacheOptions struct {
 	// four. Demand misses remain synchronous to their caller, while concurrent
 	// misses and prefetches use positional reads safely in parallel.
 	ReadConcurrency int
+	// ReadQueueDepth bounds one native asynchronous submission. Zero selects
+	// PrefetchQueue. It is independent from portable worker concurrency.
+	ReadQueueDepth int
+	// Backend selects the speculative-read engine. Auto tries one pure-Go
+	// io_uring issuer on supported Linux kernels and falls back to portable
+	// positional reads. Demand misses always retain a synchronous correctness
+	// path.
+	Backend Backend
 }
 
 func (o PageCacheOptions) normalized() (PageCacheOptions, int, error) {
@@ -105,6 +115,15 @@ func (o PageCacheOptions) normalized() (PageCacheOptions, int, error) {
 	if o.ReadConcurrency < 1 || o.ReadConcurrency > maxDeviceQueueDepth {
 		return PageCacheOptions{}, 0, fmt.Errorf("%w: read concurrency %d", ErrPageCacheReference, o.ReadConcurrency)
 	}
+	if o.ReadQueueDepth == 0 {
+		o.ReadQueueDepth = o.PrefetchQueue
+	}
+	if o.ReadQueueDepth < 1 || o.ReadQueueDepth > maxDeviceQueueDepth {
+		return PageCacheOptions{}, 0, fmt.Errorf("%w: read queue depth %d", ErrPageCacheReference, o.ReadQueueDepth)
+	}
+	if o.Backend > BackendIOUring {
+		return PageCacheOptions{}, 0, fmt.Errorf("%w: read backend %d", ErrPageCacheReference, o.Backend)
+	}
 	o.ResidentBytes = slots64 * int64(o.PageSize)
 	o.FrameSize = uint32(o.MaxPageSize)
 	return o, int(slots64), nil
@@ -140,6 +159,16 @@ type pageCacheFrame struct {
 	prefetched    bool
 }
 
+// pageCacheRingLoad is one pointer-free in-flight read descriptor owned by the
+// single io_uring worker. frame identifies stable mmap storage; no Go pointer
+// is retained by a kernel request.
+type pageCacheRingLoad struct {
+	ref   PageRef
+	key   pageCacheKey
+	frame int
+	done  bool
+}
+
 // PageCacheStats is a point-in-time accounting snapshot. ResidentBytes counts
 // the exact slot spans of admitted pages, including reads in progress.
 // QueueDepth is sampled from the bounded prefetch queue.
@@ -170,7 +199,15 @@ type PageCacheStats struct {
 	Evictions       uint64
 	PrefetchQueued  uint64
 	PrefetchDropped uint64
-	QueueDepth      uint64
+	// QueueDepth samples references waiting for a read engine.
+	QueueDepth uint64
+	// ReadQueueDepth is the configured native submission bound.
+	ReadQueueDepth uint32
+	ReadBackend    Backend
+	// AsyncReadBatches and LargestReadBatch count successful io_uring
+	// submissions. Portable worker reads do not increment them.
+	AsyncReadBatches uint64
+	LargestReadBatch uint32
 }
 
 // PageCache owns a fixed off-heap slot arena on common Unix platforms and a
@@ -198,23 +235,27 @@ type PageCache struct {
 	prefetch          chan PageRef
 	done              chan struct{}
 	workers           sync.WaitGroup
+	readBackend       atomic.Uint32
 
-	pageReads       uint64
-	readBytes       uint64
-	cacheHitsBase   atomic.Uint64
-	cacheMisses     uint64
-	coalesced       uint64
-	readErrors      uint64
-	copyOuts        uint64
-	prefetchHits    atomic.Uint64
-	evictions       uint64
-	prefetchQueued  uint64
-	prefetchDropped uint64
+	pageReads        uint64
+	readBytes        uint64
+	cacheHitsBase    atomic.Uint64
+	cacheMisses      uint64
+	coalesced        uint64
+	readErrors       uint64
+	copyOuts         uint64
+	prefetchHits     atomic.Uint64
+	evictions        uint64
+	prefetchQueued   uint64
+	prefetchDropped  uint64
+	asyncReadBatches uint64
+	largestReadBatch uint32
 }
 
 // NewPageCache creates a bounded read cache over file. The file remains
 // caller-owned and must outlive the cache. Construction allocates the complete
-// slot arena and starts the fixed portable prefetch worker set.
+// slot arena, then starts either one bounded native issuer or the fixed
+// portable prefetch worker set.
 func NewPageCache(file *os.File, options PageCacheOptions) (*PageCache, error) {
 	if file == nil {
 		return nil, fmt.Errorf("%w: nil file", ErrPageCacheReference)
@@ -242,15 +283,36 @@ func NewPageCache(file *os.File, options PageCacheOptions) (*PageCache, error) {
 	}
 	c.table = make([]atomic.Uint32, tableSize)
 	c.cond = sync.NewCond(&c.mu)
-	c.workers.Add(normalized.ReadConcurrency)
-	for range normalized.ReadConcurrency {
-		go c.runPrefetch()
+	if err := c.startPrefetchWorkers(); err != nil {
+		_ = releaseArena(arena)
+		return nil, err
 	}
 	go func() {
 		c.workers.Wait()
 		close(c.done)
 	}()
 	return c, nil
+}
+
+func (c *PageCache) startPrefetchWorkers() error {
+	if c.options.Backend != BackendPortable {
+		initialized := make(chan error)
+		c.workers.Add(1)
+		go c.runRingPrefetch(initialized)
+		if err := <-initialized; err == nil {
+			return nil
+		} else if c.options.Backend == BackendIOUring {
+			c.workers.Wait()
+			return err
+		}
+		c.workers.Wait()
+	}
+	c.readBackend.Store(uint32(BackendPortable))
+	c.workers.Add(c.options.ReadConcurrency)
+	for range c.options.ReadConcurrency {
+		go c.runPrefetch()
+	}
+	return nil
 }
 
 // PageLease pins one validated frame. The value is single-owner and must not
@@ -406,9 +468,20 @@ func (c *PageCache) AdmitDirty(ref PageRef, src []byte, dirtyGeneration uint64) 
 		return nil
 	}
 	span := int(ref.Length) / c.options.PageSize
-	index, ok := c.reserveLocked(span)
-	if !ok {
-		return ErrPageCachePinned
+	var index int
+	for {
+		var ok bool
+		index, ok = c.reserveLocked(span)
+		if ok {
+			break
+		}
+		if c.activeLoads == 0 {
+			return ErrPageCachePinned
+		}
+		c.cond.Wait()
+		if c.closing.Load() || c.closed {
+			return ErrPageCacheClosed
+		}
 	}
 	frame := &c.frames[index]
 	frame.lock.Lock()
@@ -548,6 +621,10 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 				c.mu.Unlock()
 				return PageLease{}, nil
 			}
+			if c.activeLoads != 0 {
+				c.cond.Wait()
+				continue
+			}
 			c.mu.Unlock()
 			return PageLease{}, ErrPageCachePinned
 		}
@@ -569,15 +646,7 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 		}
 		if readErr == nil {
 			var header PageHeader
-			header, _, readErr = OpenPage(page)
-			if readErr == nil && (header.StoreID != c.options.StoreID || header.PageSize != ref.Length ||
-				header.LogicalID != ref.LogicalID || header.Generation != ref.Generation ||
-				header.Kind != ref.Kind || header.Flags != ref.Flags) {
-				readErr = fmt.Errorf("%w: physical page identity does not match reference", ErrPageCacheReference)
-			}
-			if readErr == nil && c.options.Validate != nil {
-				readErr = c.options.Validate(page, ref)
-			}
+			header, readErr = c.validateLoadedPage(page, ref)
 			c.mu.Lock()
 			c.pageReads++
 			c.readBytes += uint64(n)
@@ -623,6 +692,19 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 		c.mu.Unlock()
 		return PageLease{}, readErr
 	}
+}
+
+func (c *PageCache) validateLoadedPage(page []byte, ref PageRef) (PageHeader, error) {
+	header, _, err := OpenPage(page)
+	if err == nil && (header.StoreID != c.options.StoreID || header.PageSize != ref.Length ||
+		header.LogicalID != ref.LogicalID || header.Generation != ref.Generation ||
+		header.Kind != ref.Kind || header.Flags != ref.Flags) {
+		err = fmt.Errorf("%w: physical page identity does not match reference", ErrPageCacheReference)
+	}
+	if err == nil && c.options.Validate != nil {
+		err = c.options.Validate(page, ref)
+	}
+	return header, err
 }
 
 func (c *PageCache) reserveLocked(span int) (int, bool) {
@@ -938,9 +1020,237 @@ func (c *PageCache) Prefetch(refs []PageRef) (int, error) {
 
 func (c *PageCache) runPrefetch() {
 	defer c.workers.Done()
+	c.runPortablePrefetch()
+}
+
+func (c *PageCache) runPortablePrefetch() {
 	for ref := range c.prefetch {
 		_, _ = c.load(ref, false, true)
 	}
+}
+
+// runRingPrefetch owns one ring and one OS thread for its complete lifetime.
+// It drains the bounded reference channel into ReadQueueDepth-sized batches
+// and submits non-fixed reads directly into reserved page-cache mmap spans.
+// Demand readers that reach the same page coalesce on the ordinary loading
+// state. A ring accounting or submission failure resets every affected frame
+// before this worker continues on the portable correctness path.
+func (c *PageCache) runRingPrefetch(initialized chan<- error) {
+	defer c.workers.Done()
+	runtime.LockOSThread()
+	ring, err := Open(Config{
+		Entries: uint32(c.options.ReadQueueDepth), SingleIssuer: true,
+	})
+	if err == nil {
+		if registerErr := ring.RegisterFiles([]int{int(c.file.Fd())}); registerErr != nil {
+			err = classifyRingSetupError("register read file", registerErr)
+		}
+	}
+	if err == nil && !ring.Features().AsyncRead {
+		err = ErrUnsupported
+	}
+	if err == nil {
+		err = ring.useReadArena(c.arena)
+	}
+	if err != nil {
+		if ring != nil {
+			_ = ring.Close()
+		}
+		runtime.UnlockOSThread()
+		initialized <- err
+		return
+	}
+	c.readBackend.Store(uint32(BackendIOUring))
+	initialized <- nil
+
+	loads := make([]pageCacheRingLoad, c.options.ReadQueueDepth)
+	for {
+		ref, ok := <-c.prefetch
+		if !ok {
+			_ = ring.Close()
+			runtime.UnlockOSThread()
+			return
+		}
+		count, prepareErr := c.prepareRingPrefetch(ring, loads, 0, ref)
+	drain:
+		for prepareErr == nil && count < len(loads) {
+			select {
+			case next, open := <-c.prefetch:
+				if !open {
+					ok = false
+					break drain
+				}
+				count, prepareErr = c.prepareRingPrefetch(ring, loads, count, next)
+			default:
+				break drain
+			}
+		}
+		if count == 0 {
+			if !ok {
+				_ = ring.Close()
+				runtime.UnlockOSThread()
+				return
+			}
+			continue
+		}
+		if prepareErr == nil {
+			prepareErr = ring.SubmitAndWait(uint32(count))
+		}
+		if prepareErr == nil {
+			c.recordAsyncReadBatch(count)
+			prepareErr = c.completeRingPrefetch(ring, loads[:count])
+		}
+		if prepareErr != nil {
+			// Close drains any SQEs that were prepared or submitted before the
+			// failure, so the kernel no longer owns arena bytes when frames are
+			// reset and demand reads retry them.
+			_ = ring.Close()
+			for i := range count {
+				if !loads[i].done {
+					c.completePrefetch(loads[i], 0, prepareErr)
+				}
+				loads[i] = pageCacheRingLoad{}
+			}
+			c.readBackend.Store(uint32(BackendPortable))
+			runtime.UnlockOSThread()
+			c.runPortablePrefetch()
+			return
+		}
+		clear(loads[:count])
+		if !ok {
+			_ = ring.Close()
+			runtime.UnlockOSThread()
+			return
+		}
+	}
+}
+
+func (c *PageCache) prepareRingPrefetch(
+	ring *Ring,
+	loads []pageCacheRingLoad,
+	count int,
+	ref PageRef,
+) (int, error) {
+	load, ok := c.beginPrefetch(ref)
+	if !ok {
+		return count, nil
+	}
+	loads[count] = load
+	arenaOffset := load.frame * c.options.PageSize
+	if err := ring.prepareReadArena(
+		0, arenaOffset, int(ref.Length), int64(ref.Offset), uint64(count),
+	); err != nil {
+		return count + 1, err
+	}
+	return count + 1, nil
+}
+
+func (c *PageCache) beginPrefetch(ref PageRef) (pageCacheRingLoad, bool) {
+	key, err := c.validateRef(ref)
+	if err != nil {
+		return pageCacheRingLoad{}, false
+	}
+	hash := cacheKeyHash(key)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing.Load() || c.closed {
+		return pageCacheRingLoad{}, false
+	}
+	if _, ok := c.lookupLocked(hash, key); ok {
+		return pageCacheRingLoad{}, false
+	}
+	span := int(ref.Length) / c.options.PageSize
+	index, ok := c.reserveLocked(span)
+	if !ok {
+		c.prefetchDropped++
+		return pageCacheRingLoad{}, false
+	}
+	c.cacheMisses++
+	frame := &c.frames[index]
+	frame.lock.Lock()
+	c.beginExtentLocked(index, span, key, hash)
+	frame.prefetched = true
+	c.activeLoads++
+	frame.lock.Unlock()
+	return pageCacheRingLoad{ref: ref, key: key, frame: index}, true
+}
+
+func (c *PageCache) completeRingPrefetch(ring *Ring, loads []pageCacheRingLoad) error {
+	for range loads {
+		completion, ok, err := ring.Pop()
+		if err != nil {
+			return err
+		}
+		if !ok || completion.UserData >= uint64(len(loads)) {
+			return ErrOverflow
+		}
+		index := int(completion.UserData)
+		load := &loads[index]
+		if load.done {
+			return ErrOverflow
+		}
+		load.done = true
+		readErr := completion.Err()
+		n := 0
+		if readErr == nil {
+			n = int(completion.Result)
+			if n != int(load.ref.Length) {
+				readErr = io.ErrUnexpectedEOF
+			}
+		}
+		c.completePrefetch(*load, n, readErr)
+	}
+	return nil
+}
+
+func (c *PageCache) completePrefetch(load pageCacheRingLoad, n int, readErr error) {
+	var header PageHeader
+	if readErr == nil {
+		header, readErr = c.validateLoadedPage(c.extentBytes(load.frame, load.ref.Length), load.ref)
+	}
+	c.mu.Lock()
+	c.pageReads++
+	if n > 0 {
+		c.readBytes += uint64(n)
+	}
+	c.activeLoads--
+	frame := &c.frames[load.frame]
+	frame.lock.Lock()
+	if frame.state != pageCacheLoading || frame.key != load.key {
+		c.readErrors++
+		frame.lock.Unlock()
+		c.cond.Broadcast()
+		c.mu.Unlock()
+		return
+	}
+	if readErr == nil {
+		frame.payloadLength = header.PayloadLength
+		frame.state = pageCacheReady
+	} else {
+		c.readErrors++
+		c.resetExtentLocked(load.frame)
+	}
+	frame.lock.Unlock()
+	c.cond.Broadcast()
+	c.mu.Unlock()
+}
+
+func (c *PageCache) recordAsyncReadBatch(count int) {
+	c.mu.Lock()
+	c.asyncReadBatches++
+	if uint32(count) > c.largestReadBatch {
+		c.largestReadBatch = uint32(count)
+	}
+	c.mu.Unlock()
+}
+
+// ReadBackend reports the active speculative-read engine without locking or
+// performing I/O.
+func (c *PageCache) ReadBackend() Backend {
+	if c == nil {
+		return BackendPortable
+	}
+	return Backend(c.readBackend.Load())
 }
 
 // Stats returns bounded residency, lease, I/O, eviction, and prefetch
@@ -949,21 +1259,25 @@ func (c *PageCache) Stats() PageCacheStats {
 	c.mu.Lock()
 	hits := c.cacheHitsBase.Load()
 	stats := PageCacheStats{
-		CapacityBytes:   uint64(len(c.frames) * c.options.PageSize),
-		FrameSize:       uint32(c.options.MaxPageSize),
-		Frames:          uint32(len(c.frames)),
-		PageReads:       c.pageReads,
-		ReadBytes:       c.readBytes,
-		Misses:          c.cacheMisses,
-		Coalesced:       c.coalesced,
-		ReadErrors:      c.readErrors,
-		Prefetches:      c.prefetchQueued,
-		CopyOuts:        c.copyOuts,
-		PrefetchHits:    c.prefetchHits.Load(),
-		Evictions:       c.evictions,
-		PrefetchQueued:  c.prefetchQueued,
-		PrefetchDropped: c.prefetchDropped,
-		QueueDepth:      uint64(len(c.prefetch)),
+		CapacityBytes:    uint64(len(c.frames) * c.options.PageSize),
+		FrameSize:        uint32(c.options.MaxPageSize),
+		Frames:           uint32(len(c.frames)),
+		PageReads:        c.pageReads,
+		ReadBytes:        c.readBytes,
+		Misses:           c.cacheMisses,
+		Coalesced:        c.coalesced,
+		ReadErrors:       c.readErrors,
+		Prefetches:       c.prefetchQueued,
+		CopyOuts:         c.copyOuts,
+		PrefetchHits:     c.prefetchHits.Load(),
+		Evictions:        c.evictions,
+		PrefetchQueued:   c.prefetchQueued,
+		PrefetchDropped:  c.prefetchDropped,
+		QueueDepth:       uint64(len(c.prefetch)),
+		ReadQueueDepth:   uint32(c.options.ReadQueueDepth),
+		ReadBackend:      c.ReadBackend(),
+		AsyncReadBatches: c.asyncReadBatches,
+		LargestReadBatch: c.largestReadBatch,
 	}
 	for i := range c.frames {
 		frame := &c.frames[i]

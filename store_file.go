@@ -33,7 +33,7 @@ var (
 	ErrFileStoreDeadlineRange = errors.New("simdjson: FileStore deadline is outside Unix-nanosecond range")
 )
 
-// FileStoreBackend selects the durable page-I/O implementation.
+// FileStoreBackend selects the durable commit and speculative-read engines.
 type FileStoreBackend uint8
 
 const (
@@ -78,10 +78,14 @@ type FileStoreOptions struct {
 	// durable generation. Their order assigns stable on-disk index IDs.
 	Indexes []StoreIndexDefinition
 
-	PageSize         int
-	MaxPageSize      int
-	ResidentBytes    int64
-	ReadConcurrency  int
+	PageSize      int
+	MaxPageSize   int
+	ResidentBytes int64
+	// ReadConcurrency bounds portable positional-read workers.
+	ReadConcurrency int
+	// ReadQueueDepth bounds one native asynchronous read submission.
+	ReadQueueDepth int
+	// PrefetchQueue bounds references waiting for either read engine.
 	PrefetchQueue    int
 	MaxKeyBytes      int
 	InlineValueBytes int
@@ -89,7 +93,9 @@ type FileStoreOptions struct {
 	BufferCount      int
 	QueueSlots       int
 	GroupLimit       int
-	Backend          FileStoreBackend
+	// Backend selects both engines; Stats reports the actual read and write
+	// choices independently after Auto fallback.
+	Backend FileStoreBackend
 	// ReadMode controls cache-miss reads independently from durable writes.
 	// DirectTry has observable fallback; DirectRequire fails when unavailable.
 	ReadMode FileStoreReadMode
@@ -131,6 +137,9 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 	if o.PrefetchQueue == 0 {
 		o.PrefetchQueue = 64
 	}
+	if o.ReadQueueDepth == 0 {
+		o.ReadQueueDepth = o.PrefetchQueue
+	}
 	if o.MaxKeyBytes == 0 {
 		o.MaxKeyBytes = 256
 	}
@@ -153,6 +162,7 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 		o.MaxKeyBytes < 1 || o.InlineValueBytes < 1 || o.MaxDocumentBytes < 1 ||
 		o.InlineValueBytes > o.MaxDocumentBytes || uint64(o.MaxPageSize) > uint64(^uint32(0)) ||
 		o.ReadConcurrency < 1 || o.ReadConcurrency > 32768 ||
+		o.ReadQueueDepth < 1 || o.ReadQueueDepth > 32768 ||
 		o.PrefetchQueue < 1 || o.PrefetchQueue > 32768 {
 		return normalizedFileStoreOptions{}, fmt.Errorf("simdjson: invalid FileStore page, key, value, backend, or read option")
 	}
@@ -307,7 +317,14 @@ type FileStoreStats struct {
 	Evictions       uint64
 	PrefetchQueued  uint64
 	PrefetchDropped uint64
-	ReadQueueDepth  uint64
+	// PrefetchQueueDepth samples references waiting for either read engine.
+	PrefetchQueueDepth uint64
+	// ReadQueueDepth is the configured native submission bound.
+	ReadQueueDepth uint32
+	// AsyncReadBatches counts successful native submissions.
+	AsyncReadBatches uint64
+	// LargestReadBatch is the native submission high-water.
+	LargestReadBatch uint32
 
 	PublishedGeneration uint64
 	DurableGeneration   uint64
@@ -315,7 +332,11 @@ type FileStoreStats struct {
 	DeviceCommits       uint64
 	CommittedBatches    uint64
 	LargestCommitGroup  uint32
-	Backend             FileStoreBackend
+	// Backend reports the durable write engine.
+	Backend FileStoreBackend
+	// ReadBackend reports the active speculative-read engine. Demand misses
+	// remain correct through positional reads regardless of this value.
+	ReadBackend FileStoreBackend
 	// DirectReads reports actual O_DIRECT cache-miss reads, not merely a
 	// requested try-direct policy.
 	DirectReads bool
@@ -466,6 +487,8 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 		PageSize: options.PageSize, MaxPageSize: options.MaxPageSize,
 		ResidentBytes: options.ResidentBytes, StoreID: storeID,
 		PrefetchQueue: options.PrefetchQueue, ReadConcurrency: options.ReadConcurrency,
+		ReadQueueDepth: options.ReadQueueDepth,
+		Backend:        storeio.Backend(options.Backend),
 	})
 	if err != nil {
 		if readFile != file {
@@ -874,11 +897,13 @@ func (s *FileStore) Stats() FileStoreStats {
 		CacheMisses: cache.Misses, CoalescedReads: cache.Coalesced, ReadErrors: cache.ReadErrors,
 		PrefetchHits: cache.PrefetchHits, Evictions: cache.Evictions,
 		PrefetchQueued: cache.PrefetchQueued, PrefetchDropped: cache.PrefetchDropped,
-		ReadQueueDepth:      cache.QueueDepth,
+		PrefetchQueueDepth: cache.QueueDepth, ReadQueueDepth: cache.ReadQueueDepth,
+		AsyncReadBatches: cache.AsyncReadBatches, LargestReadBatch: cache.LargestReadBatch,
 		PublishedGeneration: commit.PublishedGeneration, DurableGeneration: commit.DurableGeneration,
 		CommitQueueDepth: commit.QueuedGenerations, DeviceCommits: commit.DeviceCommits,
 		CommittedBatches: commit.CommittedBatches, LargestCommitGroup: commit.LargestGroup,
 		Backend:          FileStoreBackend(commit.Backend),
+		ReadBackend:      FileStoreBackend(cache.ReadBackend),
 		DirectReads:      s.directRead,
 		DirectWrites:     s.directWrite,
 		SnapshotCapacity: leases.Capacity, ActiveSnapshots: leases.Active,

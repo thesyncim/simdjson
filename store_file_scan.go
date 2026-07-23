@@ -48,9 +48,10 @@ func (s *FileSnapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte)
 // RangeRawReadAheadBuffer is the bounded cold-scan form of RangeRawBuffer.
 // It discovers a small chunk-ordered window, submits its document extents in
 // physical order, and still invokes fn in exact chunk/slot order. The window
-// is capped by one quarter of ResidentBytes, PrefetchQueue, four requests per
-// read worker, and 64 extents. Queue pressure merely shortens read-ahead;
-// demand reads remain authoritative and return every validation or I/O error.
+// is capped by one half of ResidentBytes, PrefetchQueue, 64 extents, and either
+// ReadQueueDepth for io_uring or four requests per portable worker. Queue
+// pressure merely shortens read-ahead; demand reads remain authoritative and
+// return every validation or I/O error.
 //
 // Read-ahead is speculative: if fn stops early, at most one bounded window may
 // already have been submitted. The method retains no page lease across fn and
@@ -65,7 +66,9 @@ func (s *FileSnapshot) RangeRawReadAheadBuffer(scratch []byte, fn func(key, valu
 	// Buffered files already receive kernel readahead, and feeding resident
 	// hits through the user-space queue costs more than a direct scan. Explicit
 	// read-ahead is for O_DIRECT, where each miss otherwise blocks the walker.
-	if !s.store.directRead || s.store.options.ReadConcurrency == 1 {
+	readBackend := s.store.cache.ReadBackend()
+	if !s.store.directRead ||
+		(readBackend != storeio.BackendIOUring && s.store.options.ReadConcurrency == 1) {
 		return s.RangeRawBuffer(scratch, fn)
 	}
 	state := s.state
@@ -152,11 +155,15 @@ func (s *FileSnapshot) RangeMasksRawBuffer(masks []StoreMask, scratch []byte, fn
 
 func (s *FileSnapshot) fileScanReadAheadWindow() (int, uint64) {
 	options := s.store.options
-	pageLimit := min(fileScanReadAheadLimit, options.PrefetchQueue, options.ReadConcurrency*4)
+	parallelLimit := options.ReadConcurrency * 4
+	if s.store.cache.ReadBackend() == storeio.BackendIOUring {
+		parallelLimit = options.ReadQueueDepth
+	}
+	pageLimit := min(fileScanReadAheadLimit, options.PrefetchQueue, parallelLimit)
 	if pageLimit < 1 {
 		pageLimit = 1
 	}
-	byteLimit := uint64(options.ResidentBytes / 4)
+	byteLimit := uint64(options.ResidentBytes / 2)
 	if byteLimit < uint64(options.MaxPageSize) {
 		byteLimit = uint64(options.MaxPageSize)
 	}
