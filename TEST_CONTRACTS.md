@@ -175,6 +175,7 @@ shape_column_typed_test.go
 shape_test.go
 store_test.go
 store_builder_test.go
+store_file_linux_test.go
 store_file_reliability_test.go
 store_file_test.go
 store_bitmap_test.go
@@ -310,6 +311,7 @@ store_scale_smoke_test.go
 shape_column_typed_bench_test.go
 store_bench_test.go
 store_file_bench_test.go
+store_file_scale_smoke_test.go
 store_index_packed_bench_test.go
 store_persist_bench_test.go
 store_persist_mmap_unix_test.go
