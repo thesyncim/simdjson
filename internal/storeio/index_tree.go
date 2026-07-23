@@ -104,7 +104,8 @@ func appendIndexTreeRange(cache *PageCache, ref PageRef, low, high IndexDirector
 		lease.Release()
 		return dst, nil
 	}
-	children := make([]IndexDirectoryChild, view.Len())
+	var childStorage [64]IndexDirectoryChild
+	children := childStorage[:view.Len()]
 	for i := range children {
 		children[i], _ = view.ChildAt(i)
 	}

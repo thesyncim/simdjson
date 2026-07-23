@@ -24,17 +24,18 @@ import (
 type Workspace struct {
 	ctx execCtx
 
-	raws           [][]simdjson.RawValue
-	numRaws        []simdjson.RawValue
-	selected       []int
-	candidates     [][]int
-	candidateUsed  int
-	emptyCandidate [1]int
-	storeMasks     [][]simdjson.StoreMask
-	storeMaskUsed  int
-	storeRows      []simdjson.StoreRow
-	storeIndexes   []simdjson.StoreIndexInfo
-	emptyStoreMask [1]simdjson.StoreMask
+	raws             [][]simdjson.RawValue
+	numRaws          []simdjson.RawValue
+	selected         []int
+	candidates       [][]int
+	candidateUsed    int
+	emptyCandidate   [1]int
+	storeMasks       [][]simdjson.StoreMask
+	storeMaskUsed    int
+	storeIndexProbes int
+	storeRows        []simdjson.StoreRow
+	storeIndexes     []simdjson.StoreIndexInfo
+	emptyStoreMask   [1]simdjson.StoreMask
 
 	containsEntries []simdjson.IndexEntry
 	text            []byte
@@ -145,7 +146,10 @@ func (p *plan) runSnapshotInto(dst *Result, snapshot simdjson.Snapshot, w *Works
 	} else if handled {
 		return nil
 	}
-	masks := p.storeCandidateMasks(snapshot, w)
+	masks, err := p.storeCandidateMasks(snapshot, w)
+	if err != nil {
+		return err
+	}
 	candidateCount := 0
 	for _, mask := range masks {
 		candidateCount += bits.OnesCount64(mask.Bits)

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"os"
 	"runtime"
 	"slices"
@@ -28,20 +29,50 @@ type FileExecutionOptions struct {
 	BatchBytes     int64
 	MemoryBytes    int64
 	SpillDirectory string
+	// Workspace retains late-bound index-planning storage across executions.
+	// It is single-consumer; concurrent calls need independent workspaces.
+	Workspace *FileExecutionWorkspace
+}
+
+// FileExecutionWorkspace owns reusable persistent-index planning storage. The
+// zero value is ready to use. It does not own worker batches or returned
+// Result cells, whose cardinality depends on each execution.
+type FileExecutionWorkspace struct {
+	planner  Workspace
+	index    simdjson.FileIndexWorkspace
+	overflow []byte
+}
+
+// Release drops storage retained by durable index planning.
+func (w *FileExecutionWorkspace) Release() {
+	if w == nil {
+		return
+	}
+	w.planner = Workspace{}
+	w.index.Release()
+	w.overflow = nil
 }
 
 // FileExecutionStats describes the physical work performed by
-// [Query.RunFileSnapshot]. BufferedBytes is the largest measured batch or
-// in-memory merge frontier; it excludes the caller-owned final Result.
+// [Query.RunFileSnapshot]. RowsTotal is the snapshot cardinality while
+// RowsScanned is the number of JSON documents admitted to execution after
+// persistent-index pushdown. An IndexBounded execution still rechecks the
+// complete predicate. BufferedBytes is the largest measured batch or in-memory
+// merge frontier; it excludes the caller-owned final Result.
 type FileExecutionStats struct {
-	Workers        int
-	RowsScanned    uint64
-	Batches        uint64
-	PeakBatchRows  int
-	PeakBatchBytes int64
-	BufferedBytes  int64
-	SpillRuns      uint64
-	SpilledBytes   int64
+	Workers         int
+	RowsTotal       uint64
+	RowsScanned     uint64
+	Batches         uint64
+	PeakBatchRows   int
+	PeakBatchBytes  int64
+	BufferedBytes   int64
+	SpillRuns       uint64
+	SpilledBytes    int64
+	IndexBounded    bool
+	IndexLookups    int
+	CandidateRows   uint64
+	CandidateChunks int
 }
 
 const (
@@ -120,7 +151,28 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 	if err != nil {
 		return result, FileExecutionStats{}, err
 	}
-	stats := FileExecutionStats{Workers: n.workers}
+	stats := FileExecutionStats{Workers: n.workers, RowsTotal: snapshot.Len()}
+	fileWorkspace := opts.Workspace
+	var localWorkspace FileExecutionWorkspace
+	if fileWorkspace == nil {
+		fileWorkspace = &localWorkspace
+	}
+	candidateMasks, err := p.fileCandidateMasks(snapshot, &fileWorkspace.index, &fileWorkspace.planner)
+	if err != nil {
+		return result, stats, err
+	}
+	stats.IndexLookups = fileWorkspace.planner.storeIndexProbes
+	stats.IndexBounded = candidateMasks != nil
+	if stats.IndexBounded {
+		for _, mask := range candidateMasks {
+			rows := bits.OnesCount64(mask.Bits)
+			if rows == 0 {
+				continue
+			}
+			stats.CandidateRows += uint64(rows)
+			stats.CandidateChunks++
+		}
+	}
 	spills := newSpillManager(n.spillDir, &stats)
 	defer spills.cleanup()
 
@@ -132,7 +184,7 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 	var stopOnce sync.Once
 	cancel := func() { stopOnce.Do(func() { close(stop) }) }
 
-	go scanFileBatches(snapshot, n, jobs, credits, scanDone, stop)
+	go scanFileBatches(snapshot, candidateMasks, &fileWorkspace.overflow, n, jobs, credits, scanDone, stop)
 	var workers sync.WaitGroup
 	workers.Add(n.workers)
 	for range n.workers {
@@ -351,7 +403,7 @@ type fileScanResult struct {
 	peakBytes int64
 }
 
-func scanFileBatches(snapshot *simdjson.FileSnapshot, opts normalizedFileOptions, jobs chan<- fileBatch, credits chan struct{}, done chan<- fileScanResult, stop <-chan struct{}) {
+func scanFileBatches(snapshot *simdjson.FileSnapshot, masks []simdjson.StoreMask, overflow *[]byte, opts normalizedFileOptions, jobs chan<- fileBatch, credits chan struct{}, done chan<- fileScanResult, stop <-chan struct{}) {
 	defer close(jobs)
 	var out fileScanResult
 	batch := newFileBatch(0, 0, opts)
@@ -374,7 +426,7 @@ func scanFileBatches(snapshot *simdjson.FileSnapshot, opts normalizedFileOptions
 			return errFileExecutionStopped
 		}
 	}
-	out.err = snapshot.RangeRaw(func(_, value []byte) error {
+	appendRow := func(_, value []byte) error {
 		select {
 		case <-stop:
 			return errFileExecutionStopped
@@ -394,7 +446,12 @@ func scanFileBatches(snapshot *simdjson.FileSnapshot, opts normalizedFileOptions
 			return flush()
 		}
 		return nil
-	})
+	}
+	if masks == nil {
+		*overflow, out.err = snapshot.RangeRawBuffer((*overflow)[:0], appendRow)
+	} else {
+		*overflow, out.err = snapshot.RangeMasksRawBuffer(masks, (*overflow)[:0], appendRow)
+	}
 	if out.err == nil {
 		out.err = flush()
 	}

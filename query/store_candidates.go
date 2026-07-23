@@ -6,27 +6,35 @@ import "github.com/thesyncim/simdjson"
 // may outlive online index creation, backfill, or drop; each Snapshot carries
 // the exact catalog generation against which this execution chooses a plan.
 
-func (p *plan) storeCandidateMasks(snapshot simdjson.Snapshot, w *Workspace) []simdjson.StoreMask {
+func (p *plan) storeCandidateMasks(snapshot simdjson.Snapshot, w *Workspace) ([]simdjson.StoreMask, error) {
 	if p.where == nil {
-		return nil
+		return nil, nil
 	}
 	w.storeMaskUsed = 0
+	w.storeIndexProbes = 0
 	w.storeIndexes = snapshot.AppendIndexes(w.storeIndexes[:0])
-	masks, bounded, _ := p.where.storeCandidates(snapshot, p.valuePaths, w.storeIndexes, w)
+	masks, bounded, _, err := p.where.storeCandidates(snapshot, p.valuePaths, w.storeIndexes, w)
+	if err != nil {
+		return nil, err
+	}
 	if !bounded {
-		return nil
+		return nil, nil
 	}
 	if masks == nil {
-		return w.emptyStoreMask[:0]
+		return w.emptyStoreMask[:0], nil
 	}
-	return masks
+	return masks, nil
 }
 
-func (p *compiledPredicate) storeCandidates(snapshot simdjson.Snapshot, paths []compiledPath, indexes []simdjson.StoreIndexInfo, w *Workspace) ([]simdjson.StoreMask, bool, bool) {
+// storeCandidates is the statically dispatched heap-Snapshot planner lane.
+// Keep this concrete rather than routing through an interface: boxing a
+// Snapshot makes variadic index needles escape and breaks RunSnapshotInto's
+// warmed zero-allocation contract.
+func (p *compiledPredicate) storeCandidates(snapshot simdjson.Snapshot, paths []compiledPath, indexes []simdjson.StoreIndexInfo, w *Workspace) ([]simdjson.StoreMask, bool, bool, error) {
 	switch p.kind {
 	case predCmp:
 		if p.op != Eq {
-			return nil, false, false
+			return nil, false, false, nil
 		}
 		path := paths[p.col].indexPath()
 		for _, index := range indexes {
@@ -36,15 +44,16 @@ func (p *compiledPredicate) storeCandidates(snapshot simdjson.Snapshot, paths []
 			out := w.nextStoreMasks()
 			out, err := snapshot.AppendIndexMasks(out, index.Name, p.needle)
 			if err != nil {
-				return nil, false, false
+				return nil, false, false, err
 			}
+			w.storeIndexProbes++
 			w.keepStoreMasks(out)
-			return out, true, true
+			return out, true, true, nil
 		}
-		return nil, false, false
+		return nil, false, false, nil
 	case predContains:
 		if p.containIndexPath == "" {
-			return nil, false, false
+			return nil, false, false, nil
 		}
 		for _, index := range indexes {
 			if index.Kind != simdjson.StoreIndexExact || index.State != simdjson.StoreIndexReady || index.ColumnCount != 1 || index.Columns[0] != p.containIndexPath {
@@ -53,56 +62,64 @@ func (p *compiledPredicate) storeCandidates(snapshot simdjson.Snapshot, paths []
 			out := w.nextStoreMasks()
 			out, err := snapshot.AppendIndexMasks(out, index.Name, p.containIndexNeedle)
 			if err != nil {
-				return nil, false, false
+				return nil, false, false, err
 			}
+			w.storeIndexProbes++
 			w.keepStoreMasks(out)
-			return out, true, true
+			return out, true, true, nil
 		}
-		return nil, false, false
+		return nil, false, false, nil
 	case predAnd:
 		return p.storeAndCandidates(snapshot, paths, indexes, w)
 	case predOr:
 		return p.storeOrCandidates(snapshot, paths, indexes, w)
 	case predNot:
 		if len(p.kids) != 1 {
-			return nil, false, false
+			return nil, false, false, nil
 		}
-		inner, bounded, exact := p.kids[0].storeCandidates(snapshot, paths, indexes, w)
+		inner, bounded, exact, err := p.kids[0].storeCandidates(snapshot, paths, indexes, w)
+		if err != nil {
+			return nil, false, false, err
+		}
 		if !bounded || !exact {
-			return nil, false, false
+			return nil, false, false, nil
 		}
 		live := snapshot.AppendLiveMasks(w.nextStoreMasks())
 		w.keepStoreMasks(live)
 		out := andNotStoreMasks(w.nextStoreMasks(), live, inner)
 		w.keepStoreMasks(out)
-		return out, true, true
+		return out, true, true, nil
 	default:
-		return nil, false, false
+		return nil, false, false, nil
 	}
 }
 
-func (p *compiledPredicate) storeAndCandidates(snapshot simdjson.Snapshot, paths []compiledPath, indexes []simdjson.StoreIndexInfo, w *Workspace) ([]simdjson.StoreMask, bool, bool) {
+func (p *compiledPredicate) storeAndCandidates(snapshot simdjson.Snapshot, paths []compiledPath, indexes []simdjson.StoreIndexInfo, w *Workspace) ([]simdjson.StoreMask, bool, bool, error) {
 	var acc []simdjson.StoreMask
 	have := false
 	allExact := true
-
-	// Prefer the widest directly usable compound definition. It resolves all
-	// of its equality components with one fingerprint probe and one bitmap.
+	var compound simdjson.StoreIndexInfo
 	if index, values, ok := p.bestCompoundIndex(paths, indexes); ok {
+		compound = index
 		acc = w.nextStoreMasks()
 		var err error
 		acc, err = snapshot.AppendIndexMasks(acc, index.Name, values[:index.ColumnCount]...)
-		if err == nil {
-			w.keepStoreMasks(acc)
-			have = true
-			// The complete predicate can still have unindexed conjuncts, so the
-			// compound bound is not by itself exact for a surrounding NOT.
-			allExact = false
+		if err != nil {
+			return nil, false, false, err
 		}
+		w.storeIndexProbes++
+		w.keepStoreMasks(acc)
+		have = true
+		allExact = false
 	}
-
 	for _, kid := range p.kids {
-		rows, bounded, exact := kid.storeCandidates(snapshot, paths, indexes, w)
+		if kid.coveredEquality(paths, compound) {
+			continue
+		}
+		rows, bounded, exact, err := kid.storeCandidates(snapshot, paths, indexes, w)
+		if err != nil {
+			return nil, false, false, err
+		}
 		if !bounded {
 			allExact = false
 			continue
@@ -116,18 +133,21 @@ func (p *compiledPredicate) storeAndCandidates(snapshot simdjson.Snapshot, paths
 		w.keepStoreMasks(acc)
 	}
 	if !have {
-		return nil, false, false
+		return nil, false, false, nil
 	}
-	return acc, true, allExact
+	return acc, true, allExact, nil
 }
 
-func (p *compiledPredicate) storeOrCandidates(snapshot simdjson.Snapshot, paths []compiledPath, indexes []simdjson.StoreIndexInfo, w *Workspace) ([]simdjson.StoreMask, bool, bool) {
+func (p *compiledPredicate) storeOrCandidates(snapshot simdjson.Snapshot, paths []compiledPath, indexes []simdjson.StoreIndexInfo, w *Workspace) ([]simdjson.StoreMask, bool, bool, error) {
 	var acc []simdjson.StoreMask
 	allExact := true
 	for i, kid := range p.kids {
-		rows, bounded, exact := kid.storeCandidates(snapshot, paths, indexes, w)
+		rows, bounded, exact, err := kid.storeCandidates(snapshot, paths, indexes, w)
+		if err != nil {
+			return nil, false, false, err
+		}
 		if !bounded {
-			return nil, false, false
+			return nil, false, false, nil
 		}
 		allExact = allExact && exact
 		if i == 0 {
@@ -137,7 +157,20 @@ func (p *compiledPredicate) storeOrCandidates(snapshot simdjson.Snapshot, paths 
 		acc = unionStoreMasks(w.nextStoreMasks(), acc, rows)
 		w.keepStoreMasks(acc)
 	}
-	return acc, true, allExact
+	return acc, true, allExact, nil
+}
+
+func (p *compiledPredicate) coveredEquality(paths []compiledPath, compound simdjson.StoreIndexInfo) bool {
+	if compound.ColumnCount < 2 || p.kind != predCmp || p.op != Eq {
+		return false
+	}
+	path := paths[p.col].indexPath()
+	for i := 0; i < int(compound.ColumnCount); i++ {
+		if compound.Columns[i] == path {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *compiledPredicate) bestCompoundIndex(paths []compiledPath, indexes []simdjson.StoreIndexInfo) (simdjson.StoreIndexInfo, [simdjson.StoreIndexMaxColumns]simdjson.Index, bool) {

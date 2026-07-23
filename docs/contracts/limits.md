@@ -252,6 +252,14 @@ one oversized row may exceed the target, and an unbounded projection or group
 result necessarily consumes output-proportional memory. Spill merge opens at
 most 32 runs at once and removes its temporary files on return.
 
+Durable exact-index planning can reduce admitted JSON rows but does not weaken
+validation: tuple hashes select candidates and the indexed paths plus complete
+predicate are rechecked. `FileExecutionStats.RowsTotal` and `RowsScanned`
+separate logical cardinality from physical JSON work. `FileIndexWorkspace` and
+`FileExecutionWorkspace` are caller-retained high-water storage and are
+single-consumer. Call `Release` after an exceptional broad probe if retaining
+that capacity is undesirable.
+
 `ReadMode` controls cache misses independently from the commit backend.
 `FileStoreReadBuffered` uses the caller descriptor. On Linux,
 `FileStoreReadDirectTry` and `FileStoreReadDirectRequire` reopen the same inode
@@ -267,10 +275,12 @@ not include process baseline, commit buffers, kernel/device memory, or the
 caller's output, and it does not promise that cold reads match resident hits.
 
 The caller owns the `*os.File` and spill directory. `FileStore.Close` does not
-close the file and fails while `FileSnapshot` leases remain. `RangeRaw` callback
-bytes expire when the callback returns; `AppendRaw` and file-query result cells
-own independent copies. The attached format is pre-v1 and version checked, but
-cross-release compatibility is not yet promised.
+close the file and fails while `FileSnapshot` leases remain. `RangeRaw`,
+`RangeRawBuffer`, and masked-range callback bytes expire when the callback
+returns; `AppendRaw` and file-query result cells own independent copies.
+Sparse masks must be strictly increasing by chunk, and a non-zero mask for a
+chunk absent from the selected snapshot is rejected. The attached format is
+pre-v1 and version checked, but cross-release compatibility is not yet promised.
 
 ## Limits that applications must add
 

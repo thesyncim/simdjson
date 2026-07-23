@@ -39,6 +39,14 @@ var (
 	// ErrStoreIndexScalar reports a lookup value that is absent, invalid, or a
 	// JSON container. Exact indexes deliberately accept scalars only.
 	ErrStoreIndexScalar = errors.New("simdjson: Store exact index requires scalar values")
+	// ErrStoreMaskOrder reports a sparse bitmap stream whose chunk ids are not
+	// strictly increasing. Ordered masks permit allocation-free merge, lookup,
+	// and range execution without copying or sorting caller storage.
+	ErrStoreMaskOrder = errors.New("simdjson: Store masks are not strictly ordered")
+	// ErrStoreMaskChunk reports a non-zero mask for a chunk absent from the
+	// selected snapshot. Failing closed prevents stale or cross-snapshot masks
+	// from silently dropping rows.
+	ErrStoreMaskChunk = errors.New("simdjson: Store mask chunk is not live")
 )
 
 type storeExactIndex struct {

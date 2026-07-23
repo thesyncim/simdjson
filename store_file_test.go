@@ -548,6 +548,44 @@ func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var indexWorkspace FileIndexWorkspace
+	bufferedMasks := make([]StoreMask, 0, 4)
+	bufferedMasks, err = old.AppendIndexMasksInto(
+		bufferedMasks[:0], &indexWorkspace, "tenant_status", acme, active,
+	)
+	if err != nil || countMasks(bufferedMasks) != 2 {
+		t.Fatalf("buffered compound masks = (%+v,%v)", bufferedMasks, err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		var runErr error
+		bufferedMasks, runErr = old.AppendIndexMasksInto(
+			bufferedMasks[:0], &indexWorkspace, "tenant_status", acme, active,
+		)
+		if runErr != nil || countMasks(bufferedMasks) != 2 {
+			panic("buffered index probe failed")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warmed AppendIndexMasksInto allocated %.2f times, want 0", allocs)
+	}
+	bufferedMasks, err = old.AppendIndexCandidateMasksInto(
+		bufferedMasks[:0], &indexWorkspace, "tenant_status", acme, active,
+	)
+	if err != nil || countMasks(bufferedMasks) != 2 {
+		t.Fatalf("buffered compound candidates = (%+v,%v)", bufferedMasks, err)
+	}
+	allocs = testing.AllocsPerRun(100, func() {
+		var runErr error
+		bufferedMasks, runErr = old.AppendIndexCandidateMasksInto(
+			bufferedMasks[:0], &indexWorkspace, "tenant_status", acme, active,
+		)
+		if runErr != nil || countMasks(bufferedMasks) != 2 {
+			panic("buffered index candidate probe failed")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warmed AppendIndexCandidateMasksInto allocated %.2f times, want 0", allocs)
+	}
 	if _, err := store.Put("k00", []byte(`{"id":0,"tenant":"acme","status":"idle"}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -584,5 +622,93 @@ func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
 	wrong.Indexes = []StoreIndexDefinition{{Name: "status", Paths: []string{"/tenant"}}, options.Indexes[1]}
 	if _, err := OpenFileStore(file, wrong); err == nil {
 		t.Fatal("OpenFileStore accepted a mismatched index catalog")
+	}
+}
+
+func TestFileSnapshotRangeMasksRawOrderedAndBuffered(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-mask-range-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	store, err := CreateFileStore(file, testFileStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for i := range 10 {
+		padding := ""
+		if i == 9 {
+			padding = strings.Repeat("x", 1024)
+		}
+		doc := []byte(fmt.Sprintf(`{"id":%d,"padding":%q}`, i, padding))
+		if _, err := store.Put(fmt.Sprintf("k%02d", i), doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if deleted, err := store.Delete("k01"); err != nil || !deleted {
+		t.Fatalf("Delete(k01) = (%v,%v)", deleted, err)
+	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+
+	masks := []StoreMask{
+		{Chunk: 0, Bits: 1<<0 | 1<<1 | 1<<3 | 1<<63},
+		{Chunk: 2, Bits: 1 << 1},
+	}
+	var keys []string
+	scratch := make([]byte, 0, 2048)
+	scratch, err = snapshot.RangeMasksRawBuffer(masks, scratch, func(key, value []byte) error {
+		keys = append(keys, string(key))
+		if len(value) == 0 {
+			t.Fatal("empty value")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(keys, ","), "k00,k03,k09"; got != want {
+		t.Fatalf("masked key order = %q, want %q", got, want)
+	}
+	if cap(scratch) < 1024 {
+		t.Fatalf("caller overflow scratch capacity = %d, want at least 1024", cap(scratch))
+	}
+	if err := snapshot.RangeMasksRaw(
+		[]StoreMask{{Chunk: 2, Bits: 1}, {Chunk: 2, Bits: 2}},
+		func(_, _ []byte) error { return nil },
+	); !errors.Is(err, ErrStoreMaskOrder) {
+		t.Fatalf("duplicate chunk error = %v, want %v", err, ErrStoreMaskOrder)
+	}
+	if err := snapshot.RangeMasksRaw(
+		[]StoreMask{{Chunk: 99, Bits: 1}},
+		func(_, _ []byte) error { return nil },
+	); !errors.Is(err, ErrStoreMaskChunk) {
+		t.Fatalf("unknown chunk error = %v, want %v", err, ErrStoreMaskChunk)
+	}
+
+	steady := []StoreMask{{Chunk: 0, Bits: 1<<0 | 1<<3}, {Chunk: 2, Bits: 1 << 1}}
+	visitBytes := 0
+	visit := func(key, value []byte) error {
+		visitBytes += len(key) + len(value)
+		return nil
+	}
+	scratch, err = snapshot.RangeMasksRawBuffer(steady, scratch[:0], visit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		visitBytes = 0
+		var runErr error
+		scratch, runErr = snapshot.RangeMasksRawBuffer(steady, scratch[:0], visit)
+		if runErr != nil || visitBytes == 0 {
+			panic("masked buffered range failed")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warmed RangeMasksRawBuffer allocated %.2f times, want 0", allocs)
 	}
 }

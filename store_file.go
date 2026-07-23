@@ -519,6 +519,31 @@ type FileSnapshot struct {
 	once  sync.Once
 }
 
+// FileIndexWorkspace retains the transient directory, document, and tape
+// buffers used to collision-recheck one durable exact-index probe. Its zero
+// value is ready to use. Reusing one workspace with AppendIndexMasksInto makes
+// a warmed probe allocation-free when caller dst and the observed candidate
+// and document high-water marks fit retained capacity.
+//
+// A workspace is single-consumer and must not be used concurrently. Release
+// drops retained storage when a rare broad probe should not pin its high-water
+// capacity.
+type FileIndexWorkspace struct {
+	directory []storeio.IndexDirectoryEntry
+	document  []byte
+	tape      []IndexEntry
+}
+
+// Release drops all storage retained by the workspace.
+func (w *FileIndexWorkspace) Release() {
+	if w == nil {
+		return
+	}
+	w.directory = nil
+	w.document = nil
+	w.tape = nil
+}
+
 // Snapshot acquires an explicit generation lease.
 func (s *FileStore) Snapshot() (*FileSnapshot, error) {
 	if s == nil {
@@ -742,215 +767,131 @@ func (s *FileStore) PrefetchKeys(keys []string) (int, error) {
 	return snapshot.PrefetchKeys(keys)
 }
 
-// AppendIndexes appends the frozen exact-index catalog visible to this file
-// snapshot. FileStore indexes are complete from generation one and therefore
-// always report Ready.
-func (s *FileSnapshot) AppendIndexes(dst []StoreIndexInfo) []StoreIndexInfo {
-	if s == nil || s.store == nil || s.state == nil {
-		return dst
-	}
-	for _, definition := range s.store.options.Indexes {
-		info := StoreIndexInfo{
-			Name: definition.Name, Kind: StoreIndexExact, State: StoreIndexReady,
-			TotalChunks: s.state.root.LiveChunks, CoveredChunks: s.state.root.LiveChunks,
-			ColumnCount: uint8(len(definition.Paths)),
-		}
-		copy(info.Columns[:], definition.Paths)
-		dst = append(dst, info)
-	}
-	return dst
-}
-
-// AppendIndexMasks appends exact, collision-rechecked stable-slot masks for a
-// frozen FileStore index. Directory and posting pages are read on demand; only
-// candidate document pages are parsed for the mandatory equality recheck.
-func (s *FileSnapshot) AppendIndexMasks(dst []StoreMask, name string, values ...Index) ([]StoreMask, error) {
-	if s == nil || s.store == nil || s.state == nil {
-		return dst, ErrFileStoreClosed
-	}
-	indexID := -1
-	for i, definition := range s.store.options.Indexes {
-		if definition.Name == name {
-			indexID = i
-			break
-		}
-	}
-	if indexID < 0 {
-		return dst, ErrStoreIndexNotFound
-	}
-	exact := s.store.options.indexes[indexID]
-	hash, err := fileIndexNeedleHash(exact, values)
-	if err != nil {
-		return dst, err
-	}
-	state := s.state
-	if state.indexRoot == (storeio.PageRef{}) {
-		return dst, nil
-	}
-	if uint64(state.root.LiveChunks) > uint64(^uint(0)>>1) {
-		return dst, ErrStoreTooLarge
-	}
-	entries, err := storeio.AppendIndexTreeHash(
-		s.store.cache, state.indexRoot, uint32(indexID), hash,
-		storeio.IndexTreeBounds{
-			FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-			IndexHighWater: state.root.IndexCount,
-		}, nil, int(state.root.LiveChunks),
-	)
-	if err != nil {
-		return dst, err
-	}
-	var raw []byte
-	var scratch []IndexEntry
-	for _, directoryEntry := range entries {
-		postingLease, acquireErr := s.store.cache.Acquire(directoryEntry.Posting.Page)
-		if acquireErr != nil {
-			return dst, acquireErr
-		}
-		postingPage, openErr := storeio.OpenPostingPage(postingLease.Page(), state.root.NextLogicalID, state.root.IndexCount)
-		if openErr != nil {
-			postingLease.Release()
-			return dst, openErr
-		}
-		segment, ok := postingPage.SegmentAt(int(directoryEntry.Posting.Segment))
-		if !ok || postingPage.Header().IndexID != uint32(indexID) || segment.Header().TupleHash != hash {
-			postingLease.Release()
-			return dst, storeio.ErrPostingPageCorrupt
-		}
-		iterator := segment.Iterator()
-		posting, ok := iterator.Next()
-		postingLease.Release()
-		if !ok || posting.Chunk != directoryEntry.Key.Chunk {
-			return dst, storeio.ErrPostingPageCorrupt
-		}
-		documentRef, ok, lookupErr := storeio.LookupChunkTree(s.store.cache, state.chunkRoot, posting.Chunk, storeio.ChunkTreeBounds{
-			FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-		})
-		if lookupErr != nil || !ok {
-			return dst, lookupErr
-		}
-		documentLease, acquireErr := s.store.cache.Acquire(documentRef)
-		if acquireErr != nil {
-			return dst, acquireErr
-		}
-		documentPage, openErr := storeio.OpenDocumentPageWithOverflow(
-			documentLease.Page(), state.root.ChunkHighWater, state.root.NextLogicalID,
-			state.super.FileEnd, state.root.PageSize,
-		)
-		if openErr != nil {
-			documentLease.Release()
-			return dst, openErr
-		}
-		verified := uint64(0)
-		for bitsLeft := posting.Bits; bitsLeft != 0; bitsLeft &= bitsLeft - 1 {
-			slot := uint8(bits.TrailingZeros64(bitsLeft))
-			value, present := documentPage.LookupValue(slot)
-			if !present {
-				documentLease.Release()
-				return dst, storeio.ErrPostingPageCorrupt
-			}
-			raw = raw[:0]
-			raw, err = s.store.appendFileValue(raw, state, value, storeio.KeyLocation{Chunk: posting.Chunk, Slot: slot})
-			if err != nil {
-				documentLease.Release()
-				return dst, err
-			}
-			needed, countErr := RequiredIndexEntries(raw)
-			if countErr != nil {
-				documentLease.Release()
-				return dst, countErr
-			}
-			if cap(scratch) < needed {
-				scratch = make([]IndexEntry, needed)
-			}
-			index, buildErr := BuildIndexOptions(raw, scratch[:needed], s.store.options.Store.IndexOptions)
-			if buildErr != nil {
-				documentLease.Release()
-				return dst, buildErr
-			}
-			matches := true
-			for column := 0; column < int(exact.n); column++ {
-				node, found, pointerErr := index.PointerCompiled(exact.paths[column])
-				if pointerErr != nil || !found || !node.Contains(values[column].Root()) || !values[column].Root().Contains(node) {
-					matches = false
-					break
-				}
-			}
-			if matches {
-				verified |= uint64(1) << slot
-			}
-		}
-		documentLease.Release()
-		if verified != 0 {
-			dst = append(dst, StoreMask{Chunk: posting.Chunk, Bits: verified})
-		}
-	}
-	return dst, nil
-}
-
-func (s *FileStore) AppendIndexMasks(dst []StoreMask, name string, values ...Index) ([]StoreMask, error) {
-	snapshot, err := s.Snapshot()
-	if err != nil {
-		return dst, err
-	}
-	defer snapshot.Close()
-	return snapshot.AppendIndexMasks(dst, name, values...)
-}
-
 // RangeRaw visits live rows in ascending chunk/slot order. key and value are
 // borrowed only for the callback; overflow values reuse one bounded buffer.
 // Returning an error stops the scan immediately.
 func (s *FileSnapshot) RangeRaw(fn func(key, value []byte) error) error {
+	_, err := s.RangeRawBuffer(nil, fn)
+	return err
+}
+
+// RangeRawBuffer is RangeRaw with caller-owned overflow storage. The returned
+// slice preserves any grown capacity for the next scan. Inline-only scans and
+// warmed overflow scans allocate nothing when scratch has sufficient capacity.
+func (s *FileSnapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) error) ([]byte, error) {
 	if s == nil || s.store == nil || s.state == nil {
-		return ErrFileStoreClosed
+		return scratch, ErrFileStoreClosed
 	}
 	if fn == nil {
-		return nil
+		return scratch, nil
 	}
 	state := s.state
-	var overflow []byte
-	return storeio.WalkChunkTree(s.store.cache, state.chunkRoot, storeio.ChunkTreeBounds{
+	err := storeio.WalkChunkTree(s.store.cache, state.chunkRoot, storeio.ChunkTreeBounds{
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
 	}, func(chunk uint32, ref storeio.PageRef) error {
-		lease, err := s.store.cache.Acquire(ref)
-		if err != nil {
-			return err
+		return s.rangeFileDocumentPage(state, chunk, ref, ^uint64(0), &scratch, fn)
+	})
+	return scratch, err
+}
+
+// RangeMasksRaw visits only the live stable slots named by ordered masks.
+// Masks must be strictly increasing by Chunk; zero and dead bits are ignored.
+// The callback order is identical to filtering RangeRaw, so query execution
+// can push an exact index bound into page reads without changing LIMIT,
+// grouping, or stable tie semantics. Inline key/value slices borrow one cache
+// lease for the callback. One overflow buffer is reused for the complete call.
+func (s *FileSnapshot) RangeMasksRaw(masks []StoreMask, fn func(key, value []byte) error) error {
+	_, err := s.RangeMasksRawBuffer(masks, nil, fn)
+	return err
+}
+
+// RangeMasksRawBuffer is RangeMasksRaw with caller-owned overflow storage.
+// The returned slice preserves capacity even when iteration stops with an
+// error, allowing a retry loop to remain allocation-free.
+func (s *FileSnapshot) RangeMasksRawBuffer(masks []StoreMask, scratch []byte, fn func(key, value []byte) error) ([]byte, error) {
+	if s == nil || s.store == nil || s.state == nil {
+		return scratch, ErrFileStoreClosed
+	}
+	if fn == nil {
+		return scratch, nil
+	}
+	state := s.state
+	bounds := storeio.ChunkTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+	}
+	var previous uint32
+	for i, mask := range masks {
+		if i != 0 && mask.Chunk <= previous {
+			return scratch, ErrStoreMaskOrder
 		}
-		view, err := storeio.OpenDocumentPageWithOverflow(
-			lease.Page(), state.root.ChunkHighWater, state.root.NextLogicalID,
-			state.super.FileEnd, state.root.PageSize,
-		)
+		previous = mask.Chunk
+		if mask.Bits == 0 {
+			continue
+		}
+		ref, ok, err := storeio.LookupChunkTree(s.store.cache, state.chunkRoot, mask.Chunk, bounds)
 		if err != nil {
+			return scratch, err
+		}
+		if !ok {
+			return scratch, ErrStoreMaskChunk
+		}
+		if err := s.rangeFileDocumentPage(state, mask.Chunk, ref, mask.Bits, &scratch, fn); err != nil {
+			return scratch, err
+		}
+	}
+	return scratch, nil
+}
+
+func (s *FileSnapshot) rangeFileDocumentPage(
+	state *fileStoreState,
+	chunk uint32,
+	ref storeio.PageRef,
+	mask uint64,
+	overflow *[]byte,
+	fn func(key, value []byte) error,
+) error {
+	lease, err := s.store.cache.Acquire(ref)
+	if err != nil {
+		return err
+	}
+	view, err := storeio.OpenDocumentPageWithOverflow(
+		lease.Page(), state.root.ChunkHighWater, state.root.NextLogicalID,
+		state.super.FileEnd, state.root.PageSize,
+	)
+	if err != nil {
+		lease.Release()
+		return err
+	}
+	if view.Header().ChunkID != chunk {
+		lease.Release()
+		return storeio.ErrDocumentPageCorrupt
+	}
+	for live := view.Header().Live & mask; live != 0; live &= live - 1 {
+		slot := uint8(bits.TrailingZeros64(live))
+		record, ok := view.Lookup(slot)
+		if !ok {
 			lease.Release()
-			return err
+			return storeio.ErrDocumentPageCorrupt
 		}
-		for live := view.Header().Live; live != 0; live &= live - 1 {
-			slot := uint8(bits.TrailingZeros64(live))
-			record, ok := view.Lookup(slot)
-			if !ok {
-				lease.Release()
-				return storeio.ErrDocumentPageCorrupt
-			}
-			value := record.JSON
-			if record.Overflow != (storeio.PageRef{}) {
-				overflow = overflow[:0]
-				overflow, err = s.store.appendFileValue(overflow, state, storeio.DocumentValue{
-					Overflow: record.Overflow, Length: record.JSONLength,
-				}, storeio.KeyLocation{Chunk: chunk, Slot: slot})
-				if err != nil {
-					lease.Release()
-					return err
-				}
-				value = overflow
-			}
-			if err := fn(record.Key, value); err != nil {
+		value := record.JSON
+		if record.Overflow != (storeio.PageRef{}) {
+			*overflow = (*overflow)[:0]
+			*overflow, err = s.store.appendFileValue(*overflow, state, storeio.DocumentValue{
+				Overflow: record.Overflow, Length: record.JSONLength,
+			}, storeio.KeyLocation{Chunk: chunk, Slot: slot})
+			if err != nil {
 				lease.Release()
 				return err
 			}
+			value = *overflow
 		}
-		lease.Release()
-		return nil
-	})
+		if err := fn(record.Key, value); err != nil {
+			lease.Release()
+			return err
+		}
+	}
+	lease.Release()
+	return nil
 }
 
 // Len returns the current durable-state key count.

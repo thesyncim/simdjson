@@ -329,6 +329,13 @@ hash is in the state root, a copy-on-write index tree maps
 `(index id, tuple hash, chunk)` to one stable-slot posting page, and each
 mutation updates affected postings in the same transaction as the document and
 key roots. Probes always reopen candidate documents for exact tuple recheck.
+The file query planner late-binds those definitions, selects one widest
+compound probe before overlapping singles, and routes ordered candidate masks
+into sparse document-page reads. Its routing masks are explicitly a hash-bounded
+superset; every survivor executes the original predicate, so that single
+document pass is also the mandatory collision check. Planner statistics expose
+total, candidate, and scanned rows; an index I/O or validation error fails the
+query instead of silently selecting a different physical plan.
 
 Key, chunk, exact-index, TTL, free, document, and overflow pages are all
 attached to public `FileStore` mutation batches. `Put`, `Delete`, deadline

@@ -44,11 +44,13 @@
 // ordering, and limiting. A compiled query is immutable and safe to run
 // concurrently; Run owns its transient scan state, while concurrent RunInto
 // calls use one independent Result and Workspace pair per goroutine.
-// [Query.RunFileSnapshot] instead scans bounded raw batches, indexes and
-// evaluates them in parallel, restores source order before partial reductions,
-// and externally merges ordered projections or groups when their transient
-// frontier reaches the configured memory target. The caller owns the final
-// result, whose size is necessarily outside that working-memory target.
+// [Query.RunFileSnapshot] first late-binds exact persistent indexes. A bounded
+// plan admits only its collision-rechecked stable-slot masks; an unbounded plan
+// scans every row. It then indexes bounded raw batches in parallel, restores
+// source order before partial reductions, and externally merges ordered
+// projections or groups when their transient frontier reaches the configured
+// memory target. The caller owns the final result, whose size is necessarily
+// outside that working-memory target.
 //
 // # Value semantics
 //

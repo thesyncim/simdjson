@@ -68,9 +68,11 @@ raw, ok := view.GetRaw("user:42")
 | `FileStore.SetDeadline` / `Persist` / `ExpireDue` | mutate the persistent deadline tree | copied key/TTL paths; due work is caller-bounded by `limit` |
 | `FileStore.Snapshot` / `FileSnapshot.Close` | acquire/release a generation lease | O(1); the lease fences physical extent reuse |
 | `FileSnapshot.AppendRaw` | copy exact JSON into caller storage | key-tree lookup + touched document/overflow pages |
-| `FileSnapshot.AppendIndexMasks` | probe a frozen exact index with mandatory document recheck | posting chunks + collision candidates |
+| `FileSnapshot.AppendIndexMasks/Into` | probe a frozen exact index with mandatory document recheck | posting chunks + collision candidates; `Into` reuses caller workspace |
+| `FileSnapshot.AppendIndexCandidateMasksInto` | append a hash-bounded superset for an engine that will recheck | index/posting pages only; never a final answer |
+| `FileSnapshot.RangeRawBuffer` / `RangeMasksRawBuffer` | ordered full or sparse stable-slot scan | touched document/overflow pages; zero allocation after caller scratch warms |
 | `FileStore.Flush` | wait until the visible generation is crash-safe | queued storage work and durability barriers |
-| `query.RunFileSnapshot` | parallel bounded batches with external ordered/group spill | O(input + merge); final result storage is caller-owned |
+| `query.RunFileSnapshot` | late-bound persistent-index pushdown, parallel bounded batches, external ordered/group spill | O(candidate input + merge), or full input when unbounded; final result storage is caller-owned |
 
 A non-positive `ExpireDue`, `BackfillIndex`, or `ReclaimIndexes` limit means all
 currently eligible work. Event loops should normally use a positive limit.
@@ -371,27 +373,52 @@ device, filesystem, queue depth, and locality.
 copy into caller storage because an evictable frame cannot safely back an
 unowned `RawValue`. `AppendRaw` is zero-allocation on a resident inline hit
 when the destination has capacity. `RangeRaw` visits chunk/slot order with one
-document lease at a time and one reusable overflow buffer. `PrefetchKeys`
-deduplicates and physically orders document extents before submitting bounded
-read-ahead.
+document lease at a time. `RangeRawBuffer` also accepts and returns the one
+reusable overflow buffer, making warmed overflow scans allocation-free.
+`RangeMasksRawBuffer` applies strictly ordered sparse stable-slot masks and
+preserves exactly the order a filtered full scan would have produced. Dead and
+zero bits cannot invent rows; a non-zero unknown chunk fails closed instead of
+silently applying a stale or cross-snapshot mask. `PrefetchKeys` deduplicates
+and physically orders document extents before submitting bounded read-ahead.
 
 Exact index definitions are frozen in `FileStoreOptions.Indexes`; their catalog
 hash is part of the durable root. Each mutation updates the affected
 `(index, tuple hash, chunk)` posting page in the same transaction. A probe first
 finds candidate masks and then reopens every candidate document for mandatory
 exact scalar recheck, so hash collisions and alternate escaped spellings cannot
-produce a false result. TTL stores the deadline beside the key and in an ordered
-persistent tree; replacement preserves the deadline and ordinary reads never
-consult the clock.
+produce a false result. `AppendIndexMasksInto` retains the directory, copied
+document, and parse-tape high-water marks in a caller-owned
+`FileIndexWorkspace`; with sufficient output capacity and resident pages, a
+warmed probe allocates zero bytes. `AppendIndexCandidateMasksInto` intentionally
+skips the document pass and returns a superset for engines that immediately
+recheck; using it as a final answer is incorrect. TTL stores the deadline beside
+the key and in an ordered persistent tree; replacement preserves the deadline
+and ordinary reads never consult the clock.
 
-`query.RunFileSnapshot` scans raw pages into bounded arenas, builds batch-local
-`DocSet` indexes in parallel, and merges batches in source order. Projection
-ordering and group state spill as sorted temporary runs after the configured
-memory frontier; multi-pass merge opens at most 32 runs. Temporary files are
-removed on success and error. The memory target excludes the returned `Result`
-and cannot make one oversized document smaller. Parallel floating aggregation
-has deterministic batch order but, like other parallel engines, may differ in
-the last rounding bits from a strictly row-at-a-time sum.
+`query.RunFileSnapshot` late-binds the frozen catalog before starting workers.
+It chooses the widest matching compound equality index, avoids redundant
+overlapping single-column probes, and can intersect `AND` or union a completely
+bounded `OR`. File `NOT` currently stays on the full-scan lane because its
+complement universe would require an independently fallible page walk. An index
+read or validation error is returned; corruption never silently changes the
+plan into a scan. Hash-bounded candidate masks drive `RangeMasksRawBuffer`, then
+the ordinary predicate is evaluated again over every survivor. This single
+document pass supplies the mandatory collision recheck while preserving source
+order, LIMIT ties, and grouped first-row ordering.
+
+Selected raw pages enter bounded arenas, build batch-local indexes in parallel,
+and merge in source order. Projection ordering and group state spill as sorted
+temporary runs after the configured memory frontier; multi-pass merge opens at
+most 32 runs. Temporary files are removed on success and error.
+`FileExecutionStats` exposes `RowsTotal`, `RowsScanned`, `IndexBounded`,
+`IndexLookups`, `CandidateRows`, and `CandidateChunks`, so plan selection is
+observable rather than inferred from latency. A reusable
+`FileExecutionWorkspace` retains index-planner and overflow scratch; worker
+batches and returned result cells remain execution-owned. The memory target
+excludes the returned `Result` and cannot make one oversized document smaller.
+Parallel floating aggregation has deterministic batch order but, like other
+parallel engines, may differ in the last rounding bits from a strictly
+row-at-a-time sum.
 
 Apple M4 Max, stable Go, 1,024 hot documents:
 
@@ -399,13 +426,21 @@ Apple M4 Max, stable Go, 1,024 hot documents:
 | --- | ---: | ---: |
 | `BenchmarkFileSnapshotAppendRaw` | 5.17-5.21 us/op | 0 B/op, 0 allocs/op |
 | `BenchmarkFileSnapshotRangeRaw` | 27.50 us/scan, 1.65 GB/s | 0 B/op, 0 allocs/op |
+| durable exact-index probe, caller workspace | 19.35-19.40 us | 0 B/op, 0 allocs/op |
+| candidate-only routing for the same probe | 2.31-2.42 us | 0 B/op, 0 allocs/op |
+| durable compound equality, 16/1,024 rows scanned | 113.0-114.2 us | 169.8 KB/op, 152 allocs/op |
+| identical unindexed predicate, 1,024/1,024 rows scanned | 664.8-665.3 us | 2.091 MB/op, 2,565 allocs/op |
 | file aggregate, one worker | 745 us, 148 MB/s | 2.42 MB/op, 4,478 allocs/op |
 | file aggregate, four workers | 414 us, 267 MB/s | 2.42 MB/op, 4,481 allocs/op |
 
-These are warm-cache local measurements, not cold-device latency. The query
-allocation is bounded transient batch/index state, not retained corpus state.
-Cold random reads pay device latency; throughput depends on locality, index
-selectivity, page size, queue depth, storage, and the resident budget.
+The 1/64 nested compound fixture is reproducible with
+`BenchmarkRunFileSnapshotPersistentIndexPushdown`; its three samples were
+5.8-5.9x faster and used about 12.3x fewer transient bytes than the same
+predicate over deliberately unindexed duplicate fields. These are warm-cache
+local measurements, not cold-device latency. Query allocation is bounded
+transient batch/index state, not retained corpus state. Cold random reads pay
+device latency; throughput depends on locality, index selectivity, page size,
+queue depth, storage, and the resident budget.
 
 ### Scale smoke: 10k to 5M records
 

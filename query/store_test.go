@@ -66,6 +66,17 @@ func TestRunSnapshotDeclaredIndexesDifferential(t *testing.T) {
 		}
 	}
 	assertSnapshotQueriesEqual(t, queries, set, store.Snapshot(), "ready")
+	plan, err := queries[0].compiled()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace Workspace
+	if _, err := plan.storeCandidateMasks(store.Snapshot(), &workspace); err != nil {
+		t.Fatal(err)
+	}
+	if workspace.storeIndexProbes != 1 {
+		t.Fatalf("compound plan issued %d index probes, want one widest probe", workspace.storeIndexProbes)
+	}
 }
 
 func assertSnapshotQueriesEqual(t *testing.T, queries []*Query, set *simdjson.DocSet, snapshot simdjson.Snapshot, phase string) {
@@ -211,7 +222,10 @@ func TestRunSnapshotSingleMemberContainmentUsesExactIndex(t *testing.T) {
 	}
 	var workspace Workspace
 	snapshot := store.Snapshot()
-	masks := plan.storeCandidateMasks(snapshot, &workspace)
+	masks, err := plan.storeCandidateMasks(snapshot, &workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
 	candidates := 0
 	for _, mask := range masks {
 		candidates += bits.OnesCount64(mask.Bits)

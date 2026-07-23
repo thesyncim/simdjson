@@ -332,6 +332,13 @@ detaches the logical index immediately. Wildcard-posting reclamation is also
 caller-bounded and never performs a hidden full-store completion scan; declared
 roots are reclaimed automatically with their last snapshot.
 
+Durable `FileStore` queries bind their frozen nested or compound definitions at
+execution time. Exact masks drive sparse document-page reads before the same
+predicate is rechecked; index corruption is returned rather than hidden by a
+fallback. `FileExecutionStats` reports total versus scanned rows, probe count,
+and candidate chunks. `FileIndexWorkspace`, caller-buffered masked ranges, and
+`query.FileExecutionWorkspace` retain hot probe and overflow scratch explicitly.
+
 The complete API, ownership rules, expiration semantics, tuning table,
 complexity bounds, zero-allocation recipes, operational counters, and DuckDB
 comparison boundary are in [Mutable Store operations](docs/store.md).
@@ -362,6 +369,8 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Exact-index replace, indexed tuple unchanged | 2.46-2.49 us, 9.9 KiB/op, no added allocations |
 | Indexed Snapshot equality at 10% selectivity | 12.44 ns/input doc, 0 allocations |
 | Indexed Snapshot compound point query | 2.82 ns/input doc, 0 allocations |
+| Durable exact-index probe / candidate-only routing | 19.35-19.40 us / 2.31-2.42 us, 0 allocations |
+| Durable nested compound query, 1/64 selectivity | 113.0-114.2 us vs 664.8-665.3 us full scan; 170 KB vs 2.09 MB transient |
 | Dense Store fused 3-predicate bitmap / ordered 4,096-row decode | 410-416 ns / 4.03-4.08 us, 0 allocations |
 | Change an existing TTL | 45 ns, 0 allocations |
 | Dense bitmap Boolean pass on M4 Max | 75-80 GB/s, 0 allocations; NEON did not beat scalar and is not dispatched |
@@ -408,7 +417,7 @@ define the methodology, gates, comparison boundaries, and pinned toolchains.
 | Incrementally durable, bounded-residency keyed datasets | `CreateFileStore`, `OpenFileStore`, `FileStore`, `FileSnapshot` |
 | Low-level immutable arenas and column extraction | `DocSet`, `ShapeCache`, `KeyInterner` |
 | SQL-shaped projection, filtering, grouping, and aggregation | `query.Query.RunInto`, `query.Result`, `query.Workspace` |
-| Parallel bounded-batch queries over a durable file snapshot | `query.Query.RunFileSnapshot`, `query.FileExecutionOptions` |
+| Persistent-indexed bounded queries over a durable file snapshot | `query.Query.RunFileSnapshot`, `query.FileExecutionOptions`, `query.FileExecutionWorkspace` |
 | Keyed updates, deletes, TTL, snapshots, exact indexes, and wildcard postings | `Store`, `Snapshot`, `StoreIndexDefinition`, `StoreStats` |
 
 The advanced document APIs are moving into `document` during the pre-v1
