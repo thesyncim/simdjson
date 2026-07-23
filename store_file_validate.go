@@ -106,7 +106,7 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 		)
 		return err
 	case storeio.PageFloat64Catalog:
-		_, err := storeio.OpenAdmittedFloat64Catalog(
+		_, err := storeio.OpenAdmittedFloat64Directory(
 			page, v.fileEnd.Load(), v.nextLogicalID.Load(), v.pageSize,
 		)
 		return err

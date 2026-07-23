@@ -58,15 +58,15 @@ func fileFloat64ProjectionValue(
 }
 
 // maintainFileFloat64Scan keeps the dense scan chain across an existing-row
-// update or delete. Projection-neutral updates reuse the old chain without
-// writing metadata. A changed projection rebuilds only the stripe containing
-// the touched chunk and one bounded catalog head; every other stripe remains
-// shared. Inserts currently decline because they may extend global chunk
-// coverage.
+// update, delete, or in-range insert. Projection-neutral updates reuse the old
+// directory without writing metadata. A changed projection rebuilds only the
+// stripe containing the touched chunk and its bounded ordered-directory path;
+// every other stripe and subtree remains shared. An insert that extends beyond
+// existing stripe coverage declines to the authoritative chunk-tree scan.
 //
 // retireWhole is true only when the caller must clear and retire the complete
-// old chain. Successful micro-rebuilds append their two replaced extents to
-// retireScratch directly.
+// old projection. Successful micro-rebuilds append their replaced stripe and
+// directory path to retireScratch directly.
 func (s *FileStore) maintainFileFloat64Scan(
 	tx *storeio.WriteTransaction,
 	state *fileStoreState,
@@ -90,9 +90,6 @@ func (s *FileStore) maintainFileFloat64Scan(
 			return oldHead, false, nil
 		}
 	}
-	if created {
-		return storeio.PageRef{}, true, nil
-	}
 	head, rebuilt, err := s.rebuildFileFloat64Stripe(
 		tx, state, chunkRoot, location.Chunk,
 	)
@@ -112,42 +109,34 @@ func (s *FileStore) rebuildFileFloat64Stripe(
 	target uint32,
 ) (storeio.PageRef, bool, error) {
 	head := state.root.Float64ScanHead
-	catalogLease, err := s.cache.Acquire(head)
+	entry, found, err := storeio.LookupFloat64Directory(
+		s.cache, head, target,
+		storeio.Float64DirectoryBounds{
+			FileEnd:       state.super.FileEnd,
+			NextLogicalID: state.root.NextLogicalID,
+		},
+		uint32(s.options.PageSize),
+	)
 	if err != nil {
 		return storeio.PageRef{}, false, err
 	}
-	catalog := storeio.AdmittedFloat64Catalog(catalogLease.Page())
-	catalogHeader := catalog.Header()
-	s.float64CatalogRefs = s.float64CatalogRefs[:0]
-	stripeAt := -1
-	var stripeHeader storeio.Float64StripeHeader
-	for position := 0; position < catalog.Len(); position++ {
-		ref, ok := catalog.RefAt(position)
-		if !ok {
-			catalogLease.Release()
-			return storeio.PageRef{}, false, storeio.ErrFloat64CatalogCorrupt
-		}
-		s.float64CatalogRefs = append(s.float64CatalogRefs, ref)
-		if stripeAt >= 0 {
-			continue
-		}
-		lease, acquireErr := s.cache.Acquire(ref)
-		if acquireErr != nil {
-			catalogLease.Release()
-			return storeio.PageRef{}, false, acquireErr
-		}
-		header := storeio.AdmittedFloat64Stripe(lease.Page()).Header()
-		lease.Release()
-		if target >= header.FirstChunk &&
-			uint64(target) <
-				uint64(header.FirstChunk)+uint64(header.ChunkCount) {
-			stripeAt = position
-			stripeHeader = header
-		}
+	if !found {
+		return storeio.PageRef{}, false, nil
 	}
-	catalogLease.Release()
-	if stripeAt < 0 {
-		// A later catalog can be handled by a future bounded prefix rewrite.
+	oldStripe := entry.Ref
+	stripeLease, err := s.cache.Acquire(oldStripe)
+	if err != nil {
+		return storeio.PageRef{}, false, err
+	}
+	stripeHeader := storeio.AdmittedFloat64Stripe(
+		stripeLease.Page(),
+	).Header()
+	stripeLease.Release()
+	if stripeHeader.FirstChunk != entry.FirstChunk ||
+		target < stripeHeader.FirstChunk ||
+		uint64(target) >=
+			uint64(stripeHeader.FirstChunk)+
+				uint64(stripeHeader.ChunkCount) {
 		return storeio.PageRef{}, false, nil
 	}
 
@@ -263,7 +252,6 @@ func (s *FileStore) rebuildFileFloat64Stripe(
 		}
 	}
 
-	oldStripe := s.float64CatalogRefs[stripeAt]
 	stripePage, err := tx.Allocate(
 		storeio.PageFloat64Stripe, pageSize, oldStripe.LogicalID,
 	)
@@ -287,37 +275,32 @@ func (s *FileStore) rebuildFileFloat64Stripe(
 	if err := stripePage.Stage(); err != nil {
 		return storeio.PageRef{}, false, err
 	}
-	s.float64CatalogRefs[stripeAt] = stripePage.Ref()
-
-	catalogPage, err := tx.Allocate(
-		storeio.PageFloat64Catalog, head.Length, head.LogicalID,
+	directory, err := storeio.ReplaceFloat64Directory(
+		s.cache, tx, head, stripeHeader.FirstChunk, stripePage.Ref(),
+		storeio.Float64DirectoryBounds{
+			FileEnd:       state.super.FileEnd,
+			NextLogicalID: state.root.NextLogicalID,
+		},
 	)
 	if err != nil {
 		return storeio.PageRef{}, false, err
 	}
-	if _, err := storeio.EncodeMutableFloat64Catalog(
-		catalogPage.Bytes(),
-		storeio.Float64CatalogHeader{
-			StoreID: s.storeID, Generation: tx.Generation(),
-			LogicalID: catalogPage.Ref().LogicalID,
-			PageSize:  catalogPage.Ref().Length,
-			Next:      catalogHeader.Next,
-		},
-		s.float64CatalogRefs, tx.FileEnd(), tx.NextLogicalID(),
-		uint32(s.options.PageSize),
-	); err != nil {
-		return storeio.PageRef{}, false, err
-	}
-	if err := catalogPage.Stage(); err != nil {
-		return storeio.PageRef{}, false, err
+	if !directory.Found || !directory.Changed ||
+		directory.Root == (storeio.PageRef{}) {
+		return storeio.PageRef{}, false,
+			storeio.ErrFloat64CatalogCorrupt
 	}
 	if err := s.appendIndexRetiredRef(state, oldStripe); err != nil {
 		return storeio.PageRef{}, false, err
 	}
-	if err := s.appendIndexRetiredRef(state, head); err != nil {
-		return storeio.PageRef{}, false, err
+	for i := range int(directory.RetiredCount) {
+		if err := s.appendIndexRetiredRef(
+			state, directory.Retired[i],
+		); err != nil {
+			return storeio.PageRef{}, false, err
+		}
 	}
-	return catalogPage.Ref(), true, nil
+	return directory.Root, true, nil
 }
 
 func (s *FileStore) visitFileFloat64StripeRange(

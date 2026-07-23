@@ -190,9 +190,11 @@ type fileStoreBulkDocumentGroupPlan struct {
 	columns                 storeio.PageRef
 }
 
-type fileStoreBulkFloat64CatalogPlan struct {
+type fileStoreBulkFloat64DirectoryPlan struct {
+	level       uint8
 	first, last int
-	ref, next   storeio.PageRef
+	children    []storeio.Float64DirectoryEntry
+	ref         storeio.PageRef
 }
 
 type fileStoreBulkFloat64StripePlan struct {
@@ -258,9 +260,9 @@ type fileStoreBulkBuild struct {
 	overflows            []fileStoreBulkOverflowPlan
 	documents            []fileStoreBulkDocumentPlan
 	documentGroups       []fileStoreBulkDocumentGroupPlan
-	float64Catalogs      []fileStoreBulkFloat64CatalogPlan
+	float64Directories   []fileStoreBulkFloat64DirectoryPlan
+	float64DirectoryRows []storeio.Float64DirectoryEntry
 	float64Stripes       []fileStoreBulkFloat64StripePlan
-	float64ScanRefs      []storeio.PageRef
 	float64ScanDocuments int
 	indexGroupEntries    []storeio.IndexGroupCatalogEntry
 	indexGroupCatalogs   []fileStoreBulkIndexGroupPlan
@@ -529,7 +531,7 @@ func (b *fileStoreBulkBuild) plan() error {
 	if err := b.planDocuments(); err != nil {
 		return err
 	}
-	if err := b.planFloat64Catalogs(); err != nil {
+	if err := b.planFloat64Directory(); err != nil {
 		return err
 	}
 	items := make([]storeChunkDirectoryItem, len(b.documents))
@@ -989,48 +991,107 @@ func (b *fileStoreBulkBuild) planDocumentGroups() error {
 // covers ordinary pages, shared sidecars, and overflow-backed documents.
 func (b *fileStoreBulkBuild) prepareFloat64ScanPlan() {
 	b.float64Head = storeio.PageRef{}
-	b.float64ScanRefs = b.float64ScanRefs[:0]
+	b.float64DirectoryRows = b.float64DirectoryRows[:0]
 	b.float64ScanDocuments = 0
 	if len(b.options.float64Columns) != 0 {
 		b.float64ScanDocuments = len(b.documents)
 	}
 }
 
-func (b *fileStoreBulkBuild) planFloat64Catalogs() error {
+// planFloat64Directory builds a 64-way ordered tree over immutable packed
+// stripes. Nodes stay at PageSize so online path copying never scales with a
+// large MaxPageSize; full scans still touch fewer than one directory page per
+// 64 stripes.
+func (b *fileStoreBulkBuild) planFloat64Directory() error {
 	if b.float64ScanDocuments == 0 {
 		return nil
 	}
-	b.float64ScanRefs = b.float64ScanRefs[:0]
 	if err := b.planFloat64Stripes(); err != nil {
 		return err
 	}
-	maxEntries := (b.options.MaxPageSize - storeio.PageHeaderSize - storeio.PageTrailerSize -
-		storeio.Float64CatalogPayloadHeaderSize) / storeio.PageRefSize
-	if maxEntries < 1 {
-		return storeio.ErrInvalidWrite
-	}
-	for first := 0; first < len(b.float64ScanRefs); first += maxEntries {
-		last := min(first+maxEntries, len(b.float64ScanRefs))
-		required := storeio.PageHeaderSize + storeio.PageTrailerSize +
-			storeio.Float64CatalogPayloadHeaderSize + (last-first)*storeio.PageRefSize
-		size, ok := fileStoreBulkExtent(required, b.options.PageSize, b.options.MaxPageSize)
-		if !ok {
+	b.float64DirectoryRows = b.float64DirectoryRows[:0]
+	for _, stripe := range b.float64Stripes {
+		if stripe.first < 0 || stripe.first >= len(b.documents) {
 			return storeio.ErrInvalidWrite
 		}
-		ref, err := b.allocator.allocate(storeio.PageFloat64Catalog, size)
+		b.float64DirectoryRows = append(
+			b.float64DirectoryRows,
+			storeio.Float64DirectoryEntry{
+				FirstChunk: b.documents[stripe.first].chunk,
+				Ref:        stripe.ref,
+			},
+		)
+	}
+	if len(b.float64DirectoryRows) == 0 ||
+		b.float64DirectoryRows[0].FirstChunk != 0 {
+		return storeio.ErrInvalidWrite
+	}
+	levelStart := 0
+	for first := 0; first < len(b.float64DirectoryRows); first += storeio.Float64DirectoryFanout {
+		last := min(
+			first+storeio.Float64DirectoryFanout,
+			len(b.float64DirectoryRows),
+		)
+		ref, err := b.allocator.allocate(
+			storeio.PageFloat64Catalog, b.allocator.pageSize,
+		)
 		if err != nil {
 			return err
 		}
-		if len(b.float64Catalogs) != 0 {
-			b.float64Catalogs[len(b.float64Catalogs)-1].next = ref
-		} else {
-			b.float64Head = ref
-		}
-		b.float64Catalogs = append(b.float64Catalogs, fileStoreBulkFloat64CatalogPlan{
-			first: first, last: last, ref: ref,
-		})
+		b.float64Directories = append(
+			b.float64Directories,
+			fileStoreBulkFloat64DirectoryPlan{
+				first: first, last: last, ref: ref,
+			},
+		)
 	}
+	levelEnd := len(b.float64Directories)
+	for level := uint8(1); levelEnd-levelStart > 1; level++ {
+		if level > storeio.Float64DirectoryMaxLevel {
+			return storeio.ErrFloat64DirectoryDepth
+		}
+		nextStart := len(b.float64Directories)
+		for first := levelStart; first < levelEnd; first += storeio.Float64DirectoryFanout {
+			last := min(
+				first+storeio.Float64DirectoryFanout, levelEnd,
+			)
+			children := make(
+				[]storeio.Float64DirectoryEntry, last-first,
+			)
+			for i := first; i < last; i++ {
+				children[i-first] = storeio.Float64DirectoryEntry{
+					FirstChunk: b.float64DirectoryLower(
+						b.float64Directories[i],
+					),
+					Ref: b.float64Directories[i].ref,
+				}
+			}
+			ref, err := b.allocator.allocate(
+				storeio.PageFloat64Catalog, b.allocator.pageSize,
+			)
+			if err != nil {
+				return err
+			}
+			b.float64Directories = append(
+				b.float64Directories,
+				fileStoreBulkFloat64DirectoryPlan{
+					level: level, children: children, ref: ref,
+				},
+			)
+		}
+		levelStart, levelEnd = nextStart, len(b.float64Directories)
+	}
+	b.float64Head = b.float64Directories[levelStart].ref
 	return nil
+}
+
+func (b *fileStoreBulkBuild) float64DirectoryLower(
+	plan fileStoreBulkFloat64DirectoryPlan,
+) uint32 {
+	if plan.level == 0 {
+		return b.float64DirectoryRows[plan.first].FirstChunk
+	}
+	return plan.children[0].FirstChunk
 }
 
 func (b *fileStoreBulkBuild) planFloat64Stripes() error {
@@ -1118,7 +1179,6 @@ func (b *fileStoreBulkBuild) allocateFloat64Stripe(
 	b.float64Stripes = append(b.float64Stripes, fileStoreBulkFloat64StripePlan{
 		first: first, last: last, rows: rows, ref: ref,
 	})
-	b.float64ScanRefs = append(b.float64ScanRefs, ref)
 	return nil
 }
 
@@ -1792,7 +1852,7 @@ func (b *fileStoreBulkBuild) write(file *os.File) error {
 	if err := b.writeFloat64StripePages(file, scratch); err != nil {
 		return err
 	}
-	if err := b.writeFloat64CatalogPages(file, scratch); err != nil {
+	if err := b.writeFloat64DirectoryPages(file, scratch); err != nil {
 		return err
 	}
 	if err := b.writeIndexGroupCatalogPages(file, scratch); err != nil {
@@ -2022,17 +2082,32 @@ func (b *fileStoreBulkBuild) writeDocumentPages(file *os.File, scratch []byte) e
 	return nil
 }
 
-func (b *fileStoreBulkBuild) writeFloat64CatalogPages(file *os.File, scratch []byte) error {
-	for _, plan := range b.float64Catalogs {
-		page, err := storeio.EncodeFloat64Catalog(
-			scratch[:plan.ref.Length],
-			storeio.Float64CatalogHeader{
-				StoreID: b.storeID, Generation: b.allocator.generation,
-				LogicalID: plan.ref.LogicalID, PageSize: plan.ref.Length, Next: plan.next,
-			},
-			b.float64ScanRefs[plan.first:plan.last],
-			b.fileEnd, b.allocator.nextLogical, b.allocator.pageSize,
-		)
+func (b *fileStoreBulkBuild) writeFloat64DirectoryPages(
+	file *os.File,
+	scratch []byte,
+) error {
+	for _, plan := range b.float64Directories {
+		header := storeio.Float64DirectoryHeader{
+			StoreID: b.storeID, Generation: b.allocator.generation,
+			LogicalID: plan.ref.LogicalID, PageSize: plan.ref.Length,
+			Level: plan.level,
+		}
+		var page []byte
+		var err error
+		if plan.level == 0 {
+			page, err = storeio.EncodeFloat64DirectoryLeaf(
+				scratch[:plan.ref.Length], header,
+				b.float64DirectoryRows[plan.first:plan.last],
+				b.fileEnd, b.allocator.nextLogical,
+				b.allocator.pageSize,
+			)
+		} else {
+			page, err = storeio.EncodeFloat64DirectoryBranch(
+				scratch[:plan.ref.Length], header, plan.children,
+				b.fileEnd, b.allocator.nextLogical,
+				b.allocator.pageSize,
+			)
+		}
 		if err != nil {
 			return err
 		}

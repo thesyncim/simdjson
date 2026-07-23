@@ -23,151 +23,168 @@ func testFloat64ScanRef(offset, logical uint64, kind PageKind) PageRef {
 	}
 }
 
-func TestFloat64CatalogExactRoundTripAndAllocs(t *testing.T) {
-	refs := [testFloat64ScanCatalogCount]PageRef{
-		testFloat64ScanRef(10, testFloat64ScanStripeID, PageFloat64Stripe),
-		testFloat64ScanRef(11, testFloat64ScanStripeID+1, PageFloat64Stripe),
+func TestFloat64DirectoryLeafExactRoundTripAndAllocs(t *testing.T) {
+	entries := [testFloat64ScanCatalogCount]Float64DirectoryEntry{
+		{
+			FirstChunk: 0,
+			Ref: testFloat64ScanRef(
+				20, testFloat64ScanStripeID, PageFloat64Stripe,
+			),
+		},
+		{
+			FirstChunk: 8,
+			Ref: testFloat64ScanRef(
+				10, testFloat64ScanStripeID+1, PageFloat64Stripe,
+			),
+		},
 	}
-	next := testFloat64ScanRef(12, testFloat64ScanStripeID+2, PageFloat64Catalog)
-	header := Float64CatalogHeader{
-		StoreID: testStoreID, Generation: 3, LogicalID: testFloat64ScanCatalogID,
-		PageSize: testSuperblockPageSize, Next: next,
-	}
-	page := make([]byte, testSuperblockPageSize)
-	page, err := EncodeFloat64Catalog(
-		page, header, refs[:], testFloat64ScanFileEnd, testFloat64ScanNextLogical,
-		testSuperblockPageSize,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	view, err := OpenFloat64Catalog(
-		page, testFloat64ScanFileEnd, testFloat64ScanNextLogical, testSuperblockPageSize,
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if view.Header() != header || view.Len() != len(refs) {
-		t.Fatalf("catalog = (%+v,%d), want (%+v,%d)", view.Header(), view.Len(), header, len(refs))
-	}
-	for index, want := range refs {
-		got, ok := view.RefAt(index)
-		if !ok || got != want {
-			t.Fatalf("ref %d = (%+v,%v), want %+v", index, got, ok, want)
-		}
-	}
-	if _, ok := view.RefAt(-1); ok {
-		t.Fatal("negative catalog index accepted")
-	}
-	if _, ok := view.RefAt(len(refs)); ok {
-		t.Fatal("past-end catalog index accepted")
-	}
-	if allocs := testing.AllocsPerRun(100, func() {
-		if _, encodeErr := EncodeFloat64Catalog(
-			page, header, refs[:], testFloat64ScanFileEnd, testFloat64ScanNextLogical,
-			testSuperblockPageSize,
-		); encodeErr != nil {
-			panic(encodeErr)
-		}
-		opened, openErr := OpenFloat64Catalog(
-			page, testFloat64ScanFileEnd, testFloat64ScanNextLogical,
-			testSuperblockPageSize,
-		)
-		if openErr != nil || opened.Len() != len(refs) {
-			panic("catalog open")
-		}
-	}); allocs != 0 {
-		t.Fatalf("catalog warm allocations = %.2f, want zero", allocs)
-	}
-}
-
-func TestMutableFloat64CatalogPermitsCopyOnWritePhysicalOrder(t *testing.T) {
-	refs := [testFloat64ScanCatalogCount]PageRef{
-		testFloat64ScanRef(20, testFloat64ScanStripeID, PageFloat64Stripe),
-		testFloat64ScanRef(10, testFloat64ScanStripeID+1, PageFloat64Stripe),
-	}
-	refs[0].Generation = 5
-	next := testFloat64ScanRef(
-		8, testFloat64ScanStripeID+2, PageFloat64Catalog,
-	)
-	header := Float64CatalogHeader{
-		StoreID: testStoreID, Generation: 5,
+	entries[0].Ref.Generation = 2
+	header := Float64DirectoryHeader{
+		StoreID: testStoreID, Generation: 3,
 		LogicalID: testFloat64ScanCatalogID,
-		PageSize:  testSuperblockPageSize, Next: next,
+		PageSize:  testSuperblockPageSize,
 	}
 	page := make([]byte, testSuperblockPageSize)
-	if _, err := EncodeFloat64Catalog(
-		page, header, refs[:], testFloat64ScanFileEnd,
-		testFloat64ScanNextLogical, testSuperblockPageSize,
-	); err == nil {
-		t.Fatal("immutable catalog accepted copy-on-write physical order")
-	}
-	page, err := EncodeMutableFloat64Catalog(
-		page, header, refs[:], testFloat64ScanFileEnd,
+	page, err := EncodeFloat64DirectoryLeaf(
+		page, header, entries[:], testFloat64ScanFileEnd,
 		testFloat64ScanNextLogical, testSuperblockPageSize,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := OpenFloat64Catalog(
+	view, err := OpenFloat64Directory(
 		page, testFloat64ScanFileEnd, testFloat64ScanNextLogical,
 		testSuperblockPageSize,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !view.Mutable() || view.Header() != header {
+	if view.Header() != header || view.Len() != len(entries) {
 		t.Fatalf(
-			"mutable catalog = (%v,%+v), want (true,%+v)",
-			view.Mutable(), view.Header(), header,
+			"directory = (%+v,%d), want (%+v,%d)",
+			view.Header(), view.Len(), header, len(entries),
 		)
 	}
-	for index, want := range refs {
-		got, ok := view.RefAt(index)
+	for index, want := range entries {
+		got, ok := view.EntryAt(index)
 		if !ok || got != want {
 			t.Fatalf(
-				"mutable ref %d = (%+v,%v), want %+v",
+				"entry %d = (%+v,%v), want %+v",
 				index, got, ok, want,
 			)
 		}
 	}
+	if got, ok := view.Floor(7); !ok || got != entries[0] {
+		t.Fatalf("floor seven = (%+v,%v)", got, ok)
+	}
+	if got, ok := view.Floor(8); !ok || got != entries[1] {
+		t.Fatalf("floor eight = (%+v,%v)", got, ok)
+	}
+	if _, ok := view.EntryAt(-1); ok {
+		t.Fatal("negative directory index accepted")
+	}
+	if _, ok := view.EntryAt(len(entries)); ok {
+		t.Fatal("past-end directory index accepted")
+	}
 	if allocs := testing.AllocsPerRun(100, func() {
-		if _, encodeErr := EncodeMutableFloat64Catalog(
-			page, header, refs[:], testFloat64ScanFileEnd,
+		if _, encodeErr := EncodeFloat64DirectoryLeaf(
+			page, header, entries[:], testFloat64ScanFileEnd,
 			testFloat64ScanNextLogical, testSuperblockPageSize,
 		); encodeErr != nil {
 			panic(encodeErr)
 		}
-		opened, openErr := OpenFloat64Catalog(
-			page, testFloat64ScanFileEnd, testFloat64ScanNextLogical,
-			testSuperblockPageSize,
+		opened, openErr := OpenFloat64Directory(
+			page, testFloat64ScanFileEnd,
+			testFloat64ScanNextLogical, testSuperblockPageSize,
 		)
-		if openErr != nil || !opened.Mutable() {
-			panic("mutable catalog open")
+		if openErr != nil || opened.Len() != len(entries) {
+			panic("directory open")
 		}
 	}); allocs != 0 {
 		t.Fatalf(
-			"mutable catalog warm allocations = %.2f, want zero",
-			allocs,
+			"directory warm allocations = %.2f, want zero", allocs,
 		)
 	}
 }
 
-func TestFloat64CatalogRejectsResealedCorruption(t *testing.T) {
-	refs := [testFloat64ScanCatalogCount]PageRef{
-		testFloat64ScanRef(10, testFloat64ScanStripeID, PageFloat64Stripe),
-		testFloat64ScanRef(11, testFloat64ScanStripeID+1, PageFloat64Stripe),
+func TestFloat64DirectoryBranchSharesOlderPhysicalChildren(t *testing.T) {
+	entries := [testFloat64ScanCatalogCount]Float64DirectoryEntry{
+		{
+			FirstChunk: 0,
+			Ref: testFloat64ScanRef(
+				20, testFloat64ScanStripeID, PageFloat64Catalog,
+			),
+		},
+		{
+			FirstChunk: 64,
+			Ref: testFloat64ScanRef(
+				10, testFloat64ScanStripeID+1, PageFloat64Catalog,
+			),
+		},
+	}
+	entries[0].Ref.Generation = 5
+	header := Float64DirectoryHeader{
+		StoreID: testStoreID, Generation: 5,
+		LogicalID: testFloat64ScanCatalogID,
+		PageSize:  testSuperblockPageSize, Level: 1,
 	}
 	page := make([]byte, testSuperblockPageSize)
-	page, err := EncodeFloat64Catalog(page, Float64CatalogHeader{
-		StoreID: testStoreID, Generation: 3, LogicalID: testFloat64ScanCatalogID,
-		PageSize: testSuperblockPageSize,
-	}, refs[:], testFloat64ScanFileEnd, testFloat64ScanNextLogical, testSuperblockPageSize)
+	page, err := EncodeFloat64DirectoryBranch(
+		page, header, entries[:], testFloat64ScanFileEnd,
+		testFloat64ScanNextLogical, testSuperblockPageSize,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstRef := PageHeaderSize + Float64CatalogPayloadHeaderSize
-	secondRef := firstRef + PageRefSize
+	view, err := OpenFloat64Directory(
+		page, testFloat64ScanFileEnd, testFloat64ScanNextLogical,
+		testSuperblockPageSize,
+	)
+	if err != nil || view.Header() != header {
+		t.Fatalf("branch = (%+v,%v), want %+v", view.Header(), err, header)
+	}
+	for index, want := range entries {
+		got, ok := view.EntryAt(index)
+		if !ok || got != want {
+			t.Fatalf(
+				"branch entry %d = (%+v,%v), want %+v",
+				index, got, ok, want,
+			)
+		}
+	}
+}
+
+func TestFloat64DirectoryRejectsResealedCorruption(t *testing.T) {
+	entries := [testFloat64ScanCatalogCount]Float64DirectoryEntry{
+		{
+			FirstChunk: 0,
+			Ref: testFloat64ScanRef(
+				10, testFloat64ScanStripeID, PageFloat64Stripe,
+			),
+		},
+		{
+			FirstChunk: 8,
+			Ref: testFloat64ScanRef(
+				11, testFloat64ScanStripeID+1, PageFloat64Stripe,
+			),
+		},
+	}
+	page := make([]byte, testSuperblockPageSize)
+	page, err := EncodeFloat64DirectoryLeaf(
+		page, Float64DirectoryHeader{
+			StoreID: testStoreID, Generation: 3,
+			LogicalID: testFloat64ScanCatalogID,
+			PageSize:  testSuperblockPageSize,
+		}, entries[:], testFloat64ScanFileEnd,
+		testFloat64ScanNextLogical, testSuperblockPageSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRecord := PageHeaderSize + Float64DirectoryPayloadHeaderSize
+	secondRecord := firstRecord + Float64DirectoryRecordSize
+	firstRef := firstRecord + 8
+	secondRef := secondRecord + 8
 	tests := []struct {
 		name   string
 		mutate func([]byte)
@@ -183,30 +200,29 @@ func TestFloat64CatalogRejectsResealedCorruption(t *testing.T) {
 		{
 			name: "count",
 			mutate: func(corrupt []byte) {
-				binary.LittleEndian.PutUint16(corrupt[PageHeaderSize+4:], 3)
+				corrupt[PageHeaderSize+6] = 3
 			},
 		},
 		{
-			name: "physical order",
+			name: "key order",
+			mutate: func(corrupt []byte) {
+				binary.LittleEndian.PutUint32(corrupt[secondRecord:], 0)
+			},
+		},
+		{
+			name: "duplicate physical ref",
 			mutate: func(corrupt []byte) {
 				binary.LittleEndian.PutUint64(
-					corrupt[secondRef:], binary.LittleEndian.Uint64(corrupt[firstRef:]),
+					corrupt[secondRef:],
+					binary.LittleEndian.Uint64(corrupt[firstRef:]),
 				)
 			},
 		},
 		{
-			name: "logical order",
+			name: "future generation",
 			mutate: func(corrupt []byte) {
 				binary.LittleEndian.PutUint64(
-					corrupt[secondRef+8:], binary.LittleEndian.Uint64(corrupt[firstRef+8:]),
-				)
-			},
-		},
-		{
-			name: "legacy generation",
-			mutate: func(corrupt []byte) {
-				binary.LittleEndian.PutUint64(
-					corrupt[firstRef+16:], 2,
+					corrupt[firstRef+16:], 4,
 				)
 			},
 		},
@@ -222,7 +238,7 @@ func TestFloat64CatalogRejectsResealedCorruption(t *testing.T) {
 			corrupt := append([]byte(nil), page...)
 			test.mutate(corrupt)
 			resealTestPage(corrupt)
-			if _, openErr := OpenFloat64Catalog(
+			if _, openErr := OpenFloat64Directory(
 				corrupt, testFloat64ScanFileEnd, testFloat64ScanNextLogical,
 				testSuperblockPageSize,
 			); !errors.Is(openErr, ErrFloat64CatalogCorrupt) {

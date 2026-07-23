@@ -107,7 +107,7 @@ type StateRoot struct {
 	KeyDirectory   PageRef
 	IndexDirectory PageRef
 	TTLDirectory   PageRef
-	// Float64ScanHead names the ordered value-stripe catalog of a compact or
+	// Float64ScanHead names the ordered value-stripe directory of a compact or
 	// incrementally maintained generation. It is only a scan accelerator;
 	// documented mutation fallbacks clear it and use the authoritative tree.
 	Float64ScanHead PageRef
@@ -317,8 +317,7 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 		length := uint64(ref.Length)
 		if root.Options&StateOptionFloat64Columns == 0 ||
 			ref.Kind != PageFloat64Catalog || ref.Flags != 0 || ref.Aux != 0 ||
-			!validPhysicalPageSize(ref.Length) || ref.Length < root.PageSize ||
-			ref.Length%root.PageSize != 0 ||
+			ref.Length != root.PageSize ||
 			ref.Generation == 0 || ref.Generation > root.Generation ||
 			ref.LogicalID <= StateRootLogicalID || ref.LogicalID >= root.NextLogicalID ||
 			ref.Offset < uint64(superblockCopies)*pageSize || ref.Offset%pageSize != 0 ||

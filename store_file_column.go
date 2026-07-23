@@ -2,6 +2,7 @@ package simdjson
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/thesyncim/simdjson/internal/storeio"
 )
@@ -88,91 +89,99 @@ func (s *FileSnapshot) ReduceFloat64PathsInto(dst []Float64Aggregate, paths []st
 }
 
 // reduceFloat64ScanChain is the compact dense-projection fast path. The
-// state-root catalog and value-only stripes omit the stable-slot tree walk.
-// Incremental copy-on-write stripe replacement keeps this path active through
-// ordinary updates/deletes; documented fallback cases clear the head and make
-// the general overlay-aware path above authoritative.
+// state-root ordered directory and value-only stripes omit the stable-slot
+// tree walk. Incremental copy-on-write stripe replacement keeps this path
+// active through ordinary updates/deletes; documented fallback cases clear
+// the root and make the general overlay-aware path above authoritative.
 func (s *FileSnapshot) reduceFloat64ScanChain(dst []Float64Aggregate, ordinals []uint16) error {
 	state := s.state
-	catalogRef := state.root.Float64ScanHead
 	nextChunk := uint32(0)
-	var previousScanRef storeio.PageRef
-	mutableCatalog := false
-	for catalogRef != (storeio.PageRef{}) {
-		lease, err := s.store.cache.Acquire(catalogRef)
-		if err != nil {
-			return err
-		}
-		catalog := storeio.AdmittedFloat64Catalog(lease.Page())
-		header := catalog.Header()
-		mutableCatalog = mutableCatalog || catalog.Mutable()
-		var refs [64]storeio.PageRef
-		for first := 0; first < catalog.Len(); first += len(refs) {
-			count := min(len(refs), catalog.Len()-first)
-			for i := 0; i < count; i++ {
-				var ok bool
-				refs[i], ok = catalog.RefAt(first + i)
-				if !ok {
-					lease.Release()
-					return storeio.ErrFloat64CatalogCorrupt
-				}
+	err := storeio.WalkFloat64DirectoryLeaves(
+		s.store.cache, state.root.Float64ScanHead,
+		storeio.Float64DirectoryBounds{
+			FileEnd:       state.super.FileEnd,
+			NextLogicalID: state.root.NextLogicalID,
+		},
+		uint32(s.store.options.PageSize),
+		func(leaf storeio.Float64DirectoryView) error {
+			var refs [storeio.Float64DirectoryFanout]storeio.PageRef
+			for i := 0; i < leaf.Len(); i++ {
+				entry, _ := leaf.EntryAt(i)
+				refs[i] = entry.Ref
 			}
-			if _, err := s.store.cache.Prefetch(refs[:count]); err != nil {
-				lease.Release()
+			prefetch := refs[:leaf.Len()]
+			slices.SortFunc(
+				prefetch,
+				func(a, b storeio.PageRef) int {
+					switch {
+					case a.Offset < b.Offset:
+						return -1
+					case a.Offset > b.Offset:
+						return 1
+					default:
+						return 0
+					}
+				},
+			)
+			if _, err := s.store.cache.Prefetch(
+				prefetch,
+			); err != nil {
 				return err
 			}
-			for i := 0; i < count; i++ {
-				if previousScanRef != (storeio.PageRef{}) &&
-					(refs[i].LogicalID <= previousScanRef.LogicalID ||
-						!mutableCatalog &&
-							refs[i].Offset <= previousScanRef.Offset) {
-					lease.Release()
-					return fmt.Errorf(
-						"%w: float64 catalog global order",
-						storeio.ErrFloat64CatalogCorrupt,
-					)
-				}
-				groupLease, acquireErr := s.store.cache.Acquire(refs[i])
+			for i := 0; i < leaf.Len(); i++ {
+				entry, _ := leaf.EntryAt(i)
+				groupLease, acquireErr := s.store.cache.Acquire(
+					entry.Ref,
+				)
 				if acquireErr != nil {
-					lease.Release()
 					return acquireErr
 				}
-				stripe := storeio.AdmittedFloat64Stripe(groupLease.Page())
+				stripe := storeio.AdmittedFloat64Stripe(
+					groupLease.Page(),
+				)
 				stripeHeader := stripe.Header()
-				if stripeHeader.FirstChunk != nextChunk ||
-					stripeHeader.ColumnCount != uint16(len(s.store.options.float64Columns)) {
+				if entry.FirstChunk != nextChunk ||
+					stripeHeader.FirstChunk != entry.FirstChunk ||
+					stripeHeader.ColumnCount !=
+						uint16(len(s.store.options.float64Columns)) {
 					groupLease.Release()
-					lease.Release()
-					return fmt.Errorf("%w: float64 stripe coverage", storeio.ErrFloat64StripeCorrupt)
+					return fmt.Errorf(
+						"%w: float64 stripe coverage",
+						storeio.ErrFloat64StripeCorrupt,
+					)
 				}
 				for column, ordinal := range ordinals {
-					values, encoding, found := stripe.ColumnValues(int(ordinal))
-					if !found || !dst[column].addPackedFloat64Width(values, encoding.ByteWidth()) {
+					values, encoding, found := stripe.ColumnValues(
+						int(ordinal),
+					)
+					if !found ||
+						!dst[column].addPackedFloat64Width(
+							values, encoding.ByteWidth(),
+						) {
 						groupLease.Release()
-						lease.Release()
-						return fmt.Errorf("%w: float64 stripe column", storeio.ErrFloat64StripeCorrupt)
+						return fmt.Errorf(
+							"%w: float64 stripe column",
+							storeio.ErrFloat64StripeCorrupt,
+						)
 					}
 				}
 				coveredChunks := stripeHeader.ChunkCount
-				if uint64(nextChunk)+uint64(coveredChunks) > uint64(^uint32(0)) {
+				if uint64(nextChunk)+uint64(coveredChunks) >
+					uint64(^uint32(0)) {
 					groupLease.Release()
-					lease.Release()
-					return fmt.Errorf("%w: float64 scan chunk overflow", storeio.ErrFloat64GroupCorrupt)
+					return fmt.Errorf(
+						"%w: float64 scan chunk overflow",
+						storeio.ErrFloat64GroupCorrupt,
+					)
 				}
 				nextChunk += coveredChunks
-				previousScanRef = refs[i]
 				groupLease.Release()
 			}
-		}
-		next := header.Next
-		if next != (storeio.PageRef{}) &&
-			(next.LogicalID <= catalogRef.LogicalID ||
-				!catalog.Mutable() && next.Offset <= catalogRef.Offset) {
-			lease.Release()
-			return fmt.Errorf("%w: float64 catalog link order", storeio.ErrFloat64CatalogCorrupt)
-		}
-		lease.Release()
-		catalogRef = next
+			return nil
+		},
+	)
+	if err != nil {
+		return err
 	}
 	if nextChunk != state.root.ChunkHighWater {
 		return fmt.Errorf("%w: incomplete float64 stripe coverage", storeio.ErrFloat64StripeCorrupt)

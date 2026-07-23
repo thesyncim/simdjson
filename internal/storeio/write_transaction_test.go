@@ -149,13 +149,18 @@ func TestWriteTransactionAllowsPackedAcceleratorExtents(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, kind := range []PageKind{
-		PageFloat64Stripe, PageFloat64Catalog, PageIndexGroupCatalog,
+		PageFloat64Stripe, PageIndexGroupCatalog,
 	} {
 		if _, err := tx.Allocate(
 			kind, 2*testSuperblockPageSize, 0,
 		); err != nil {
 			t.Fatalf("Allocate(%v) = %v", kind, err)
 		}
+	}
+	if _, err := tx.Allocate(
+		PageFloat64Catalog, 2*testSuperblockPageSize, 0,
+	); err == nil {
+		t.Fatal("variable-size float64 directory node accepted")
 	}
 	if err := tx.Abort(); err != nil {
 		t.Fatal(err)

@@ -248,27 +248,39 @@ func TestWriteFileStoreBulkGroupsExactDocumentsAndPeelsMutations(t *testing.T) {
 	}
 	var scanProjectionRefs []storeio.PageRef
 	catalogColumn := storeio.PageRef{}
-	for catalogRef := state.root.Float64ScanHead; catalogRef != (storeio.PageRef{}); {
-		catalogLease, acquireErr := store.cache.Acquire(catalogRef)
-		if acquireErr != nil {
-			t.Fatal(acquireErr)
-		}
-		catalog := storeio.AdmittedFloat64Catalog(catalogLease.Page())
-		for entry := 0; entry < catalog.Len(); entry++ {
-			ref, found := catalog.RefAt(entry)
-			if !found {
-				catalogLease.Release()
-				t.Fatalf("float64 catalog entry %d missing", entry)
+	directoryBounds := storeio.Float64DirectoryBounds{
+		FileEnd:       state.super.FileEnd,
+		NextLogicalID: state.root.NextLogicalID,
+	}
+	err = storeio.WalkFloat64DirectoryLeaves(
+		store.cache, state.root.Float64ScanHead, directoryBounds,
+		uint32(options.PageSize),
+		func(leaf storeio.Float64DirectoryView) error {
+			for i := 0; i < leaf.Len(); i++ {
+				entry, _ := leaf.EntryAt(i)
+				if catalogColumn == (storeio.PageRef{}) {
+					catalogColumn = entry.Ref
+				}
+				scanProjectionRefs = append(
+					scanProjectionRefs, entry.Ref,
+				)
 			}
-			if catalogColumn == (storeio.PageRef{}) {
-				catalogColumn = ref
-			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = storeio.WalkFloat64DirectoryPages(
+		store.cache, state.root.Float64ScanHead, directoryBounds,
+		uint32(options.PageSize),
+		func(ref storeio.PageRef) error {
 			scanProjectionRefs = append(scanProjectionRefs, ref)
-		}
-		next := catalog.Header().Next
-		catalogLease.Release()
-		scanProjectionRefs = append(scanProjectionRefs, catalogRef)
-		catalogRef = next
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
 	found := catalogColumn != (storeio.PageRef{})
 	if !found || catalogColumn.Kind != storeio.PageFloat64Stripe {
@@ -602,35 +614,37 @@ func TestWriteFileStoreBulkCatalogedFloat64ScanExact(t *testing.T) {
 	}
 	defer store.Close()
 	state := store.state.Load()
-	catalogRef := state.root.Float64ScanHead
 	coveredChunks := uint32(0)
 	extents := 0
-	for catalogRef != (storeio.PageRef{}) {
-		lease, acquireErr := store.cache.Acquire(catalogRef)
-		if acquireErr != nil {
-			t.Fatal(acquireErr)
-		}
-		catalog := storeio.AdmittedFloat64Catalog(lease.Page())
-		next := catalog.Header().Next
-		for entry := 0; entry < catalog.Len(); entry++ {
-			ref, ok := catalog.RefAt(entry)
-			if !ok {
-				t.Fatalf("catalog entry %d missing", entry)
-			}
-			groupLease, acquireErr := store.cache.Acquire(ref)
+	err = storeio.WalkFloat64Directory(
+		store.cache, state.root.Float64ScanHead,
+		storeio.Float64DirectoryBounds{
+			FileEnd:       state.super.FileEnd,
+			NextLogicalID: state.root.NextLogicalID,
+		},
+		uint32(options.PageSize),
+		func(entry storeio.Float64DirectoryEntry) error {
+			groupLease, acquireErr := store.cache.Acquire(entry.Ref)
 			if acquireErr != nil {
-				t.Fatal(acquireErr)
+				return acquireErr
 			}
 			header := storeio.AdmittedFloat64Stripe(groupLease.Page()).Header()
 			groupLease.Release()
-			if header.FirstChunk != coveredChunks {
-				t.Fatalf("linked extent %d starts at %d, want %d", extents, header.FirstChunk, coveredChunks)
+			if entry.FirstChunk != coveredChunks ||
+				header.FirstChunk != coveredChunks {
+				return fmt.Errorf(
+					"linked extent %d starts at (%d,%d), want %d",
+					extents, entry.FirstChunk, header.FirstChunk,
+					coveredChunks,
+				)
 			}
 			coveredChunks += uint32(header.ChunkCount)
 			extents++
-		}
-		lease.Release()
-		catalogRef = next
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if extents < 1 || coveredChunks != state.root.ChunkHighWater {
 		t.Fatalf(
@@ -658,6 +672,276 @@ func TestWriteFileStoreBulkCatalogedFloat64ScanExact(t *testing.T) {
 	}
 	if allocs != 0 {
 		t.Fatalf("linked score warm allocations = %.2f, want zero", allocs)
+	}
+}
+
+func TestWriteFileStoreBulkFloat64DirectoryMultiLevelChurn(t *testing.T) {
+	const (
+		documents = 4095
+		columns   = 128
+	)
+	options := testFileStoreOptions()
+	options.Store = StoreOptions{
+		ChunkDocuments: 2,
+		ShapeTapes:     true,
+	}
+	options.MaxPageSize = 8192
+	options.InlineValueBytes = 2048
+	options.MaxDocumentBytes = 8192
+	options.ResidentBytes = 16 << 20
+	options.BufferCount = 128
+	options.Float64Columns = make([]string, columns)
+	for column := range columns {
+		options.Float64Columns[column] = fmt.Sprintf("/c%02d", column)
+	}
+	document := func(row, first int) []byte {
+		dst := make([]byte, 0, 1024)
+		dst = append(dst, '{')
+		for column := range columns {
+			if column != 0 {
+				dst = append(dst, ',')
+			}
+			value := (row + column) & 255
+			if column == 0 {
+				value = first
+			}
+			dst = fmt.Appendf(dst, `"c%02d":%d`, column, value)
+		}
+		return append(dst, '}')
+	}
+	builder, err := NewStoreBuilder(options.Store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var initialSum float64
+	for row := range documents {
+		value := row & 255
+		initialSum += float64(value)
+		if err := builder.Append(
+			fmt.Sprintf("doc:%04d", row), document(row, value),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(
+		t.TempDir(), "file-store-float64-directory-*",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := source.WriteFileStore(file, options); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := store.state.Load()
+	oldRoot := state.root.Float64ScanHead
+	rootLease, err := store.cache.Acquire(oldRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootLevel := storeio.AdmittedFloat64Directory(
+		rootLease.Page(),
+	).Header().Level
+	rootLease.Release()
+	if rootLevel == 0 {
+		t.Fatal("forced float64 directory remained a single leaf")
+	}
+	bounds := storeio.Float64DirectoryBounds{
+		FileEnd:       state.super.FileEnd,
+		NextLogicalID: state.root.NextLogicalID,
+	}
+	var entries []storeio.Float64DirectoryEntry
+	if err := storeio.WalkFloat64Directory(
+		store.cache, oldRoot, bounds, uint32(options.PageSize),
+		func(entry storeio.Float64DirectoryEntry) error {
+			entries = append(entries, entry)
+			return nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) <= storeio.Float64DirectoryFanout {
+		t.Fatalf(
+			"float64 stripe count = %d, want more than %d",
+			len(entries), storeio.Float64DirectoryFanout,
+		)
+	}
+	targetEntry := entries[storeio.Float64DirectoryFanout+3]
+	target := int(targetEntry.FirstChunk) *
+		options.Store.ChunkDocuments
+	if target <= 0 || target >= documents {
+		t.Fatalf("target chunk = %d", target)
+	}
+	untouched := entries[0].Ref
+	var oldDirectoryPages []storeio.PageRef
+	if err := storeio.WalkFloat64DirectoryPages(
+		store.cache, oldRoot, bounds, uint32(options.PageSize),
+		func(ref storeio.PageRef) error {
+			oldDirectoryPages = append(oldDirectoryPages, ref)
+			return nil
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	historical, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := target & 255
+	if created, err := store.Put(
+		fmt.Sprintf("doc:%04d", target), document(target, 3000),
+	); err != nil || created {
+		t.Fatalf("multi-level projection update = (%v,%v)", created, err)
+	}
+	updatedState := store.state.Load()
+	if updatedState.root.Float64ScanHead == (storeio.PageRef{}) ||
+		updatedState.root.Float64ScanHead == oldRoot {
+		t.Fatalf(
+			"multi-level update root = %+v, old %+v",
+			updatedState.root.Float64ScanHead, oldRoot,
+		)
+	}
+	updatedEntry, found, err := storeio.LookupFloat64Directory(
+		store.cache, updatedState.root.Float64ScanHead,
+		uint32(target/options.Store.ChunkDocuments),
+		storeio.Float64DirectoryBounds{
+			FileEnd:       updatedState.super.FileEnd,
+			NextLogicalID: updatedState.root.NextLogicalID,
+		},
+		uint32(options.PageSize),
+	)
+	if err != nil || !found || updatedEntry.Ref == targetEntry.Ref {
+		t.Fatalf(
+			"updated stripe = (%+v,%v,%v), old %+v",
+			updatedEntry, found, err, targetEntry.Ref,
+		)
+	}
+	untouchedEntry, found, err := storeio.LookupFloat64Directory(
+		store.cache, updatedState.root.Float64ScanHead, 0,
+		storeio.Float64DirectoryBounds{
+			FileEnd:       updatedState.super.FileEnd,
+			NextLogicalID: updatedState.root.NextLogicalID,
+		},
+		uint32(options.PageSize),
+	)
+	if err != nil || !found || untouchedEntry.Ref != untouched {
+		t.Fatalf(
+			"untouched stripe = (%+v,%v,%v), want %+v",
+			untouchedEntry, found, err, untouched,
+		)
+	}
+	retired := func(ref storeio.PageRef) bool {
+		for _, extent := range store.retireScratch {
+			if extent.Offset <= ref.Offset &&
+				uint64(ref.Length) <= extent.Length &&
+				ref.Offset-extent.Offset <=
+					extent.Length-uint64(ref.Length) {
+				return true
+			}
+		}
+		return false
+	}
+	if !retired(targetEntry.Ref) || retired(untouched) {
+		t.Fatalf(
+			"stripe retirement = (target %v, untouched %v)",
+			retired(targetEntry.Ref), retired(untouched),
+		)
+	}
+	retiredDirectoryPages := 0
+	for _, ref := range oldDirectoryPages {
+		if retired(ref) {
+			retiredDirectoryPages++
+		}
+	}
+	if retiredDirectoryPages != int(rootLevel)+1 {
+		t.Fatalf(
+			"retired directory pages = %d, want path length %d",
+			retiredDirectoryPages, int(rootLevel)+1,
+		)
+	}
+	if deleted, err := store.Delete(
+		fmt.Sprintf("doc:%04d", target),
+	); err != nil || !deleted {
+		t.Fatalf("multi-level projection delete = (%v,%v)", deleted, err)
+	}
+	if store.state.Load().root.Float64ScanHead == (storeio.PageRef{}) {
+		t.Fatal("in-range delete dropped float64 directory")
+	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, covered, err := snapshot.ReduceFloat64Path("/c00")
+	if err != nil || !covered {
+		t.Fatalf(
+			"multi-level reduction preflight = (%+v,%v,%v)",
+			total, covered, err,
+		)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		total, covered, err = snapshot.ReduceFloat64Path("/c00")
+		if err != nil || !covered {
+			panic("multi-level float64 reduction")
+		}
+	})
+	if closeErr := snapshot.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	wantSum := initialSum - float64(original)
+	if err != nil || !covered || total.Count != documents-1 ||
+		total.Sum != wantSum {
+		t.Fatalf(
+			"multi-level reduction = (%+v,%v,%v), want sum %.0f",
+			total, covered, err, wantSum,
+		)
+	}
+	if allocs != 0 {
+		t.Fatalf(
+			"multi-level reduction allocations = %.2f, want zero",
+			allocs,
+		)
+	}
+	oldTotal, oldCovered, oldErr := historical.ReduceFloat64Path("/c00")
+	if closeErr := historical.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if oldErr != nil || !oldCovered || oldTotal.Count != documents ||
+		oldTotal.Sum != initialSum {
+		t.Fatalf(
+			"historical multi-level reduction = (%+v,%v,%v)",
+			oldTotal, oldCovered, oldErr,
+		)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered, err := reopened.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, covered, err = recovered.ReduceFloat64Path("/c00")
+	if closeErr := recovered.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil || !covered || total.Count != documents-1 ||
+		total.Sum != wantSum {
+		t.Fatalf(
+			"recovered multi-level reduction = (%+v,%v,%v)",
+			total, covered, err,
+		)
 	}
 }
 

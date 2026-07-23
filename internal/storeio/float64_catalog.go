@@ -7,108 +7,124 @@ import (
 )
 
 const (
-	Float64CatalogPayloadHeaderSize = 64
-	float64CatalogVersionV1         = uint32(1)
-	float64CatalogVersion           = uint32(2)
+	Float64DirectoryPayloadHeaderSize = 32
+	Float64DirectoryRecordSize        = 40
+	Float64DirectoryFanout            = 64
+	Float64DirectoryMaxLevel          = 6
+	float64DirectoryVersion           = uint32(3)
 )
 
-// ErrFloat64CatalogCorrupt reports a checksum-valid compact scan catalog with
-// malformed ordering, bounds, or typed-extent references.
-var ErrFloat64CatalogCorrupt = errors.New("simdjson: corrupt Store float64 scan catalog")
+// ErrFloat64CatalogCorrupt reports a checksum-valid numeric stripe directory
+// with malformed ordering, bounds, or page references. The historical error
+// name remains internal so callers do not need two corruption paths.
+var ErrFloat64CatalogCorrupt = errors.New("simdjson: corrupt Store float64 stripe directory")
 
-// Float64CatalogHeader identifies one immutable page in the clean-generation
-// scan list. Catalogs contain value-only stripe refs and no per-row state.
-type Float64CatalogHeader struct {
+// ErrFloat64DirectoryDepth reports an impossible path beyond the format's
+// fixed fanout/level contract.
+var ErrFloat64DirectoryDepth = errors.New("simdjson: Store float64 stripe directory is too deep")
+
+// Float64DirectoryEntry is one ordered lower bound. Leaves map FirstChunk to
+// a packed value stripe; branches map it to a directory child. Keeping both
+// node forms identical makes traversal compact and bounds mutation scratch to
+// one fixed array without interfaces or heap allocation.
+type Float64DirectoryEntry struct {
+	FirstChunk uint32
+	Ref        PageRef
+}
+
+// Float64DirectoryHeader identifies one immutable node in the ordered stripe
+// directory. Level zero is a leaf; higher levels contain child references.
+type Float64DirectoryHeader struct {
 	StoreID    [16]byte
 	Generation uint64
 	LogicalID  uint64
 	PageSize   uint32
-	Next       PageRef
+	Level      uint8
 }
 
-// Float64CatalogView borrows one admitted catalog page.
-type Float64CatalogView struct {
-	header  Float64CatalogHeader
+// Float64DirectoryView borrows one admitted directory node.
+type Float64DirectoryView struct {
+	header  Float64DirectoryHeader
 	payload []byte
-	count   int
-	version uint32
+	count   uint8
 }
 
-// EncodeFloat64Catalog writes one ordered scan-catalog page without
-// allocating. refs must follow physical and logical bulk-build order.
-func EncodeFloat64Catalog(
+// EncodeFloat64DirectoryLeaf writes one ordered stripe-directory leaf without
+// allocating. Directory nodes are fixed PageSize metadata pages even when the
+// referenced stripes use larger packed extents.
+func EncodeFloat64DirectoryLeaf(
 	dst []byte,
-	header Float64CatalogHeader,
-	refs []PageRef,
+	header Float64DirectoryHeader,
+	entries []Float64DirectoryEntry,
 	fileEnd, nextLogicalID uint64,
 	allocationQuantum uint32,
 ) ([]byte, error) {
-	return encodeFloat64Catalog(
-		dst, header, refs, fileEnd, nextLogicalID, allocationQuantum,
-		float64CatalogVersionV1,
+	if header.Level != 0 {
+		return nil, fmt.Errorf("%w: float64 directory leaf level", ErrInvalidWrite)
+	}
+	return encodeFloat64Directory(
+		dst, header, entries, fileEnd, nextLogicalID, allocationQuantum,
 	)
 }
 
-// EncodeMutableFloat64Catalog writes a catalog whose logical stripe order is
-// stable while replacement extents may have newer generations and arbitrary
-// physical offsets. This is the copy-on-write form used after incrementally
-// rebuilding one dense stripe.
-func EncodeMutableFloat64Catalog(
+// EncodeFloat64DirectoryBranch writes one ordered directory branch without
+// allocating. Child generations may be older than the branch because an
+// incremental copy-on-write mutation shares every untouched subtree.
+func EncodeFloat64DirectoryBranch(
 	dst []byte,
-	header Float64CatalogHeader,
-	refs []PageRef,
+	header Float64DirectoryHeader,
+	entries []Float64DirectoryEntry,
 	fileEnd, nextLogicalID uint64,
 	allocationQuantum uint32,
 ) ([]byte, error) {
-	return encodeFloat64Catalog(
-		dst, header, refs, fileEnd, nextLogicalID, allocationQuantum,
-		float64CatalogVersion,
+	if header.Level == 0 {
+		return nil, fmt.Errorf("%w: float64 directory branch level", ErrInvalidWrite)
+	}
+	return encodeFloat64Directory(
+		dst, header, entries, fileEnd, nextLogicalID, allocationQuantum,
 	)
 }
 
-func encodeFloat64Catalog(
+func encodeFloat64Directory(
 	dst []byte,
-	header Float64CatalogHeader,
-	refs []PageRef,
+	header Float64DirectoryHeader,
+	entries []Float64DirectoryEntry,
 	fileEnd, nextLogicalID uint64,
 	allocationQuantum uint32,
-	version uint32,
 ) ([]byte, error) {
-	mutable := version == float64CatalogVersion
-	if len(refs) == 0 || len(refs) > int(^uint16(0)) ||
-		header.StoreID == ([16]byte{}) || header.Generation == 0 ||
-		header.LogicalID <= StateRootLogicalID || header.LogicalID >= nextLogicalID ||
-		!validPhysicalPageSize(header.PageSize) ||
-		!validPhysicalPageSize(allocationQuantum) ||
-		header.PageSize < allocationQuantum || header.PageSize%allocationQuantum != 0 ||
-		Float64CatalogPayloadHeaderSize+len(refs)*PageRefSize >
-			int(header.PageSize)-PageHeaderSize-PageTrailerSize {
-		return nil, fmt.Errorf("%w: float64 catalog header", ErrInvalidWrite)
-	}
-	if err := validateFloat64CatalogNext(
-		header, fileEnd, nextLogicalID, allocationQuantum, mutable,
+	if err := validateFloat64DirectoryHeader(
+		header, len(entries), nextLogicalID, allocationQuantum,
 	); err != nil {
 		return nil, err
 	}
-	if err := validateFloat64CatalogRefs(
-		refs, header, fileEnd, nextLogicalID, allocationQuantum, mutable,
-	); err != nil {
-		return nil, err
+	var seen chunkDirectoryRefSet
+	for i, entry := range entries {
+		if i != 0 && entries[i-1].FirstChunk >= entry.FirstChunk {
+			return nil, fmt.Errorf("%w: float64 directory key order", ErrInvalidWrite)
+		}
+		if err := validateFloat64DirectoryRef(
+			header, entry.Ref, fileEnd, nextLogicalID, allocationQuantum,
+		); err != nil || !seen.add(entry.Ref) {
+			return nil, fmt.Errorf("%w: float64 directory reference", ErrInvalidWrite)
+		}
 	}
+	payloadLength := Float64DirectoryPayloadHeaderSize +
+		len(entries)*Float64DirectoryRecordSize
 	payload, err := InitPage(dst, PageHeader{
-		StoreID: header.StoreID, Generation: header.Generation, LogicalID: header.LogicalID,
-		PageSize: header.PageSize, PayloadLength: uint32(Float64CatalogPayloadHeaderSize + len(refs)*PageRefSize),
-		Kind: PageFloat64Catalog,
+		StoreID: header.StoreID, Generation: header.Generation,
+		LogicalID: header.LogicalID, PageSize: header.PageSize,
+		PayloadLength: uint32(payloadLength), Kind: PageFloat64Catalog,
 	})
 	if err != nil {
 		return nil, err
 	}
-	binary.LittleEndian.PutUint32(payload[0:4], version)
-	binary.LittleEndian.PutUint16(payload[4:6], uint16(len(refs)))
-	encodePageRef(payload[8:8+PageRefSize], header.Next)
-	for i, ref := range refs {
-		start := Float64CatalogPayloadHeaderSize + i*PageRefSize
-		encodePageRef(payload[start:start+PageRefSize], ref)
+	binary.LittleEndian.PutUint32(payload[0:4], float64DirectoryVersion)
+	payload[4] = header.Level
+	payload[6] = uint8(len(entries))
+	for i, entry := range entries {
+		record := payload[Float64DirectoryPayloadHeaderSize+i*Float64DirectoryRecordSize:]
+		binary.LittleEndian.PutUint32(record[0:4], entry.FirstChunk)
+		encodePageRef(record[8:8+PageRefSize], entry.Ref)
 	}
 	page := dst[:int(header.PageSize)]
 	if _, err := sealInitializedPage(page); err != nil {
@@ -117,176 +133,204 @@ func encodeFloat64Catalog(
 	return page, nil
 }
 
-func validateFloat64CatalogNext(
-	header Float64CatalogHeader,
-	fileEnd, nextLogicalID uint64,
-	allocationQuantum uint32,
-	mutable bool,
-) error {
-	if header.Next == (PageRef{}) {
-		return nil
-	}
-	ref := header.Next
-	if ref.Kind != PageFloat64Catalog || ref.Flags != 0 || ref.Aux != 0 ||
-		(!mutable && ref.Generation != header.Generation) ||
-		mutable && (ref.Generation == 0 || ref.Generation > header.Generation) ||
-		ref.LogicalID <= header.LogicalID ||
-		ref.LogicalID >= nextLogicalID || ref.Offset%uint64(allocationQuantum) != 0 ||
-		!validPhysicalPageSize(ref.Length) || ref.Length < allocationQuantum ||
-		ref.Length%allocationQuantum != 0 || uint64(ref.Length) > fileEnd ||
-		ref.Offset > fileEnd-uint64(ref.Length) {
-		return fmt.Errorf("%w: float64 catalog next", ErrInvalidWrite)
-	}
-	return nil
-}
-
-func validateFloat64CatalogRefs(
-	refs []PageRef,
-	header Float64CatalogHeader,
-	fileEnd, nextLogicalID uint64,
-	allocationQuantum uint32,
-	mutable bool,
-) error {
-	var previous PageRef
-	for _, ref := range refs {
-		if !validFloat64CatalogRef(
-			ref, previous, header.Generation, fileEnd, nextLogicalID,
-			allocationQuantum, mutable,
-		) {
-			return fmt.Errorf("%w: float64 catalog entry", ErrInvalidWrite)
-		}
-		previous = ref
-	}
-	return nil
-}
-
-func validFloat64CatalogRef(
-	ref, previous PageRef,
-	generation, fileEnd, nextLogicalID uint64,
-	allocationQuantum uint32,
-	mutable bool,
-) bool {
-	length := uint64(ref.Length)
-	return ref.Kind == PageFloat64Stripe &&
-		ref.Flags == 0 && ref.Aux == 0 &&
-		(!mutable && ref.Generation == generation ||
-			mutable &&
-				ref.Generation != 0 && ref.Generation <= generation) &&
-		ref.LogicalID > StateRootLogicalID && ref.LogicalID < nextLogicalID &&
-		validPhysicalPageSize(ref.Length) && ref.Length >= allocationQuantum &&
-		ref.Length%allocationQuantum == 0 &&
-		ref.Offset%uint64(allocationQuantum) == 0 &&
-		length <= fileEnd && ref.Offset <= fileEnd-length &&
-		(previous == (PageRef{}) ||
-			ref.LogicalID > previous.LogicalID &&
-				(mutable || ref.Offset > previous.Offset))
-}
-
-// OpenFloat64Catalog verifies a complete catalog page.
-func OpenFloat64Catalog(
+// OpenFloat64Directory verifies one complete stripe-directory node.
+func OpenFloat64Directory(
 	src []byte,
 	fileEnd, nextLogicalID uint64,
 	allocationQuantum uint32,
-) (Float64CatalogView, error) {
+) (Float64DirectoryView, error) {
 	pageHeader, payload, err := OpenPage(src)
 	if err != nil {
-		return Float64CatalogView{}, fmt.Errorf("%w: %w", ErrFloat64CatalogCorrupt, err)
+		return Float64DirectoryView{}, fmt.Errorf(
+			"%w: %w", ErrFloat64CatalogCorrupt, err,
+		)
 	}
-	return openFloat64CatalogPayload(pageHeader, payload, fileEnd, nextLogicalID, allocationQuantum)
-}
-
-// OpenAdmittedFloat64Catalog validates a payload after common CRC admission.
-func OpenAdmittedFloat64Catalog(
-	src []byte,
-	fileEnd, nextLogicalID uint64,
-	allocationQuantum uint32,
-) (Float64CatalogView, error) {
-	pageHeader, ok := decodePageHeader(src)
-	if !ok || len(src) != int(pageHeader.PageSize) {
-		return Float64CatalogView{}, ErrFloat64CatalogCorrupt
-	}
-	end := PageHeaderSize + int(pageHeader.PayloadLength)
-	return openFloat64CatalogPayload(
-		pageHeader, src[PageHeaderSize:end:end], fileEnd, nextLogicalID, allocationQuantum,
+	return openFloat64DirectoryPayload(
+		pageHeader, payload, fileEnd, nextLogicalID, allocationQuantum,
 	)
 }
 
-func openFloat64CatalogPayload(
+// OpenAdmittedFloat64Directory validates a directory node after common CRC
+// admission.
+func OpenAdmittedFloat64Directory(
+	src []byte,
+	fileEnd, nextLogicalID uint64,
+	allocationQuantum uint32,
+) (Float64DirectoryView, error) {
+	pageHeader, ok := decodePageHeader(src)
+	if !ok || len(src) != int(pageHeader.PageSize) {
+		return Float64DirectoryView{}, ErrFloat64CatalogCorrupt
+	}
+	end := PageHeaderSize + int(pageHeader.PayloadLength)
+	return openFloat64DirectoryPayload(
+		pageHeader, src[PageHeaderSize:end:end],
+		fileEnd, nextLogicalID, allocationQuantum,
+	)
+}
+
+func openFloat64DirectoryPayload(
 	pageHeader PageHeader,
 	payload []byte,
 	fileEnd, nextLogicalID uint64,
 	allocationQuantum uint32,
-) (Float64CatalogView, error) {
+) (Float64DirectoryView, error) {
 	if pageHeader.Kind != PageFloat64Catalog || pageHeader.Flags != 0 ||
-		len(payload) < Float64CatalogPayloadHeaderSize ||
-		(binary.LittleEndian.Uint32(payload[0:4]) != float64CatalogVersionV1 &&
-			binary.LittleEndian.Uint32(payload[0:4]) != float64CatalogVersion) ||
-		!allZero(payload[6:8]) || !pageRefReservedZero(payload[8:8+PageRefSize]) ||
-		!allZero(payload[40:Float64CatalogPayloadHeaderSize]) {
-		return Float64CatalogView{}, fmt.Errorf("%w: header or reserved bytes", ErrFloat64CatalogCorrupt)
+		len(payload) < Float64DirectoryPayloadHeaderSize ||
+		binary.LittleEndian.Uint32(payload[0:4]) != float64DirectoryVersion ||
+		payload[5] != 0 || payload[7] != 0 ||
+		!allZero(payload[8:Float64DirectoryPayloadHeaderSize]) {
+		return Float64DirectoryView{}, fmt.Errorf(
+			"%w: header or reserved bytes", ErrFloat64CatalogCorrupt,
+		)
 	}
-	count := int(binary.LittleEndian.Uint16(payload[4:6]))
-	if count == 0 || len(payload) != Float64CatalogPayloadHeaderSize+count*PageRefSize {
-		return Float64CatalogView{}, fmt.Errorf("%w: count or payload length", ErrFloat64CatalogCorrupt)
-	}
-	header := Float64CatalogHeader{
+	count := int(payload[6])
+	header := Float64DirectoryHeader{
 		StoreID: pageHeader.StoreID, Generation: pageHeader.Generation,
 		LogicalID: pageHeader.LogicalID, PageSize: pageHeader.PageSize,
-		Next: decodePageRef(payload[8 : 8+PageRefSize]),
+		Level: payload[4],
 	}
-	version := binary.LittleEndian.Uint32(payload[0:4])
-	mutable := version == float64CatalogVersion
-	if err := validateFloat64CatalogNext(
-		header, fileEnd, nextLogicalID, allocationQuantum, mutable,
-	); err != nil {
-		return Float64CatalogView{}, fmt.Errorf("%w: %v", ErrFloat64CatalogCorrupt, err)
+	if err := validateFloat64DirectoryHeader(
+		header, count, nextLogicalID, allocationQuantum,
+	); err != nil ||
+		len(payload) != Float64DirectoryPayloadHeaderSize+
+			count*Float64DirectoryRecordSize {
+		return Float64DirectoryView{}, fmt.Errorf(
+			"%w: node bounds", ErrFloat64CatalogCorrupt,
+		)
 	}
-	var previous PageRef
+	var previous uint32
+	var seen chunkDirectoryRefSet
 	for i := 0; i < count; i++ {
-		start := Float64CatalogPayloadHeaderSize + i*PageRefSize
-		if !pageRefReservedZero(payload[start : start+PageRefSize]) {
-			return Float64CatalogView{}, fmt.Errorf("%w: entry reserved bytes", ErrFloat64CatalogCorrupt)
+		record := payload[Float64DirectoryPayloadHeaderSize+i*Float64DirectoryRecordSize:]
+		first := binary.LittleEndian.Uint32(record[0:4])
+		ref := decodePageRef(record[8 : 8+PageRefSize])
+		if !allZero(record[4:8]) ||
+			i != 0 && previous >= first ||
+			!pageRefReservedZero(record[8:8+PageRefSize]) {
+			return Float64DirectoryView{}, fmt.Errorf(
+				"%w: record order or reserved bytes",
+				ErrFloat64CatalogCorrupt,
+			)
 		}
-		ref := decodePageRef(payload[start : start+PageRefSize])
-		if !validFloat64CatalogRef(
-			ref, previous, header.Generation, fileEnd, nextLogicalID,
-			allocationQuantum, mutable,
-		) {
-			return Float64CatalogView{}, fmt.Errorf("%w: entry bounds or order", ErrFloat64CatalogCorrupt)
+		if err := validateFloat64DirectoryRef(
+			header, ref, fileEnd, nextLogicalID, allocationQuantum,
+		); err != nil || !seen.add(ref) {
+			return Float64DirectoryView{}, fmt.Errorf(
+				"%w: record reference", ErrFloat64CatalogCorrupt,
+			)
 		}
-		previous = ref
+		previous = first
 	}
-	return Float64CatalogView{
-		header: header, payload: payload, count: count, version: version,
+	return Float64DirectoryView{
+		header: header, payload: payload, count: uint8(count),
 	}, nil
 }
 
-// AdmittedFloat64Catalog reconstructs a previously validated catalog.
-func AdmittedFloat64Catalog(src []byte) Float64CatalogView {
+func validateFloat64DirectoryHeader(
+	header Float64DirectoryHeader,
+	count int,
+	nextLogicalID uint64,
+	allocationQuantum uint32,
+) error {
+	payloadLength := Float64DirectoryPayloadHeaderSize +
+		count*Float64DirectoryRecordSize
+	if header.StoreID == ([16]byte{}) || header.Generation == 0 ||
+		header.LogicalID <= StateRootLogicalID ||
+		header.LogicalID >= nextLogicalID ||
+		header.PageSize != allocationQuantum ||
+		!validPhysicalPageSize(allocationQuantum) ||
+		header.Level > Float64DirectoryMaxLevel ||
+		count < 1 || count > Float64DirectoryFanout ||
+		payloadLength >
+			int(header.PageSize)-PageHeaderSize-PageTrailerSize {
+		return fmt.Errorf("%w: float64 directory header", ErrInvalidWrite)
+	}
+	return nil
+}
+
+func validateFloat64DirectoryRef(
+	header Float64DirectoryHeader,
+	ref PageRef,
+	fileEnd, nextLogicalID uint64,
+	allocationQuantum uint32,
+) error {
+	length := uint64(ref.Length)
+	wantKind := PageFloat64Catalog
+	exactLength := true
+	if header.Level == 0 {
+		wantKind = PageFloat64Stripe
+		exactLength = false
+	}
+	if ref.Kind != wantKind || ref.Flags != 0 || ref.Aux != 0 ||
+		ref.Generation == 0 || ref.Generation > header.Generation ||
+		ref.LogicalID <= StateRootLogicalID ||
+		ref.LogicalID >= nextLogicalID ||
+		ref.LogicalID == header.LogicalID ||
+		!validPhysicalPageSize(ref.Length) ||
+		ref.Length < allocationQuantum ||
+		exactLength && ref.Length != allocationQuantum ||
+		ref.Length%allocationQuantum != 0 ||
+		ref.Offset%uint64(allocationQuantum) != 0 ||
+		ref.Offset < 2*uint64(allocationQuantum) ||
+		length > fileEnd || ref.Offset > fileEnd-length {
+		return fmt.Errorf("%w: float64 directory ref", ErrInvalidWrite)
+	}
+	return nil
+}
+
+// AdmittedFloat64Directory reconstructs a previously validated directory
+// node. Calling it on unvalidated bytes is invalid.
+func AdmittedFloat64Directory(src []byte) Float64DirectoryView {
 	pageHeader, _ := decodePageHeader(src)
 	end := PageHeaderSize + int(pageHeader.PayloadLength)
 	payload := src[PageHeaderSize:end:end]
-	return Float64CatalogView{
-		header: Float64CatalogHeader{
+	return Float64DirectoryView{
+		header: Float64DirectoryHeader{
 			StoreID: pageHeader.StoreID, Generation: pageHeader.Generation,
 			LogicalID: pageHeader.LogicalID, PageSize: pageHeader.PageSize,
-			Next: decodePageRef(payload[8 : 8+PageRefSize]),
+			Level: payload[4],
 		},
-		payload: payload, count: int(binary.LittleEndian.Uint16(payload[4:6])),
-		version: binary.LittleEndian.Uint32(payload[0:4]),
+		payload: payload, count: payload[6],
 	}
 }
 
-func (v Float64CatalogView) Header() Float64CatalogHeader { return v.header }
-func (v Float64CatalogView) Len() int                     { return v.count }
-func (v Float64CatalogView) Mutable() bool {
-	return v.version == float64CatalogVersion
+func (v Float64DirectoryView) Header() Float64DirectoryHeader {
+	return v.header
 }
 
-func (v Float64CatalogView) RefAt(index int) (PageRef, bool) {
-	start := Float64CatalogPayloadHeaderSize + index*PageRefSize
-	if index < 0 || index >= v.count || start+PageRefSize > len(v.payload) {
-		return PageRef{}, false
+func (v Float64DirectoryView) Len() int { return int(v.count) }
+
+// EntryAt returns one ordered lower-bound mapping.
+func (v Float64DirectoryView) EntryAt(
+	index int,
+) (Float64DirectoryEntry, bool) {
+	if index < 0 || index >= int(v.count) {
+		return Float64DirectoryEntry{}, false
 	}
-	return decodePageRef(v.payload[start : start+PageRefSize]), true
+	record := v.payload[Float64DirectoryPayloadHeaderSize+index*Float64DirectoryRecordSize:]
+	return Float64DirectoryEntry{
+		FirstChunk: binary.LittleEndian.Uint32(record[0:4]),
+		Ref:        decodePageRef(record[8 : 8+PageRefSize]),
+	}, true
+}
+
+// Floor returns the mapping with the greatest FirstChunk not exceeding chunk.
+func (v Float64DirectoryView) Floor(
+	chunk uint32,
+) (Float64DirectoryEntry, bool) {
+	low, high := 0, int(v.count)
+	for low < high {
+		middle := int(uint(low+high) >> 1)
+		record := v.payload[Float64DirectoryPayloadHeaderSize+
+			middle*Float64DirectoryRecordSize:]
+		if binary.LittleEndian.Uint32(record[0:4]) <= chunk {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	if low == 0 {
+		return Float64DirectoryEntry{}, false
+	}
+	return v.EntryAt(low - 1)
 }

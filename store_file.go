@@ -286,16 +286,16 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 	maxTransactionPages := overflowPages + metadataPageLimit
 	// One document and its overflow chain may use maximum-size extents. A
 	// categorical cover can replace one packed catalog, while a numeric
-	// projection can replace one packed stripe and catalog. Every tree/root
-	// page remains exactly PageSize. The slot cache therefore reserves the
-	// actual worst-case dirty bytes instead of charging MaxPageSize for every
-	// metadata descriptor.
+	// projection replaces one packed stripe plus a bounded path of PageSize
+	// directory nodes. Every tree/root page remains exactly PageSize. The slot
+	// cache therefore reserves the actual worst-case dirty bytes instead of
+	// charging MaxPageSize for every metadata descriptor.
 	largePages := overflowPages + 1
 	if len(compiled) != 0 {
 		largePages++
 	}
 	if len(columns) != 0 {
-		largePages += 2
+		largePages++
 	}
 	metadataPages := maxTransactionPages - largePages
 	maxTransactionBytes := uint64(largePages)*uint64(o.MaxPageSize) +
@@ -381,7 +381,6 @@ type FileStore struct {
 	reusableBlock           *storemem.Block
 	float64Masks            []uint64
 	float64Values           []float64
-	float64CatalogRefs      []storeio.PageRef
 	float64StripeBytes      []byte
 	float64StripeColumns    []storeio.Float64StripeColumn
 	freeLoaded              bool
@@ -2532,10 +2531,11 @@ func (s *FileStore) appendIndexGroupRetirements(
 }
 
 // appendFloat64ScanRetirements releases a complete aggregate-only projection
-// after an insert or an incremental-rebuild fallback. Bulk stripe and catalog
-// pages are allocated as one physical run. Adjacent refs are folded into one
-// retirement record so reclamation metadata remains O(1) for a large store.
-// TTL-only and projection-neutral publications retain the projection.
+// after an out-of-range insert or incremental-rebuild fallback. Bulk stripes
+// and ordered-directory levels are allocated as one physical run. Adjacent
+// refs are folded into one retirement record so reclamation metadata remains
+// O(1) for a large compact generation. TTL-only and projection-neutral
+// publications retain the projection.
 //
 // Authoritative detached PageFloat64Group sidecars are not catalog entries
 // and remain reachable from document refs.
@@ -2563,54 +2563,30 @@ func (s *FileStore) appendFloat64ScanRetirements(old *fileStoreState) error {
 		})
 		return nil
 	}
-	// First append every stripe in logical catalog order. A fresh bulk build is
-	// also physically ordered and therefore coalesces to one retirement extent.
-	// Mutable catalogs preserve logical order while replacement pages may live
-	// anywhere; appendRef safely retains those outliers as separate extents
-	// without requiring a ref-sized Go object per catalog entry.
-	var previousScanRef storeio.PageRef
-	for pass := 0; pass < 2; pass++ {
-		ref := old.root.Float64ScanHead
-		for ref != (storeio.PageRef{}) {
-			lease, err := s.cache.Acquire(ref)
-			if err != nil {
-				return err
-			}
-			catalog := storeio.AdmittedFloat64Catalog(lease.Page())
-			if pass == 0 {
-				for entry := 0; entry < catalog.Len(); entry++ {
-					scanRef, ok := catalog.RefAt(entry)
-					if !ok {
-						lease.Release()
-						return storeio.ErrFloat64CatalogCorrupt
-					}
-					if previousScanRef != (storeio.PageRef{}) &&
-						scanRef.LogicalID <= previousScanRef.LogicalID {
-						lease.Release()
-						return storeio.ErrFloat64CatalogCorrupt
-					}
-					previousScanRef = scanRef
-					if err := appendRef(scanRef); err != nil {
-						lease.Release()
-						return err
-					}
-				}
-			} else if err := appendRef(ref); err != nil {
-				lease.Release()
-				return err
-			}
-			next := catalog.Header().Next
-			if next != (storeio.PageRef{}) &&
-				(next.LogicalID <= ref.LogicalID ||
-					!catalog.Mutable() && next.Offset <= ref.Offset) {
-				lease.Release()
-				return storeio.ErrFloat64CatalogCorrupt
-			}
-			lease.Release()
-			ref = next
-		}
+	bounds := storeio.Float64DirectoryBounds{
+		FileEnd:       old.super.FileEnd,
+		NextLogicalID: old.root.NextLogicalID,
 	}
-	return nil
+	err := storeio.WalkFloat64DirectoryLeaves(
+		s.cache, old.root.Float64ScanHead, bounds,
+		uint32(s.options.PageSize),
+		func(leaf storeio.Float64DirectoryView) error {
+			for i := 0; i < leaf.Len(); i++ {
+				entry, _ := leaf.EntryAt(i)
+				if err := appendRef(entry.Ref); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return err
+	}
+	return storeio.WalkFloat64DirectoryPages(
+		s.cache, old.root.Float64ScanHead, bounds,
+		uint32(s.options.PageSize), appendRef,
+	)
 }
 
 func (s *FileStore) appendTTLRetirements(old *fileStoreState, mutation storeio.TTLTreeMutation) error {
