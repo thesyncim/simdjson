@@ -149,7 +149,7 @@ func TestFreeDirectorySteadyAllocation(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		benchmarkFreeExtent, _ = view.ExtentAt(view.LowerBound(5 * pageSize))
+		freeExtentSink, _ = view.ExtentAt(view.LowerBound(5 * pageSize))
 	}); allocs != 0 {
 		t.Fatalf("free-directory codec and lookup allocations = %g, want 0", allocs)
 	}
@@ -207,7 +207,7 @@ func TestRecoverStateRootValidatesFreeDirectorySchema(t *testing.T) {
 	}
 }
 
-var benchmarkFreeExtent FreeExtent
+var freeExtentSink FreeExtent
 
 func testFreeDirectoryRef(logicalID, page, generation uint64) PageRef {
 	return PageRef{

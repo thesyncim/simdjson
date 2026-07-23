@@ -81,11 +81,8 @@ widened into classic tapes. Group keys use the same byte-exact semantics as the
 document layer. Stable ordering retains input order for equal keys.
 
 `Cell` stores raw JSON, decoded text only when the value is a string, and one
-tagged numeric/boolean word. On 64-bit targets it is 56 bytes rather than the
-former 72-byte parallel integer/float representation. Result materialization
-therefore writes 22% fewer bytes per cell; four-column projection on the M4 Max
-fixture improved from 165.4-166.7 to 145.4-146.0 ns/document while remaining
-zero-allocation. Aggregate and grouping scans stayed within benchmark noise.
+tagged numeric/boolean word. Its 64-bit layout is fixed by tests so adding a
+value kind cannot silently grow every result row.
 Computed aggregates no longer grow or borrow an eagerly formatted number arena:
 `Int64`/`Float64` consume them directly and `AppendJSON` formats only when a
 text encoding is actually requested. The convenience `JSON` accessor may
@@ -126,16 +123,15 @@ correctness precondition.
 
 Sorted sparse posting lists use linear merge/intersection. Native dense masks
 may use the internal SIMD Boolean kernel. Transient sparse-to-dense conversion
-is intentionally rejected until a complete build/combine/decode benchmark wins.
+is intentionally rejected because it adds build and decode passes; a future
+route must justify those passes with a planner-visible cost model.
 
-## Measurement boundary
+## Evidence boundary
 
-Query evidence uses generator-owned counts, aggregates, result digests, and
-allocation checks. Timings are direct in-process calls over explicitly labelled
-heap or recovered bounded-cache state. Durable file bytes, live heap, admitted
-cache, commit staging, caller workspaces, and process RSS remain separate
-accounting domains. Machine-specific values belong in reproducible benchmark
-output, not as timeless API promises in this ADR.
+Query evidence uses generator-owned counts, aggregates, result digests,
+physical-read counters, and allocation checks. Durable file bytes, live heap,
+admitted cache, commit staging, caller workspaces, and process RSS remain
+separate accounting domains.
 
 ## Non-goals
 

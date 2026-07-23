@@ -47,20 +47,18 @@ var (
 )
 
 func pageChecksum(data []byte) uint32 {
-	// Native AMD EPYC 7763 measurements showed the standard library's
-	// hardware CRC32C path beating the 128-bit candidate by about 1.9x. The
-	// wider candidate has no native winning sample yet. Keep both pure-Go SIMD
-	// bodies compiled and directly checked, but do not put an unproven kernel
-	// on every durable write merely because a feature bit is present.
+	// Keep the standard library's hardware-aware CRC32C path authoritative.
+	// The pure-Go SIMD bodies remain directly correctness- and ISA-tested
+	// candidates, but feature availability alone does not select one for every
+	// durable write.
 	return crc32.Checksum(data, pageChecksumTable)
 }
 
 // pageChecksumPCLMUL8 folds eight independent 128-bit streams. Eight streams
 // cover 4 KiB and 64 KiB pages without a scalar tail and hide PCLMUL latency on
 // ordinary AVX-era amd64 CPUs. It remains a directly tested candidate rather
-// than a dispatched tier: native AMD EPYC 7763 measurements lost to Go's
-// hardware CRC32C path. A future dispatch requires a native per-CPU win and an
-// exact PCLMUL capability check; AVX alone does not imply PCLMUL.
+// than a dispatched tier. Any future dispatch requires an exact PCLMUL
+// capability check; AVX alone does not imply PCLMUL.
 func pageChecksumPCLMUL8(data []byte) uint32 {
 	base := unsafe.SliceData(data)
 	x0 := loadCRC32CBlock128(base, 0).

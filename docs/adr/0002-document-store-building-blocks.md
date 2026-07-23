@@ -33,8 +33,8 @@ Keep the multi-document substrate in this repository:
 - versioned `DocSet` serialization stores sources, tapes, shapes, dictionaries,
   and postings in a reopenable image. Formats remain unstable before v1.
 
-The root module keeps no third-party dependency. Corpus and benchmark-only
-dependencies remain isolated in nested modules.
+The root module keeps no third-party dependency. Corpus-only dependencies
+remain isolated in nested modules.
 
 ## Required invariants
 
@@ -62,8 +62,8 @@ can make their ingest or metadata cost unprofitable.
 
 Sparse postings remain sorted ordinals. A native dense bitmap may use the
 allocation-free word kernels in `internal/bitset`, but an ephemeral posting
-list is not converted merely to reach SIMD. End-to-end measurements found that
-list-to-bitmap build plus result decode outweighed the faster Boolean kernel.
+list is not converted merely to reach SIMD: conversion would add a dense build
+and result-decode pass to a representation already suitable for linear merge.
 
 ## API boundary
 
@@ -79,14 +79,10 @@ semantics remain outside this storage ADR.
 The implementation is held by classic-versus-compact differential tests,
 bounded exhaustive representation checks, corrupt-image tests, retained-value
 and forced-GC tests, portable/SIMD parity, race and `checkptr` runs, and
-allocation benchmarks.
+allocation-contract tests.
 
-Machine-specific results belong in reproducible benchmark output rather than
-in this decision record. The current commands and measurement boundary are in:
-
-- [`benchmarks/README.md`](../../benchmarks/README.md) for local benchmark
-  methodology;
-- [`docs/store.md`](../store.md) for mutable Store behavior and measurements.
+[`docs/store.md`](../store.md) defines mutable Store behavior, ownership, and
+operational counters.
 
 ## Consequences
 

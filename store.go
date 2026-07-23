@@ -422,7 +422,7 @@ func buildStoreChunk(
 // buildStoreChunkSchema is the schema-on specialization of buildStoreChunk.
 // Keeping the replacement append explicit gives the much more common
 // schemaless build a direct DocSet.Append call; a callback or inner-loop mode
-// branch measured as avoidable update overhead.
+// branch would add work to every schemaless mutation.
 func buildStoreChunkSchema(
 	options storeStateOptions,
 	schema *StoreSchema,

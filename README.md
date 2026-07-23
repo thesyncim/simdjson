@@ -395,14 +395,6 @@ a 128 MiB Go limit sampled 17.0 MiB RSS, 18.1 MiB peak RSS, and 3.50 MiB Go
 heap while scanning at 78.0 MiB/s. That is a bounded-residency correctness
 result, not a claim that cold storage has resident-memory latency.
 
-The Linux/ARM64 pressure benchmark now separates serial direct reads, four
-portable read-ahead workers, and native queue-depth sweeps. With 2,048 inline
-documents behind a cache smaller than the corpus, one-second samples measured
-median 60.18 MiB/s serial, 75.03 MiB/s portable read-ahead, and 182.16 MiB/s
-at native depth 64. The native lane was 2.43x the portable median and 3.03x
-serial, with 0 B/op and 0 allocs/op on every path. This is measured
-container-backed storage evidence, not a portable device guarantee.
-
 The separate physical gate compiles outside a 64 MiB Linux cgroup, requires
 direct reads and writes, and stores one nested exact index with 2,137 large
 documents. Its live key+JSON source was 6,713,852,053 bytes (127.7x the
@@ -511,7 +503,7 @@ candidate chunks.
 
 The complete API, ownership rules, expiration semantics, tuning table,
 complexity bounds, zero-allocation recipes, operational counters, limits, and
-reproducible Store measurements are in
+Store evidence boundaries are in
 [Mutable Store operations](docs/store.md).
 
 ## Performance
@@ -528,42 +520,6 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Lookup primitives (probe hit, hashed `Get`) | 3.8–6.4 ns |
 | Extract one field across a document set | 8.1 ns/doc |
 | Extract a typed `int64` column | 12 ns/doc |
-| Immutable `Store.GetRaw` point read | 21.9-23.9 ns, 0 allocations |
-| Compiled stable-slot `Store.GetRawKey` | 8.0-8.5 ns, 0 allocations |
-| Bulk `StoreBuilder` vs repeated `Put` | about 7.7x throughput, 93.7% fewer transient bytes |
-| Mapped `OpenStore`, 16,384 keys / 5.40 MB image | 1.04-1.05 ms, 234.7 KB Go heap, 1.21 MB pointer-free external metadata |
-| Mapped `OpenStore`, one compound exact index | 2.64-2.67 ms, 450.6 KB Go heap, 1.21 MB pointer-free external metadata |
-| Mapped keyed read, ordinary / compiled stable slot | 9.22-9.29 ns / 4.63-4.66 ns, 0 allocations |
-| Mapped compound query, 32 rows in 2/256 pages | 2.55-2.61 us, 0 allocations |
-| `Store.WriteTo`, 5.40 MB / 16,384 documents | 1.07-1.09 ms, 4.96-5.04 GB/s, 3 allocations |
-| Default-chunk Store replace | 2.24 us median, 9.8 KiB/op |
-| Exact-index replace, indexed tuple unchanged | 2.46-2.49 us, 9.9 KiB/op, no added allocations |
-| Indexed Snapshot equality at 10% selectivity | 12.44 ns/input doc, 0 allocations |
-| Indexed Snapshot compound point query | 2.82 ns/input doc, 0 allocations |
-| Durable exact-index probe / candidate-only routing | 19.35-19.40 us / 2.31-2.42 us, 0 allocations |
-| Durable nested compound query, 1/64 selectivity | 113.0-114.2 us vs 664.8-665.3 us full scan; 170 KB vs 2.09 MB transient |
-| Compact durable bytes, 10K rows | 3.16 MiB (0.81x key+JSON) with one exact index and one numeric cover |
-| Recovered exact filter, 10K rows | 14.50 us, 2 posting pages, 0 JSON rows/rechecks |
-| Recovered scalar-object `@>`, 10K rows | 13.08 us, 2 posting pages, 0 JSON rows/rechecks |
-| Clean-stripe durable SUM, 5M rows / 1.25M finite values | 1.948 ms, 0 JSON rows |
-| Compact durable bytes, 5M-row capacity smoke | 1.555 GiB (0.813x key+JSON); the stripe costs 2.39 MiB |
-| Recovered exact filter, 5M-row capacity smoke | 4.376 ms, 540 posting pages, 0 JSON rows/rechecks |
-| Recovered scalar-object `@>`, 5M-row capacity smoke | 4.486 ms, 540 posting pages, 0 JSON rows/rechecks |
-| Clean exact-index grouping into a reused result, 100K rows / 32 groups | 4.586-4.620 us, 0 B/op, 0 allocs/op, and 0 posting or JSON pages |
-| Real-derived grouping, 128 MiB | CITM 542 ns / Twitter 792 ns, 0 posting or JSON pages; one added 4 KiB catalog page per file |
-| Real-derived Twitter covered SUM, 128 MiB | 51.125 us, 0 JSON rows |
-| Dense Store fused 3-predicate bitmap / ordered 4,096-row decode | 410-416 ns / 4.03-4.08 us, 0 allocations |
-| Change an existing TTL | 45 ns, 0 allocations |
-| Dense bitmap Boolean pass on M4 Max | 75-80 GB/s, 0 allocations; NEON did not beat scalar and is not dispatched |
-| Packed resident document page, JSON-only / full string-key verify | 2.566-2.576 ns / 4.034-4.092 ns, 0 allocations |
-| Packed 64-way chunk-directory hit | 7.17-7.26 ns, 0 allocations |
-| 5M-row indexed Store scale smoke | 0.93M build docs/s, 48 ns point read, 14.3 Go-heap + 148.7 external B/doc, 0.016 heap objects/doc, 4.16 packed-index B/doc |
-
-On the hosted AMD EPYC 7763 runner, AVX2 reduced the fused dense Store
-three-predicate kernel from 815-823 ns to 174-175 ns (about 4.7x). The complete
-kernel-plus-ordered-row decode improved from 8.44-8.51 us to 7.67-7.77 us at
-zero allocations. Hosted results are directional; the benchmark artifacts
-retain raw samples for both x64 and arm64.
 
 Performance changes must preserve correctness, ownership, retained memory,
 `B/op`, and `allocs/op`. Native CI exercises matched portable and SIMD behavior

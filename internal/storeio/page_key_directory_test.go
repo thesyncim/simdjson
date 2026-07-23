@@ -156,14 +156,3 @@ func TestKeyHashStableVectors(t *testing.T) {
 		}
 	}
 }
-
-func BenchmarkKeyHash16(b *testing.B) {
-	key := "customer:012345"
-	storeID := [16]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
-	b.ReportAllocs()
-	for range b.N {
-		benchmarkUint64 = KeyHash(storeID, key)
-	}
-}
-
-var benchmarkUint64 uint64

@@ -93,14 +93,10 @@ memory.
 
 Nil `StoreOptions.Schema` preserves the specialized schemaless path. The
 schema pointer lives once in collection configuration and is excluded from
-every immutable generation, preserving the pre-schema state size class. On the
-local one-row mutation benchmark, schemaless updates retained 2,552 B/op and
-10 allocations/op; four already-compiled constraints added about 7% at the
-median of a five-run sample while retaining the same allocation counts. Direct
-validation of four nested fields measured 65-67 ns/op, 0 B/op, and 0
-allocations/op. Run
-`BenchmarkStoreSchemaMutation` and `BenchmarkStoreSchemaValidateIndex` for
-machine-local evidence.
+every immutable generation, preserving the pre-schema state size class.
+Allocation-contract tests require successful validation with caller-owned
+scratch to allocate nothing; mutation tests cover both schemaless and compiled
+schema paths.
 
 Schema identity is durable. `WriteTo` embeds the definition and `OpenStore`
 recompiles and revalidates it. FileStore and the bounded page format bind the
@@ -239,32 +235,21 @@ candidate resolves the original chunk key and compares all bytes, so
 collisions cannot create a false duplicate. The table grows geometrically,
 reserved insert/lookup is zero-allocation, and `Build` drops it before
 publishing the compact mapped key directory. `Build` then freezes the graph and
-performs one publication instead of path-copying it once per row. On the
-16,384-document benchmark fixture it
-measured 4.57-4.76 ms (206-214 MB/s) versus 35.8-37.1 ms (26.4-27.3 MB/s) for
-repeated `Put`: about 7.7x the throughput, with 8.9 MiB rather than 143 MiB of
-transient allocation bytes. Including a ready 16-value exact index measured
-5.70-5.86 ms (167-172 MB/s) and 9.2 MiB. Run `BenchmarkStoreBulkBuild` for the
-exact local result.
+performs one publication instead of path-copying it once per row. Bulk-build
+tests assert duplicate rejection, failure atomicity, ready-on-first-publication
+indexes, and equality with the online mutation path.
 
 Index construction reuses the same per-page tuple extraction, fingerprinting,
 exact-recheck contract, stable-slot masks, and immutable bulk radix builders as
 online backfill. It does not maintain a parallel bulk-only index format.
 
-### Mutation measurements
+### Mutation cost model
 
-Apple M4 Max, darwin/arm64, Go 1.26, shape tapes enabled, 1,024 resident small
-documents, the median of six 500 ms samples:
-
-| chunk documents | replace | delete + insert | replace bytes/op |
-| ---: | ---: | ---: | ---: |
-| 1 | 0.81 us | 1.99 us | 2.3 KiB |
-| 8 | 0.90 us | 2.24 us | 3.2 KiB |
-| 64 | 2.24 us | 5.00 us | 9.8 KiB |
-
-`BenchmarkStoreMutation` and `BenchmarkStoreMutationModes` reproduce the
-bounded-copy and full-rebuild control paths. These numbers are local regression
-evidence, not external-database command latency claims.
+A replacement copies only the affected immutable micro-page and the radix
+spine needed to publish it. Delete plus insert additionally updates the key
+directory and may reuse a stable slot. Exact indexes and TTL state are
+copy-on-write only when their logical value changes. Tests assert that failed
+validation, duplicate insertion, and write errors publish no partial state.
 
 ## Snapshot and borrowing rules
 
@@ -363,25 +348,11 @@ copy-out and allocate zero bytes when `dst` has enough capacity. Automatic
 unmapping and finalizer-based ownership remain deliberately absent.
 
 The image is a startup/off-heap boundary, not a larger-than-memory engine;
-`FileStore` below is the explicit bounded-residency surface. On the
-16,384-document local fixture, the mapped image is 5.40 MB. A
-key-only open takes 1.04-1.05 ms and allocates 234,688-234,689 Go-heap bytes in
-273 allocations; its pointer-free metadata is 688,136 external key bytes plus
-524,288 external row bytes. Compared with the former per-key HAMT/per-row
-`Index` reopen (about 3.36 MiB, 19,206 allocations, and 1.74-1.82 ms), that is
-about 93% less Go-heap metadata, 98.6% fewer allocations, and 40% lower open
-latency. One compound exact index raises open to 2.65-2.68 ms and about 423.6
-KB of transient allocation while constructing its 45,056-byte external packed
-base; that build can fault document pages. `BenchmarkStorePersistOpenMapped`
-reports `mapped-B`, all three external metadata classes, `B/op`, and
-`allocs/op` so the RSS/heap distinction cannot disappear behind one throughput
-number.
-
-Once open, mapped source bytes add no steady allocation or ownership wrapper:
-ordinary keyed reads measured 9.22-9.29 ns and generation-pinned compiled reads
-4.63-4.66 ns. A nested two-column exact query selecting 32 documents from two
-of 256 micro-pages measured 2.55-2.61 us, also at zero allocations. These rows
-measure a hot mapping after eager open; they are not cold-storage latency.
+`FileStore` below is the explicit bounded-residency surface. Open accounts for
+mapped document, key, row, and index bytes separately from Go heap bytes.
+Mapped source bytes add no steady ownership wrapper. Allocation-contract tests
+cover keyed reads, compiled reads, and caller-buffered copy-out; cold access
+still pays the operating system's page-fault and storage costs.
 
 ### Dense Boolean workspaces
 
@@ -403,22 +374,12 @@ the scalar reference; v3+ calls AVX2 directly. All amd64 levels retain the
 unrolled scalar loop below eight words, where the two-vector body cannot run.
 Generated-code CI verifies that
 the v1/v2 dispatch contains no vector instruction before the guard and that
-the vector bodies retain `VPAND`, `VPOR`, `VPANDN`, and `VZEROUPPER`. M4 Max
-NEON measured only parity with the scalar loop at roughly 75-80 GB/s, so arm64
-deliberately keeps the scalar dispatch. Sparse page-id merges remain scalar
-because converting a selective stream to dense words merely to reach SIMD
-would lose. `BenchmarkStoreDenseBitmapPlan` measures both the fused kernel and
-ordered row decoding through the public Store surface.
+the vector bodies retain `VPAND`, `VPOR`, `VPANDN`, and `VZEROUPPER`. Arm64
+keeps the scalar implementation until a separate vector dispatch is justified.
+Sparse page-id merges remain scalar because converting a selective stream to
+dense words merely to reach SIMD adds a dense materialization pass.
 
-On the hosted x64 runner (AMD EPYC 7763), SIMD reduced the fused three-index
-intersection from 815.1-823.4 ns to 174.3-174.8 ns, about 4.7x. Including
-ordered decoding of 4,096 candidate rows measured 8.44-8.51 us portable versus
-7.67-7.77 us SIMD, with zero allocations in both cases. These are directional
-hosted-runner results rather than a cross-machine release gate; the benchmark
-workflow retains the raw per-architecture artifacts.
-
-`WriteTo` streams the same 5.40 MB image in 1.07-1.09 ms (4.96-5.04 GB/s)
-with three allocations total on this fixture. Persistence headers, endian
+`WriteTo` streams the image without materializing document copies. Persistence headers, endian
 scratch, nested page offset rebasing, and at-most-64-row page manifests use
 writer-owned fixed storage; only the top-level reference list, Store manifest,
 and writer object allocate. The manifest must be buffered to checksum before a
@@ -488,10 +449,9 @@ arbitrary historical point require external replicas or backups. Deterministic
 tearing is a release gate; longer real-device power-cut and recovery-fuzz
 campaigns remain additional evidence rather than a completed guarantee.
 
-`BenchmarkPageCacheBlockAllocatorPressure` fills a 1,048,576-quantum
-(4 GiB at 4 KiB) geometry, then repeatedly releases and reacquires maximum
-16-quantum spans. M4 Max measured 3.73-3.77 ns/op and zero allocations. This
-isolates span control from CLOCK victim selection and device latency.
+Allocator tests fill a large quantum geometry, then repeatedly release and
+reacquire maximum spans while asserting zero steady allocation. This isolates
+span control from CLOCK victim selection and device latency.
 
 Page construction is serialized. With `Synchronous`, `Put`, `Delete`, TTL
 changes, and expiry return only after durability, but the caller waits outside
@@ -760,97 +720,25 @@ Parallel floating aggregation has deterministic batch order but, like other
 parallel engines, may differ in the last rounding bits from a strictly
 row-at-a-time sum.
 
-Apple M4 Max, stable Go, 1,024 hot documents:
+Query tests assert physical work, not wall-clock claims: exact-index and
+certificate-decided plans report posting pages, JSON pages, rechecks, and
+selected rows; covered numeric and grouping plans report typed/catalog pages
+and zero JSON reads. Caller-provided workspaces and result storage are checked
+for zero steady allocation once capacity is sufficient.
 
-| Benchmark | Result | Allocation |
-| --- | ---: | ---: |
-| `BenchmarkFileSnapshotAppendRaw` | 5.17-5.21 us/op | 0 B/op, 0 allocs/op |
-| `BenchmarkFileSnapshotRangeRaw` | 27.50 us/scan, 1.65 GB/s | 0 B/op, 0 allocs/op |
-| durable exact-index probe, caller workspace | 19.35-19.40 us | 0 B/op, 0 allocs/op |
-| candidate-only routing for the same probe | 2.31-2.42 us | 0 B/op, 0 allocs/op |
-| durable compound equality, 16/1,024 rows scanned | 113.0-114.2 us | 169.8 KB/op, 152 allocs/op |
-| identical unindexed predicate, 1,024/1,024 rows scanned | 664.8-665.3 us | 2.091 MB/op, 2,565 allocs/op |
-| legacy JSON file aggregate, one worker | 745 us, 148 MB/s | 2.42 MB/op, 4,478 allocs/op |
-| legacy JSON file aggregate, four workers | 414 us, 267 MB/s | 2.42 MB/op, 4,481 allocs/op |
-| 10K-row recovered exact filter | 14.50 us, 2 posting pages, 0 JSON rows/rechecks | certificate-decided |
-| 10K-row recovered scalar-object `@>` | 13.08 us, 2 posting pages, 0 JSON rows/rechecks | certificate-decided |
-| 5M-row recovered SUM through one clean typed stripe | 1.948 ms, 0 JSON rows | contiguous typed cover |
-| 128 MiB real-derived Twitter covered SUM | 51.125 us, 0 JSON rows | contiguous typed cover |
-| 100K-row / 32-group clean exact-index catalog into reused `Result` | 4.586-4.620 us, 0 posting or JSON pages | complete owned result is 0 B/op, 0 allocs/op after warm-up |
-| 128 MiB real-derived CITM / Twitter grouping | 542 ns / 792 ns, 0 posting or JSON pages | one 4 KiB catalog page per file |
-
-The 1/64 nested compound fixture is reproducible with
-`BenchmarkRunFileSnapshotPersistentIndexPushdown`; its three samples were
-5.8-5.9x faster and used about 12.3x fewer transient bytes than the same
-predicate over deliberately unindexed duplicate fields. These are warm-cache
-local measurements, not cold-device latency. Query allocation is bounded
-transient batch/index state, not retained corpus state. Cold random reads pay
-device latency; throughput depends on locality, index selectivity, page size,
-queue depth, storage, and the resident budget.
-
-`BenchmarkRunFileSnapshotIndexSelectivityCrossover` compares indexed and
-unindexed duplicate fields over the same 2,048 rows. On buffered M4 and direct
-Linux/ARM64 runs, the durable exact index remained faster through roughly
-94% selectivity, was effectively tied near 97%, and lost at 100%. That rejects
-an arbitrary low cutoff such as 10% or 25%. The current planner does not switch
-after probing because it learns exact posting cardinality only after paying the
-index lookup; blindly rescanning then can pay both paths. A future cutoff needs
-persisted cardinality estimates or a measured online cost model.
-
-### Scale smoke: 10k to 5M records
-
-`TestStoreScaleSmoke` is an explicit, non-CI ladder:
-
-```sh
-STORE_SCALE_SMOKE=10000,100000,5000000 \
-  go test . -run '^TestStoreScaleSmoke$' -v -count=1
-```
-
-It bulk-loads identical-shape documents with one nested single-column index and
-one nested compound index, forces GC before measuring live heap, then measures
-random keyed reads, a 1/256 compound query, updates, delete/reinsert churn, and
-TTL changes. Apple M4 Max, stable Go, one run:
-
-| Records | Build docs/s | Source B/doc | Go heap B/doc | External B/doc | Accounted/source | Heap objects/doc | Packed document extents B/doc | Packed exact indexes B/doc | Point read | Compound query |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | 1.22M | 92.9 | 15.5 | 147.2 | 1.75x | 0.021 | 128.2 | 7.27 | 19 ns | 3.81 us / 39 masks |
-| 100,000 | 1.33M | 94.9 | 14.5 | 150.4 | 1.74x | 0.016 | 128.0 | 4.45 | 28 ns | 42.03 us / 390 masks |
-| 5,000,000 | 0.93M | 98.7 | 14.3 | 148.7 | 1.65x | 0.016 | 128.0 | 4.16 | 48 ns | 7.84 ms / 19,531 masks |
-
-At 5M rows, keys plus JSON are 493,480,886 bytes. The complete Store-accounted
-state is 815,323,370 bytes (1.65x source): 71,693,992 bytes of Go live heap plus
-743,629,378 bytes in pointer-free external arenas. External memory avoids GC
-scan and pacing costs; it remains real process memory and is therefore never
-reported as a space saving by itself. Relative to the earlier
-3,995,694,760-byte, 13,246,371-object layout, the current accounted bytes are
-20.4% as large and its 80,674 Go heap objects are 0.61% as numerous.
-
-Actual packed index storage is 20,798,476 bytes (4.16 B/doc), within 0.04% of
-the independent 20,791,296-byte page projection. The variable document extent
-model projects to 640,000,000 bytes (1.30x source); document plus posting
-extents are about 1.34x source before key/value directories, TTL/free-space
-metadata, roots, allocator slack, and retained generations. The measured
-0.016 heap objects/doc is about 165x below the original 2.665; corpus bytes and
-base index postings no longer create one GC-visible object per row. `FileStore`
-instead keeps corpus metadata in evictable pages, so heap objects/doc is not its
-residency metric.
-
-Across the same 5M run, indexed update averaged 5.27 us, delete plus reinsert
-9.80 us, and changing an existing TTL 46 ns. The point-read rise from 19 ns to
-48 ns is a cache-footprint result, not an algorithmic complexity change. Query
-time scales with the number of exact result masks because this smoke
-materializes them; a Boolean consumer can combine those stable-slot words
-without decoding rejected documents.
+The planner does not use a fixed selectivity threshold. It currently learns
+exact posting cardinality only after paying the index lookup, so abandoning the
+probe for a scan can pay both paths. A future crossover decision requires
+durable cardinality estimates or an online cost model whose inputs and failure
+behavior are part of the file format contract.
 
 ### Capacity planning for 1 TiB
 
-On the current 5M-row, two-index fixture, heap `Store` accounts for 1.65 bytes
-per source key+JSON byte: 0.15 bytes of Go live heap and 1.51 bytes in
-pointer-free external arenas. A linear 1 TiB extrapolation of that exact
-workload is therefore about 1.65 TiB of process-owned memory, including roughly
-0.15 TiB visible to the Go heap. This is workload evidence, not a universal
-multiplier, and external allocation changes GC cost rather than capacity. Heap
-`Store` is not presented as a 1 TiB-on-64-GiB database.
+Heap `Store` owns its complete corpus and is not presented as a
+1 TiB-on-64-GiB database. External arenas reduce GC scanning but remain real
+resident memory. Use `Store.Stats` and `Snapshot.IndexStats` to account the
+actual key, document, index, TTL, retained-generation, heap, and external
+domains for a workload.
 
 `FileStore` decouples corpus size from Go heap: `ResidentBytes` fixes admitted
 page capacity, while queues, buffers, snapshot leases, and retirement records
@@ -859,11 +747,8 @@ does not establish acceptable performance. The explicit Linux storage-pressure
 gate now places 21,347,320 source key+JSON bytes behind a 200,704-byte cache
 (106.4x); the physical high-water is 120,057,856 bytes. It reopens twice and
 checks a complete ordered scan, distant reads, update, delete, and a changed TTL
-under eviction with direct reads and writes active. In a 256 MiB
-Docker/Linux container it completed in 11.63 seconds; the 21,347,320-byte scan
-took 260.9 ms (78.0 MiB/s), the Go heap sample was 3.50 MiB, current RSS was
-17.0 MiB, and peak RSS was 18.1 MiB. The run recorded 2,393 minor and 15 major
-faults. Run it with:
+under eviction with direct reads and writes active. The gate records Go heap,
+current and peak RSS, page faults, cache admissions, and evictions. Run it with:
 
 ```text
 SIMDJSON_FILESTORE_100X=1 \
@@ -879,15 +764,14 @@ only logical file length:
 scripts/run-filestore-physical-scale.sh
 ```
 
-The measured Linux/ARM64 Docker run stored 2,137 large documents with one
+The Linux/ARM64 Docker resource gate stored 2,137 large documents with one
 nested exact index: 6,713,852,053 live key+JSON bytes and 6,920,364,032
 allocated file bytes under a 52,576,256-byte complete cgroup peak, or 127.7x
 and 131.6x peak. File high-water was 6,923,669,504 bytes. Required direct
 reads and writes remained active through reopen, distant and nested-index
-probes, update, delete, and changed TTL; the complete run took 14.79 seconds
-and recorded 2,214 page reads and 2,164 evictions. The synthetic 3 MiB-value
-fixture deliberately keeps row count manageable, so it is a residency and
-correctness proof rather than a small-row latency result.
+probes, update, delete, and changed TTL. The synthetic 3 MiB-value fixture
+deliberately keeps row count manageable, so it is a residency and correctness
+proof rather than a latency result.
 
 Neither gate is an equal-latency claim. Directory and posting pages compete
 with documents for the same cache, cold random access pays storage latency,
@@ -896,22 +780,11 @@ cardinality, and free-space headroom add disk amplification. A 1 TiB
 deployment still needs workload-specific working-set sweeps, amplification,
 latency-percentile, and fragmentation measurements.
 
-On the same Linux/ARM64 Docker host, 1 KiB asynchronous replacement updates
-with a final durability fence measured 0.34-0.37 ms through the direct
-positional writer versus a noisy 0.19-0.31 ms through buffered writes. Both
-grouped up to roughly 32 generations. Direct writes are intentionally optional:
-their value is preventing write traffic from displacing the read working set,
-not making small commits universally faster.
-
-The same Linux/ARM64 container, 2,048 inline documents, and a cache smaller
-than the corpus measured one-second medians of 60.18 MiB/s for serial direct
-reads, 75.03 MiB/s for four portable read-ahead workers, and 182.16 MiB/s for
-the zero-copy native lane at depth 64. Native read-ahead was 2.43x the portable
-median and 3.03x serial. Every path measured 0 B/op and 0 allocs/op after
-warmup. Depth is explicitly tunable: the sweep covered 4, 8, 16, 32, and 64,
-and shorter samples showed greater device variance at wider depths. These are
-directional local measurements, not a portable latency guarantee; direct or
-native samples skip when the host cannot provide the requested feature.
+Direct writes are optional: their purpose is to prevent write traffic from
+displacing the read working set, not to promise lower latency for small
+commits. Read-ahead depth is explicitly tunable. Direct and native validation
+tests skip when the host cannot provide the requested feature and always retain
+the portable path as the semantic reference.
 
 ## TTL
 
@@ -1025,28 +898,10 @@ not answers.
 `Snapshot.IndexStats` reports current physical `Fingerprints`, `ChunkWords`,
 candidate bits, directory/bitmap nodes, and `EstimatedBytes` without allocating.
 The estimate counts reachable index-owned objects but not allocator size-class
-rounding. On the repository's 65,536-document, 16-value enum fixture, both a
-single and a two-column exact index are about **4.2 index bytes/document**.
-Cardinality and value distribution materially change that number; measure the
-production definition instead of treating the fixture as a guarantee.
-
-Measured on Apple M4 Max, darwin/arm64, Go 1.26, 1,024 resident shape-taped
-documents and 64-document chunks:
-
-| replacement | time | bytes/op | allocs/op |
-| --- | ---: | ---: | ---: |
-| no declared exact index | 2.24 us | 9.8 KiB | 12 |
-| exact single index, tuple unchanged | 2.46 us | 9.9 KiB | 12 |
-| exact compound index, tuple unchanged | 2.49 us | 9.9 KiB | 12 |
-| exact single index, tuple changed | 2.84 us | 11.9 KiB | 18 |
-| exact compound index, tuple changed | 3.03 us | 11.9 KiB | 18 |
-
-On 4,096 documents, a warmed 10%-selective indexed `RunSnapshotInto` measured
-12.44 ns/input document versus 67.2 ns/document for the same equality-filtered
-`DocSet` scan (about 5.4x). A compound point query measured 2.82 ns/input
-document. These local microbenchmarks exclude protocol, durability, and client
-costs and are reproducible with `BenchmarkStoreExactIndex*` and
-`BenchmarkQueryRunSnapshotIndexed`.
+rounding. Cardinality and value distribution materially change physical size;
+inspect the production definition rather than treating a fixture as a
+guarantee. Update tests distinguish unchanged and changed tuples so an
+unchanged value cannot publish new index nodes.
 
 ## Wildcard postings
 
@@ -1142,71 +997,9 @@ snapshots and compiled queries may be read concurrently. Its copy-on-write
 protocol is the durability mechanism; it is not a user-visible WAL and does
 not provide log shipping or point-in-time restore.
 
-Every measurement lane is correctness-gated against generator-owned counts,
-aggregates, result digests, and recovery checks. Timings are direct in-process
-calls over explicitly labelled heap or recovered bounded-cache state. Durable
-file bytes, live heap, admitted cache, commit staging, caller workspaces, and
-process RSS remain separate accounting domains.
-
-The deterministic 10,000-document M4 Max run writes the data, one exact index,
-and one numeric cover as a 3.16 MiB FileStore, 0.81x logical key+JSON. Static
-JSON structure is stored once per shape, repeated scalar spellings use a
-bounded dictionary, and one-byte short-literal tokens avoid per-value length
-varints. Keys and numeric covers stay directly addressable; exact JSON is
-reconstructed into caller capacity. Compact creation takes 39.75 ms including
-StoreBuilder work and both durability fences. After 256 updates and deletes,
-the file high-water is 5.49 MiB with 2.30 MiB already reusable.
-
-The recovered exact filter and equivalent one-member object `@>` each acquire
-two packed posting pages, certify all 84 matches, and admit zero JSON rows.
-They measure 14.50 us and 13.08 us. The 128 MiB real-derived Twitter covered
-SUM measures 51.125 us; clean categorical grouping measures 542 ns for CITM
-and 792 ns for Twitter.
-
-### Five-million-row capacity smoke
-
-A separate one-repetition capacity smoke used the same deterministic
-four-shape corpus at 5,000,000 rows: 53,888,890 key bytes plus 2,000,153,357
-JSON bytes (1.91 GiB), digest
-`19f8307d4d296e8a6ac7f32fa87df2a395b4ef882fb120d15ec40e3856dd2416`.
-The FileStore lane used the minimum of three repetitions on an Apple M4 Max.
-
-| Measure | Recovered FileStore |
-| --- | ---: |
-| Durable file | 1.555 GiB (0.813x payload) |
-| File after 256 updates and deletes | 1.559 GiB (5.99 MiB reusable) |
-| Engine-accounted warm state | about 16.2 MiB, excluding caller query state |
-| Largest caller query buffer | 488.76 MiB |
-| Recovery/open | 1.276 ms |
-| Keyed point read | 9.625 us |
-| Exact filter, 38,800 matches | 4.376 ms |
-| Scalar-object `@>`, 38,800 matches | 4.486 ms |
-| Covered `SUM`, 1.25M finite values / 5M rows | 1.948 ms |
-| `GROUP BY`, 5M inputs | 4.126 s, retained pre-catalog run |
-| Durable update / operation | 9.176 ms |
-| Durable delete / operation | 8.624 ms |
-
-The exact filter and containment probes opened 540 packed posting pages,
-certified every matching stable slot, and performed zero document rechecks.
-Posting-page coalescing reduced the earlier FileStore filter and containment
-from about 45 ms to the low-millisecond range by sharing one immutable page
-lease and decode across consecutive streams. Grouped document extents cut this
-run's file by 43.3%, page reads by 91.3%, and read bytes by 48.7% relative to
-the preceding 4 KiB-page run. The clean-generation typed scan stripe adds
-2,510,848 bytes—0.12% of logical payload—to the file and replaces 10,346
-scattered sidecar/tree reads per warmed reduction with a contiguous 2.4 MiB
-dense integer projection. This closes the numeric aggregate gap without
-weakening mutation correctness: projection-neutral replacements reuse the
-scan, and a changed value or delete replaces one stripe plus a bounded 64-way
-directory path from authoritative sidecars and peeled pages. The documented
-fallback cases retire the full projection. TTL-only publications retain it.
-The later categorical catalog similarly condenses eligible exact
-indexes to O(groups) count/first/value records, now across bounded linked pages
-when necessary; the old 5M grouping row above predates it, while the retained
-100K/32-group and real-derived reruns provide current evidence without
-extrapolating a new 5M number.
-
-The measured FileStore engine-plus-largest-query envelope is 504.97 MiB
-(16.21 MiB + 488.76 MiB). It is not process RSS: it deliberately combines
-engine-owned warm state with the largest caller-owned query workspace so the
-capacity boundary remains visible.
+Correctness and resource gates use generator-owned counts, aggregates, result
+digests, recovery checks, physical page counters, and explicit memory domains.
+Durable file bytes, live Go heap, external arenas, admitted cache, commit
+staging, retained generations, caller workspaces, and process RSS are never
+collapsed into one number. Workload-specific capacity planning must record all
+of them.

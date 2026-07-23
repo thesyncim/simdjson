@@ -202,7 +202,7 @@ The current core values preserve the Store's JSON contract:
 Raw source JSON remains available when exact whitespace or escape spelling
 must round-trip. A future fused ingestion path may validate the binary value,
 emit compact source bytes, and build structural metadata in one pass. Until
-that exists, binary-to-source conversion is a measured cost and must not be
+that exists, binary-to-source conversion remains explicit work and must not be
 called zero-cost.
 
 Query results use borrowed batches: validity bitmaps, fixed-width typed
@@ -283,5 +283,5 @@ captured generations until that stronger contract exists.
 - every queue, batch, plan, nesting depth, and retained byte count is bounded.
 
 Cold readable-JSON compilation, first preparation, network transfer, and
-binary-value transcoding are real costs. Benchmarks report them separately
-from steady prepared execution.
+binary-value transcoding are real costs and remain outside the steady prepared
+execution contract.

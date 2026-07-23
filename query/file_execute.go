@@ -73,7 +73,7 @@ func (w *FileExecutionWorkspace) Release() {
 // opening JSON;
 // IndexRecheckRows required exact document comparison. An ordinary
 // IndexBounded execution still evaluates the complete predicate. BufferedBytes
-// is the largest measured batch or in-memory merge frontier; it excludes the
+// is the largest observed batch or in-memory merge frontier; it excludes the
 // caller-owned final Result. CoveringColumns counts distinct typed columns
 // reduced without admitting JSON.
 type FileExecutionStats struct {

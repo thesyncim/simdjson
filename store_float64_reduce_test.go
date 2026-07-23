@@ -2,7 +2,6 @@ package simdjson
 
 import (
 	"encoding/binary"
-	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -83,46 +82,5 @@ func TestFileStoreFloat64EncodingPreservesSignedZero(t *testing.T) {
 	}
 	if got := fileStoreFloat64Encoding(0); got != 0 {
 		t.Fatalf("positive-zero encoding rank = %d, want uint8", got)
-	}
-}
-
-func BenchmarkPackedFloat64Reduction(b *testing.B) {
-	values := make([]byte, 256*8)
-	for i := range 256 {
-		binary.LittleEndian.PutUint64(values[i*8:(i+1)*8], math.Float64bits(float64(i)))
-	}
-	b.SetBytes(int64(len(values)))
-	b.ReportAllocs()
-	for b.Loop() {
-		summary := reducePackedFloat64LE(values)
-		if summary.count != 256 || summary.sum != 32640 {
-			b.Fatal(summary)
-		}
-	}
-}
-
-func BenchmarkPackedUnsignedReduction(b *testing.B) {
-	for _, width := range []int{1, 2, 4} {
-		b.Run(fmt.Sprintf("uint%d", width*8), func(b *testing.B) {
-			values := make([]byte, 256*width)
-			for index := range 256 {
-				switch width {
-				case 1:
-					values[index] = byte(index)
-				case 2:
-					binary.LittleEndian.PutUint16(values[index*2:], uint16(index))
-				case 4:
-					binary.LittleEndian.PutUint32(values[index*4:], uint32(index))
-				}
-			}
-			b.SetBytes(int64(len(values)))
-			b.ReportAllocs()
-			for b.Loop() {
-				summary := reducePackedUnsignedLE(values, width)
-				if summary.count != 256 || summary.sum != 32640 {
-					b.Fatal(summary)
-				}
-			}
-		})
 	}
 }

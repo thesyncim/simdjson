@@ -100,8 +100,8 @@ type DocSet struct {
 	// re-materialized, under widenMu so concurrent reads stay safe once
 	// appending stops. wideValueTapes is the width test seam: it forces
 	// 16-byte value entries for narrow-eligible documents so the
-	// differential and benchmark suites can hold the two widths against
-	// each other on identical documents; nothing outside tests sets it.
+	// differential tests can hold the two widths against each other on
+	// identical documents; nothing outside tests sets it.
 	tapeRefs       []shapeTapeRef
 	narrow         []shapeNarrowValue
 	shapes         ShapeCache
@@ -280,12 +280,13 @@ func (s *DocSet) appendStoreSchema(
 // builds directly into the current chunk's free tail — the common case, one
 // validation pass and no copy. A document that outgrows the tail builds once
 // into the spill tape and moves its exact entry count into a fresh chunk while
-// the entries are cache-hot; a precount pass (RequiredIndexEntries) would
-// instead rescan every document's source, which benchmarks slower than the
-// occasional spill copy. Under ShapeTapes a conforming document is compacted
+// the entries are cache-hot; a precount pass (`RequiredIndexEntries`) would
+// instead rescan every document's source on the common path. Under ShapeTapes
+// a conforming document is compacted
 // to its value entries between build and commit (shapeTapeCompact), so key
-// entries never reach committed storage; the returned ref is its dedup
-// header, zero for classic documents.
+// entries never reach committed storage; the returned ref is its dedup header,
+// zero for classic documents. The spill path avoids a mandatory source
+// precount and therefore preserves the one-pass common case.
 func (s *DocSet) buildDoc(src []byte) (Index, shapeTapeRef, error) {
 	if cap(s.entryChunk) == 0 {
 		s.entryChunk = make([]IndexEntry, 0, s.entryChunkMinimum())

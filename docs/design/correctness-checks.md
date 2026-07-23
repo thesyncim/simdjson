@@ -15,10 +15,8 @@ is a proof of whole-system correctness:
   word domain. That check is a proof of the specific algebraic invariant it
   discharges — the bit arithmetic — not a statement about the wider system.
 
-They complement the differential and oracle suites, which compare against
-`encoding/json` and a live PostgreSQL server
-([`benchmarks/pgbaseline`](../../benchmarks/pgbaseline/METHODOLOGY.md)). The goal
-is correctness evidence, not performance.
+They complement the differential and committed oracle suites. The goal is
+correctness evidence, not performance.
 
 The mutable layer adds a separate stable-slot differential in
 `store_index_exact_test.go`: across chunk sizes 1, 3, 8, and 64 it interleaves
@@ -206,8 +204,7 @@ obligation for the bit arithmetic, and the Go checks cover the same invariants
 over the bounded domain. `scripts/verify-smt.sh` discharges the scripts with any
 conforming solver (`Z3=/path/to/solver` overrides the default) and records the
 verbatim result to `testdata/smt/z3-results.log`, the artifact that pins the
-result the way `benchmarks/results/contains-oracle.log` pins the containment
-oracle. The scripts model fixed machine-word domains and never need widening as
+result. The scripts model fixed machine-word domains and never need widening as
 the Go bounds rise; they change only when a layout constant does.
 
 ## What is checked, and how strongly

@@ -2,8 +2,8 @@ package storeio
 
 import "testing"
 
-var benchmarkKeyLocation KeyLocation
-var benchmarkKeyRef PageRef
+var keyLocationSink KeyLocation
+var keyRefSink PageRef
 
 func TestKeyDirectorySteadyAllocation(t *testing.T) {
 	leafHeader := testKeyDirectoryHeader(0, 9)
@@ -26,7 +26,7 @@ func TestKeyDirectorySteadyAllocation(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		benchmarkKeyLocation, _ = leaf.Lookup([]byte("omega"))
+		keyLocationSink, _ = leaf.Lookup([]byte("omega"))
 		if _, err := EncodeKeyDirectoryBranch(branchPage, branchHeader, children, testKeyDirectoryFileEnd, testKeyDirectoryNextLogicalID); err != nil {
 			panic(err)
 		}
@@ -34,7 +34,7 @@ func TestKeyDirectorySteadyAllocation(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		benchmarkKeyRef, _ = branch.Child([]byte("omega"))
+		keyRefSink, _ = branch.Child([]byte("omega"))
 	}); allocs != 0 {
 		t.Fatalf("key-directory codec and lookup allocations = %g, want 0", allocs)
 	}

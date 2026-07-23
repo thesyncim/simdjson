@@ -403,9 +403,8 @@ func TestDocSetShapeTapesStats(t *testing.T) {
 		t.Fatalf("Widened = %d before any Doc call", st.Widened)
 	}
 
-	// The width seam forces the wide form on the same documents: the seam is
-	// what the width benchmarks and differentials stand on, so its effect is
-	// pinned here.
+	// The width seam forces the wide form on the same documents so differential
+	// tests can pin its effect.
 	wide := &DocSet{
 		Options:        document.IndexOptions{HashKeys: true},
 		ShapeTapes:     true,

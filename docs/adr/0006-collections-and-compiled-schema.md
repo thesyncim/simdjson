@@ -91,14 +91,8 @@ builder still calls `DocSet.Append` directly, while the schema builder inserts
 validation between parse and compaction. The small duplicated choreography is
 intentional; a callback or inner-loop mode branch would penalize every
 schemaless mutation.
-
-On darwin/arm64 with Go 1.26, the regression benchmark retained the pre-change
-schemaless result of 2,552 B/op and 10 allocations/op for a one-row update.
-Four compiled constraints measured 65-67 ns/op, 0 B/op, and 0 allocations/op
-when validating an already-built index. The median end-to-end one-row update
-added roughly 7% in a five-run local sample and retained identical allocation
-counts. These are implementation regression measurements, not service-level
-promises.
+Allocation-contract tests cover validation over an already-built index, and
+mutation tests pin the specialized schema-on and schema-off routes.
 
 ## Durability and mismatch behavior
 

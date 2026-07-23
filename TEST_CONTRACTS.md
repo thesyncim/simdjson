@@ -263,6 +263,8 @@ internal/storeio/key_directory_alloc_test.go
 internal/storeio/posting_page_alloc_test.go
 internal/storeio/state_root_alloc_test.go
 internal/storeio/superblock_alloc_test.go
+store_file_physical_linux_test.go
+store_file_scale_smoke_test.go
 ```
 
 ### `ROUTE`
@@ -302,30 +304,14 @@ query/value_type_test.go
 ### `PERF`
 
 ```text
-contains_bench_test.go
-docset_persist_bench_test.go
-docset_persist_mmap_unix_test.go
-docset_postings_bench_test.go
-docset_shape_bench_test.go
 docset_stream_bench_test.go
-docset_valuedict_bench_test.go
 index_tapescan_bench_test.go
 multidoc_bench_test.go
 parser_bench_test.go
 portable_backend_bench_test.go
-query/postings_bench_test.go
-query/query_bench_test.go
 shape_bench_test.go
 shape_column_bench_test.go
-store_scale_smoke_test.go
 shape_column_typed_bench_test.go
-store_bench_test.go
-store_file_bench_test.go
-store_file_physical_linux_test.go
-store_file_scale_smoke_test.go
-store_index_packed_bench_test.go
-store_persist_bench_test.go
-store_persist_mmap_unix_test.go
 typed_bench_test.go
 typed_hook_bench_test.go
 benchmarks/bench_test.go

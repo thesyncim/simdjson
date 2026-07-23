@@ -147,13 +147,13 @@ func TestTTLDirectorySteadyAllocation(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		benchmarkTTLKey, _ = view.EntryAt(view.LowerBound(TTLKey{Deadline: 2}))
+		ttlKeySink, _ = view.EntryAt(view.LowerBound(TTLKey{Deadline: 2}))
 	}); allocs != 0 {
 		t.Fatalf("TTL-directory codec and lookup allocations = %g, want 0", allocs)
 	}
 }
 
-var benchmarkTTLKey TTLKey
+var ttlKeySink TTLKey
 
 func testTTLDirectoryRef(logicalID, page, generation uint64) PageRef {
 	return PageRef{

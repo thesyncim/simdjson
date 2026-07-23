@@ -28,20 +28,18 @@ The migration has three ordered stages:
    ownership and ordinary mutable heap publications above its immutable base;
    and
 3. deprecate the old set-facing API only after bulk, persistence, query, and
-   memory-map users have a measured Store replacement.
+   memory-map users have a tested Store replacement.
 
 Deleting the immutable core first is rejected. Store chunks already use it for
 validation, tapes, shapes, sparse gathers, and exact rechecks. Reimplementing
 those paths under a new name would increase code and correctness risk while
 making Store slower.
 
-## Performance target
+## Construction target
 
 The ordinary `Put` path is optimized for one online mutation: it validates one
-document, path-copies persistent metadata, and publishes one generation. On
-the 16,384-document fixture, repeated `Put` measures about 26-27 MB/s. Dense
-construction avoids republishing and path-copying per row and measures about
-206-214 MB/s on the same fixture.
+document, path-copies persistent metadata, and publishes one generation. Dense
+construction avoids republishing and path-copying per row.
 
 Bulk construction must therefore be a separate transaction, not a loop hidden
 behind `Put`:
@@ -61,26 +59,14 @@ The implemented builder fills final chunks, constructs the key HAMT and chunk
 vector through uniquely owned transient nodes, and publishes the frozen Store
 once. Declared nested and compound indexes collect sorted page-local tuples and
 reuse the existing immutable bitmap/radix bulk constructors, so they are Ready
-in that first reader-visible generation. On the 16,384-document microbenchmark
-without a declared index, construction is about 7.7x faster than repeated
-`Put` and reduces transient allocation bytes from 143 MiB to 8.9 MiB. Adding a
-ready 16-value exact index costs about 1 ms and 0.2 MiB on that fixture.
+in that first reader-visible generation.
 
 ## Key-directory choice and CHAMP
 
 The in-memory key directory keeps fixed 32-way nodes on its cache-hot path and
 a two-leaf bucket after 15 hash bits. The compiler inlines its complete lookup
-loop. On the 65,536-key fixture, a local packed CHAMP prototype produced this
-trade-off:
-
-| directory | retained bytes | keyed lookup | allocation |
-| --- | ---: | ---: | ---: |
-| fixed prefix + two-leaf bucket | 9.17 MiB | 15.0-15.7 ns | zero |
-| packed CHAMP prototype | 3.77 MiB | 17.7-18.6 ns | zero |
-
-CHAMP reduced directory space by 59%, but lookup was about 20% slower and its
-bitmap/data/node dispatch exceeded the compiler's inline budget. This is a
-workload-specific result, not a rejection of CHAMP. The design from
+loop. A packed CHAMP remains a candidate for cold sparse directories. The
+design from
 [Steindorfer and Vinju](https://michael.steindorfer.name/publications/oopsla15.pdf)
 uses separate data and node bitmaps, popcount rank, packed arrays, and canonical
 delete compaction; those properties are particularly valuable for iteration
@@ -90,11 +76,11 @@ also applies array-mapped tries to external blocks.
 
 Consequently:
 
-- keep the faster fixed-node directory for hot heap-resident point reads;
+- keep the fixed-node directory for hot heap-resident point reads;
 - evaluate CHAMP for the mapped logical-page directory and sparse cold index
-  roots, where footprint and block density dominate a few extra instructions;
-- require an end-to-end Store benchmark, retained-byte measurement, compiler
-  inlining report, and churn test before changing either representation.
+  roots, where footprint and block density matter;
+- require retained-byte accounting, compiler inlining evidence, differential
+  lookup tests, and mutation-churn tests before changing either representation.
 
 ## Implemented Store-image boundary
 
@@ -122,24 +108,12 @@ copy-out with zero allocation when capacity is sufficient. A `Building` index
 cannot be serialized because restoring partial coverage would make latency and
 fallback behavior image-dependent.
 
-The 16,384-document fixture produces a 5.40 MB image. A key-only mapped open
-takes 1.04-1.05 ms and allocates 234,688-234,689 Go-heap bytes in 273
-allocations, plus 688,136 pointer-free external key bytes and 524,288 external
-row bytes. Against the earlier per-key HAMT/per-row reopen, this is about 93%
-less Go heap, 98.6% fewer allocations, and 40% lower open latency. One compound
-exact index raises open to 2.64-2.67 ms and about 450.6 KB Go heap because its
-root is not mapped yet. This is a useful off-heap payload/startup boundary, but
-the remaining eager validation and root reconstruction are explicit evidence
-that it is not the final greater-than-memory representation.
+This is a useful off-heap payload/startup boundary, but eager validation and
+exact-index root reconstruction make it distinct from the bounded-residency
+representation. Accounting separates mapped documents, keys, rows, index
+bases, and Go heap rather than collapsing them into one memory figure.
 
-After open, the same mapping measured 9.22-9.29 ns for ordinary keyed reads,
-4.63-4.66 ns for compiled generation-pinned stable-slot reads, and 2.55-2.61 us
-for a zero-allocation compound query selecting 32 rows from two of 256
-micro-pages. These are hot-mapping measurements, not promises for storage
-faults.
-
-Writing the 5.40 MB fixture measures 1.07-1.09 ms (4.96-5.04 GB/s) and three
-allocations total. Generated-code inspection showed that passing stack record
+Generated-code inspection showed that passing stack record
 headers through `io.Writer` originally created per-document escapes. Fixed
 writer-owned scratch, bounded page manifests, and relative-offset rebasing now
 stream every nested page without per-row or per-page heap objects.
@@ -179,9 +153,8 @@ rescanning the arena. The resident hit path locks only the selected frame; the
 global lock is reserved for misses, admission, eviction, and statistics. Cold
 references retain physical offset, length, logical id, and generation and
 enter bounded read workers.
-On M4 Max, a filled 1,048,576-quantum allocator geometry measured
-3.73-3.77 ns per maximum-span release/reacquire with zero allocations; this is
-control-plane evidence, not device-I/O latency.
+Allocation-contract tests fill a large allocator geometry and repeatedly
+release and reacquire maximum spans without steady allocation.
 
 `FileStore.Stats` exposes resident/dirty bytes, reads, cache/prefetch hits,
 evictions, queue depths, durable generation, snapshots, retired extents, and
@@ -359,11 +332,8 @@ zero-allocation while capacity is available. Recycling and worker notification
 touch no channel on their ready/busy fast paths; exhausting capacity or waking
 an actually parked worker enters the runtime's blocking machinery. `Wait` and
 `Flush` are explicit blocking durability fences.
-On the Apple M4 Max development host, recycling one index through the tagged
-pool measured 8.70-8.79 ns versus 16.47-16.74 ns through a capacity-one Go
-channel, both at zero allocations. This isolates control-plane reuse and does
-not include storage latency. Reserving and aborting a one-page batch—one
-descriptor plus two buffers—measured 16.17-16.38 ns and zero allocations.
+Allocation-contract tests cover tagged-pool recycling and reserve/abort
+without storage I/O.
 
 The committer drives either the portable device or the pure-Go Linux ring
 device. The latter uses no cgo and owns one locked writer thread, registered
@@ -371,8 +341,8 @@ files, anonymous off-heap fixed buffers, fixed-buffer I/O, runtime opcode
 probing, and explicit completion/overflow checks. It writes all data pages,
 passes a data barrier, writes only the newest grouped root, and passes the final
 barrier before advancing `DurableGeneration`. Unsupported kernels and sandbox
-policies fall back to the portable device. SQ polling remains an opt-in
-benchmark decision. Reads and writes independently offer buffered, try-direct,
+policies fall back to the portable device. SQ polling remains opt-in. Reads
+and writes independently offer buffered, try-direct,
 and require-direct modes. Each Linux direct lane reopens the same inode through
 `/proc/self/fd` with `O_DIRECT`, leaving the caller-owned descriptor and flags
 unchanged. The direct writer feeds either commit device and prevents sustained
@@ -394,19 +364,11 @@ header or either root page is torn, truncated, or corrupt. Caller-owned page
 scratch bounds recovery memory, and the encode/decode/select hot paths allocate
 zero bytes. The checksum implementation is scoped to `internal/storeio` and
 contains no handwritten assembly. Stable builds use Go's hardware-aware
-CRC32C. SIMD builds dispatch pure-Go PMULL on Darwin ARM64, where it wins, and
-retain the standard path on Linux ARM64 and amd64. Native Ubuntu ARM64 measured
-PMULL at 192.3-192.4 ns per 4 KiB versus 154.6-154.8 ns standard. AMD EPYC 7763
-measured the ordinary PCLMUL candidate at 323.0-323.2 ns versus
-170.7-170.8 ns standard. Both losing dispatches are therefore rejected. The
-pure-Go amd64 PCLMUL and AVX-512 bodies remain directly correctness- and
-ISA-tested candidates; feature availability alone is not evidence of a win.
-On M4 Max, stable Go measured 383.3-387.5 ns per 4 KiB page and
-5.924-6.296 us per 64 KiB page. The pure-Go nine-stream PMULL fold measured
-89.17-91.66 ns and 1.131-1.146 us respectively: about 4.2x and 5.5x faster,
-with zero allocations. Native CI retains stable and SIMD samples for x64 and
-arm64 separately. Emulation proves correctness and instruction coverage, not
-performance.
+CRC32C. SIMD builds dispatch the scoped pure-Go PMULL implementation only on
+the supported Darwin ARM64 route and retain the standard implementation
+elsewhere. Candidate PCLMUL and AVX-512 bodies remain correctness- and
+ISA-tested but are not dispatched merely because the feature exists.
+Emulation proves correctness and instruction coverage only.
 
 Every attached-Store page now has a deterministic 64-byte pointer-free header
 and an eight-byte CRC32C/complement trailer. The header binds Store id, physical
@@ -422,9 +384,8 @@ a physical offset and immutable
 logical-id/generation pair, so unchanged roots can be shared without a Go
 pointer or a global lookup. Recovery validates those top-level directory pages
 and their identities before selecting a generation; a torn or mismatched newer
-directory therefore falls back to the older root. On M4 Max, the complete
-pure-Go SIMD state-root encoder measured 170.0-171.6 ns per 4 KiB page and the
-decoder 152.4-153.3 ns, both at zero allocations.
+directory therefore falls back to the older root. Allocation-contract tests
+cover the complete state-root encode/decode path.
 
 Heap `Store` retains its packed multi-stream exact-index base plus dirty-chunk
 delta. `FileStore` uses a different durable representation: its frozen catalog
@@ -501,7 +462,7 @@ buffer. The query executor copies selected values into its result.
 This is load-bearing: an evictable frame cannot safely back an unowned
 `RawValue`. The file surface therefore does not return one. A sufficient
 destination makes an inline resident `AppendRaw` allocation-free, but it is
-still a copy and is measured separately from heap `Store` reads.
+still a copy and is accounted separately from heap `Store` reads.
 
 ## Research basis and rejected shortcuts
 
@@ -509,10 +470,10 @@ still a copy and is measured separately from heap `Store` reads.
 relevant low-overhead buffer-manager direction: explicit replacement preserves
 control beyond RAM, and pointer swizzling can reduce resident access cost.
 `FileStore` adopts explicit replacement but currently uses a bounded cache
-lookup rather than claiming a swizzled fast path. Warm acquire/release remains
-zero-allocation and measured 25.5 ns on the M4 Max; independent resident pages
-no longer share one cache mutex. Its stable 64-slot masks and immutable
-publication remain specific to JSON queries.
+lookup rather than claiming a swizzled fast path. Warm acquire/release has a
+zero-allocation contract; independent resident pages no longer share one cache
+mutex. Its stable 64-slot masks and immutable publication remain specific to
+JSON queries.
 
 The CIDR paper
 [Are You Sure You Want to Use MMAP in Your Database Management System?](https://db.cs.cmu.edu/papers/2022/cidr2022-p13-crotty.pdf)
@@ -613,7 +574,7 @@ SIMDJSON_FILESTORE_100X=1 \
 
 The physical-memory gate builds its Linux test binary before entering a
 64 MiB cgroup, requires `O_DIRECT` on both lanes, and checks `st_blocks` so a
-sparse logical file cannot pass. The measured ARM64 Docker volume stored 2,137
+sparse logical file cannot pass. The ARM64 Docker resource gate stored 2,137
 large documents and one nested exact index: 6,713,852,053 live source bytes,
 6,923,669,504 bytes at file high-water, and 6,920,364,032 allocated bytes
 under a 52,576,256-byte cgroup peak. The source/peak and allocated/peak ratios
@@ -628,11 +589,7 @@ Direct full scans use a chunk-ordered read-ahead window bounded by one half of
 cache bytes, the configured queue, 64 extents, and either native
 `ReadQueueDepth` or four requests per portable worker. Extents are submitted in
 physical order while callbacks remain logically ordered. Buffered files stay
-serial and use kernel readahead. On the same Linux/ARM64 container, a
-2,048-document pressure benchmark measured one-second medians of 60.18 MiB/s
-serial, 75.03 MiB/s with four positional-read workers, and 182.16 MiB/s with
-the zero-copy native issuer at depth 64. The native lane was 2.43x portable
-read-ahead and 3.03x serial; all paths remained 0 B/op and 0 allocs/op.
+serial and use kernel readahead.
 `ReadBackend`, `AsyncReadBatches`, and `LargestReadBatch` expose the selected
 engine and actual batch high-water.
 
@@ -648,10 +605,9 @@ release gates are:
 - device/firmware power-loss campaigns and long recovery fuzzing in addition
   to deterministic write-boundary tearing; and
 - persistent range/ordered indexes, safe `NOT` complements, and persisted
-  cardinality estimates for a pre-probe cost model. The current crossover
-  fixture rejects an arbitrary 10-25% cutoff: exact equality remained useful
-  until approximately 94-97% selectivity on the measured buffered/direct
-  hosts.
+  cardinality estimates for a pre-probe cost model. A fixed selectivity cutoff
+  is rejected until the planner has durable statistics and an explicit cost
+  model.
 
 `OpenStore` remains the caller-owned mapped heap-Store checkpoint.
 `OpenFileStore` is the incremental durable and bounded-residency surface. The

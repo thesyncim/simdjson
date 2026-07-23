@@ -153,8 +153,8 @@ func (s *DocSet) valueDictAppend(i int, ref shapeTapeRef) {
 // subtree skipped, so a recurring sub-object is one reference rather than a
 // reference per scalar inside it; only a value not taken is descended, and only
 // into a container's member values, keys never — that redundancy belongs to the
-// shape layer. The root is descended, never interned: a whole-document repeat is
-// a corpus artifact of a tiled benchmark, not a property to harvest. It appends
+// shape layer. The root is descended, never interned: whole-document repetition
+// is an input property rather than a value-dictionary opportunity. It appends
 // the document's splices to the set-wide slab in ascending source order and
 // returns the header windowing them.
 func (s *DocSet) valueDictScan(idx Index) valueDictRef {

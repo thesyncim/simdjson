@@ -129,10 +129,10 @@ func TestOverflowPageSteadyAllocation(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		benchmarkOverflowData = view.Data()
+		overflowDataSink = view.Data()
 	}); allocs != 0 {
 		t.Fatalf("overflow-page codec allocations = %g, want 0", allocs)
 	}
 }
 
-var benchmarkOverflowData []byte
+var overflowDataSink []byte

@@ -63,27 +63,3 @@ func TestIndexPoolMaximumDeviceIndex(t *testing.T) {
 		t.Fatal("maximum-sized pool returned an extra index")
 	}
 }
-
-func BenchmarkIndexPoolRoundTrip(b *testing.B) {
-	pool := newIndexPool(1)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		index, ok := pool.pop()
-		if !ok {
-			b.Fatal("empty pool")
-		}
-		pool.push(index)
-	}
-}
-
-func BenchmarkChannelPoolRoundTrip(b *testing.B) {
-	pool := make(chan uint32, 1)
-	pool <- 0
-	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
-		index := <-pool
-		pool <- index
-	}
-}

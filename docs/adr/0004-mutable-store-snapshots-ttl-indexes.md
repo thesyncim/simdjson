@@ -48,9 +48,9 @@ compare the full key.
 
 The key HAMT uses fixed 32-way nodes for its cache-hot first 15 hash bits. A
 terminal slot keeps two leaves before promoting the rare third collision to
-another node. The two-leaf policy is the measured latency/space knee: it keeps
-the 58-cost lookup small enough for the compiler to inline while
-avoiding most sparse deep nodes. Delete flattens a promoted subtree as soon as
+another node. The two-leaf policy keeps the lookup small enough for the
+compiler to inline while avoiding most sparse deep nodes. Delete flattens a
+promoted subtree as soon as
 it fits the terminal bucket again, so churn cannot leave a permanently expanded
 tail.
 
@@ -221,34 +221,16 @@ and `Index` also borrows its source, so either can outlive the Store or Snapshot
 value that produced it. Finalizer-driven or eager unmapping could invalidate a
 live handle. The caller must keep the image mapped until all borrowed values
 are dead. A future automatic mode still requires an explicit scoped lease or
-owner-bearing handles whose latency and size are accepted by benchmark. No
-unsafe lifetime shortcut is hidden behind `StoreOptions`.
+owner-bearing handles whose lifetime and size are explicit in the type system.
+No unsafe lifetime shortcut is hidden behind `StoreOptions`.
 
-## Measured mutation result
+## Mutation evidence
 
-On Apple M4 Max, darwin/arm64, Go 1.26, shape tapes enabled, 1,024 resident
-small documents, the median of six 500 ms samples:
-
-| chunk documents | replace | delete + insert | replace bytes |
-| ---: | ---: | ---: | ---: |
-| 1 | 0.81 us | 1.99 us | 2.3 KiB |
-| 8 | 0.90 us | 2.24 us | 3.2 KiB |
-| 64 | 2.24 us | 5.00 us | 9.8 KiB |
-
-`Store.GetRaw` is 21.92-23.88 ns with zero allocations. A compiled stable-slot
-`GetRawKey` is 7.99-8.50 ns with zero allocations and falls back to ordinary
-lookup when its cached location is no longer valid. These are local regression
-fixtures, not universal cross-engine SQL claims.
-
-Declared-index regression fixtures on the same machine add no allocation when
-the indexed tuple is unchanged: a single or compound definition measures about
-2.46–2.49 us, 9.9 KiB, and 12 allocations. Moving the tuple costs 2.84–3.03 us,
-11.9 KiB, and 18 allocations. A 65,536-document, 16-value enum definition is
-about 4.2 reachable index bytes/document. A warmed 10%-selective Snapshot query
-measures about 12.44 ns/input document versus 67.2 ns/document for the matching
-full scan; a compound point query measures about 2.82 ns/input document.
-Distribution changes posting density, so `Snapshot.IndexStats` is the
-production sizing authority.
+Replacement, delete plus insert, stable-slot reuse, unchanged and changed
+index tuples, compiled-key fallback, and retained snapshots are covered by
+state-machine and allocation-contract tests. Distribution changes posting
+density, so `Snapshot.IndexStats` is the production sizing authority rather
+than a fixed bytes-per-document claim.
 
 ## Validation
 

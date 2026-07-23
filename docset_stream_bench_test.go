@@ -57,14 +57,11 @@ func makeStreamBenchCorpus(name string, target int, size func(r *rand.Rand, i in
 	return streamBenchCorpus{name: name, data: data, docs: docs}
 }
 
-// streamBenchCorpora returns the ingestion profiles: mixed document sizes
-// (100 B to 10 KiB, skewed small like event streams), small-document
-// dominated (1 KiB), and two large-document profiles (466 KiB and 1 MiB).
-// The 466 KiB profile is the Gap D witness: a document large enough to route
-// through the large-document builder yet several to a source chunk, where a
-// capped fast walk would have sent every document to the two-scan slow lane.
-// The ~390 MiB of corpora are built once, on first benchmark use, so plain
-// test runs pay nothing.
+// streamBenchCorpora returns the three ingestion profiles: mixed document
+// sizes (100 B to 10 KiB, skewed small like event streams), small-document
+// dominated (1 KiB), and large-document dominated (1 MiB). The ~300 MiB of
+// corpora are built once, on first benchmark use, so plain test runs pay
+// nothing.
 var streamBenchCorpora = sync.OnceValue(func() []streamBenchCorpus {
 	return []streamBenchCorpus{
 		makeStreamBenchCorpus("Mixed", 96<<20, func(r *rand.Rand, i int) int {
@@ -78,7 +75,6 @@ var streamBenchCorpora = sync.OnceValue(func() []streamBenchCorpus {
 			}
 		}),
 		makeStreamBenchCorpus("Small1KB", 96<<20, func(r *rand.Rand, i int) int { return 1 << 10 }),
-		makeStreamBenchCorpus("Large466KB", 100<<20, func(r *rand.Rand, i int) int { return 466 << 10 }),
 		makeStreamBenchCorpus("Large1MB", 100<<20, func(r *rand.Rand, i int) int { return 1 << 20 }),
 	}
 })

@@ -2,9 +2,9 @@
 
 This ledger separates implemented behavior from accepted design and missing
 work. It is a merge checklist, not a performance claim. Machine-specific
-evidence stays in reproducible benchmarks; an item moves to “implemented” only
-with code, correctness tests, allocation/accounting evidence where relevant,
-and user-facing documentation.
+timings are not published here; an item moves to “implemented” only with code,
+correctness tests, allocation/accounting evidence where relevant, and
+user-facing documentation.
 
 ## Implemented in this branch
 
@@ -35,10 +35,9 @@ and user-facing documentation.
 - A scoped `internal/orderedkey` foundation: canonical exact-decimal and
   decoded-string order, ascending/descending components, compound equality
   prefixes, fail-closed parsing, and zero-allocation caller-buffered encoding.
-- Native/self benchmark workloads, synthetic scale tests, real corpora,
-  portable/SIMD parity, unsafe inventory, generated test contracts, and
-  corruption/recovery campaigns. External comparison scoreboards are not part
-  of the repository.
+- Synthetic scale tests, real corpora, portable/SIMD parity, unsafe inventory,
+  generated test contracts, and corruption/recovery campaigns. External
+  comparison scoreboards are not part of the repository.
 
 ## Accepted design, not yet implemented
 
@@ -80,9 +79,9 @@ and user-facing documentation.
 - Add profitable amd64 and arm64 SIMD typed lanes with a scalar-identical
   implementation and route-parity tests. Inspect generated code; do not add
   assembly merely to claim SIMD.
-- Gate changes on synthetic 10K/100K/5M rows and real corpora, reporting
-  throughput, tail latency, bytes read, cache admission, B/op, allocations,
-  retained bytes, and exact result digests.
+- Gate changes on synthetic 10K/100K/5M rows and real corpora, recording exact
+  result digests, bytes read, cache admission, allocation-contract results,
+  retained bytes, and physical plan counters.
 
 ### Mutation, concurrency, and durability
 
@@ -91,7 +90,8 @@ and user-facing documentation.
 - Measure and reduce remaining transient key/index maintenance allocations.
 - Profile reader/writer contention under point reads, range scans, index
   backfill, TTL expiry, commit grouping, and long snapshots. Replace locks or
-  maps only when the measured route and memory accounting improve.
+  maps only when profiles, resource accounting, and route-level tests justify
+  the change.
 - Keep immutable reader publication and bounded single-writer ownership unless
   a multi-writer protocol proves failure atomicity, reclamation safety, and
   better throughput. “Lock-free” is not itself an acceptance criterion.
@@ -149,4 +149,4 @@ and user-facing documentation.
    together.
 4. Treat the ironic name as no excuse for loose engineering. Trust comes from
    explicit invariants, bounded resources, readable code, failure tests,
-   reproducible measurements, and honest limitations—not adjectives.
+   reproducible resource accounting, and honest limitations—not adjectives.

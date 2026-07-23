@@ -175,7 +175,7 @@ func TestContainsEscapedStringSteadyAllocs(t *testing.T) {
 		t.Fatal("equivalent escaped strings did not contain one another")
 	}
 	if n := testing.AllocsPerRun(100, func() {
-		containsBenchSink = haystack.Contains(needle)
+		containsResultSink = haystack.Contains(needle)
 	}); n != 0 {
 		t.Fatalf("Contains allocated %.1f times for two long escaped strings", n)
 	}
@@ -188,11 +188,13 @@ func TestContainsEscapedStringSteadyAllocs(t *testing.T) {
 		t.Fatal("equivalent long escaped object keys did not match")
 	}
 	if n := testing.AllocsPerRun(100, func() {
-		containsBenchSink = haystack.Contains(needle)
+		containsResultSink = haystack.Contains(needle)
 	}); n != 0 {
 		t.Fatalf("Contains allocated %.1f times for a long escaped object key", n)
 	}
 }
+
+var containsResultSink bool
 
 // ---------------------------------------------------------------------------
 // The naive reference evaluator.

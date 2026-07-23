@@ -149,13 +149,13 @@ func TestIndexDirectorySteadyAllocation(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
-		benchmarkIndexPosting, _ = view.Lookup(entries[1].Key)
+		indexPostingSink, _ = view.Lookup(entries[1].Key)
 	}); allocs != 0 {
 		t.Fatalf("index-directory codec and lookup allocations = %g, want 0", allocs)
 	}
 }
 
-var benchmarkIndexPosting IndexPostingRef
+var indexPostingSink IndexPostingRef
 
 func testIndexPageRef(kind PageKind, logicalID, page, generation uint64) PageRef {
 	return PageRef{

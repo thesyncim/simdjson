@@ -13,10 +13,9 @@ import (
 // indexed documents: Node.Contains is the primitive, running directly on
 // two tapes, and RawContains is the one-shot spelling that indexes its
 // operands first. The oracle is PostgreSQL's documented behavior — the
-// curated table in testdata/contains_oracle.tsv is verified against a real
-// server by benchmarks/pgbaseline/run-pg-contains.sh — and ADR 0002's
-// phase 4 prunes containment candidates with postings that this evaluator
-// then verifies.
+// curated table in testdata/contains_oracle.tsv pins that semantic contract,
+// and ADR 0002's phase 4 prunes containment candidates with postings that this
+// evaluator then verifies.
 //
 // The evaluation is one structural recursion with no heap allocation on any
 // validated input. Object members resolve through the Get lookup ladder, so an
