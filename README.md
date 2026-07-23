@@ -439,12 +439,13 @@ definitions are frozen when the file is created. The complete contract and
 measured limits are in [Mutable Store operations](docs/store.md).
 
 [ADR 0007](docs/adr/0007-compact-document-query-wire.md) locks the next query
-boundary without pretending it is already implemented: one compact
-`find`/`where`/`join`/`select`/`group`/`order`/`limit` document compiles once
-to a binary prepared plan, while the pure-Go builder emits the same typed
-operators directly. Nested objects are nested matches, point commands bypass
-the relation engine, and ordered nested/compound/multikey indexes are the
-explicit prerequisite for range, order-plus-limit, and indexed joins.
+architecture without pretending it is already implemented: a typed operation
+algebra compiles once to a binary prepared plan, while readable JSON-shaped
+queries and SQL remain changeable cold adapters. Point commands bypass the
+relation engine, and ordered nested/compound/multikey indexes are the explicit
+prerequisite for range, order-plus-limit, and indexed joins. The
+[Store completion ledger](docs/store-roadmap.md) separates implemented,
+accepted, and missing work and records the post-merge sequence.
 
 An update parses only its replacement. Unchanged source and structural-tape
 storage stays immutable and is shared into the next bounded chunk; deletes copy

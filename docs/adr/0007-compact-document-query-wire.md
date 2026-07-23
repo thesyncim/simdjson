@@ -1,13 +1,16 @@
-# ADR 0007: Compact document queries and binary prepared plans
+# ADR 0007: Typed operations and binary prepared plans
 
-- Status: accepted design; implementation staged after the current storage
-  format work
-- Scope: query authoring, prepared execution, wire input, and index planning
+- Status: accepted architecture; readable adapters and binary encoding remain
+  pre-v1 and changeable
+- Scope: operation semantics, query authoring, prepared execution, wire input,
+  result typing, and index planning
 
 ## Decision
 
-The canonical readable query is one compact JSON document. It follows document
-shape instead of exposing SQL or storage-level pointer spelling:
+The stable boundary is a typed operation algebra, not a query string or one
+particular JSON spelling. A readable JSON document is the leading adapter
+candidate because it follows document shape instead of exposing SQL or
+storage-level pointer spelling:
 
 ```json
 {
@@ -40,6 +43,11 @@ shape instead of exposing SQL or storage-level pointer spelling:
 }
 ```
 
+That spelling is intentionally provisional. It may be simplified before v1
+without changing prepared execution, ordered keys, the Go builder, or durable
+state. SQL remains another optional cold adapter. Neither readable form is
+retained by execution.
+
 The defaults carry the common case:
 
 - nested objects mean nested field matching;
@@ -58,6 +66,28 @@ expression; `$literal` disambiguates source data whose keys begin with `$`.
 One `join` tuple is `[collection, localField, foreignField, outputField]`.
 Multiple joins use an array of those tuples. This compact surface is only an
 authoring form: it is never retained by prepared execution.
+
+## Complete operation families
+
+The operation model must express every Store action without escaping into a
+second protocol:
+
+- collection and schema create, inspect, replace, and drop;
+- point get, multi-get, insert, replace/upsert, delete, and caller-bounded
+  iteration;
+- set/change/clear deadline, persist, and bounded expiration;
+- index create, resumable backfill, inspect, validate, and drop;
+- find, filter, project, join, group, aggregate, having, order, limit, and
+  streaming results;
+- prepare, bind, execute, cancel, and release;
+- atomic mutation batches, flush/durability waits, compaction, statistics, and
+  health/feature discovery.
+
+Only already implemented Store operations may be advertised by a server.
+Capability negotiation exposes the rest incrementally. Point and
+administrative commands use fixed typed payloads rather than constructing a
+relation plan. Relational operators remain compositional so a future feature
+adds one typed opcode and validation rule, not a string-only escape hatch.
 
 ## Field identity
 
@@ -148,9 +178,17 @@ Direct `Get`, `Put`, `Delete`, deadline, persist, and index-administration
 messages have fixed payloads and never instantiate a query plan. Joins and
 analytical operators therefore add no branch to point operations.
 
-## JSON-semantic values and results
+## Extensible values and results
 
-Wire values preserve the Store's JSON contract:
+Every value begins with a versioned type id and a bounded payload length.
+Built-in JSON types occupy a reserved core range with gaps between families;
+future core scalars can be inserted without renumbering existing ids.
+Negotiated application types occupy a separate extension range and carry an
+independent semantic version. Unknown required types fail closed. A column
+explicitly marked optional may be skipped by an older reader using its payload
+length without interpreting it.
+
+The current core values preserve the Store's JSON contract:
 
 - null and booleans have single-byte tags;
 - strings contain decoded UTF-8;
@@ -172,6 +210,12 @@ vectors, offsets plus string/number bytes, and length-delimited nested values.
 The pure-Go client exposes views valid until the next read or explicit
 release. `Into` variants copy into caller storage. There is no object or
 interface allocation per result row.
+
+Type descriptors are cold schema metadata. Execution and column ordinals use
+numeric ids; names exist for diagnostics and display only. Adding timestamps,
+binary values, decimals with declared scale, vectors, geometry, or
+application-defined values therefore does not change the framing or force a
+new result container.
 
 ## Framing, flow control, and retries
 
@@ -213,8 +257,11 @@ wire administration, durable catalog, and planner.
 The current durable exact indexes are certified hash postings. They already
 cover nested and one-to-four-column equality probes, but they do not yet
 provide ordered range/order traversal, multikey array semantics, or join
-planning. Those features require an ordered typed key format and bounded
-backfill; this ADR does not mislabel the existing hash index as that work.
+planning. A scoped internal ordered-key package now proves canonical
+exact-decimal, decoded-string, compound-prefix, ascending, and descending byte
+order with zero-allocation caller-buffered encoding. Durable ordered pages,
+backfill, residual rows, and planner binding remain separate work; this ADR
+does not mislabel the codec as a completed index.
 
 ## Snapshot semantics for joins
 
