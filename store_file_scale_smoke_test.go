@@ -89,13 +89,20 @@ func TestFileStoreHundredXResidentSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if cap(scanScratch) < 3072 {
+		t.Fatalf("read-ahead returned scratch capacity = %d, want at least 3072", cap(scanScratch))
+	}
 	scanElapsed := time.Since(scanStarted)
 	if scanRows != records || scanBytes != sourceBytes {
 		t.Fatalf("read-ahead scan = %d rows/%d bytes, want %d/%d", scanRows, scanBytes, records, sourceBytes)
 	}
 	scanStats := reopened.Stats()
-	if scanStats.PrefetchQueued == 0 || scanStats.PrefetchHits+scanStats.CoalescedReads == 0 {
+	if scanStats.DirectReads &&
+		(scanStats.PrefetchQueued == 0 || scanStats.PrefetchHits+scanStats.CoalescedReads == 0) {
 		t.Fatalf("read-ahead scan performed no overlapping reads: %+v", scanStats)
+	}
+	if !scanStats.DirectReads && scanStats.PrefetchQueued != 0 {
+		t.Fatalf("buffered scan bypassed the serial kernel-readahead lane: %+v", scanStats)
 	}
 	readBuffer := make([]byte, 0, 3072)
 	for _, row := range []int{records - 1, 0, records / 2, 17, records - 101, 1} {

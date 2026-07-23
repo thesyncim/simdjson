@@ -710,6 +710,9 @@ func TestFileSnapshotRangeMasksRawOrderedAndBuffered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if cap(scratch) < 2048 || visitBytes == 0 {
+		t.Fatalf("masked steady scan returned scratch capacity %d and visited %d bytes", cap(scratch), visitBytes)
+	}
 }
 
 func TestFileStoreExactIndexWorkspaceAllocations(t *testing.T) {
