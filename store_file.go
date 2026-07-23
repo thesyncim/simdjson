@@ -248,7 +248,20 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 			catalogHash = fileIndexHashBytes(catalogHash, []byte{0})
 		}
 	}
-	if len(compiled) == 0 && len(columns) == 0 {
+	if o.Store.Schema != nil {
+		catalogHash = fileIndexHashBytes(
+			catalogHash, []byte{0x53, 0x43, 0x48},
+		)
+		var identity [8]byte
+		binary.LittleEndian.PutUint64(
+			identity[:], o.Store.Schema.hash,
+		)
+		catalogHash = fileIndexHashBytes(
+			catalogHash, identity[:],
+		)
+	}
+	if len(compiled) == 0 && len(columns) == 0 &&
+		o.Store.Schema == nil {
 		catalogHash = 0
 	}
 	maxRowBytes := o.MaxKeyBytes + max(o.InlineValueBytes, storeio.DocumentOverflowDescriptorSize)
@@ -499,8 +512,11 @@ func OpenFileStore(file *os.File, options FileStoreOptions) (*FileStore, error) 
 	if err != nil {
 		return nil, err
 	}
+	rootHasSchema := root.Options&storeio.StateOptionSchema != 0
 	if root.ChunkDocuments != uint32(normalized.Store.ChunkDocuments) ||
-		root.IndexCount != uint32(len(normalized.indexes)) || root.IndexCatalogHash != normalized.indexCatalogHash {
+		root.IndexCount != uint32(len(normalized.indexes)) ||
+		root.IndexCatalogHash != normalized.indexCatalogHash ||
+		rootHasSchema != (normalized.Store.Schema != nil) {
 		return nil, fmt.Errorf("simdjson: FileStore options or unsupported durable catalog mismatch")
 	}
 	store, err := newFileStoreResources(file, normalized, root.StoreID)
@@ -698,6 +714,9 @@ func (s *FileStore) createInitialState() error {
 	}
 	if len(s.options.float64Columns) != 0 {
 		root.Options |= storeio.StateOptionFloat64Columns
+	}
+	if s.options.Store.Schema != nil {
+		root.Options |= storeio.StateOptionSchema
 	}
 	if _, err := storeio.EncodeStateRootPage(statePage.Bytes(), root, tx.FileEnd()); err != nil {
 		_ = tx.Abort()
@@ -1913,7 +1932,15 @@ func (s *FileStore) validateDocument(src []byte) (Index, error) {
 	for {
 		index, err := BuildIndexOptions(src, s.parseScratch[:cap(s.parseScratch)], s.options.Store.IndexOptions)
 		if err != document.ErrIndexFull {
-			return index, err
+			if err != nil {
+				return index, err
+			}
+			if schema := s.options.Store.Schema; schema != nil {
+				if schemaErr := schema.ValidateIndex(index); schemaErr != nil {
+					return Index{}, schemaErr
+				}
+			}
+			return index, nil
 		}
 		if cap(s.parseScratch) > s.options.MaxDocumentBytes {
 			return Index{}, ErrFileStoreDocumentTooLarge

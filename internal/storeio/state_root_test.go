@@ -84,6 +84,39 @@ func TestStateRootFloat64ScanHeadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStateRootSchemaOnlyCatalogRoundTrip(t *testing.T) {
+	want := StateRoot{
+		StoreID:          testStoreID,
+		Generation:       1,
+		PageSize:         testSuperblockPageSize,
+		Options:          StateOptionSchema,
+		NextLogicalID:    2,
+		ChunkDocuments:   64,
+		IndexCatalogHash: 0x6d4b3a291807f5e3,
+	}
+	fileEnd := 2 * uint64(testSuperblockPageSize)
+	page := make([]byte, testSuperblockPageSize)
+	encoded, err := EncodeStateRootPage(page, want, fileEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeStateRootPage(encoded, fileEnd)
+	if err != nil || got != want {
+		t.Fatalf(
+			"schema state root = (%+v,%v), want (%+v,nil)",
+			got, err, want,
+		)
+	}
+
+	invalid := want
+	invalid.IndexCatalogHash = 0
+	if _, err := EncodeStateRootPage(
+		page, invalid, fileEnd,
+	); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("schema without identity = %v, want %v", err, ErrInvalidWrite)
+	}
+}
+
 func TestStateRootIndexGroupHeadRoundTrip(t *testing.T) {
 	want, _ := testStateRoot(11)
 	want.IndexGroupHead = testStatePageRef(

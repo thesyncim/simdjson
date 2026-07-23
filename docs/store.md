@@ -33,10 +33,94 @@ view := store.Snapshot()
 raw, ok := view.GetRaw("user:42")
 ```
 
+## Collections and optional schemas
+
+`Store` is the physical collection boundary: it already owns one keyspace,
+snapshot sequence, TTL directory, index catalog, and serialized writer.
+`Collection` adds an immutable name without adding a collection id or pointer
+to each row. `Database` is a concurrency-safe in-memory catalog:
+
+```go
+schema, err := simdjson.CompileStoreSchema(simdjson.StoreSchemaDefinition{
+	Root: simdjson.SchemaObject,
+	Fields: []simdjson.StoreSchemaField{
+		{Path: "/id", Types: simdjson.SchemaInteger, Required: true},
+		{
+			Path: "/profile/name",
+			Types: simdjson.SchemaString | simdjson.SchemaNull,
+		},
+	},
+})
+if err != nil {
+	return err
+}
+
+var database simdjson.Database
+users, err := database.CreateCollection("users", simdjson.StoreOptions{
+	ShapeTapes: true,
+	Schema:     schema,
+})
+if err != nil {
+	return err
+}
+_, err = users.Put(
+	"user:42",
+	[]byte(`{"id":42,"profile":{"name":"Ada"}}`),
+)
+```
+
+Holding `users` keeps all CRUD, snapshot, query, TTL, and nested/compound-index
+operations on the ordinary Store path. The catalog lock and name lookup occur
+only during catalog operations. Different collections may use the same key.
+Collection options are validated and frozen when the collection is created.
+`DropCollection` unlinks the name but cannot invalidate handles or snapshots
+already acquired; recreating the name creates an independent empty collection.
+
+Schema compilation owns and canonicalizes its paths. `Required` distinguishes
+an absent path from a present `null`; include `SchemaNull` in the type mask to
+accept null. `SchemaInteger` accepts number spellings without a fraction or
+exponent and does not impose an `int64` range. Paths may address nested object
+members and array elements. Unspecified fields remain legal: this is an
+evolving-document contract, not a closed-row or full JSON Schema
+implementation.
+
+Validation is fused into the structural-index build before shape compaction,
+so Store, StoreBuilder, FileStore, and page-backed writes do not parse valid
+input twice. A constraint failure publishes nothing. Bulk FileStore creation
+gathers each field across a complete 64-slot source page instead of resolving
+one row at a time. `ValidateIndex` and successful field checks allocate zero
+memory.
+
+Nil `StoreOptions.Schema` preserves the specialized schemaless path. The
+schema pointer lives once in collection configuration and is excluded from
+every immutable generation, preserving the pre-schema state size class. On the
+local one-row mutation benchmark, schemaless updates retained 2,552 B/op and
+10 allocations/op; four already-compiled constraints added about 7% at the
+median of a five-run sample while retaining the same allocation counts. Direct
+validation of four nested fields measured 65-67 ns/op, 0 B/op, and 0
+allocations/op. Run
+`BenchmarkStoreSchemaMutation` and `BenchmarkStoreSchemaValidateIndex` for
+machine-local evidence.
+
+Schema identity is durable. `WriteTo` embeds the definition and `OpenStore`
+recompiles and revalidates it. FileStore and the bounded page format bind the
+identity in their durable root; callers must provide the same compiled schema
+when reopening them. `Store.WriteFileStore` validates a schemaless source
+against the target FileStore schema before writing. Schemas cannot be changed
+in place: bulk-rewrite into a collection with the new contract.
+
+`Database` itself is currently an in-memory catalog, and every FileStore,
+Store image, or page file represents one durable collection. There is no
+cross-collection transaction or atomic durable multi-collection catalog claim.
+The rationale and complete flow matrix are in
+[ADR 0006](adr/0006-collections-and-compiled-schema.md).
+
 ## Command reference
 
 | Operation | Result | Complexity |
 | --- | --- | --- |
+| `CompileStoreSchema` / `ValidateIndex` | compile nested type/required constraints; validate an existing index | one-time path compile / O(constrained paths), zero allocation on successful validation |
+| `Database.CreateCollection` / `Collection` / `DropCollection` | create, resolve, or unlink one named Store | catalog lock + name-map operation; held handles bypass the catalog |
 | `NewStoreBuilder` + `Append` + `Build` | bulk-validates unique keys into final pages; publishes one Store | O(total input + transient key-radix construction) |
 | `Put(key, json)` | `created=true` on insert; validates and copies input | O(replacement bytes + one chunk's metadata + radix height) |
 | `Delete(key)` | true when the key existed | O(one chunk's metadata + radix height) |
@@ -85,9 +169,11 @@ currently eligible work. Event loops should normally use a positive limit.
 
 `Put` copies caller input and validates the copy before publication. The caller
 may reuse the input after return. Invalid JSON, invalid frozen options, or
-address exhaustion returns an error and changes no snapshot. Updating an
-existing key preserves its TTL. `Delete` removes the TTL with the document and
-returns false for a missing key.
+schema violation returns an error and changes no snapshot. A failed new-key
+write takes key ownership only after document validation, so it does not retain
+or transiently clone the rejected key. Updating an existing key preserves its
+TTL. `Delete` removes the TTL with the document and returns false for a missing
+key.
 
 Writes are serialized. Each successful write builds a complete next graph and
 publishes it through one atomic pointer store. An update parses only the
@@ -240,8 +326,10 @@ total memory footprint.
 `Store.WriteTo` emits a Store-native container of the existing bounded `DocSet`
 page images plus a checksummed tail manifest. It records effective options,
 stable slots and keys, generation, reusable empty page ids, ready nested or
-compound index definitions, wildcard posting consumers, and TTL deadlines.
-There is no second JSON, tape, or query representation.
+compound index definitions, wildcard posting consumers, TTL deadlines, and the
+optional canonical schema. There is no second JSON, tape, or query
+representation. `OpenStore` recompiles a persisted schema and validates rows
+in micro-page batches before publishing the graph.
 
 This is a full checkpoint: each call writes every live micro-page. It is not a
 per-mutation persistence requirement or an incremental durability protocol.

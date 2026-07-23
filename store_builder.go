@@ -125,7 +125,17 @@ func (b *StoreBuilder) Append(key string, src []byte) error {
 
 	// DocSet.Append owns and validates src before any key or directory state is
 	// committed. Its rollback contract leaves the page unchanged on error.
-	ord, err := b.current.docs.Append(src)
+	var (
+		ord int
+		err error
+	)
+	if b.options.Schema == nil {
+		ord, err = b.current.docs.Append(src)
+	} else {
+		ord, err = b.current.docs.appendStoreSchema(
+			src, b.options.Schema,
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -155,7 +165,9 @@ func newStoreBuilderChunk(options StoreOptions, shapes []*shapeRecord, sourceCap
 	chunk := &storeChunk{
 		keys: make([]string, options.ChunkDocuments),
 	}
-	initChunkDocSet(&chunk.docs, options, options.Postings)
+	initChunkDocSet(
+		&chunk.docs, options.stateOptions(), options.Postings,
+	)
 	if sourceCapacity > 0 {
 		chunk.docs.srcChunk = make([]byte, 0, sourceCapacity)
 	}
@@ -276,7 +288,7 @@ func (b *StoreBuilder) Build() (*Store, error) {
 		count:      b.count,
 		chunkCount: b.chunks.count,
 		seed:       b.seed,
-		options:    b.options,
+		options:    b.options.stateOptions(),
 		baseKeys:   baseKeys,
 		chunks:     b.chunks,
 	}

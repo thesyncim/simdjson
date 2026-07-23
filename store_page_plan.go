@@ -165,7 +165,7 @@ func planStoreKeyDirectories(entries []storeio.PageKeyLocation, generation uint6
 	return plans, plans[levelStart].ref
 }
 
-func storePageOptionFlags(options StoreOptions) uint32 {
+func storePageOptionFlags(options storeStateOptions) uint32 {
 	var flags uint32
 	if options.ShapeTapes {
 		flags |= storeio.StateOptionShapeTapes

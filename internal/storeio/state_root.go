@@ -43,13 +43,18 @@ const (
 	// StateOptionFloat64Columns means every live document page carries the
 	// complete configured float64 covering-column catalog.
 	StateOptionFloat64Columns
+	// StateOptionSchema means the durable catalog hash also binds an
+	// application-supplied document schema. The schema definition remains
+	// caller configuration; reopening with a different definition fails.
+	StateOptionSchema
 )
 
 const stateRootKnownOptions = StateOptionShapeTapes |
 	StateOptionPostings |
 	StateOptionValueDict |
 	StateOptionHashKeys |
-	StateOptionFloat64Columns
+	StateOptionFloat64Columns |
+	StateOptionSchema
 
 // ErrStateRootCorrupt reports a common page that passed basic framing but does
 // not encode a valid Store state root.
@@ -78,18 +83,20 @@ type PageRef struct {
 // secondary indexes, and TTL ordering so a mutation copies only affected
 // paths. The persistent free-page tree remains a separate Superblock root.
 type StateRoot struct {
-	StoreID          [16]byte
-	Generation       uint64
-	PageSize         uint32
-	Options          uint32
-	DocumentCount    uint64
-	TTLCount         uint64
-	NextLogicalID    uint64
-	ChunkHighWater   uint32
-	LiveChunks       uint32
-	ChunkDocuments   uint32
-	IndexCount       uint32
-	IndexMaxDepth    uint32
+	StoreID        [16]byte
+	Generation     uint64
+	PageSize       uint32
+	Options        uint32
+	DocumentCount  uint64
+	TTLCount       uint64
+	NextLogicalID  uint64
+	ChunkHighWater uint32
+	LiveChunks     uint32
+	ChunkDocuments uint32
+	IndexCount     uint32
+	IndexMaxDepth  uint32
+	// IndexCatalogHash binds every caller-supplied durable accelerator and
+	// validation contract: exact indexes, covering columns, and schema.
 	IndexCatalogHash uint64
 	// FreeChunkHint is a conservative lower bound for the first chunk that
 	// may contain a free stable slot. ChunkHighWater means no known hole.
@@ -260,7 +267,8 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 	if fileEnd < uint64(superblockCopies)*pageSize || fileEnd > maxSuperblockFileOffset || fileEnd%pageSize != 0 {
 		return fmt.Errorf("%w: state file high-water mark", ErrInvalidWrite)
 	}
-	hasCatalog := root.IndexCount != 0 || root.Options&StateOptionFloat64Columns != 0
+	hasCatalog := root.IndexCount != 0 ||
+		root.Options&(StateOptionFloat64Columns|StateOptionSchema) != 0
 	if root.ChunkDocuments == 0 || root.ChunkDocuments > 64 ||
 		root.LiveChunks > root.ChunkHighWater || root.TTLCount > root.DocumentCount ||
 		root.FreeChunkHint > root.ChunkHighWater || root.NextLogicalID <= StateRootLogicalID ||

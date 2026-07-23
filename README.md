@@ -164,6 +164,39 @@ raw, ok := before.GetRaw("session:42")
 raw, ok = before.GetRawKey(sessionKey)
 ```
 
+A `Store` is also the physical boundary for one JSON collection. Named
+`Collection` handles group independent keyspaces in an in-memory `Database`
+catalog without adding a collection id to rows or a catalog lookup to held
+handle operations. Optional schemas compile nested RFC 6901 constraints once:
+
+```go
+schema, err := simdjson.CompileStoreSchema(simdjson.StoreSchemaDefinition{
+	Root: simdjson.SchemaObject,
+	Fields: []simdjson.StoreSchemaField{
+		{Path: "/id", Types: simdjson.SchemaInteger, Required: true},
+		{Path: "/profile/name", Types: simdjson.SchemaString},
+	},
+})
+if err != nil {
+	return err
+}
+var database simdjson.Database
+users, err := database.CreateCollection("users", simdjson.StoreOptions{
+	ShapeTapes: true,
+	Schema:     schema,
+})
+```
+
+Validation is fused into the existing structural parse before publication and
+shape compaction. Nil schema keeps the specialized schemaless state layout and
+write path; successful four-field `ValidateIndex` measured 65-67 ns with zero
+allocations locally. Schemas allow unspecified fields, persist in Store images,
+and bind FileStore/page-file recovery to the same compiled identity. Each
+durable file is currently one collection; the multi-collection catalog itself
+is not yet durable. Full semantics, measured overhead, and migration limits are
+in [Mutable Store operations](docs/store.md#collections-and-optional-schemas)
+and [ADR 0006](docs/adr/0006-collections-and-compiled-schema.md).
+
 For an initial keyed corpus, `StoreBuilder` validates and copies rows directly
 into their final micro-pages. Duplicate detection uses a geometric,
 pointer-free table that packs a hash fingerprint and row ordinal into one word;
@@ -212,7 +245,9 @@ The image bytes must remain immutable and live until the Store, retained
 snapshots, and borrowed values are dead. `AppendRaw`/`AppendRawKey` make an
 owned copy into caller capacity and allocate nothing after capacity is warm.
 `WriteTo` remains a full checkpoint: later heap-Store mutations do not update
-that image.
+that image. The checkpoint also carries an optional compiled schema definition;
+`OpenStore` restores it and fails closed before publication if any row violates
+the contract.
 
 For an immutable checkpoint that must be read through an explicit fixed-size
 page cache, `Store.WritePageFile` and `OpenStorePageReader` provide a narrower
@@ -220,8 +255,10 @@ page-file surface. `StorePageDB` can durably replace or delete existing keys in
 that format and can insert a missing key by reusing the first free stable slot
 or splitting its copy-on-write key and chunk paths. It is kept as a focused
 page-I/O and crash-consistency baseline; it does not support TTL, secondary
-indexes, overflow values, or extent reuse. Use `FileStore` for the general
-durable collection below.
+indexes, overflow values, or extent reuse. Schema-bound page files require the
+same `StorePageOpenOptions.Schema` on reader/database open, and
+`StorePageDB.Put` enforces it before page construction. Use `FileStore` for the
+general durable collection below.
 
 For incremental durability and a bounded resident set, attach a `FileStore` to
 a caller-owned file. Its key, chunk, exact-index, TTL, free-space, document, and

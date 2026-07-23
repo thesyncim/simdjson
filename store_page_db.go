@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/thesyncim/simdjson/document"
 	"github.com/thesyncim/simdjson/internal/storeio"
 )
 
@@ -226,6 +227,8 @@ type StorePageDB struct {
 	path    [storePageDBMaxDirectoryDepth]storePageDBDirectoryNode
 	keyLeaf storePageDBKeyLeaf
 	keyPath [storePageKeyMaxDepth - 1]storePageDBKeyBranchNode
+
+	parseScratch []IndexEntry
 }
 
 // OpenStorePageDB recovers the newest valid generation, truncates any
@@ -256,6 +259,9 @@ func OpenStorePageDB(path string, options StorePageDBOptions) (*StorePageDB, err
 	if root.IndexCount != 0 || root.TTLCount != 0 ||
 		root.IndexDirectory != (storeio.PageRef{}) || root.TTLDirectory != (storeio.PageRef{}) {
 		return nil, closeWriter(ErrStorePageUnsupported)
+	}
+	if !storePageSchemaMatches(root, options.Open.Schema) {
+		return nil, closeWriter(ErrStorePageSchemaMismatch)
 	}
 	// A failed pre-root commit can leave valid-looking bytes beyond FileEnd.
 	// They are unreachable by definition and must be overwritten, not allowed
@@ -359,7 +365,10 @@ func (db *StorePageDB) AppendRawKey(dst []byte, key StorePageDBKey) ([]byte, boo
 // first stable-slot hole at or above the persistent free-chunk hint before
 // extending ChunkHighWater.
 func (db *StorePageDB) Put(key string, src []byte) (created bool, err error) {
-	if !Valid(src) {
+	if db == nil {
+		return false, ErrStorePageClosed
+	}
+	if db.options.Open.Schema == nil && !Valid(src) {
 		return false, ErrStorePageInvalidJSON
 	}
 	return db.mutate(key, src, false)
@@ -387,6 +396,11 @@ func (db *StorePageDB) mutate(key string, src []byte, deleting bool) (bool, erro
 	pages := db.pages.Load()
 	if pages == nil {
 		return false, ErrStorePageClosed
+	}
+	if !deleting && db.options.Open.Schema != nil {
+		if err := db.validateDocument(src); err != nil {
+			return false, err
+		}
 	}
 	root, fileEnd := db.root, db.fileEnd
 	compiled := StorePageKey{key: key, storeID: root.StoreID, hash: storeio.KeyHash(root.StoreID, key)}
@@ -449,6 +463,38 @@ func (db *StorePageDB) mutate(key string, src []byte, deleting bool) (bool, erro
 		closeErr = value.Close()
 	}
 	return false, errors.Join(err, closeErr)
+}
+
+func (db *StorePageDB) validateDocument(src []byte) error {
+	if len(src) > int(db.options.Open.MaxDocumentPageBytes) {
+		return ErrStoreDocumentPageTooLarge
+	}
+	estimate := max(len(src)/8+8, 8)
+	if cap(db.parseScratch) < estimate {
+		db.parseScratch = make([]IndexEntry, estimate)
+	}
+	indexOptions := document.IndexOptions{
+		MaxDepth: int(db.root.IndexMaxDepth),
+		HashKeys: db.root.Options&storeio.StateOptionHashKeys != 0,
+	}
+	for {
+		index, err := BuildIndexOptions(
+			src, db.parseScratch[:cap(db.parseScratch)], indexOptions,
+		)
+		if err != document.ErrIndexFull {
+			if err != nil {
+				return fmt.Errorf("%w: %v", ErrStorePageInvalidJSON, err)
+			}
+			return db.options.Open.Schema.ValidateIndex(index)
+		}
+		limit := int(db.options.Open.MaxDocumentPageBytes)
+		if cap(db.parseScratch) >= limit {
+			return ErrStoreDocumentPageTooLarge
+		}
+		db.parseScratch = make(
+			[]IndexEntry, min(cap(db.parseScratch)*2, limit),
+		)
+	}
 }
 
 func (db *StorePageDB) buildDocumentRows(doc storeio.DocumentPageView, slot uint8, src []byte,

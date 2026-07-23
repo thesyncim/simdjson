@@ -29,6 +29,29 @@ type StoreOptions struct {
 	Postings bool
 	// ValueDict enables a value dictionary scoped to each immutable chunk.
 	ValueDict bool
+	// Schema optionally enforces compiled root and RFC 6901 field constraints
+	// on every insert or replacement. Nil preserves the schemaless fast path.
+	Schema *StoreSchema
+}
+
+// storeStateOptions is the pointer-free subset copied into every immutable
+// Store generation. Collection-wide schema belongs to Store, not to each
+// publication; keeping it out of this value preserves the schemaless state
+// size class and avoids bytes/op growth on every mutation.
+type storeStateOptions struct {
+	IndexOptions   document.IndexOptions
+	ChunkDocuments int
+	ShapeTapes     bool
+	Postings       bool
+	ValueDict      bool
+}
+
+func (o StoreOptions) stateOptions() storeStateOptions {
+	return storeStateOptions{
+		IndexOptions: o.IndexOptions, ChunkDocuments: o.ChunkDocuments,
+		ShapeTapes: o.ShapeTapes, Postings: o.Postings,
+		ValueDict: o.ValueDict,
+	}
 }
 
 const storeMaxChunkDocuments = 64
@@ -47,6 +70,12 @@ func (o StoreOptions) normalized() (StoreOptions, error) {
 	}
 	if o.ChunkDocuments < 1 || o.ChunkDocuments > storeMaxChunkDocuments {
 		return StoreOptions{}, fmt.Errorf("simdjson: Store ChunkDocuments must be in [1,%d]", storeMaxChunkDocuments)
+	}
+	if o.Schema != nil && !o.Schema.valid() {
+		return StoreOptions{}, fmt.Errorf(
+			"%w: uninitialized compiled schema",
+			ErrStoreSchemaDefinition,
+		)
 	}
 	return o, nil
 }
@@ -101,7 +130,7 @@ type storeState struct {
 	// state-level owner while retained snapshots keep their own chunk owners.
 	mappedDocChunks uint32
 	seed            maphash.Seed
-	options         StoreOptions
+	options         storeStateOptions
 	keys            *storeKeyNode
 	// baseKeys is the compact immutable directory created by StoreBuilder or
 	// OpenStore. keys is then only the path-copied overlay for later insertions
@@ -160,7 +189,11 @@ func (s *storeIDSet) remove(id uint32) {
 	}
 }
 
-func initChunkDocSet(docs *DocSet, options StoreOptions, postings bool) {
+func initChunkDocSet(
+	docs *DocSet,
+	options storeStateOptions,
+	postings bool,
+) {
 	*docs = DocSet{
 		Options:    options.IndexOptions,
 		ShapeTapes: options.ShapeTapes,
@@ -190,7 +223,14 @@ func initChunkDocSet(docs *DocSet, options StoreOptions, postings bool) {
 // shared; row tables and the narrow-value slab are copied because their offsets
 // are chunk-local. Excluding replaceSlot is what prevents an updated-away
 // shape from becoming historical cache debt.
-func prepareStoreDocSet(docs *DocSet, options StoreOptions, postings bool, old *storeChunk, live uint64, replaceSlot int) {
+func prepareStoreDocSet(
+	docs *DocSet,
+	options storeStateOptions,
+	postings bool,
+	old *storeChunk,
+	live uint64,
+	replaceSlot int,
+) {
 	initChunkDocSet(docs, options, postings)
 	count := bits.OnesCount64(live)
 	docs.docs = make([]Index, 0, count)
@@ -324,7 +364,15 @@ func copyStoreShapeTape(dst *DocSet, index Index) (Index, shapeTapeRef, bool) {
 // replacements, deletes, expiry batches, index backfill, and index reclaim.
 // live is the exact post-edit slot mask. replaceSlot selects one slot whose
 // bytes come from src; -1 means every remaining document comes from old.
-func buildStoreChunk(options StoreOptions, postings bool, old *storeChunk, live uint64, replaceSlot int, key string, src []byte) (*storeChunk, error) {
+func buildStoreChunk(
+	options storeStateOptions,
+	postings bool,
+	old *storeChunk,
+	live uint64,
+	replaceSlot int,
+	key string,
+	src []byte,
+) (*storeChunk, error) {
 	if live == 0 {
 		// Deleting or expiring the final row removes the vector leaf outright.
 		// There is no replacement to validate and no empty chunk object to
@@ -371,7 +419,76 @@ func buildStoreChunk(options StoreOptions, postings bool, old *storeChunk, live 
 	return chunk, nil
 }
 
-func rebuildStoreChunk(options StoreOptions, postings bool, old *storeChunk, slot int, key string, src []byte, keep bool) (*storeChunk, error) {
+// buildStoreChunkSchema is the schema-on specialization of buildStoreChunk.
+// Keeping the replacement append explicit gives the much more common
+// schemaless build a direct DocSet.Append call; a callback or inner-loop mode
+// branch measured as avoidable update overhead.
+func buildStoreChunkSchema(
+	options storeStateOptions,
+	schema *StoreSchema,
+	postings bool,
+	old *storeChunk,
+	live uint64,
+	replaceSlot int,
+	key string,
+	src []byte,
+) (*storeChunk, error) {
+	if live == 0 {
+		return nil, nil
+	}
+	chunk := &storeChunk{
+		keys: make([]string, options.ChunkDocuments),
+	}
+	prepareStoreDocSet(
+		&chunk.docs, options, postings, old, live, replaceSlot,
+	)
+	if old != nil {
+		for bitsLeft := old.live; bitsLeft != 0; bitsLeft &= bitsLeft - 1 {
+			slot := bits.TrailingZeros64(bitsLeft)
+			chunk.keys[slot] = old.key(slot)
+		}
+	}
+	chunk.live = live
+	if old != nil {
+		for removed := old.live &^ live; removed != 0; removed &= removed - 1 {
+			chunk.keys[bits.TrailingZeros64(removed)] = ""
+		}
+	}
+	if replaceSlot >= 0 {
+		chunk.keys[replaceSlot] = key
+	}
+	for bitsLeft := chunk.live; bitsLeft != 0; bitsLeft &= bitsLeft - 1 {
+		i := bits.TrailingZeros64(bitsLeft)
+		var ord int
+		if i == replaceSlot {
+			var err error
+			ord, err = chunk.docs.appendStoreSchema(src, schema)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			ord = appendStoreDoc(
+				&chunk.docs, &old.docs, int(old.ord[i]),
+			)
+		}
+		chunk.ord[i] = uint8(ord)
+		chunk.count++
+	}
+	if chunk.count == 0 {
+		return nil, nil
+	}
+	return chunk, nil
+}
+
+func rebuildStoreChunk(
+	options storeStateOptions,
+	postings bool,
+	old *storeChunk,
+	slot int,
+	key string,
+	src []byte,
+	keep bool,
+) (*storeChunk, error) {
 	var live uint64
 	if old != nil {
 		live = old.live
@@ -379,16 +496,45 @@ func rebuildStoreChunk(options StoreOptions, postings bool, old *storeChunk, slo
 	mask := uint64(1) << uint(slot)
 	if keep {
 		live |= mask
-		return buildStoreChunk(options, postings, old, live, slot, key, src)
+		return buildStoreChunk(
+			options, postings, old, live, slot, key, src,
+		)
 	}
-	return buildStoreChunk(options, postings, old, live&^mask, -1, "", nil)
+	return buildStoreChunk(
+		options, postings, old, live&^mask, -1, "", nil,
+	)
 }
 
-func cloneStoreChunk(options StoreOptions, postings bool, old *storeChunk) (*storeChunk, error) {
+func rebuildStoreChunkSchema(
+	options storeStateOptions,
+	schema *StoreSchema,
+	postings bool,
+	old *storeChunk,
+	slot int,
+	key string,
+	src []byte,
+) (*storeChunk, error) {
+	var live uint64
+	if old != nil {
+		live = old.live
+	}
+	live |= uint64(1) << uint(slot)
+	return buildStoreChunkSchema(
+		options, schema, postings, old, live, slot, key, src,
+	)
+}
+
+func cloneStoreChunk(
+	options storeStateOptions,
+	postings bool,
+	old *storeChunk,
+) (*storeChunk, error) {
 	if old == nil {
 		return nil, nil
 	}
-	return buildStoreChunk(options, postings, old, old.live, -1, "", nil)
+	return buildStoreChunk(
+		options, postings, old, old.live, -1, "", nil,
+	)
 }
 
 func (c *storeChunk) key(slot int) string {
@@ -408,7 +554,9 @@ func (s *Store) initLocked() (*storeState, error) {
 	}
 	s.options = options
 	s.free.pos = make(map[uint32]int)
-	state := &storeState{seed: maphash.MakeSeed(), options: options}
+	state := &storeState{
+		seed: maphash.MakeSeed(), options: options.stateOptions(),
+	}
 	s.state.Store(state)
 	return state, nil
 }
@@ -429,7 +577,19 @@ func (s *Store) Put(key string, src []byte) (created bool, err error) {
 	old, loc, found := storeStateKeyLookupChunk(state, hash, key)
 	if found {
 		storedKey := old.key(int(loc.slot))
-		chunk, err := rebuildStoreChunk(state.options, s.postingsRequiredLocked(), old, int(loc.slot), storedKey, src, true)
+		var chunk *storeChunk
+		if schema := s.options.Schema; schema != nil {
+			chunk, err = rebuildStoreChunkSchema(
+				state.options, schema,
+				s.postingsRequiredLocked(), old, int(loc.slot),
+				storedKey, src,
+			)
+		} else {
+			chunk, err = rebuildStoreChunk(
+				state.options, s.postingsRequiredLocked(), old,
+				int(loc.slot), storedKey, src, true,
+			)
+		}
 		if err != nil {
 			return false, err
 		}
@@ -452,12 +612,27 @@ func (s *Store) Put(key string, src []byte) (created bool, err error) {
 	if len(s.free.ids) == 0 && state.chunks.count == ^uint32(0) {
 		return false, ErrStoreTooLarge
 	}
-	key = strings.Clone(key)
 	chunkID, slot, old := s.allocateSlotLocked(state)
-	chunk, err := rebuildStoreChunk(state.options, s.postingsRequiredLocked(), old, slot, key, src, true)
+	var chunk *storeChunk
+	if schema := s.options.Schema; schema != nil {
+		chunk, err = rebuildStoreChunkSchema(
+			state.options, schema, s.postingsRequiredLocked(),
+			old, slot, key, src,
+		)
+	} else {
+		chunk, err = rebuildStoreChunk(
+			state.options, s.postingsRequiredLocked(), old,
+			slot, key, src, true,
+		)
+	}
 	if err != nil {
 		return false, err
 	}
+	// Validation is complete and publication cannot fail. Only now take key
+	// ownership, so malformed JSON and schema violations do not allocate a
+	// transient key that is immediately discarded.
+	key = strings.Clone(key)
+	chunk.keys[slot] = key
 	next := *state
 	next.generation++
 	next.count++
@@ -509,7 +684,10 @@ func (s *Store) deleteLocked(key string) bool {
 	if !found {
 		return false
 	}
-	chunk, err := rebuildStoreChunk(state.options, s.postingsRequiredLocked(), old, int(loc.slot), "", nil, false)
+	chunk, err := rebuildStoreChunk(
+		state.options, s.postingsRequiredLocked(), old,
+		int(loc.slot), "", nil, false,
+	)
 	if err != nil {
 		panic("simdjson: rebuilding validated Store chunk: " + err.Error())
 	}

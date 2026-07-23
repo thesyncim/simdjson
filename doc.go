@@ -136,8 +136,14 @@
 // object keys to dense identifiers for engines that group fields across
 // documents.
 //
-// A [Store] adds keyed insert, replace, delete, TTL, immutable [Snapshot]
-// publication, declared single/compound exact indexes, and wildcard postings.
+// A [Store] is one physical JSON collection and adds keyed insert, replace,
+// delete, TTL, immutable [Snapshot] publication, declared single/compound
+// exact indexes, and wildcard postings. [Database] catalogs named [Collection]
+// handles without adding namespace metadata or catalog lookup to their Store
+// hot paths. [CompileStoreSchema] builds an optional immutable nested-field
+// contract shared by Store, StoreBuilder, FileStore, and page-backed writes;
+// successful validation uses the document's existing structural index and
+// allocates no memory.
 // [StoreBuilder] bulk-loads unique keyed documents directly into final bounded
 // chunks, bulk-builds declared exact indexes, and publishes one completed
 // Store, avoiding per-row persistent path copies while retaining the same

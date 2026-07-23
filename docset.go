@@ -247,6 +247,35 @@ func (s *DocSet) Append(src []byte) (int, error) {
 	return s.commitDoc(index, ref), nil
 }
 
+// appendStoreSchema is Store's fused parse-and-schema path. The schema sees
+// the complete structural index before optional shape compaction, so a valid
+// write is parsed once and a rejected write commits neither source nor tape.
+func (s *DocSet) appendStoreSchema(
+	src []byte,
+	schema *StoreSchema,
+) (int, error) {
+	if len(s.srcChunk)+len(src) > cap(s.srcChunk) {
+		s.srcChunk = make(
+			[]byte, 0,
+			docSetChunkCap(
+				cap(s.srcChunk), len(src), s.sourceChunkMinimum(),
+				docSetMaxSrcChunk,
+			),
+		)
+	}
+	mark := len(s.srcChunk)
+	s.srcChunk = append(s.srcChunk, src...)
+	index, ref, err := s.buildDocSchema(
+		s.srcChunk[mark:len(s.srcChunk):len(s.srcChunk)],
+		schema,
+	)
+	if err != nil {
+		s.srcChunk = s.srcChunk[:mark]
+		return 0, err
+	}
+	return s.commitDoc(index, ref), nil
+}
+
 // buildDoc indexes one arena-resident document into the entry arena. It first
 // builds directly into the current chunk's free tail — the common case, one
 // validation pass and no copy. A document that outgrows the tail builds once
@@ -266,7 +295,8 @@ func (s *DocSet) buildDoc(src []byte) (Index, shapeTapeRef, error) {
 	index, err := buildIndexOptions(src, free, s.Options)
 	if err == nil {
 		n := len(index.entries)
-		if n > 0 && unsafe.SliceData(index.entries) != unsafe.SliceData(free) {
+		if n > 0 &&
+			unsafe.SliceData(index.entries) != unsafe.SliceData(free) {
 			// Both builders write into the storage they are handed; the
 			// commit below extends the chunk over exactly those entries. If
 			// the invariant ever broke, extending would expose garbage, so
@@ -289,6 +319,74 @@ func (s *DocSet) buildDoc(src []byte) (Index, shapeTapeRef, error) {
 	}
 	index, err = buildIndexOptions(src, s.scratch[:0], s.Options)
 	if err != nil {
+		return Index{}, shapeTapeRef{}, err
+	}
+	index, ref := s.shapeTapeCompact(index)
+	n := len(index.entries)
+	if n == 0 && s.dropEmptySpill {
+		return Index{src: src}, ref, nil
+	}
+	chunk := make(
+		[]IndexEntry, n,
+		docSetChunkCap(
+			cap(s.entryChunk), n, s.entryChunkMinimum(),
+			docSetMaxEntryChunk,
+		),
+	)
+	copy(chunk, index.entries)
+	s.entryChunk = chunk
+	return Index{src: src, entries: chunk[:n:n]}, ref, nil
+}
+
+// buildDocSchema intentionally specializes buildDoc rather than adding a
+// validator callback or branch to DocSet's public hot path. The duplicated
+// arena choreography is small and mechanically parallel; keeping it here
+// preserves identical schemaless code generation while placing validation
+// between the one structural parse and shape-tape compaction.
+func (s *DocSet) buildDocSchema(
+	src []byte,
+	schema *StoreSchema,
+) (Index, shapeTapeRef, error) {
+	if cap(s.entryChunk) == 0 {
+		s.entryChunk = make([]IndexEntry, 0, s.entryChunkMinimum())
+	}
+	used := len(s.entryChunk)
+	free := s.entryChunk[used:]
+	index, err := buildIndexOptions(src, free, s.Options)
+	if err == nil {
+		n := len(index.entries)
+		if n > 0 && unsafe.SliceData(index.entries) != unsafe.SliceData(free) {
+			// Both builders write into the storage they are handed; the
+			// commit below extends the chunk over exactly those entries. If
+			// the invariant ever broke, extending would expose garbage, so
+			// fail closed: the document keeps the storage it was built in and
+			// the chunk stays unchanged.
+			if err := schema.ValidateIndex(index); err != nil {
+				return Index{}, shapeTapeRef{}, err
+			}
+			return index, shapeTapeRef{}, nil
+		}
+		index.entries = index.entries[:n:n]
+		if err := schema.ValidateIndex(index); err != nil {
+			return Index{}, shapeTapeRef{}, err
+		}
+		index, ref := s.shapeTapeCompact(index)
+		s.entryChunk = s.entryChunk[:used+len(index.entries)]
+		return index, ref, nil
+	}
+	if !errors.Is(err, document.ErrIndexFull) {
+		return Index{}, shapeTapeRef{}, err
+	}
+	// One entry is recorded per value or key, and each spans at least one
+	// distinct source byte, so len(src)+2 entries always suffice.
+	if cap(s.scratch) < len(src)+2 {
+		s.scratch = make([]IndexEntry, 0, len(src)+2)
+	}
+	index, err = buildIndexOptions(src, s.scratch[:0], s.Options)
+	if err != nil {
+		return Index{}, shapeTapeRef{}, err
+	}
+	if err := schema.ValidateIndex(index); err != nil {
 		return Index{}, shapeTapeRef{}, err
 	}
 	index, ref := s.shapeTapeCompact(index)

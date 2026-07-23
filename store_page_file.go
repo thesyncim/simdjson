@@ -43,6 +43,11 @@ var (
 	// ErrStorePageCorrupt reports a checksum, identity, schema, or durable
 	// graph violation while opening or reading a page file.
 	ErrStorePageCorrupt = errors.New("simdjson: corrupt Store page file")
+	// ErrStorePageSchemaMismatch reports a missing or different compiled
+	// schema when opening a schema-bound page file.
+	ErrStorePageSchemaMismatch = errors.New(
+		"simdjson: Store page schema mismatch",
+	)
 )
 
 func corruptStorePage(detail string, cause error) error {
@@ -102,6 +107,10 @@ type StorePageOpenOptions struct {
 	ResidentBytes        int64
 	MaxDocumentPageBytes uint32
 	DirectIO             StoreDirectIO
+	// Schema must match the optional schema of the Store that wrote the page
+	// file. StorePageDB applies it to every later Put. Nil selects a
+	// schemaless file.
+	Schema *StoreSchema
 }
 
 func (o StorePageOpenOptions) normalized() (StorePageOpenOptions, error) {
@@ -115,6 +124,12 @@ func (o StorePageOpenOptions) normalized() (StorePageOpenOptions, error) {
 		o.MaxDocumentPageBytes&(o.MaxDocumentPageBytes-1) != 0 ||
 		o.ResidentBytes < 2*int64(o.MaxDocumentPageBytes) {
 		return StorePageOpenOptions{}, fmt.Errorf("simdjson: invalid Store page-open options")
+	}
+	if o.Schema != nil && !o.Schema.valid() {
+		return StorePageOpenOptions{}, fmt.Errorf(
+			"%w: uninitialized compiled schema",
+			ErrStoreSchemaDefinition,
+		)
 	}
 	return o, nil
 }
@@ -146,13 +161,17 @@ func (s *Store) WritePageFile(file *os.File, options StorePageWriteOptions) (int
 
 	s.mu.Lock()
 	state := s.state.Load()
+	var schema *StoreSchema
 	if state == nil {
 		normalized, normalizeErr := s.Options.normalized()
 		if normalizeErr != nil {
 			s.mu.Unlock()
 			return 0, normalizeErr
 		}
-		state = &storeState{options: normalized}
+		schema = normalized.Schema
+		state = &storeState{options: normalized.stateOptions()}
+	} else {
+		schema = s.options.Schema
 	}
 	if len(s.ttl.heap) != 0 || len(state.indexes) != 0 {
 		s.mu.Unlock()
@@ -305,6 +324,10 @@ func (s *Store) WritePageFile(file *os.File, options StorePageWriteOptions) (int
 		FreeChunkHint:  freeChunkHint,
 		ChunkDirectory: chunkRoot, KeyDirectory: keyRoot,
 	}
+	if schema != nil {
+		root.Options |= storeio.StateOptionSchema
+		root.IndexCatalogHash = schema.hash
+	}
 	statePage, err := storeio.EncodeStateRootPage(scratch[:storePageQuantum], root, fileEnd)
 	if err != nil {
 		return 0, err
@@ -369,6 +392,9 @@ func OpenStorePageReader(path string, options StorePageOpenOptions) (*StorePageR
 	if closeErr != nil {
 		return nil, closeErr
 	}
+	if !storePageSchemaMatches(root, options.Schema) {
+		return nil, ErrStorePageSchemaMismatch
+	}
 	pages, err := openStorePageFile(path, options, root.StoreID, func() (storeio.StateRoot, uint64) {
 		return root, super.FileEnd
 	})
@@ -378,6 +404,17 @@ func OpenStorePageReader(path string, options StorePageOpenOptions) (*StorePageR
 	reader := &StorePageReader{root: root, fileEnd: super.FileEnd}
 	reader.pages.Store(pages)
 	return reader, nil
+}
+
+func storePageSchemaMatches(
+	root storeio.StateRoot,
+	schema *StoreSchema,
+) bool {
+	persisted := root.Options&storeio.StateOptionSchema != 0
+	if schema == nil {
+		return !persisted && root.IndexCatalogHash == 0
+	}
+	return persisted && root.IndexCatalogHash == schema.hash
 }
 
 // openStorePageFile centralizes page admission for immutable readers and the

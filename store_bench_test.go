@@ -7,11 +7,11 @@ import (
 )
 
 var (
-	storeRawSink  RawValue
-	storeKeysSink []string
-	storeRowsSink []StoreRow
+	storeRawSink   RawValue
+	storeKeysSink  []string
+	storeRowsSink  []StoreRow
 	storeWordsSink []uint64
-	storeBoolSink bool
+	storeBoolSink  bool
 )
 
 func benchmarkStore(b *testing.B, options StoreOptions, documents int) *Store {
@@ -167,6 +167,89 @@ func BenchmarkStoreMutation(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func BenchmarkStoreSchemaMutation(b *testing.B) {
+	schema, err := CompileStoreSchema(StoreSchemaDefinition{
+		Root: SchemaObject,
+		Fields: []StoreSchemaField{
+			{Path: "/id", Types: SchemaInteger, Required: true},
+			{Path: "/group", Types: SchemaInteger, Required: true},
+			{Path: "/active", Types: SchemaBool, Required: true},
+			{Path: "/name", Types: SchemaString, Required: true},
+		},
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, chunkDocuments := range []int{1, 64} {
+		for _, mode := range []struct {
+			name   string
+			schema *StoreSchema
+		}{
+			{name: "schemaless"},
+			{name: "four-fields", schema: schema},
+		} {
+			b.Run(
+				mode.name+"/chunk="+itoaStore(chunkDocuments),
+				func(b *testing.B) {
+					options := StoreOptions{
+						ChunkDocuments: chunkDocuments,
+						ShapeTapes:     true,
+						Schema:         mode.schema,
+					}
+					store := benchmarkStore(b, options, 1024)
+					keys := make([]string, 1024)
+					for i := range keys {
+						keys[i] = fmt.Sprintf("key-%05d", i)
+					}
+					doc := []byte(
+						`{"id":7,"group":3,"active":true,"name":"replacement"}`,
+					)
+					b.ReportAllocs()
+					b.ResetTimer()
+					for i := 0; i < b.N; i++ {
+						if _, err := store.Put(
+							keys[i&1023], doc,
+						); err != nil {
+							b.Fatal(err)
+						}
+					}
+				},
+			)
+		}
+	}
+}
+
+func BenchmarkStoreSchemaValidateIndex(b *testing.B) {
+	schema, err := CompileStoreSchema(StoreSchemaDefinition{
+		Root: SchemaObject,
+		Fields: []StoreSchemaField{
+			{Path: "/id", Types: SchemaInteger, Required: true},
+			{Path: "/profile/age", Types: SchemaInteger},
+			{Path: "/profile/name", Types: SchemaString, Required: true},
+			{Path: "/tags/0", Types: SchemaString},
+		},
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	index, err := BuildIndex(
+		[]byte(
+			`{"id":7,"profile":{"name":"Ada","age":42},"tags":["go"]}`,
+		),
+		make([]IndexEntry, 128),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := schema.ValidateIndex(index); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

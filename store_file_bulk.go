@@ -52,7 +52,7 @@ func (s *Store) WriteFileStore(file *os.File, options FileStoreOptions) (int64, 
 			s.mu.Unlock()
 			return 0, normalizeErr
 		}
-		state = &storeState{options: sourceOptions}
+		state = &storeState{options: sourceOptions.stateOptions()}
 	}
 	rows, collectErr := collectFileStoreBulkRows(state, &s.ttl, normalized)
 	s.mu.Unlock()
@@ -523,6 +523,9 @@ func (b *fileStoreBulkBuild) targetLocation(row int) storeio.KeyLocation {
 }
 
 func (b *fileStoreBulkBuild) plan() error {
+	if err := b.validateSchema(); err != nil {
+		return err
+	}
 	if err := b.planDocuments(); err != nil {
 		return err
 	}
@@ -578,6 +581,51 @@ func (b *fileStoreBulkBuild) plan() error {
 	}
 	if len(b.options.float64Columns) != 0 {
 		b.root.Options |= storeio.StateOptionFloat64Columns
+	}
+	if b.options.Store.Schema != nil {
+		b.root.Options |= storeio.StateOptionSchema
+	}
+	return nil
+}
+
+func (b *fileStoreBulkBuild) validateSchema() error {
+	schema := b.options.Store.Schema
+	if schema == nil {
+		return nil
+	}
+	var (
+		rows   [storeMaxChunkDocuments]int
+		values [storeMaxChunkDocuments]RawValue
+	)
+	for first := 0; first < len(b.rows); {
+		chunkID := b.rows[first].sourceChunk
+		chunk := b.source.chunks.get(chunkID)
+		if chunk == nil {
+			return storeio.ErrDocumentPageCorrupt
+		}
+		last := first
+		for last < len(b.rows) &&
+			b.rows[last].sourceChunk == chunkID {
+			entry := b.rows[last]
+			if last-first == len(rows) ||
+				chunk.live&(uint64(1)<<entry.sourceSlot) == 0 {
+				return storeio.ErrDocumentPageCorrupt
+			}
+			rows[last-first] = int(chunk.ord[entry.sourceSlot])
+			last++
+		}
+		failed, err := schema.validateDocSetRows(
+			&chunk.docs, rows[:last-first], values[:0],
+		)
+		if err != nil {
+			if failed < 0 {
+				return err
+			}
+			return fmt.Errorf(
+				"simdjson: row %d: %w", first+failed, err,
+			)
+		}
+		first = last
 	}
 	return nil
 }

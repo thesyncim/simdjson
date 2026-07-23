@@ -310,7 +310,10 @@ func (s *Store) ExpireDue(now time.Time, limit int) int {
 			next.count--
 			last++
 		}
-		chunk, err := buildStoreChunk(state.options, s.postingsRequiredLocked(), old, old.live&^remove, -1, "", nil)
+		chunk, err := buildStoreChunk(
+			state.options, s.postingsRequiredLocked(), old,
+			old.live&^remove, -1, "", nil,
+		)
 		if err != nil {
 			panic("simdjson: rebuilding validated Store chunk: " + err.Error())
 		}
