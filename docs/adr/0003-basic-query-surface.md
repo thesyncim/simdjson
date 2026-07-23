@@ -19,12 +19,36 @@ single-`DocSet` query:
 - scalar comparisons, containment, `EXISTS`, and null tests;
 - `AND`, `OR`, and `NOT` composition;
 - `GROUP BY`, stable `ORDER BY`, and `LIMIT`; and
-- equivalent SQL text and programmatic builder front ends.
+- equivalent SQL text and programmatic builder front ends; and
+- one public immutable typed `Plan` below both front ends.
 
 Compilation produces one immutable plan. `Run` is the allocating convenience.
 `RunInto` accepts a reusable `Result` and `Workspace`; after their row,
 posting, decoded-text, ordering, and group capacities warm, execution allocates
 zero bytes.
+
+## Front-end and transport boundary
+
+SQL is syntax, not execution state. `PrepareSQL` parses SQL and the builder's
+`Prepare` method lowers builder values into the same `Plan`. The plan retains
+compiled pointers, typed constants, numeric path/aggregate/group slots, and
+late-bound index probes. It does not retain SQL source, lexer tokens, or the
+builder predicate tree. Execution consequently performs no SQL parsing and no
+string dispatch.
+
+Schemaless JSON field names cannot disappear without an application-provided
+schema: a peer must transmit each path's bytes at least once. They remain cold,
+immutable compiled-pointer metadata. Result headers are likewise display and
+compatibility metadata, kept separately from the hot operator array. Output
+columns have stable ordinal IDs through `Plan.AppendSchema`; result cells are
+typed and `Cell.AppendJSON` writes to a caller buffer. A future binary protocol
+can therefore encode schema/path bytes once, then carry ordinals, type tags,
+constants, bitmap batches, and typed cells without making SQL or formatted
+strings its intermediate representation.
+
+This ADR intentionally does not freeze a network byte layout before versioning,
+limits, ownership, and compatibility rules exist. A decoder will be another
+front end to the same typed plan, not a second executor.
 
 ## Execution
 
@@ -38,6 +62,18 @@ Projection, aggregation, and grouping consume typed columns directly.
 Shape-taped rows are read at their native narrow or wide width and are not
 widened into classic tapes. Group keys use the same byte-exact semantics as the
 document layer. Stable ordering retains input order for equal keys.
+
+`Cell` stores raw JSON, decoded text only when the value is a string, and one
+tagged numeric/boolean word. On 64-bit targets it is 56 bytes rather than the
+former 72-byte parallel integer/float representation. Result materialization
+therefore writes 22% fewer bytes per cell; four-column projection on the M4 Max
+fixture improved from 165.4-166.7 to 145.4-146.0 ns/document while remaining
+zero-allocation. Aggregate and grouping scans stayed within benchmark noise.
+Computed aggregates no longer grow or borrow an eagerly formatted number arena:
+`Int64`/`Float64` consume them directly and `AppendJSON` formats only when a
+text encoding is actually requested. The convenience `JSON` accessor may
+allocate for a computed number; its caller-buffered counterpart is the
+zero-allocation transport contract.
 
 ## Correctness and ownership
 
@@ -70,14 +106,15 @@ is intentionally rejected until a complete build/combine/decode benchmark wins.
 
 ## Competitive boundary
 
-The comparable Redis surface is RedisJSON with RediSearch projection,
-filtering, and aggregation on one shard and one connection. Containment is an
-additional capability because RediSearch has no equivalent exact JSON
-containment operator. Server round-trip time, durability, and replication are
-reported separately from in-process execution.
+The comparable DuckDB surface stores exact JSON, materializes the same scalar
+paths, and builds single-column ART indexes for key and exact filter lookup.
+Both sides use one execution lane and must reproduce generator-owned counts and
+aggregates. Store timing is a direct in-process call; DuckDB's profiled latency
+also includes SQL parse, bind, optimization, and execution. Durable file, WAL,
+buffer peak, and Store live heap remain separate accounting domains.
 
 The reproducible setup is
-[`benchmarks/redisbench/redis-methodology.md`](../../benchmarks/redisbench/redis-methodology.md).
+[`benchmarks/duckdbbench/duckdb-methodology.md`](../../benchmarks/duckdbbench/duckdb-methodology.md).
 Machine-specific ratios belong in generated benchmark reports, not as timeless
 API promises in this ADR.
 

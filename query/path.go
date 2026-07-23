@@ -15,7 +15,6 @@ import (
 // Node.Get semantics: names match by decoded content and duplicate keys
 // resolve to the last occurrence.
 type compiledPath struct {
-	spec    string
 	single  bool                     // a single top-level object field
 	name    string                   // the field name when single
 	key     simdjson.CompiledKey     // compiled name when single
@@ -31,7 +30,7 @@ func compilePath(spec string) (compiledPath, error) {
 		if err != nil {
 			return compiledPath{}, err
 		}
-		return compiledPath{spec: spec, pointer: pointer}, nil
+		return compiledPath{pointer: pointer}, nil
 	}
 	segments := strings.Split(spec, ".")
 	if len(segments) == 1 {
@@ -40,7 +39,6 @@ func compilePath(spec string) (compiledPath, error) {
 			return compiledPath{}, err
 		}
 		return compiledPath{
-			spec:    spec,
 			single:  true,
 			name:    spec,
 			key:     simdjson.CompileKey(spec),
@@ -51,7 +49,7 @@ func compilePath(spec string) (compiledPath, error) {
 	if err != nil {
 		return compiledPath{}, err
 	}
-	return compiledPath{spec: spec, pointer: pointer}, nil
+	return compiledPath{pointer: pointer}, nil
 }
 
 func (p compiledPath) pointerForStore() simdjson.CompiledPointer { return p.pointer }
@@ -60,9 +58,6 @@ func (p compiledPath) pointerForStore() simdjson.CompiledPointer { return p.poin
 // indexes. Query's dotted syntax is a front-end convenience; index matching is
 // performed only on this exact compiled form.
 func (p compiledPath) indexPath() string {
-	if p.single {
-		return "/" + escapePointerSegment(p.name)
-	}
 	return p.pointer.String()
 }
 

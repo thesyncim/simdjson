@@ -85,6 +85,7 @@ func postingsPredBattery() []Predicate {
 		Cmp("a", Ne, 1),               // unpostable operator: full scan
 		Cmp("a", Gt, 1),               // unpostable operator: full scan
 		Contains("tags", `"x"`),       // scalar containment: WhereContains prunes
+		Contains("", `{"a":1}`),       // one-member object: derived a=1 probe
 		Contains("tags", `["x","y"]`), // structured needle: unpostable leaf
 		Contains("m", `{"k":1}`),      // structured needle: unpostable leaf
 		IsNull("a"),

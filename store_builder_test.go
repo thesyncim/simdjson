@@ -1,6 +1,7 @@
 package simdjson
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"testing"
@@ -93,6 +94,119 @@ func TestStoreBuilderEquivalentAndMutable(t *testing.T) {
 	}
 }
 
+const storeBuilderTemplateRows = 32
+
+func buildNestedTemplateStore(t *testing.T) *Store {
+	t.Helper()
+	builder, err := NewStoreBuilder(StoreOptions{ChunkDocuments: 8, ShapeTapes: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := builder.CreateIndex(StoreIndexDefinition{Name: "country", Paths: []string{"/profile/geo/country"}}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < storeBuilderTemplateRows; i++ {
+		doc := fmt.Sprintf(`{"id":%d,"profile":{"geo":{"country":"c%d"}},"active":%t}`, i, i%4, i&1 == 0)
+		if err := builder.Append(fmt.Sprintf("k%02d", i), []byte(doc)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+func TestStoreBuilderInternsNestedStructuralTemplates(t *testing.T) {
+	const rows = storeBuilderTemplateRows
+	store := buildNestedTemplateStore(t)
+	state := store.state.Load()
+	if state.mappedDocs == nil || len(state.mappedDocs.templates) != 1 {
+		t.Fatalf("nested template catalog = %+v", state.mappedDocs)
+	}
+	state.chunks.each(func(id uint32, chunk *storeChunk) bool {
+		for row := 0; row < chunk.docs.Len(); row++ {
+			ref := state.mappedDocs.refAt(chunk.docs.mappedBase + uint64(row))
+			if !storeOwnedDocIsTemplate(ref.kind) || ref.shapeID != 0 || len(chunk.docs.docAt(row).entries) != 0 {
+				t.Fatalf("chunk %d row %d ref/index = %+v/%+v", id, row, ref, chunk.docs.docAt(row))
+			}
+		}
+		return true
+	})
+
+	pointer := MustCompilePointer("/profile/geo/country")
+	values := make([]RawValue, 0, rows)
+	values, err := store.Snapshot().AppendPointer(values, pointer)
+	if err != nil || len(values) != rows || string(values[7].Bytes()) != `"c3"` {
+		t.Fatalf("template pointer = (%d,%q,%v)", len(values), values[7].Bytes(), err)
+	}
+	keys := make([]string, 0, rows)
+	keys, err = store.Snapshot().AppendIndexRawKeys(keys, "country", []byte(`"c3"`))
+	if err != nil || len(keys) != rows/4 {
+		t.Fatalf("template exact index = (%d,%v)", len(keys), err)
+	}
+	index, ok := store.Get("k07")
+	if !ok {
+		t.Fatal("navigable template Get missed")
+	}
+	node, ok, err := index.PointerCompiled(pointer)
+	if err != nil || !ok || string(node.Raw().Bytes()) != `"c3"` {
+		t.Fatalf("widened template pointer = (%q,%v,%v)", node.Raw().Bytes(), ok, err)
+	}
+	var image bytes.Buffer
+	if _, err := store.WriteTo(&image); err != nil {
+		t.Fatal(err)
+	}
+	before := store.Snapshot()
+	if _, err := store.Put("k07", []byte(`{"id":7,"profile":{"geo":{"country":"new"}},"active":false}`)); err != nil {
+		t.Fatal(err)
+	}
+	if raw, ok := before.GetRaw("k07"); !ok || !bytes.Contains(raw.Bytes(), []byte(`"c3"`)) {
+		t.Fatalf("retained template snapshot = (%q,%v)", raw.Bytes(), ok)
+	}
+	if keys, err = store.Snapshot().AppendIndexRawKeys(keys[:0], "country", []byte(`"new"`)); err != nil || len(keys) != 1 || keys[0] != "k07" {
+		t.Fatalf("mutated template index = (%v,%v)", keys, err)
+	}
+
+	reopened, err := OpenStore(image.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw, ok := reopened.GetRaw("k07"); !ok || !bytes.Contains(raw.Bytes(), []byte(`"c3"`)) {
+		t.Fatalf("reopened template = (%q,%v)", raw.Bytes(), ok)
+	}
+}
+
+func TestStoreBuilderNestedStructuralTemplateAllocs(t *testing.T) {
+	store := buildNestedTemplateStore(t)
+	pointer := MustCompilePointer("/profile/geo/country")
+	values := make([]RawValue, 0, storeBuilderTemplateRows)
+	var err error
+	values, err = store.Snapshot().AppendPointer(values, pointer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		values, err = store.Snapshot().AppendPointer(values[:0], pointer)
+	})
+	if err != nil || allocs != 0 {
+		t.Fatalf("template pointer allocs/error = %.2f/%v", allocs, err)
+	}
+
+	keys := make([]string, 0, storeBuilderTemplateRows)
+	keys, err = store.Snapshot().AppendIndexRawKeys(keys, "country", []byte(`"c3"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocs = testing.AllocsPerRun(100, func() {
+		keys, err = store.Snapshot().AppendIndexRawKeys(keys[:0], "country", []byte(`"c3"`))
+	})
+	if err != nil || allocs != 0 {
+		t.Fatalf("template exact index allocs/error = %.2f/%v", allocs, err)
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
@@ -125,6 +239,10 @@ func TestStoreBuilderCompactsKeyDirectory(t *testing.T) {
 		state.baseKeys.sourceBlock == nil {
 		t.Fatalf("published key directory retained builder graph: %+v", state)
 	}
+	if state.baseKeys.dense == nil || state.baseKeys.compact != nil || state.baseKeys.refs != nil ||
+		state.baseKeys.denseShift != 1 {
+		t.Fatalf("power-of-two chunks did not select dense key refs: %+v", state.baseKeys)
+	}
 	state.chunks.each(func(_ uint32, chunk *storeChunk) bool {
 		if chunk.keys != nil || chunk.keyBytes != nil || chunk.mappedKeys != state.baseKeys {
 			t.Fatalf("chunk retained heap key storage: %+v", chunk)
@@ -154,6 +272,87 @@ func TestStoreBuilderCompactsKeyDirectory(t *testing.T) {
 	}
 	if _, ok := store.GetRaw("alpha"); ok {
 		t.Fatal("deleted compact-base key remained visible")
+	}
+}
+
+func TestStoreBuilderCompactsNonPowerOfTwoKeyDirectory(t *testing.T) {
+	builder, err := NewStoreBuilder(StoreOptions{ChunkDocuments: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row := 0; row < 7; row++ {
+		if err := builder.Append(fmt.Sprintf("key-%d", row), []byte(fmt.Sprintf(`{"n":%d}`, row))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := store.state.Load().baseKeys
+	if base == nil || base.compact == nil || base.dense != nil || base.refs != nil {
+		t.Fatalf("non-power-of-two chunks did not select explicit compact refs: %+v", base)
+	}
+	for row := 0; row < 7; row++ {
+		key := fmt.Sprintf("key-%d", row)
+		if raw, ok := store.GetRaw(key); !ok || string(raw.Bytes()) != fmt.Sprintf(`{"n":%d}`, row) {
+			t.Fatalf("GetRaw(%q) = (%q, %v)", key, raw.Bytes(), ok)
+		}
+	}
+}
+
+func TestStoreBuilderSharesImmutableShapesAcrossChunks(t *testing.T) {
+	builder, err := NewStoreBuilder(StoreOptions{ChunkDocuments: 2, ShapeTapes: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		if err := builder.Append(string(rune('a'+i)), []byte(`{"a":1,"b":"x"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shared *shapeRecord
+	store.state.Load().chunks.each(func(id uint32, chunk *storeChunk) bool {
+		if len(chunk.docs.mappedShapes) != 1 || len(chunk.docs.shapes.shapes) != 0 {
+			t.Fatalf("chunk %d mapped/heap shapes = %d/%d, want 1/0", id, len(chunk.docs.mappedShapes), len(chunk.docs.shapes.shapes))
+		}
+		rec := chunk.docs.mappedShapes[0]
+		if shared == nil {
+			shared = rec
+		} else if rec != shared {
+			t.Fatalf("chunk %d recompiled immutable shape", id)
+		}
+		for row := 0; row < chunk.docs.Len(); row++ {
+			if chunk.docs.shapeTapeRefAt(row).rec != shared {
+				t.Fatalf("chunk %d row %d did not use shared shape", id, row)
+			}
+		}
+		return true
+	})
+}
+
+func TestStoreBuilderReservesOneBoundedSourceArena(t *testing.T) {
+	const rows = 64
+	builder, err := NewStoreBuilder(StoreOptions{ChunkDocuments: rows, ShapeTapes: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := []byte(`{"a":"0123456789abcdef","b":123456789}`)
+	for i := 0; i < rows; i++ {
+		if err := builder.Append(string(rune(i+1)), document); err != nil {
+			t.Fatal(err)
+		}
+	}
+	chunk := builder.chunks.get(0)
+	if chunk == nil || len(chunk.docs.srcChunk) != rows*len(document) {
+		t.Fatalf("source arena length = %d, want %d", len(chunk.docs.srcChunk), rows*len(document))
+	}
+	if cap(chunk.docs.srcChunk) < rows*len(document) || cap(chunk.docs.srcChunk) > rows*len(document)*5/4 {
+		t.Fatalf("source arena capacity = %d, want [%d,%d]", cap(chunk.docs.srcChunk), rows*len(document), rows*len(document)*5/4)
 	}
 }
 

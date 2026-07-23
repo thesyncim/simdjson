@@ -22,6 +22,10 @@ var (
 	// ErrPageCacheReference reports a malformed or physically unordered page
 	// reference before any file I/O is attempted.
 	ErrPageCacheReference = errors.New("simdjson: invalid Store page cache reference")
+	// Compatibility names used by the immutable StorePageReader surface.
+	ErrPageCacheFull   = ErrPageCachePinned
+	ErrPageReference   = ErrPageCacheReference
+	ErrPageLeaseClosed = errors.New("simdjson: Store page lease already closed")
 )
 
 // PageCacheOptions fixes the complete resident and prefetch memory of a
@@ -29,6 +33,13 @@ var (
 // size frames; it must hold at least one. StoreID binds every admitted page to
 // one file.
 type PageCacheOptions struct {
+	// FrameSize is the legacy StorePageReader spelling of MaxPageSize. When
+	// supplied without PageSize, metadata retains the 4 KiB file quantum.
+	FrameSize uint32
+	// Validate optionally applies a kind-specific payload check before a page
+	// becomes visible. FileStore performs those checks at its typed tree
+	// boundary; StorePageReader supplies them here for zero-copy admitted views.
+	Validate func([]byte, PageRef) error
 	// PageSize is the Store allocation quantum and the exact size of metadata
 	// pages. Document and overflow extents may be larger powers of two.
 	PageSize int
@@ -47,7 +58,11 @@ type PageCacheOptions struct {
 
 func (o PageCacheOptions) normalized() (PageCacheOptions, int, error) {
 	if o.PageSize == 0 {
-		o.PageSize = defaultBufferSize
+		if o.FrameSize != 0 {
+			o.PageSize = 4096
+		} else {
+			o.PageSize = defaultBufferSize
+		}
 	}
 	if o.StoreID == ([16]byte{}) || o.PageSize < 0 ||
 		uint64(o.PageSize) > uint64(^uint32(0)) || !validPhysicalPageSize(uint32(o.PageSize)) {
@@ -55,6 +70,11 @@ func (o PageCacheOptions) normalized() (PageCacheOptions, int, error) {
 	}
 	if o.MaxPageSize == 0 {
 		o.MaxPageSize = o.PageSize
+		if o.FrameSize != 0 {
+			o.MaxPageSize = int(o.FrameSize)
+		}
+	} else if o.FrameSize != 0 && o.MaxPageSize != int(o.FrameSize) {
+		return PageCacheOptions{}, 0, fmt.Errorf("%w: conflicting maximum page sizes", ErrPageCacheReference)
 	}
 	if o.MaxPageSize < o.PageSize || uint64(o.MaxPageSize) > uint64(^uint32(0)) ||
 		!validPhysicalPageSize(uint32(o.MaxPageSize)) || o.MaxPageSize%o.PageSize != 0 {
@@ -82,6 +102,7 @@ func (o PageCacheOptions) normalized() (PageCacheOptions, int, error) {
 		return PageCacheOptions{}, 0, fmt.Errorf("%w: read concurrency %d", ErrPageCacheReference, o.ReadConcurrency)
 	}
 	o.ResidentBytes = frames64 * int64(o.MaxPageSize)
+	o.FrameSize = uint32(o.MaxPageSize)
 	return o, int(frames64), nil
 }
 
@@ -117,6 +138,19 @@ type pageCacheFrame struct {
 type PageCacheStats struct {
 	CapacityBytes   uint64
 	ResidentBytes   uint64
+	FrameSize       uint32
+	Frames          uint32
+	ReadyFrames     uint32
+	LoadingFrames   uint32
+	FailedFrames    uint32
+	PinnedFrames    uint32
+	Pins            uint64
+	Hits            uint64
+	Misses          uint64
+	Coalesced       uint64
+	ReadErrors      uint64
+	Prefetches      uint64
+	CopyOuts        uint64
 	PinnedPages     uint64
 	DirtyBytes      uint64
 	PageReads       uint64
@@ -156,6 +190,10 @@ type PageCache struct {
 	pageReads       uint64
 	readBytes       uint64
 	cacheHits       uint64
+	cacheMisses     uint64
+	coalesced       uint64
+	readErrors      uint64
+	copyOuts        uint64
 	prefetchHits    uint64
 	evictions       uint64
 	prefetchQueued  uint64
@@ -240,6 +278,9 @@ func (l *PageLease) Page() []byte {
 	return l.page
 }
 
+// Bytes is the StorePageReader compatibility spelling of Page.
+func (l *PageLease) Bytes() []byte { return l.Page() }
+
 // Release unpins the frame. It is idempotent for one PageLease value.
 func (l *PageLease) Release() {
 	if l == nil || l.cache == nil {
@@ -253,11 +294,63 @@ func (l *PageLease) Release() {
 	l.header = PageHeader{}
 }
 
+// Close releases one StorePageReader lease and diagnoses a repeated close.
+// FileStore uses the idempotent Release form for defer-friendly cleanup.
+func (l *PageLease) Close() error {
+	if l == nil || l.cache == nil {
+		return ErrPageLeaseClosed
+	}
+	l.Release()
+	return nil
+}
+
 // Acquire returns a lease over ref. Concurrent misses for the same ref share
 // one physical read. A miss returns ErrPageCachePinned when the fixed budget
 // contains no unleased victim; it never grows the resident set.
 func (c *PageCache) Acquire(ref PageRef) (PageLease, error) {
 	return c.load(ref, true, false)
+}
+
+// Pin is the StorePageReader compatibility spelling of Acquire.
+func (c *PageCache) Pin(ref PageRef) (PageLease, error) { return c.Acquire(ref) }
+
+// AppendPage copies one validated page into dst and releases its frame.
+func (c *PageCache) AppendPage(dst []byte, ref PageRef) ([]byte, error) {
+	lease, err := c.Acquire(ref)
+	if err != nil {
+		return dst, err
+	}
+	dst = append(dst, lease.Page()...)
+	lease.Release()
+	c.mu.Lock()
+	c.copyOuts++
+	c.mu.Unlock()
+	return dst, nil
+}
+
+// Invalidate removes one clean, unpinned admitted reference. Loading, dirty,
+// or leased frames remain in place.
+func (c *PageCache) Invalidate(ref PageRef) bool {
+	if c == nil {
+		return false
+	}
+	key, err := c.validateRef(ref)
+	if err != nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	index, ok := c.byKey[key]
+	if !ok {
+		return false
+	}
+	frame := &c.frames[index]
+	if frame.state == pageCacheLoading || frame.pins != 0 || frame.dirty != 0 {
+		return false
+	}
+	delete(c.byKey, key)
+	resetPageCacheFrame(frame)
+	return true
 }
 
 // AdmitDirty copies one newly encoded immutable page into the bounded cache
@@ -374,6 +467,7 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 					c.mu.Unlock()
 					return PageLease{}, nil
 				}
+				c.coalesced++
 				c.cond.Wait()
 				continue
 			case pageCacheReady:
@@ -405,6 +499,7 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 			c.mu.Unlock()
 			return PageLease{}, ErrPageCachePinned
 		}
+		c.cacheMisses++
 		frame := &c.frames[index]
 		frame.key = key
 		frame.header = PageHeader{}
@@ -435,6 +530,9 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 				header.Kind != ref.Kind || header.Flags != ref.Flags) {
 				readErr = fmt.Errorf("%w: physical page identity does not match reference", ErrPageCacheReference)
 			}
+			if readErr == nil && c.options.Validate != nil {
+				readErr = c.options.Validate(page, ref)
+			}
 			c.mu.Lock()
 			c.pageReads++
 			c.readBytes += uint64(n)
@@ -454,6 +552,7 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 				return lease, nil
 			}
 			delete(c.byKey, key)
+			c.readErrors++
 			resetPageCacheFrame(frame)
 			c.cond.Broadcast()
 			c.mu.Unlock()
@@ -466,6 +565,7 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 		c.activeLoads--
 		frame = &c.frames[index]
 		delete(c.byKey, key)
+		c.readErrors++
 		resetPageCacheFrame(frame)
 		c.cond.Broadcast()
 		c.mu.Unlock()
@@ -613,9 +713,17 @@ func (c *PageCache) Stats() PageCacheStats {
 	c.mu.Lock()
 	stats := PageCacheStats{
 		CapacityBytes:   uint64(len(c.frames) * c.options.MaxPageSize),
+		FrameSize:       uint32(c.options.MaxPageSize),
+		Frames:          uint32(len(c.frames)),
 		PageReads:       c.pageReads,
 		ReadBytes:       c.readBytes,
 		CacheHits:       c.cacheHits,
+		Hits:            c.cacheHits,
+		Misses:          c.cacheMisses,
+		Coalesced:       c.coalesced,
+		ReadErrors:      c.readErrors,
+		Prefetches:      c.prefetchQueued,
+		CopyOuts:        c.copyOuts,
 		PrefetchHits:    c.prefetchHits,
 		Evictions:       c.evictions,
 		PrefetchQueued:  c.prefetchQueued,
@@ -623,11 +731,19 @@ func (c *PageCache) Stats() PageCacheStats {
 		QueueDepth:      uint64(len(c.prefetch)),
 	}
 	for i := range c.frames {
+		switch c.frames[i].state {
+		case pageCacheLoading:
+			stats.LoadingFrames++
+		case pageCacheReady:
+			stats.ReadyFrames++
+		}
 		if c.frames[i].state != pageCacheEmpty {
 			stats.ResidentBytes += uint64(c.options.MaxPageSize)
 		}
 		if c.frames[i].pins != 0 {
 			stats.PinnedPages++
+			stats.PinnedFrames++
+			stats.Pins += uint64(c.frames[i].pins)
 		}
 		if c.frames[i].dirty != 0 {
 			stats.DirtyBytes += uint64(c.options.MaxPageSize)

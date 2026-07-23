@@ -1,0 +1,86 @@
+package storeio
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"sync"
+)
+
+// ErrDirectIOUnsupported reports a platform or filesystem that cannot honor
+// required direct page reads.
+var ErrDirectIOUnsupported = errors.New("simdjson: direct Store page reads unsupported")
+
+// DirectMode controls explicit direct-I/O admission. DirectTry falls back only
+// when the platform or filesystem rejects direct I/O; unrelated open errors
+// remain errors.
+type DirectMode uint8
+
+const (
+	DirectOff DirectMode = iota
+	DirectTry
+	DirectRequire
+)
+
+// PageFileOptions configures an owned read-only file and its bounded cache.
+type PageFileOptions struct {
+	Cache  PageCacheOptions
+	Direct DirectMode
+}
+
+// PageFile owns a read-only file and its PageCache. Direct reports whether the
+// file was actually opened with explicit direct-I/O semantics.
+type PageFile struct {
+	file      *os.File
+	cache     *PageCache
+	direct    bool
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// OpenPageFile opens path read-only and constructs its bounded page cache.
+// DirectTry is explicit, observable fallback; DirectRequire never silently
+// changes I/O semantics. The cache's anonymous frame arena satisfies the
+// alignment and lifetime requirements of Linux O_DIRECT reads.
+func OpenPageFile(path string, options PageFileOptions) (*PageFile, error) {
+	if options.Direct > DirectRequire {
+		return nil, fmt.Errorf("%w: direct mode %d", ErrPageReference, options.Direct)
+	}
+	file, direct, err := openPageFile(path, options.Direct)
+	if err != nil {
+		return nil, err
+	}
+	cache, err := NewPageCache(file, options.Cache)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return &PageFile{file: file, cache: cache, direct: direct}, nil
+}
+
+// Cache returns the owned bounded cache. It becomes invalid when PageFile is
+// closed.
+func (f *PageFile) Cache() *PageCache {
+	if f == nil {
+		return nil
+	}
+	return f.cache
+}
+
+// Direct reports whether direct I/O is active rather than merely requested.
+func (f *PageFile) Direct() bool { return f != nil && f.direct }
+
+// Close atomically stops admission, waits for page leases, releases cache
+// frames, and closes the file. Concurrent calls are safe and return one result.
+func (f *PageFile) Close() error {
+	if f == nil {
+		return nil
+	}
+	f.closeOnce.Do(func() {
+		// Keep both pointers immutable. A reader that acquired PageFile just
+		// before Close can safely observe the cache's closing state; the cache
+		// drains all in-flight reads and leases before the descriptor closes.
+		f.closeErr = errors.Join(f.cache.Close(), f.file.Close())
+	})
+	return f.closeErr
+}

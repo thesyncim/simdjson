@@ -159,3 +159,33 @@ func TestStoreIndexMasksNextMatchesOrderedTraversal(t *testing.T) {
 		t.Fatal("next past uint32 address space unexpectedly hit")
 	}
 }
+
+func TestStoreOnlineBackfillFoldsPackedBase(t *testing.T) {
+	store := NewStore(StoreOptions{ChunkDocuments: 2})
+	for i := 0; i < 10; i++ {
+		if _, err := store.Put(string(rune('a'+i)), []byte(`{"nested":{"v":1}}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.CreateIndex(StoreIndexDefinition{Name: "v", Paths: []string{"/nested/v"}}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := store.BackfillIndex("v", 0)
+	if err != nil || info.State != StoreIndexReady {
+		t.Fatalf("BackfillIndex = (%+v,%v)", info, err)
+	}
+	index, ok := store.Snapshot().exactIndex("v")
+	if !ok || index.base == nil || index.root != nil || index.dirty.root != nil {
+		t.Fatalf("ready online index was not folded: %+v", index)
+	}
+	if keys, err := store.Snapshot().AppendIndexRawKeys(nil, "v", []byte(`1`)); err != nil || len(keys) != 10 {
+		t.Fatalf("packed online result = (%v,%v)", keys, err)
+	}
+	if _, err := store.Put("a", []byte(`{"nested":{"v":2}}`)); err != nil {
+		t.Fatal(err)
+	}
+	index, _ = store.Snapshot().exactIndex("v")
+	if index.base == nil || index.root == nil || index.dirty.get(0) == 0 {
+		t.Fatalf("online packed mutation did not create bounded delta: %+v", index)
+	}
+}

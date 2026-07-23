@@ -6,9 +6,9 @@ import (
 	"strings"
 )
 
-// The SQL-text front end. Compile lexes and parses the supported subset into
-// the same builder IR the programmatic API produces, so a compiled SQL query
-// and its hand-built twin are indistinguishable to the executor. The grammar is
+// The SQL-text front end. Compile lexes and parses the supported subset, then
+// lowers it into the same typed Plan as the programmatic builder, so a prepared
+// SQL query and its hand-built twin are indistinguishable to the executor. The grammar is
 // deliberately basic — one table (the FROM name is accepted and ignored, since
 // the table is the DocSet Run is handed), columns that are path projections or
 // aggregates, and a WHERE of comparisons, containment, existence, and null

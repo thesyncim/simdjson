@@ -402,7 +402,8 @@ func TestStoreExactIndexStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Fingerprints != 2 || stats.ChunkWords != 10 || stats.CandidateRows != 10 || stats.EstimatedBytes == 0 {
+	if stats.Fingerprints != 2 || stats.ChunkWords != 10 || stats.CandidateRows != 10 ||
+		stats.EstimatedBytes == 0 || stats.PackedBytes == 0 || stats.DirectoryNodes != 0 {
 		t.Fatalf("IndexStats = %+v", stats)
 	}
 	allocs := testing.AllocsPerRun(100, func() {

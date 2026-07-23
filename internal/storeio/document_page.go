@@ -214,6 +214,26 @@ func openDocumentPage(src []byte, chunkHighWater uint32, nextLogicalID, fileEnd 
 	}, nil
 }
 
+// AdmittedDocumentPage reconstructs a view of a page already validated by
+// PageCache admission. Calling it on arbitrary bytes is invalid. The packed
+// row directory is checked once per admission, not once per point read.
+func AdmittedDocumentPage(src []byte) DocumentPageView {
+	pageHeader, _ := decodePageHeader(src)
+	payloadEnd := PageHeaderSize + int(pageHeader.PayloadLength)
+	payload := src[PageHeaderSize:payloadEnd:payloadEnd]
+	count := int(payload[20])
+	return DocumentPageView{
+		header: DocumentPageHeader{
+			StoreID: pageHeader.StoreID, Generation: pageHeader.Generation,
+			LogicalID: pageHeader.LogicalID, PageSize: pageHeader.PageSize,
+			ChunkID: binary.LittleEndian.Uint32(payload[4:8]),
+			Live:    binary.LittleEndian.Uint64(payload[8:16]), Flags: payload[21],
+		},
+		payload: payload, dataStart: DocumentPagePayloadHeaderSize + count*DocumentPageRecordSize,
+		count: uint8(count),
+	}
+}
+
 // Header returns the value-only identity and stable-slot metadata of the view.
 func (v DocumentPageView) Header() DocumentPageHeader { return v.header }
 

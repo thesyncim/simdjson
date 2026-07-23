@@ -49,6 +49,38 @@ type storePackedBuildStream struct {
 	entries []storeIndexChunkMask
 }
 
+// storeIndexPending materializes a completed transient posting HAMT for the
+// one-time packed-base fold. It is never retained or used by steady queries.
+func storeIndexPending(root *storeIndexPostingNode) map[uint64][]storeIndexChunkMask {
+	if root == nil {
+		return nil
+	}
+	pending := make(map[uint64][]storeIndexChunkMask)
+	var walk func(*storeIndexPostingNode)
+	walk = func(node *storeIndexPostingNode) {
+		if node == nil {
+			return
+		}
+		for i := range node.slots {
+			slot := node.slots[i]
+			if slot.child != nil {
+				walk(slot.child)
+			}
+			if slot.leaf == nil {
+				continue
+			}
+			entries := make([]storeIndexChunkMask, 0, int(slot.leaf.masks.n)+int(slot.leaf.masks.wide.words))
+			slot.leaf.masks.each(func(chunk uint32, mask uint64) bool {
+				entries = append(entries, storeIndexChunkMask{chunk: chunk, mask: mask})
+				return true
+			})
+			pending[slot.leaf.hash] = entries
+		}
+	}
+	walk(root)
+	return pending
+}
+
 func newStorePackedIndex(pending map[uint64][]storeIndexChunkMask) (*storePackedIndex, error) {
 	if len(pending) == 0 {
 		return nil, nil

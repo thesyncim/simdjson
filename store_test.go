@@ -371,7 +371,8 @@ func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing key %q", key)
 		}
-		return state.chunks.get(loc.chunk).rawSlot(int(loc.slot))
+		chunk := state.chunks.get(loc.chunk)
+		return chunk.docs.rawAt(int(chunk.ord[loc.slot]))
 	}
 	before := store.Snapshot()
 	beforeChunk := before.state.chunks.get(0)
@@ -435,7 +436,8 @@ func TestStoreMutationReusesOnlyLiveImmutableStorage(t *testing.T) {
 		current := lookupSource(fmt.Sprintf("k%d", i))
 		state := after.state
 		loc, _ := storeKeyLookup(state.keys, maphashString(state.seed, fmt.Sprintf("k%d", i)), fmt.Sprintf("k%d", i))
-		prior := state.chunks.get(loc.chunk).rawSlot(int(loc.slot))
+		chunk := state.chunks.get(loc.chunk)
+		prior := chunk.docs.rawAt(int(chunk.ord[loc.slot]))
 		if &current[0] != &prior[0] {
 			t.Fatalf("delete copied surviving source %d", i)
 		}

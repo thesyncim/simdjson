@@ -487,7 +487,7 @@ func (m storePersistManifest) open(data []byte) (*Store, error) {
 		source:     data,
 		chunks:     storeChunkVectorWithHighWater(m.chunkHighWater),
 	}
-	baseKeys, err := newStoreMappedKeys(m.bytes, int(m.count))
+	baseKeys, err := newStoreMappedKeys(m.bytes, int(m.count), m.chunkHighWater >= storeMappedLocationMaxChunk)
 	if err != nil {
 		return nil, fmt.Errorf("simdjson: OpenStore key directory: %w", err)
 	}
@@ -506,6 +506,7 @@ func (m storePersistManifest) open(data []byte) (*Store, error) {
 			return nil, fmt.Errorf("simdjson: OpenStore document directory: %w", allocErr)
 		}
 		state.mappedDocs = mappedDocs
+		state.mappedDocChunks = m.liveChunks
 	}
 	store := &Store{Options: m.options, options: m.options}
 	store.free.pos = make(map[uint32]int)
@@ -558,9 +559,8 @@ func (m storePersistManifest) open(data []byte) (*Store, error) {
 			key := byteview.String(keyBytes)
 			hash := maphash.String(seed, key)
 			ref := uint64(seenKeys)
-			baseKeys.refs[ref] = storeMappedKeyRef{
-				off: keyOffset, length: keyLen, loc: storeLocation{chunk: id, slot: slot},
-			}
+			baseKeys.setKeySpan(ref, keyOffset, keyLen)
+			baseKeys.setLocation(ref, storeLocation{chunk: id, slot: slot})
 			if inserted := baseKeys.insert(hash, ref); !inserted {
 				return nil, fmt.Errorf("%w: duplicate key %q", ErrStorePersistCorrupt, key)
 			}

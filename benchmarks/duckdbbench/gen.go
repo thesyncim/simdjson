@@ -1,20 +1,19 @@
-// Package redisbench is the ADR 0003 comparison harness: it generates the
-// shared corpus set, measures this library's side of the query surface
-// (a keyed Store with a matching declared exact index, plus DocSet
-// representation diagnostics), parses the
-// RedisJSON/RediSearch protocol logs produced by run-redis.sh, and emits the
-// scoreboard the query subpackage must keep green as it lands.
+// Package duckdbbench implements the reproducible Store/DuckDB comparison.
+// It owns the shared corpora, byte-accounting rules, expected query results,
+// native Store measurements, DuckDB profile ingestion, and report rendering.
 //
 // Everything here is methodology: the corpus definitions, the byte
 // accounting rules, and the scenario matrix are code so that later work
-// cannot move the goalposts. See redis-methodology.md in this directory.
-package redisbench
+// cannot move the goalposts. See duckdb-methodology.md in this directory.
+package duckdbbench
 
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -25,13 +24,11 @@ import (
 	stdlibcorpus "github.com/thesyncim/simdjson/tests/stdlib"
 )
 
-// keyPrefix is the Redis key namespace every document is loaded under; it is
-// also the FT.CREATE ON JSON prefix, so the RediSearch index sees exactly the
-// corpus and nothing else.
+// keyPrefix is the stable key namespace used by both engines.
 const keyPrefix = "doc:"
 
 // Manifest describes one generated corpus. It is written as manifest.json
-// (read by the Go tools) and manifest.env (read by run-redis.sh), and carries
+// (read by the Go tools) and manifest.env (read by run-duckdb.sh), and carries
 // the query parameters plus the expected result counts, so both sides of the
 // comparison run the same scenarios and can be cross-checked against the same
 // expectations.
@@ -40,10 +37,14 @@ type Manifest struct {
 	Class string `json:"class"` // "clustered", "heterogeneous", or "real"
 	Docs  int    `json:"docs"`
 
-	// SourceBytes is the minified byte count: the sum of the exact bytes of
-	// every document with no separators. This is the denominator for all
-	// space and throughput accounting on both sides.
+	// SourceBytes is the sum of the exact minified JSON bytes, without NDJSON
+	// separators. KeyBytes is the sum of the logical UTF-8 key bytes. Their sum
+	// is the payload denominator for storage and throughput reporting.
 	SourceBytes int64 `json:"source_bytes"`
+	KeyBytes    int64 `json:"key_bytes"`
+	// NDJSONSHA256 binds every result artifact to the exact transport bytes,
+	// including one newline after each document.
+	NDJSONSHA256 string `json:"ndjson_sha256"`
 	// PrettyBytes is the size of the pretty-printed original for real
 	// corpora (0 for synthetic ones). It is recorded for provenance only;
 	// no ratio uses it.
@@ -55,8 +56,8 @@ type Manifest struct {
 	ShapeCount int `json:"shape_count"`
 
 	// The query parameters. All keys and values are alphanumeric (plus
-	// underscore) by construction so they can be spliced into RediSearch
-	// schema paths and TAG queries verbatim; Generate fails otherwise.
+	// underscore) by construction so the runner can build JSON paths and SQL
+	// string literals without an escaping ambiguity; generation fails otherwise.
 	//
 	// ExtractField is the point-projection path. ContainKey/ContainValue is
 	// the equality predicate: the filtered-scan and group-by scenarios read
@@ -84,14 +85,14 @@ type Manifest struct {
 	GroupExpected   int   `json:"group_expected,omitempty"`
 }
 
-// spliceSafe is the alphabet permitted in query keys and values; it is what
-// makes the RediSearch schema-path and TAG splicing in run-redis.sh safe.
+// spliceSafe is the deliberately narrow alphabet permitted in generated SQL
+// fragments. The runner still quotes values; this also prevents a manifest
+// from smuggling SQL through an environment file.
 var spliceSafe = regexp.MustCompile(`^[A-Za-z0-9_]*$`)
 
 // groupCardinality is the GROUP BY result size under SQL semantics: the number
-// of distinct present group values, plus one NULL group when any of the total
-// documents lacks the group field — matching RediSearch, which collects every
-// document missing the TAG into a single empty-tag group.
+// of distinct present group values, plus one NULL group when any document
+// lacks the group field.
 func groupCardinality(distinct, present, total int) int {
 	if present < total {
 		return distinct + 1
@@ -99,15 +100,13 @@ func groupCardinality(distinct, present, total int) int {
 	return distinct
 }
 
-// corpusWriter streams a corpus to docs.ndjson (one minified document per
-// line, our side's input) and docs.resp (the same documents as JSON.SET
-// commands in the Redis RESP protocol, mass-loadable with redis-cli --pipe),
-// accumulating the manifest as it goes.
+// corpusWriter streams one minified document per line to docs.ndjson. Both
+// engines consume this exact file; no engine-specific copy is generated.
 type corpusWriter struct {
 	dir    string
 	ndjson *bufio.Writer
-	resp   *bufio.Writer
-	nf, rf *os.File
+	nf     *os.File
+	digest hash.Hash
 	m      Manifest
 }
 
@@ -119,39 +118,17 @@ func newCorpusWriter(dir string, m Manifest) (*corpusWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	rf, err := os.Create(filepath.Join(dir, "docs.resp"))
-	if err != nil {
-		nf.Close()
-		return nil, err
-	}
 	return &corpusWriter{
 		dir:    dir,
 		ndjson: bufio.NewWriterSize(nf, 1<<20),
-		resp:   bufio.NewWriterSize(rf, 1<<20),
 		nf:     nf,
-		rf:     rf,
+		digest: sha256.New(),
 		m:      m,
 	}, nil
 }
 
-// writeRESP appends one `JSON.SET doc:<n> $ <doc>` command in the Redis RESP
-// protocol. Bulk strings are length-prefixed and binary-safe, so the minified
-// document bytes need no escaping — this is the redis-cli --pipe mass-load
-// format, the RedisJSON analogue of a bulk COPY.
-func (w *corpusWriter) writeRESP(n int, doc []byte) error {
-	key := keyPrefix + strconv.Itoa(n)
-	// *4 command: "JSON.SET", key, "$", doc.
-	if _, err := fmt.Fprintf(w.resp, "*4\r\n$8\r\nJSON.SET\r\n$%d\r\n%s\r\n$1\r\n$\r\n$%d\r\n", len(key), key, len(doc)); err != nil {
-		return err
-	}
-	if _, err := w.resp.Write(doc); err != nil {
-		return err
-	}
-	_, err := w.resp.WriteString("\r\n")
-	return err
-}
-
-// add writes one minified document to both outputs and counts its bytes.
+// add writes one minified document and accounts for the logical key and JSON
+// separately. The newline is transport framing and is not charged as payload.
 func (w *corpusWriter) add(doc []byte) error {
 	if _, err := w.ndjson.Write(doc); err != nil {
 		return err
@@ -159,9 +136,9 @@ func (w *corpusWriter) add(doc []byte) error {
 	if err := w.ndjson.WriteByte('\n'); err != nil {
 		return err
 	}
-	if err := w.writeRESP(w.m.Docs, doc); err != nil {
-		return err
-	}
+	_, _ = w.digest.Write(doc)
+	_, _ = w.digest.Write([]byte{'\n'})
+	w.m.KeyBytes += int64(len(keyPrefix) + len(strconv.Itoa(w.m.Docs)))
 	w.m.Docs++
 	w.m.SourceBytes += int64(len(doc))
 	return nil
@@ -172,18 +149,13 @@ func (w *corpusWriter) close() (Manifest, error) {
 	if err := w.ndjson.Flush(); err != nil {
 		return Manifest{}, err
 	}
-	if err := w.resp.Flush(); err != nil {
-		return Manifest{}, err
-	}
 	if err := w.nf.Close(); err != nil {
 		return Manifest{}, err
 	}
-	if err := w.rf.Close(); err != nil {
-		return Manifest{}, err
-	}
+	w.m.NDJSONSHA256 = fmt.Sprintf("%x", w.digest.Sum(nil))
 	for _, s := range []string{w.m.ExtractField, w.m.ExistKey, w.m.ContainKey, w.m.ContainValue, w.m.SumField} {
 		if !spliceSafe.MatchString(s) {
-			return Manifest{}, fmt.Errorf("corpus %s: %q is not splice safe for a RediSearch schema", w.m.Name, s)
+			return Manifest{}, fmt.Errorf("corpus %s: %q is not safe for generated SQL", w.m.Name, s)
 		}
 	}
 	js, err := json.MarshalIndent(w.m, "", "\t")
@@ -193,8 +165,9 @@ func (w *corpusWriter) close() (Manifest, error) {
 	if err := os.WriteFile(filepath.Join(w.dir, "manifest.json"), append(js, '\n'), 0o644); err != nil {
 		return Manifest{}, err
 	}
-	env := fmt.Sprintf("NAME=%s\nDOCS=%d\nKEY_PREFIX=%s\nEXTRACT_FIELD=%s\nCONTAIN_KEY=%s\nCONTAIN_VALUE=%s\nSUM_FIELD=%s\n",
-		w.m.Name, w.m.Docs, keyPrefix, w.m.ExtractField, w.m.ContainKey, w.m.ContainValue, w.m.SumField)
+	env := fmt.Sprintf("NAME=%s\nDOCS=%d\nSOURCE_BYTES=%d\nKEY_BYTES=%d\nNDJSON_SHA256=%s\nKEY_PREFIX=%s\nEXTRACT_FIELD=%s\nCONTAIN_KEY=%s\nCONTAIN_VALUE=%s\nSUM_FIELD=%s\n",
+		w.m.Name, w.m.Docs, w.m.SourceBytes, w.m.KeyBytes, w.m.NDJSONSHA256, keyPrefix,
+		w.m.ExtractField, w.m.ContainKey, w.m.ContainValue, w.m.SumField)
 	if err := os.WriteFile(filepath.Join(w.dir, "manifest.env"), []byte(env), 0o644); err != nil {
 		return Manifest{}, err
 	}
@@ -306,7 +279,7 @@ func GenerateSynthetic(dir string, spec SynthSpec) (Manifest, error) {
 	}
 	groups := map[string]bool{}
 	containDocs := 0
-	r := rand.New(rand.NewPCG(spec.Seed, 0x726564697362656e)) // "redisben"
+	r := rand.New(rand.NewPCG(spec.Seed, 0x6475636b6462626e)) // "duckdbbn"
 	var doc []byte
 	for n := range spec.Docs {
 		var f02 string
@@ -335,8 +308,7 @@ func GenerateSynthetic(dir string, spec SynthSpec) (Manifest, error) {
 		}
 	}
 	// Grouping is SQL GROUP BY semantics: documents lacking the group field
-	// form one NULL group, exactly as RediSearch collects them into a single
-	// empty-tag group.
+	// form one NULL group.
 	w.m.GroupExpected = groupCardinality(len(groups), containDocs, spec.Docs)
 	return w.close()
 }
@@ -416,8 +388,8 @@ func GenerateReal(dir string, spec RealSpec) (Manifest, error) {
 				return Manifest{}, err
 			}
 			rec.containMatch = bytes.Equal(c, quoted)
-			// Only a non-empty string is a real group; anything else (absent,
-			// null, empty, or non-string) lands in RediSearch's empty-tag group.
+			// Only a non-empty string is a real group; anything else is counted
+			// with the absent/null group by the benchmark contract.
 			var s string
 			if json.Unmarshal(v, &s) == nil {
 				rec.groupValue = s
@@ -489,3 +461,8 @@ func ReadManifest(dir string) (Manifest, error) {
 	}
 	return m, nil
 }
+
+// LogicalBytes is the exact logical key-plus-JSON payload supplied to both
+// engines. Transport delimiters, allocator slack, indexes, and metadata are
+// deliberately excluded.
+func (m Manifest) LogicalBytes() int64 { return m.SourceBytes + m.KeyBytes }

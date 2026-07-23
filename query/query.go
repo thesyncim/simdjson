@@ -1,30 +1,39 @@
-// Package query is a basic, single-table query surface over a
+// Package query is a typed, single-table query engine over a
 // [simdjson.DocSet], heap [simdjson.Snapshot], or durable
 // [simdjson.FileSnapshot]: the product layer that turns indexing, projection,
-// containment, and grouping primitives into a small SQL-shaped engine. Each
-// document is one row and columns are JSON paths. It answers SELECT of path
-// projections and aggregates
+// containment, and grouping primitives into one compiled plan with a
+// programmatic builder and an optional SQL front end. Each document is one row
+// and columns are JSON paths. It answers SELECT of path projections and
+// aggregates
 // (COUNT, SUM, AVG, MIN, MAX); WHERE with comparisons, containment (@>),
 // existence, and null tests combined by And/Or/Not; GROUP BY; ORDER BY; and
 // LIMIT. Joins, subqueries, mutation, and full SQL are out of scope.
 //
-// A query is built once with the programmatic builder — the same plan a SQL
-// text parser would emit — and compiled once (paths to compiled pointers and
-// keys, literals to typed constants), then run over a DocSet any number of
-// times at the primitives' speed:
+// The builder and optional SQL parser are front ends for one immutable [Plan].
+// Preparing resolves paths to compiled pointers and numeric slots, predicates
+// to typed operators, and literals to typed constants. SQL text and the
+// builder tree are then discarded; neither is interpreted during execution:
 //
 //	q := query.Select(query.Path("name"), query.Sum("score")).
 //		Where(query.Cmp("active", query.Eq, true)).
 //		GroupBy("team").
 //		OrderBy("team", query.Asc).
 //		Limit(10)
-//	result, err := q.Run(&docs)
+//	plan, err := q.Prepare()
+//	result, err := plan.Run(&docs)
 //
 // Hot paths retain their destination and scratch storage:
 //
 //	var result query.Result
 //	var workspace query.Workspace
-//	err := q.RunInto(&result, &docs, &workspace)
+//	err = plan.RunInto(&result, &docs, &workspace)
+//
+// [PrepareSQL] produces the identical Plan directly from SQL. Plan output has
+// stable ordinal IDs through [Plan.AppendSchema], and [Cell] exposes typed
+// values plus caller-buffered [Cell.AppendJSON]. A transport encoder can
+// therefore consume typed batches without header lookup or intermediate
+// string formatting. Field-name bytes remain only in immutable compiled-path
+// metadata because schemaless JSON has no external schema ID to replace them.
 //
 // The executor is column-oriented. Without an applicable posting bound it
 // extracts each needed path as a dense column and evaluates WHERE in one full
@@ -145,12 +154,12 @@ type plan struct {
 	valuePaths []compiledPath // extracted as scalar columns
 	numPaths   []compiledPath // extracted as numeric columns (aggregate args)
 
+	headers []string // result schema; cold metadata, parallel to columns
 	columns []planColumn
 	where   *compiledPredicate
 
 	grouped   bool
-	groupCols []int       // value-column indices of GROUP BY paths
-	groupSlot map[int]int // value-column index -> position in groupCols
+	groupCols []int // value-column indices of GROUP BY paths
 
 	hasAggregate bool
 	singleRow    bool // aggregates without GROUP BY: one result row
@@ -162,11 +171,10 @@ type plan struct {
 
 // A planColumn is one compiled SELECT column.
 type planColumn struct {
-	header string
-	agg    aggKind
-	value  int // scalar-column index for a projection or COUNT(path); -1 for COUNT(*)
-	num    int // numeric-column index for SUM/AVG/MIN/MAX; -1 otherwise
-	slot   int // for a grouped projection, its position in groupCols; -1 otherwise
+	agg   aggKind
+	value int // scalar-column index for a projection or COUNT(path); -1 for COUNT(*)
+	num   int // numeric-column index for SUM/AVG/MIN/MAX; -1 otherwise
+	slot  int // for a grouped projection, its position in groupCols; -1 otherwise
 }
 
 // A planOrder is one compiled ORDER BY key.
@@ -224,15 +232,16 @@ func (q *Query) compile() (*plan, error) {
 	}
 
 	p := &plan{
-		grouped:   grouped,
-		groupSlot: map[int]int{},
-		limit:     q.limit,
-		hasLimit:  q.hasLimit,
+		grouped:  grouped,
+		limit:    q.limit,
+		hasLimit: q.hasLimit,
 	}
+	p.headers = make([]string, 0, len(q.columns))
+	p.columns = make([]planColumn, 0, len(q.columns))
 
 	hasProjection := false
 	for _, col := range q.columns {
-		pc := planColumn{header: col.header, agg: col.agg, value: -1, num: -1, slot: -1}
+		pc := planColumn{agg: col.agg, value: -1, num: -1, slot: -1}
 		switch col.agg {
 		case aggNone:
 			hasProjection = true
@@ -261,6 +270,7 @@ func (q *Query) compile() (*plan, error) {
 			}
 			pc.num = idx
 		}
+		p.headers = append(p.headers, col.header)
 		p.columns = append(p.columns, pc)
 	}
 
@@ -277,24 +287,25 @@ func (q *Query) compile() (*plan, error) {
 		p.where = cp
 	}
 
+	groupSlot := make(map[int]int, len(q.groupBy))
 	for _, g := range q.groupBy {
 		idx, err := values.add(g)
 		if err != nil {
 			return nil, err
 		}
-		if _, seen := p.groupSlot[idx]; !seen {
-			p.groupSlot[idx] = len(p.groupCols)
+		if _, seen := groupSlot[idx]; !seen {
+			groupSlot[idx] = len(p.groupCols)
 			p.groupCols = append(p.groupCols, idx)
 		}
 	}
 	// Resolve each grouped projection to its group-key slot.
 	for i := range p.columns {
 		if p.columns[i].agg == aggNone && grouped {
-			p.columns[i].slot = p.groupSlot[p.columns[i].value]
+			p.columns[i].slot = groupSlot[p.columns[i].value]
 		}
 	}
 
-	if err := q.compileOrder(p, values, groupSet); err != nil {
+	if err := q.compileOrder(p, values, groupSet, groupSlot); err != nil {
 		return nil, err
 	}
 
@@ -305,7 +316,7 @@ func (q *Query) compile() (*plan, error) {
 
 // compileOrder resolves the ORDER BY keys, enforcing the grouped-path rule and
 // skipping ordering for a single-row aggregate result.
-func (q *Query) compileOrder(p *plan, values *pathRegistry, groupSet map[string]bool) error {
+func (q *Query) compileOrder(p *plan, values *pathRegistry, groupSet map[string]bool, groupSlot map[int]int) error {
 	if p.singleRow {
 		return nil // one result row; nothing to order
 	}
@@ -319,7 +330,7 @@ func (q *Query) compileOrder(p *plan, values *pathRegistry, groupSet map[string]
 		}
 		po := planOrder{value: idx, slot: -1, dir: o.dir}
 		if p.grouped {
-			po.slot = p.groupSlot[idx]
+			po.slot = groupSlot[idx]
 		}
 		p.order = append(p.order, po)
 	}
@@ -340,8 +351,9 @@ func (q *Query) Run(s *simdjson.DocSet) (Result, error) {
 // The zero values of Result and Workspace are ready to use. After one warm-up,
 // executions whose row count, posting frontier, decoded text, and group count
 // fit the retained high-water marks allocate no heap memory, including stable
-// ordering, grouping, containment indexing, aggregate formatting, and escaped
-// string decoding.
+// ordering, grouping, containment indexing, typed aggregates, and escaped
+// string decoding. Use Cell.AppendJSON with a retained destination to format
+// computed aggregates without allocating.
 //
 // RunInto overwrites dst. Result cells may borrow both s and w; they remain
 // valid until s is modified, dst is reused, or the next RunInto using w. A

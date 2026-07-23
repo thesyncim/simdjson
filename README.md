@@ -211,6 +211,13 @@ owned copy into caller capacity and allocate nothing after capacity is warm.
 `WriteTo` remains a full checkpoint: later heap-Store mutations do not update
 that image.
 
+For an immutable checkpoint that must be read through an explicit fixed-size
+page cache, `Store.WritePageFile` and `OpenStorePageReader` provide a narrower
+page-file surface. `StorePageDB` can durably replace or delete existing keys in
+that format. It is kept as a focused page-I/O and crash-consistency baseline;
+it does not support insertion, TTL, secondary indexes, overflow values, or
+extent reuse. Use `FileStore` for the general durable collection below.
+
 For incremental durability and a bounded resident set, attach a `FileStore` to
 a caller-owned file. Its key, chunk, exact-index, TTL, free-space, document, and
 overflow structures are checksummed copy-on-write pages selected by alternating
@@ -310,7 +317,7 @@ caller-bounded and never performs a hidden full-store completion scan; declared
 roots are reclaimed automatically with their last snapshot.
 
 The complete API, ownership rules, expiration semantics, tuning table,
-complexity bounds, zero-allocation recipes, operational counters, and Redis
+complexity bounds, zero-allocation recipes, operational counters, and DuckDB
 comparison boundary are in [Mutable Store operations](docs/store.md).
 
 ## Performance
@@ -381,6 +388,7 @@ define the methodology, gates, comparison boundaries, and pinned toolchains.
 | Compact, indented, or canonical output | `Compact`, `Indent`, `Canonicalize` |
 | Borrowed selection or repeated document navigation | `RawValue`, `Index`/`Node`, or `Parse`/`Value` |
 | Keyed datasets, including bulk construction | `StoreBuilder`, `Store`, `Snapshot` |
+| Fixed-cache reads or replacement/deletion of an immutable page checkpoint | `Store.WritePageFile`, `OpenStorePageReader`, `StorePageDB` |
 | Incrementally durable, bounded-residency keyed datasets | `CreateFileStore`, `OpenFileStore`, `FileStore`, `FileSnapshot` |
 | Low-level immutable arenas and column extraction | `DocSet`, `ShapeCache`, `KeyInterner` |
 | SQL-shaped projection, filtering, grouping, and aggregation | `query.Query.RunInto`, `query.Result`, `query.Workspace` |

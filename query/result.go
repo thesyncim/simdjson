@@ -1,6 +1,7 @@
 package query
 
 import (
+	"math"
 	"strconv"
 
 	"github.com/thesyncim/simdjson/internal/byteview"
@@ -12,11 +13,12 @@ import (
 // projection yields one row per surviving document; a query with aggregates
 // and no GROUP BY yields exactly one row; a GROUP BY yields one row per group.
 //
-// Cells produced by Run/RunInto borrow the DocSet's storage, exactly like the
-// RawValue they came from. RunInto may additionally place decoded escaped text
-// and computed aggregate JSON in its Workspace. Copy Cell.JSON and, when
-// needed, Cell.TextBytes before the DocSet, Result, or Workspace is reused if a
-// cell must outlive that borrowing boundary. RunFileSnapshot instead copies
+// Cells that project a document value borrow the DocSet's storage, exactly
+// like the RawValue they came from. RunInto may additionally place decoded
+// escaped text in its Workspace. Computed aggregates remain typed and borrow
+// no formatted-number arena. Copy projected Cell.JSON and, when needed,
+// Cell.TextBytes before the DocSet, Result, or Workspace is reused if a cell
+// must outlive that borrowing boundary. RunFileSnapshot instead copies
 // selected values into Result-owned backing, so its cells survive snapshot
 // close and page eviction.
 type Result struct {
@@ -25,7 +27,9 @@ type Result struct {
 }
 
 // A ResultColumn is one output column: its Header (the projection path or the
-// aggregate spelling, e.g. "sum(price)") and its Cells, one per row.
+// aggregate spelling, e.g. "sum(price)") and its Cells, one per row. Header is
+// display/compatibility metadata; its stable execution and transport ID is the
+// column's ordinal, available before execution through [Plan.AppendSchema].
 type ResultColumn struct {
 	Header string
 	Cells  []Cell
@@ -58,16 +62,26 @@ const (
 // A Cell is one value in a Result: a projected document value or a computed
 // aggregate. Its typed accessors report false for the wrong kind, matching the
 // core RawValue/Node accessors. JSON returns the exact bytes for a projected
-// value and a formatted encoding for a computed one.
+// value and a formatted encoding for a computed one. The representation uses
+// one tagged value word rather than parallel integer, float, and bool fields;
+// it occupies 56 bytes on 64-bit targets.
 type Cell struct {
-	kind  CellKind
-	bval  bool
-	fval  float64
-	ival  int64
-	isInt bool
-	text  string
-	raw   []byte
+	// raw and text are the only dual representation a cell can need: raw keeps
+	// exact JSON while text keeps a decoded JSON string. Numeric and boolean
+	// values share one tagged word instead of retaining parallel Go values.
+	raw  []byte
+	text string
+	word uint64
+	kind CellKind
+	flag cellFlag
 }
+
+type cellFlag uint8
+
+const (
+	cellInteger cellFlag = 1 << iota
+	cellTrue
+)
 
 var (
 	nullBytes  = []byte("null")
@@ -83,33 +97,22 @@ func cellFromScalar(s scalar) Cell {
 		return Cell{kind: KindNull, raw: nullBytes}
 	case kindBool:
 		raw := falseBytes
+		flag := cellFlag(0)
 		if s.bval {
 			raw = trueBytes
+			flag = cellTrue
 		}
-		return Cell{kind: KindBool, bval: s.bval, raw: raw}
+		return Cell{kind: KindBool, flag: flag, raw: raw}
 	case kindNumber:
+		if s.isInt {
+			return Cell{kind: KindNumber, flag: cellInteger, word: uint64(s.ival), raw: s.num}
+		}
 		f, _ := s.float64OfNumber()
-		return Cell{kind: KindNumber, fval: f, isInt: s.isInt, ival: s.ival, raw: s.num}
+		return Cell{kind: KindNumber, word: math.Float64bits(f), raw: s.num}
 	case kindString:
 		return Cell{kind: KindString, text: s.sval, raw: s.raw}
 	default:
 		return Cell{kind: KindJSON, raw: s.raw}
-	}
-}
-
-// floatCell builds a computed numeric cell (a SUM, AVG, MIN, or MAX result).
-func floatCell(f float64) Cell {
-	return Cell{kind: KindNumber, fval: f, raw: strconv.AppendFloat(nil, f, 'g', -1, 64)}
-}
-
-// countCell builds a COUNT result, an exact non-negative integer.
-func countCell(n int) Cell {
-	return Cell{
-		kind:  KindNumber,
-		fval:  float64(n),
-		ival:  int64(n),
-		isInt: true,
-		raw:   strconv.AppendInt(nil, int64(n), 10),
 	}
 }
 
@@ -130,7 +133,7 @@ func (c Cell) Bool() (bool, bool) {
 	if c.kind != KindBool {
 		return false, false
 	}
-	return c.bval, true
+	return c.flag&cellTrue != 0, true
 }
 
 // Float64 returns the cell's numeric value as a float64, and false for a
@@ -139,14 +142,17 @@ func (c Cell) Float64() (float64, bool) {
 	if c.kind != KindNumber {
 		return 0, false
 	}
-	return c.fval, true
+	if c.flag&cellInteger != 0 {
+		return float64(int64(c.word)), true
+	}
+	return math.Float64frombits(c.word), true
 }
 
 // Int64 returns the cell's numeric value as an int64 when it is an integer
 // within range, and false otherwise.
 func (c Cell) Int64() (int64, bool) {
-	if c.kind == KindNumber && c.isInt {
-		return c.ival, true
+	if c.kind == KindNumber && c.flag&cellInteger != 0 {
+		return int64(c.word), true
 	}
 	return 0, false
 }
@@ -171,9 +177,32 @@ func (c Cell) TextBytes() ([]byte, bool) {
 }
 
 // JSON returns the cell as JSON bytes: the exact source bytes for a projected
-// value, a formatted encoding for a computed aggregate. The slice must not be
-// modified and, for a projected value, borrows the DocSet.
-func (c Cell) JSON() []byte { return c.raw }
+// value, or a newly formatted encoding for a computed numeric aggregate. The
+// projected slice must not be modified and borrows the DocSet. Call
+// [Cell.AppendJSON] with retained storage when computed values must not
+// allocate.
+func (c Cell) JSON() []byte {
+	if c.raw != nil {
+		return c.raw
+	}
+	return c.AppendJSON(nil)
+}
+
+// AppendJSON appends the cell's compact JSON representation to dst. It is the
+// caller-buffered transport form of [Cell.JSON] and allocates only if dst does
+// not have enough capacity.
+func (c Cell) AppendJSON(dst []byte) []byte {
+	if c.raw != nil {
+		return append(dst, c.raw...)
+	}
+	if c.kind != KindNumber {
+		return dst
+	}
+	if c.flag&cellInteger != 0 {
+		return strconv.AppendInt(dst, int64(c.word), 10)
+	}
+	return strconv.AppendFloat(dst, math.Float64frombits(c.word), 'g', -1, 64)
+}
 
 // String returns a compact debugging spelling of the cell.
-func (c Cell) String() string { return string(c.raw) }
+func (c Cell) String() string { return string(c.AppendJSON(nil)) }

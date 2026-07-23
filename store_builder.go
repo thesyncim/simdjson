@@ -42,6 +42,13 @@ type StoreBuilder struct {
 	keyBytes int
 	closed   bool
 	exact    map[string]*storeExactIndex
+	shapes   []*shapeRecord
+	shapeSet map[*shapeRecord]struct{}
+	// sourceHint is the exact JSON bytes in the preceding full chunk. It lets
+	// the next unpublished chunk reserve one bounded arena instead of retaining
+	// every geometric growth generation through already-built Index slices.
+	sourceHint      int
+	currentDocBytes int
 }
 
 // NewStoreBuilder returns an empty bulk builder. It validates StoreOptions up
@@ -109,7 +116,8 @@ func (b *StoreBuilder) Append(key string, src []byte) error {
 		if b.chunks.count == ^uint32(0) {
 			return ErrStoreTooLarge
 		}
-		b.current = newStoreBuilderChunk(b.options)
+		capacity := storeBuilderSourceCapacity(b.options.ChunkDocuments, len(src), b.sourceHint)
+		b.current = newStoreBuilderChunk(b.options, b.shapes, capacity)
 	}
 
 	// DocSet.Append owns and validates src before any key or directory state is
@@ -118,6 +126,7 @@ func (b *StoreBuilder) Append(key string, src []byte) error {
 	if err != nil {
 		return err
 	}
+	b.currentDocBytes += len(src)
 	keyStart := len(b.current.keyBytes)
 	b.current.keyBytes = append(b.current.keyBytes, key...)
 	storedKey := byteview.String(b.current.keyBytes[keyStart:])
@@ -137,22 +146,114 @@ func (b *StoreBuilder) Append(key string, src []byte) error {
 	return nil
 }
 
-func newStoreBuilderChunk(options StoreOptions) *storeChunk {
+func newStoreBuilderChunk(options StoreOptions, shapes []*shapeRecord, sourceCapacity int) *storeChunk {
 	chunk := &storeChunk{
 		keys: make([]string, options.ChunkDocuments),
 	}
 	initChunkDocSet(&chunk.docs, options, options.Postings)
+	if sourceCapacity > 0 {
+		chunk.docs.srcChunk = make([]byte, 0, sourceCapacity)
+	}
+	for _, rec := range shapes {
+		chunk.docs.shapes.seedRecord(rec)
+	}
 	return chunk
 }
 
+func storeBuilderSourceCapacity(chunkDocuments, firstDocumentBytes, previousBytes int) int {
+	if chunkDocuments <= 0 || firstDocumentBytes <= 0 {
+		return 0
+	}
+	sample := docSetMaxSrcChunk
+	if firstDocumentBytes <= docSetMaxSrcChunk/chunkDocuments {
+		sample = firstDocumentBytes * chunkDocuments
+	}
+	if previousBytes <= 0 {
+		return storeBuilderSourceHeadroom(sample, chunkDocuments)
+	}
+	previousBytes = min(previousBytes, docSetMaxSrcChunk)
+	average := (previousBytes + chunkDocuments - 1) / chunkDocuments
+	// Reuse the exact preceding-page size only while the new first row is a
+	// plausible member of the same size distribution. A phase change switches
+	// immediately to the current sample instead of pinning stale capacity.
+	if firstDocumentBytes >= max(average/2, 1) && firstDocumentBytes <= average*2 {
+		return storeBuilderSourceHeadroom(previousBytes, chunkDocuments)
+	}
+	return storeBuilderSourceHeadroom(sample, chunkDocuments)
+}
+
+func storeBuilderSourceHeadroom(size, chunkDocuments int) int {
+	if size >= docSetMaxSrcChunk {
+		return docSetMaxSrcChunk
+	}
+	if chunkDocuments <= 1 {
+		return size
+	}
+	// One average row absorbs ordinary page-to-page variance without the
+	// 2x retained cost of crossing an arena boundary by a few bytes.
+	headroom := max(size/chunkDocuments, 256)
+	if size > docSetMaxSrcChunk-headroom {
+		return docSetMaxSrcChunk
+	}
+	return size + headroom
+}
+
 func (b *StoreBuilder) flush() {
+	if b.options.ShapeTapes {
+		compactStoreBuilderShapes(&b.current.docs)
+		if b.shapeSet == nil {
+			b.shapeSet = make(map[*shapeRecord]struct{})
+		}
+		for _, rec := range b.current.docs.shapes.shapes {
+			if _, exists := b.shapeSet[rec]; exists {
+				continue
+			}
+			b.shapeSet[rec] = struct{}{}
+			b.shapes = append(b.shapes, rec)
+		}
+	}
 	b.chunks.appendTransient(b.current)
+	if int(b.current.count) == b.options.ChunkDocuments {
+		b.sourceHint = b.currentDocBytes
+	}
+	b.currentDocBytes = 0
 	b.current = nil
 }
 
-// Build freezes the accumulated graph and transfers it to a new Store. Empty
-// input produces an initialized empty Store. The builder closes even when it
-// is empty, preventing accidental aliasing through later Append calls.
+// compactStoreBuilderShapes revisits the first sighting of every shape after
+// its page-local repeat has compiled the immutable record. Ordinary DocSet
+// append cannot rewrite an already returned Index, but an unpublished builder
+// owns every row and can safely drop those redundant classic key tapes before
+// publication. Existing postings and value dictionaries are independent and
+// remain exact because the document bytes do not change.
+func compactStoreBuilderShapes(docs *DocSet) {
+	if docs == nil || len(docs.shapes.shapes) == 0 || len(docs.tapeRefs) == 0 {
+		return
+	}
+	allCompact := true
+	for i := range docs.docs {
+		if docs.shapeTapeRefAt(i).rec != nil {
+			continue
+		}
+		index, ref, ok := copyStoreShapeTape(docs, docs.docs[i])
+		if !ok {
+			allCompact = false
+			continue
+		}
+		docs.docs[i] = index
+		docs.tapeRefs[i] = ref
+	}
+	if allCompact {
+		docs.entryChunk = nil
+		docs.scratch = nil
+	}
+}
+
+// Build freezes the accumulated graph, compacts immutable keys and document
+// source/tapes into pointer-free owned blocks, and transfers them to a new
+// Store. Empty input produces an initialized empty Store. The builder closes
+// even when it is empty, preventing accidental aliasing through later Append
+// calls.
 func (b *StoreBuilder) Build() (*Store, error) {
 	if b == nil || b.closed {
 		return nil, ErrStoreBuilderClosed
@@ -192,11 +293,18 @@ func (b *StoreBuilder) Build() (*Store, error) {
 	if err := b.buildExactIndexes(store, state); err != nil {
 		return nil, err
 	}
+	if err := b.compactDocuments(state); err != nil {
+		return nil, err
+	}
 	store.state.Store(state)
 	b.keys = nil
 	b.chunks = storeChunkVector{}
 	b.current = nil
 	b.exact = nil
+	b.shapes = nil
+	b.shapeSet = nil
+	b.sourceHint = 0
+	b.currentDocBytes = 0
 	return store, nil
 }
 
@@ -208,7 +316,7 @@ func (b *StoreBuilder) compactBaseKeys() (*storeMappedKeys, error) {
 	if b.count == 0 {
 		return nil, nil
 	}
-	base, err := newStoreOwnedKeys(b.count, b.keyBytes)
+	base, err := newStoreOwnedKeys(b.count, b.keyBytes, b.chunks.count >= storeMappedLocationMaxChunk, b.options.ChunkDocuments)
 	if err != nil {
 		return nil, fmt.Errorf("simdjson: compact StoreBuilder keys: %w", err)
 	}
@@ -222,14 +330,12 @@ func (b *StoreBuilder) compactBaseKeys() (*storeMappedKeys, error) {
 			start := position
 			position += copy(base.source[position:], key)
 			ref := refBase + uint64(chunk.ord[slot])
-			if ref >= uint64(len(base.refs)) {
+			if ref >= uint64(base.keyRefCount()) {
 				valid = false
 				return false
 			}
-			base.refs[ref] = storeMappedKeyRef{
-				off: uint64(start), length: uint32(len(key)),
-				loc: storeLocation{chunk: id, slot: uint8(slot)},
-			}
+			base.setKeySpan(ref, uint64(start), uint32(len(key)))
+			base.setLocation(ref, storeLocation{chunk: id, slot: uint8(slot)})
 			if !base.insert(maphash.String(b.seed, key), ref) {
 				valid = false
 				return false

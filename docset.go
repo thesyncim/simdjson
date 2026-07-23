@@ -216,6 +216,9 @@ func (s *DocSet) Len() int {
 // engines wanting the space win extract through the batch primitives, which
 // read the deduplicated form directly.
 func (s *DocSet) Doc(i int) Index {
+	if template, ok := s.storeTemplateAt(i); ok {
+		return s.widenStoreTemplate(i, template)
+	}
 	if r := s.shapeTapeRefAt(i); r.rec != nil {
 		return s.widenShapeTape(i, r)
 	}
@@ -338,16 +341,37 @@ func docSetChunkCap(prev, need, min, max int) int {
 func (s *DocSet) AppendPointer(dst []RawValue, pointer CompiledPointer) ([]RawValue, error) {
 	mark := len(dst)
 	var hint shapeTapeHint
+	var templateHint storeTemplatePointerHint
 	var key0 CompiledKey
 	if len(pointer.tokens) > 0 {
 		key0 = CompiledKey{key: pointer.tokens[0].text, hash: pointer.tokens[0].hash}
 	}
 	for i := 0; i < s.Len(); i++ {
+		if template, templateOK := s.storeTemplateAt(i); templateOK {
+			ordinal, ok, err := templateHint.resolve(template, pointer)
+			if err != nil {
+				return dst[:mark], err
+			}
+			if !ok {
+				dst = append(dst, RawValue{})
+				continue
+			}
+			span := s.storeTemplateSpan(i, template, ordinal)
+			doc := s.docAt(i)
+			raw := RawValue{src: doc.src[span&0xffff : span>>16]}
+			if s.ValueDict {
+				raw = s.valueRaw(i, span&0xffff, raw)
+			}
+			dst = append(dst, raw)
+			continue
+		}
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
 			doc := s.docAt(i)
 			if len(pointer.tokens) == 0 {
-				// The empty pointer selects the root; its span is the header's.
-				dst = append(dst, RawValue{src: doc.src[r.start:r.end]})
+				// The empty pointer selects the root. Compact Store rows recover
+				// this otherwise-cold span from their validated source.
+				start, end := s.shapeTapeRootSpan(doc, r)
+				dst = append(dst, RawValue{src: doc.src[start:end]})
 				continue
 			}
 			ord := hint.lookup(r.rec, key0)
@@ -439,15 +463,35 @@ func (s *DocSet) AppendPointer(dst []RawValue, pointer CompiledPointer) ([]RawVa
 func (s *DocSet) AppendPointerRows(dst []RawValue, rows []int, pointer CompiledPointer) ([]RawValue, error) {
 	mark := len(dst)
 	var hint shapeTapeHint
+	var templateHint storeTemplatePointerHint
 	var key0 CompiledKey
 	if len(pointer.tokens) > 0 {
 		key0 = CompiledKey{key: pointer.tokens[0].text, hash: pointer.tokens[0].hash}
 	}
 	for _, i := range rows {
+		if template, templateOK := s.storeTemplateAt(i); templateOK {
+			ordinal, ok, err := templateHint.resolve(template, pointer)
+			if err != nil {
+				return dst[:mark], err
+			}
+			if !ok {
+				dst = append(dst, RawValue{})
+				continue
+			}
+			span := s.storeTemplateSpan(i, template, ordinal)
+			doc := s.docAt(i)
+			raw := RawValue{src: doc.src[span&0xffff : span>>16]}
+			if s.ValueDict {
+				raw = s.valueRaw(i, span&0xffff, raw)
+			}
+			dst = append(dst, raw)
+			continue
+		}
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
 			doc := s.docAt(i)
 			if len(pointer.tokens) == 0 {
-				dst = append(dst, RawValue{src: doc.src[r.start:r.end]})
+				start, end := s.shapeTapeRootSpan(doc, r)
+				dst = append(dst, RawValue{src: doc.src[start:end]})
 				continue
 			}
 			ord := hint.lookup(r.rec, key0)

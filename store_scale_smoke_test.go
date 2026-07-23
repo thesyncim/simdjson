@@ -118,6 +118,9 @@ func runStoreScaleSmoke(t *testing.T, records int) {
 	runtime.ReadMemStats(&after)
 	liveHeap := positiveDelta(after.HeapAlloc, before.HeapAlloc)
 	heapObjects := positiveDelta(after.HeapObjects, before.HeapObjects)
+	storeStats := store.Stats()
+	externalBytes := storeStats.ExternalKeyBytes + storeStats.ExternalDocumentBytes + storeStats.ExternalIndexBytes
+	accountedBytes := liveHeap + externalBytes
 	pause := time.Duration(positiveDelta(after.PauseTotalNs, before.PauseTotalNs))
 	gcCycles := positiveDelta(uint64(after.NumGC), uint64(before.NumGC))
 	if profilePath := os.Getenv("STORE_SCALE_HEAP_PROFILE"); profilePath != "" {
@@ -216,7 +219,7 @@ func runStoreScaleSmoke(t *testing.T, records int) {
 		indexBytes += stats.EstimatedBytes
 	}
 
-	t.Logf("STORE_SCALE records=%d build=%s build_docs_s=%.0f source_bytes=%d source_B_doc=%.1f live_heap=%d heap_B_doc=%.1f heap_source_ratio=%.2f heap_objects=%d objects_doc=%.3f gc_cycles=%d gc_pause=%s document_extent_bytes=%d document_extent_B_doc=%.1f extent_source_ratio=%.2f index_bytes=%d index_B_doc=%.2f posting_extent_bytes=%d posting_extent_B_doc=%.2f group_posting_extent_bytes=%d compound_posting_extent_bytes=%d posting_vs_heap_index=%.3f point=%s point_runs=%d compound=%s compound_runs=%d compound_masks=%d group=%s group_runs=%d group_masks=%d update=%s delete_insert=%s ttl_change=%s",
+	t.Logf("STORE_SCALE records=%d build=%s build_docs_s=%.0f source_bytes=%d source_B_doc=%.1f live_heap=%d heap_B_doc=%.1f heap_source_ratio=%.2f external_bytes=%d external_B_doc=%.1f external_key_bytes=%d external_document_bytes=%d external_index_bytes=%d accounted_bytes=%d accounted_B_doc=%.1f accounted_source_ratio=%.2f heap_objects=%d objects_doc=%.3f gc_cycles=%d gc_pause=%s document_extent_bytes=%d document_extent_B_doc=%.1f extent_source_ratio=%.2f index_bytes=%d index_B_doc=%.2f posting_extent_bytes=%d posting_extent_B_doc=%.2f group_posting_extent_bytes=%d compound_posting_extent_bytes=%d posting_vs_heap_index=%.3f point=%s point_runs=%d compound=%s compound_runs=%d compound_masks=%d group=%s group_runs=%d group_masks=%d update=%s delete_insert=%s ttl_change=%s",
 		records,
 		buildDuration,
 		float64(records)/buildDuration.Seconds(),
@@ -225,6 +228,14 @@ func runStoreScaleSmoke(t *testing.T, records int) {
 		liveHeap,
 		float64(liveHeap)/float64(records),
 		float64(liveHeap)/float64(sourceBytes),
+		externalBytes,
+		float64(externalBytes)/float64(records),
+		storeStats.ExternalKeyBytes,
+		storeStats.ExternalDocumentBytes,
+		storeStats.ExternalIndexBytes,
+		accountedBytes,
+		float64(accountedBytes)/float64(records),
+		float64(accountedBytes)/float64(sourceBytes),
 		heapObjects,
 		float64(heapObjects)/float64(records),
 		gcCycles,

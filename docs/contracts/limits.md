@@ -201,8 +201,18 @@ toward RSS. `OpenStore` validates every key and row and still eagerly rebuilds
 distinct shapes, optional accelerators, and declared exact-index roots as Go
 objects. The image size is therefore not a resident-memory limit. Applications
 must measure mapped image bytes, external metadata, and reconstructed heap
-metadata separately; current Store images do not yet provide an eviction budget
-or a 100x-RAM guarantee.
+metadata separately; `OpenStore` images do not provide an eviction budget or a
+100x-RAM guarantee. `StorePageReader` and `StorePageDB` do provide an explicit
+fixed frame budget, and their 4,096-row smoke keeps a 1,155,072-byte file
+correct over an 8,192-byte cache (141.0x). That ratio covers the page cache,
+not process baseline, kernel cache, or equal latency. `StorePageDB` currently
+supports durable existing-key replacement and deletion only; inserts, TTL and
+secondary-index roots, overflow values, and free-extent reuse remain rejected
+or unavailable rather than silently exceeding the contract. In this
+specialized checkpoint format, replacement versions increase file bytes even
+though resident memory stays bounded. The separate `FileStore` format below
+implements insertion, TTL, frozen exact indexes, overflow extents, and
+snapshot-safe persistent extent reuse.
 
 Dense Store bitmap workspaces use one `uint64` per logical chunk high-water id,
 including empty historical ids. Prefer sparse `StoreMask` streams for selective

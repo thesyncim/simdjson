@@ -71,7 +71,22 @@ import (
 func (c *ShapeCache) AppendField(dst []RawValue, s *DocSet, name string) []RawValue {
 	fs := newFieldScan(name)
 	var th shapeTapeHint
+	var templateHint storeTemplateFieldHint
 	for i := 0; i < s.Len(); i++ {
+		if template, templateOK := s.storeTemplateAt(i); templateOK {
+			if ord := templateHint.lookup(template, fs.key); ord >= 0 {
+				span := s.storeTemplateSpan(i, template, ord)
+				doc := s.docAt(i)
+				raw := RawValue{src: doc.src[span&0xffff : span>>16]}
+				if s.ValueDict {
+					raw = s.valueRaw(i, span&0xffff, raw)
+				}
+				dst = append(dst, raw)
+			} else {
+				dst = append(dst, RawValue{})
+			}
+			continue
+		}
 		if r := s.shapeTapeRefAt(i); r.rec != nil {
 			doc := s.docAt(i)
 			if ord := th.lookup(r.rec, fs.key); ord >= 0 {

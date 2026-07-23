@@ -1,16 +1,13 @@
-// Command redisbench drives the ADR 0003 RedisJSON/RediSearch comparison
-// harness.
+// Command duckdbbench drives the reproducible Store/DuckDB comparison.
 //
 // Usage:
 //
-//	redisbench gen [-dir corpora] [-docs N] [-docbytes N] [-realbytes N] [-only name]
-//	redisbench ours [-dir corpora] [-out results/ours.json] [-reps N] [-only name]
-//	redisbench report [-dir corpora] [-redis results/redis] [-ours results/ours.json] [-out results/redis-report.md]
+//	duckdbbench gen [-dir corpora] [-docs N] [-docbytes N] [-realbytes N] [-only name]
+//	duckdbbench ours [-dir corpora] [-out results/ours.json] [-reps N] [-only name]
+//	duckdbbench report [-duckdb results/duckdb] [-ours results/ours.json] [-out results/duckdb-report.md]
 //
-// gen writes the corpus set (NDJSON for our side, RESP JSON.SET commands for
-// RedisJSON, and the shared query manifests). run-redis.sh runs the
-// RedisJSON/RediSearch protocol over the generated corpora. ours measures this
-// library's side. report joins everything into the scoreboard.
+// gen writes the shared NDJSON and manifests. run-duckdb.sh records immutable
+// DuckDB profiles. ours measures Store. report verifies and joins both sides.
 //
 // The full corpus set is several gigabytes and a full run takes tens of
 // minutes; nothing in this module's tests invokes any of it.
@@ -23,14 +20,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 
-	"github.com/thesyncim/simdjson/benchmarks/redisbench"
+	"github.com/thesyncim/simdjson/benchmarks/duckdbbench"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: redisbench gen|ours|report [flags]")
+		fmt.Fprintln(os.Stderr, "usage: duckdbbench gen|ours|report [flags]")
 		os.Exit(2)
 	}
 	var err error
@@ -45,7 +41,7 @@ func main() {
 		err = fmt.Errorf("unknown subcommand %q", os.Args[1])
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "redisbench:", err)
+		fmt.Fprintln(os.Stderr, "duckdbbench:", err)
 		os.Exit(1)
 	}
 }
@@ -53,8 +49,8 @@ func main() {
 // synthSpecs returns the shape-clustered synthetics at each shape count plus
 // the adversarially heterogeneous set. Seeds are fixed; corpora are
 // deterministic.
-func synthSpecs(docs, docBytes int) []redisbench.SynthSpec {
-	return []redisbench.SynthSpec{
+func synthSpecs(docs, docBytes int) []duckdbbench.SynthSpec {
+	return []duckdbbench.SynthSpec{
 		{Name: "synth_s1", Docs: docs, Shapes: 1, DocBytes: docBytes, Seed: 1},
 		{Name: "synth_s4", Docs: docs, Shapes: 4, DocBytes: docBytes, Seed: 4},
 		{Name: "synth_s64", Docs: docs, Shapes: 64, DocBytes: docBytes, Seed: 64},
@@ -62,8 +58,8 @@ func synthSpecs(docs, docBytes int) []redisbench.SynthSpec {
 	}
 }
 
-func realSpecs(targetBytes int64) []redisbench.RealSpec {
-	return []redisbench.RealSpec{
+func realSpecs(targetBytes int64) []duckdbbench.RealSpec {
+	return []duckdbbench.RealSpec{
 		{
 			// Individual tweets: the natural document unit of the twitter
 			// corpus, a real shape-clustered workload. retweet_count is the
@@ -106,7 +102,7 @@ func runGen(args []string) error {
 		if *only != "" && spec.Name != *only {
 			continue
 		}
-		m, err := redisbench.GenerateSynthetic(filepath.Join(*dir, spec.Name), spec)
+		m, err := duckdbbench.GenerateSynthetic(filepath.Join(*dir, spec.Name), spec)
 		if err != nil {
 			return err
 		}
@@ -116,7 +112,7 @@ func runGen(args []string) error {
 		if *only != "" && spec.Name != *only {
 			continue
 		}
-		m, err := redisbench.GenerateReal(filepath.Join(*dir, spec.Name), spec)
+		m, err := duckdbbench.GenerateReal(filepath.Join(*dir, spec.Name), spec)
 		if err != nil {
 			return err
 		}
@@ -140,7 +136,7 @@ func corpusDirs(dir, only string) ([]string, error) {
 		}
 	}
 	if len(dirs) == 0 {
-		return nil, fmt.Errorf("no generated corpora under %s (run redisbench gen)", dir)
+		return nil, fmt.Errorf("no generated corpora under %s (run duckdbbench gen)", dir)
 	}
 	return dirs, nil
 }
@@ -151,16 +147,17 @@ func runOurs(args []string) error {
 	out := fs.String("out", "results/ours.json", "output file")
 	reps := fs.Int("reps", 3, "repetitions per timed section (minimum wins)")
 	only := fs.String("only", "", "measure only the named corpus")
+	host := fs.String("host", "", "optional machine model/OS label recorded in the artifact")
 	fs.Parse(args)
 
 	dirs, err := corpusDirs(*dir, *only)
 	if err != nil {
 		return err
 	}
-	res := redisbench.OursResults{GoVersion: runtime.Version(), GOARCH: runtime.GOARCH}
+	res := duckdbbench.OursResults{GoVersion: runtime.Version(), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, Host: *host}
 	for _, d := range dirs {
 		fmt.Printf("measuring %s...\n", d)
-		c, err := redisbench.MeasureDir(d, *reps)
+		c, err := duckdbbench.MeasureDir(d, *reps)
 		if err != nil {
 			return err
 		}
@@ -178,36 +175,34 @@ func runOurs(args []string) error {
 
 func runReport(args []string) error {
 	fs := flag.NewFlagSet("report", flag.ExitOnError)
-	dir := fs.String("dir", "corpora", "corpus directory (unused placeholder for symmetry)")
-	redisDir := fs.String("redis", "results/redis", "directory of run-redis.sh session logs")
+	duckdbDir := fs.String("duckdb", "results/duckdb", "directory of run-duckdb.sh artifacts")
 	oursPath := fs.String("ours", "results/ours.json", "ours.json path")
-	out := fs.String("out", "results/redis-report.md", "report output path")
+	out := fs.String("out", "results/duckdb-report.md", "report output path")
 	fs.Parse(args)
-	_ = dir
 
 	js, err := os.ReadFile(*oursPath)
 	if err != nil {
 		return err
 	}
-	var res redisbench.OursResults
+	var res duckdbbench.OursResults
 	if err := json.Unmarshal(js, &res); err != nil {
 		return fmt.Errorf("%s: %v", *oursPath, err)
 	}
-	logs := map[string]redisbench.RedisLog{}
-	if entries, err := os.ReadDir(*redisDir); err == nil {
+	logs := map[string]duckdbbench.DuckDBLog{}
+	if entries, err := os.ReadDir(*duckdbDir); err == nil {
 		for _, e := range entries {
-			if !strings.HasSuffix(e.Name(), ".log") {
+			if !e.IsDir() {
 				continue
 			}
-			l, err := redisbench.ParseRedisLog(filepath.Join(*redisDir, e.Name()))
+			l, err := duckdbbench.ParseDuckDBRun(filepath.Join(*duckdbDir, e.Name()))
 			if err != nil {
 				return err
 			}
-			logs[strings.TrimSuffix(e.Name(), ".log")] = l
+			logs[e.Name()] = l
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(*out), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(*out, []byte(redisbench.BuildReport(res, logs)), 0o644)
+	return os.WriteFile(*out, []byte(duckdbbench.BuildReport(res, logs)), 0o644)
 }

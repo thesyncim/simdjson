@@ -1,0 +1,16 @@
+//go:build !linux
+
+package storeio
+
+import (
+	"fmt"
+	"os"
+)
+
+func openPageFile(path string, mode DirectMode) (*os.File, bool, error) {
+	if mode == DirectRequire {
+		return nil, false, fmt.Errorf("%w: direct page reads require Linux", ErrDirectIOUnsupported)
+	}
+	file, err := os.Open(path)
+	return file, false, err
+}

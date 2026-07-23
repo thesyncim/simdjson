@@ -293,7 +293,6 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 			resultRows = 0
 		}
 		prepareResult(&result, p, resultRows)
-		w.prepareNumbers(resultRows * len(p.columns) * 32)
 		if resultRows != 0 {
 			p.fillAggregateCells(&result, 0, accs, nil, &w)
 		}
@@ -650,7 +649,6 @@ func (p *plan) fileGroupResult(groups []fileGroup) Result {
 	var result Result
 	prepareResult(&result, p, len(groups))
 	var w Workspace
-	w.prepareNumbers(len(groups) * len(p.columns) * 32)
 	for row := range groups {
 		g := group{scalars: groups[row].scalars, accs: groups[row].accs}
 		p.fillAggregateCells(&result, row, g.accs, &g, &w)

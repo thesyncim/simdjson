@@ -7,6 +7,13 @@ caller-owned file. They share JSON validation, stable 64-slot chunks, exact
 scalar semantics, and the compiled query layer; they intentionally have
 different ownership and index-lifecycle surfaces.
 
+`StorePageReader` and `StorePageDB` preserve a smaller page-file contract:
+fixed-cache reads plus durable replacement/deletion of keys already present in
+a `Store.WritePageFile` checkpoint. They are useful as a specialized I/O
+baseline, but their format does not support insertion, TTL, secondary indexes,
+overflow values, or extent reuse. Their hash-routed page-key directory is
+therefore intentionally separate from `FileStore`'s variable-key tree.
+
 The zero value is ready to use. Options are frozen by the first `Put`,
 `CreateIndex`, or `AddIndex`.
 
@@ -54,6 +61,8 @@ raw, ok := view.GetRaw("user:42")
 | `AppendIndexBitmap` / `AppendLiveBitmap` | append one dense stable-slot word per logical page | O(page high-water + exact lookup work) |
 | `AppendStoreBitmapAnd/And3/Or/AndNot` | combine dense caller-owned workspaces | O(shortest or longest input words), zero allocation with capacity |
 | `query.RunSnapshotInto` | late-bound indexed query over a snapshot | candidate masks + selected-column work |
+| `Store.WritePageFile` / `OpenStorePageReader` | write/open the specialized fixed-cache checkpoint | full export / bounded page-cache open |
+| `StorePageDB.Put` / `Delete` | durably replace/delete an existing checkpoint key | copied page paths + synchronous barriers |
 | `CreateFileStore` / `OpenFileStore` | create or lazily recover a durable page graph | bounded root/page scratch; no corpus walk on open |
 | `FileStore.Put` / `Delete` | publish a copy-on-write durable generation | changed document plus copied metadata paths |
 | `FileStore.SetDeadline` / `Persist` / `ExpireDue` | mutate the persistent deadline tree | copied key/TTL paths; due work is caller-bounded by `limit` |
@@ -157,7 +166,7 @@ documents, the median of six 500 ms samples:
 
 `BenchmarkStoreMutation` and `BenchmarkStoreMutationModes` reproduce the
 bounded-copy and full-rebuild control paths. These numbers are local regression
-evidence, not Redis command latency claims.
+evidence, not external-database command latency claims.
 
 ## Snapshot and borrowing rules
 
@@ -674,19 +683,20 @@ and single-writer, though snapshots and compiled queries may be read
 concurrently. Its copy-on-write protocol is the durability mechanism; it is not
 a user-visible WAL and does not provide log shipping or point-in-time restore.
 
-The RedisJSON/RediSearch harness compares a keyed heap Store plus a matching
-declared exact index over identical corpora, while retaining DocSet-only rows
-as representation diagnostics. The
-latest local 65,536-document clustered run measured 62.4 MiB live Store heap
-including its 0.5 MiB exact index, versus 62.0 MiB RedisJSON keyspace plus a
-17.5 MiB RediSearch index: 0.79x as many accounted bytes. Store load was 1.89x
-faster, exact-index build about 415x faster, point projection 112x faster,
-indexed filter 1.92x faster, group-by 24.1x faster, and SUM 47.8x faster.
+The DuckDB harness compares keyed heap `Store` operations with DuckDB's
+embedded JSON, materialized scalar columns, and eligible single-column ART
+indexes over one deterministic NDJSON corpus. Both sides are correctness-gated
+and use one execution lane. The frozen 10,000-document M4 Max run measured
+4.85 MiB of Store-accounted resident state (1.25x logical key+JSON bytes), a
+5.01 MiB checkpointed DuckDB file (1.29x), and 5.75 MiB of warm DuckDB-managed
+buffers. Store bulk load was 2.23x faster in that run; read and mutation ratios
+varied substantially by operation and are reported individually.
 
-Those are same-hardware single-core results, not a claim of server equivalence:
-Redis ran in a Linux container, Store ran natively, Redis scenario time came
-from SLOWLOG without client round-trip cost, and Store has none of the services
-listed above. Match durability, protocol/client time, document distribution,
-index definitions, and expiry semantics before applying the ratios. See
-the [frozen run](../benchmarks/results/redis-synth-s4.md) and
-[`benchmarks/redisbench/redis-methodology.md`](../benchmarks/redisbench/redis-methodology.md).
+These are mechanism measurements, not a claim that the systems are equivalent.
+Store timings are direct in-process calls. DuckDB latency includes SQL parsing,
+binding, optimization, and execution; DuckDB also supplies ACID transactions,
+WAL/checkpoints, SQL, vectorized execution, and snapshot isolation that the
+heap Store does not. Store resident bytes, DuckDB durable file bytes, and
+DuckDB buffer memory are deliberately separate accounting domains. See the
+[frozen run](../benchmarks/results/duckdb-synth-s4.md) and
+[`benchmarks/duckdbbench/duckdb-methodology.md`](../benchmarks/duckdbbench/duckdb-methodology.md).
