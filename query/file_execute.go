@@ -330,9 +330,18 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 type fileBatch struct {
 	seq   uint64
 	base  uint64
-	docs  *simdjson.DocSet
-	rows  int
+	data  []byte
+	ends  []int
 	bytes int64
+}
+
+func newFileBatch(seq, base uint64, opts normalizedFileOptions) fileBatch {
+	dataCapacity := int(min(opts.batchBytes, 64<<10))
+	rowCapacity := min(opts.batchRows, defaultBatchRows)
+	return fileBatch{
+		seq: seq, base: base,
+		data: make([]byte, 0, dataCapacity), ends: make([]int, 0, rowCapacity),
+	}
 }
 
 type fileScanResult struct {
@@ -346,9 +355,9 @@ type fileScanResult struct {
 func scanFileBatches(snapshot *simdjson.FileSnapshot, opts normalizedFileOptions, jobs chan<- fileBatch, credits chan struct{}, done chan<- fileScanResult, stop <-chan struct{}) {
 	defer close(jobs)
 	var out fileScanResult
-	var batch fileBatch
+	batch := newFileBatch(0, 0, opts)
 	flush := func() error {
-		if batch.rows == 0 {
+		if len(batch.ends) == 0 {
 			return nil
 		}
 		select {
@@ -359,7 +368,7 @@ func scanFileBatches(snapshot *simdjson.FileSnapshot, opts normalizedFileOptions
 		select {
 		case jobs <- batch:
 			out.batches++
-			batch = fileBatch{seq: batch.seq + 1, base: out.rows}
+			batch = newFileBatch(batch.seq+1, out.rows, opts)
 			return nil
 		case <-stop:
 			<-credits
@@ -372,22 +381,17 @@ func scanFileBatches(snapshot *simdjson.FileSnapshot, opts normalizedFileOptions
 			return errFileExecutionStopped
 		default:
 		}
-		if batch.docs == nil {
-			batch.docs = &simdjson.DocSet{ShapeTapes: true, Postings: true}
-		}
-		if _, err := batch.docs.Append(value); err != nil {
-			return err
-		}
-		batch.rows++
+		batch.data = append(batch.data, value...)
+		batch.ends = append(batch.ends, len(batch.data))
 		batch.bytes += int64(len(value))
 		out.rows++
-		if batch.rows > out.peakRows {
-			out.peakRows = batch.rows
+		if len(batch.ends) > out.peakRows {
+			out.peakRows = len(batch.ends)
 		}
 		if batch.bytes > out.peakBytes {
 			out.peakBytes = batch.bytes
 		}
-		if batch.rows >= opts.batchRows || batch.bytes >= opts.batchBytes {
+		if len(batch.ends) >= opts.batchRows || batch.bytes >= opts.batchBytes {
 			return flush()
 		}
 		return nil
@@ -423,16 +427,25 @@ type fileGroup struct {
 
 func (p *plan) makeFilePartial(batch fileBatch) filePartial {
 	part := filePartial{seq: batch.seq}
+	docs := &simdjson.DocSet{ShapeTapes: true, Postings: true}
+	start := 0
+	for _, end := range batch.ends {
+		if _, err := docs.Append(batch.data[start:end]); err != nil {
+			part.err = err
+			return part
+		}
+		start = end
+	}
 	var w Workspace
 	w.candidateUsed = 0
-	candidates := p.candidateRows(batch.docs, &w)
-	compact := preferSparseRows(len(candidates), batch.docs.Len(), candidates != nil)
+	candidates := p.candidateRows(docs, &w)
+	compact := preferSparseRows(len(candidates), docs.Len(), candidates != nil)
 	var sourceRows []int
 	if compact {
 		sourceRows = candidates
 	}
 	ctx := &w.ctx
-	ctx.s, ctx.rows = batch.docs, batch.docs.Len()
+	ctx.s, ctx.rows = docs, docs.Len()
 	if compact {
 		ctx.rows = len(sourceRows)
 	}

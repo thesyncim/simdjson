@@ -94,3 +94,53 @@ func TestRunFileSnapshotOptions(t *testing.T) {
 		t.Fatal("undersized memory target accepted")
 	}
 }
+
+func BenchmarkRunFileSnapshotParallelAggregate(b *testing.B) {
+	file, err := os.CreateTemp(b.TempDir(), "query-file-benchmark-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer file.Close()
+	store, err := simdjson.CreateFileStore(file, simdjson.FileStoreOptions{
+		Store: simdjson.StoreOptions{ChunkDocuments: 64}, Synchronous: false,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer store.Close()
+	var sourceBytes int64
+	for i := range 1024 {
+		doc := []byte(fmt.Sprintf(`{"id":%d,"bucket":%d,"score":%d,"active":%t,"padding":%q}`,
+			i, i%16, i*7, i%3 != 0, strings.Repeat("x", i%96)))
+		sourceBytes += int64(len(doc))
+		if _, err := store.Put(fmt.Sprintf("key-%05d", i), doc); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := store.Flush(); err != nil {
+		b.Fatal(err)
+	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer snapshot.Close()
+	q := Select(Count(), Sum("score"), Avg("score")).Where(And(Cmp("active", Eq, true), Cmp("bucket", Ge, 4)))
+	for _, workers := range []int{1, 4} {
+		b.Run(fmt.Sprintf("workers-%d", workers), func(b *testing.B) {
+			opts := FileExecutionOptions{Workers: workers, BatchRows: 128, BatchBytes: 1 << 20, MemoryBytes: 64 << 20}
+			if _, _, err := q.RunFileSnapshot(snapshot, opts); err != nil {
+				b.Fatal(err)
+			}
+			b.SetBytes(sourceBytes)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				result, _, err := q.RunFileSnapshot(snapshot, opts)
+				if err != nil || result.RowCount != 1 {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
