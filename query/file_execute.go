@@ -448,7 +448,7 @@ func scanFileBatches(snapshot *simdjson.FileSnapshot, masks []simdjson.StoreMask
 		return nil
 	}
 	if masks == nil {
-		*overflow, out.err = snapshot.RangeRawBuffer((*overflow)[:0], appendRow)
+		*overflow, out.err = snapshot.RangeRawReadAheadBuffer((*overflow)[:0], appendRow)
 	} else {
 		*overflow, out.err = snapshot.RangeMasksRawBuffer(masks, (*overflow)[:0], appendRow)
 	}

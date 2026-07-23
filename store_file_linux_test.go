@@ -4,6 +4,7 @@ package simdjson
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -26,8 +27,12 @@ func TestFileStoreRequiredDirectReads(t *testing.T) {
 	if !store.Stats().DirectReads {
 		t.Fatal("required direct reads were not reported active")
 	}
-	if _, err := store.Put("linux:direct", []byte(`{"v":1}`)); err != nil {
-		t.Fatal(err)
+	for row := range 64 {
+		key := fmt.Sprintf("linux:direct:%02d", row)
+		value := fmt.Appendf(nil, `{"v":%d}`, row)
+		if _, err := store.Put(key, value); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -37,10 +42,28 @@ func TestFileStoreRequiredDirectReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if got, ok, err := reopened.AppendRaw(nil, "linux:direct"); err != nil || !ok || string(got) != `{"v":1}` {
+	if got, ok, err := reopened.AppendRaw(nil, "linux:direct:01"); err != nil || !ok || string(got) != `{"v":1}` {
 		t.Fatalf("required direct read = (%q,%v,%v)", got, ok, err)
 	}
-	if stats := reopened.Stats(); !stats.DirectReads || stats.PageReads == 0 {
+	snapshot, err := reopened.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := 0
+	if _, err := snapshot.RangeRawReadAheadBuffer(nil, func(_, _ []byte) error {
+		rows++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 64 {
+		t.Fatalf("required direct read-ahead rows = %d, want 64", rows)
+	}
+	if stats := reopened.Stats(); !stats.DirectReads || stats.PageReads == 0 ||
+		stats.PrefetchQueued == 0 || stats.PrefetchHits+stats.CoalescedReads == 0 {
 		t.Fatalf("required direct stats = %+v", stats)
 	}
 }

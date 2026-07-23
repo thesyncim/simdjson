@@ -39,6 +39,15 @@ jobs:
       - name: Tests, portable
         run: go test ./...
 
+      - name: FileStore 100x resident-pressure gate
+        if: ${{ matrix.primary && github.event_name == 'schedule' }}
+        run: >-
+          go test . -run '^TestFileStoreHundredXResidentSmoke$'
+          -v -count=1
+        env:
+          GOMEMLIMIT: 128MiB
+          SIMDJSON_FILESTORE_100X: 1
+
       - name: Experiment flag retains portable fallback
         run: go test -tags=simdjson_future_compiler_test ./...
         env:

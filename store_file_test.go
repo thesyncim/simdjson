@@ -52,6 +52,16 @@ func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
 	if _, err := options.normalized(); err == nil {
 		t.Fatal("invalid direct-read mode accepted")
 	}
+	options = testFileStoreOptions()
+	options.ReadConcurrency = -1
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("invalid read concurrency accepted")
+	}
+	options = testFileStoreOptions()
+	options.PrefetchQueue = 32769
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("invalid prefetch queue accepted")
+	}
 }
 
 func TestFileStoreDirectReadModeAndCallerDescriptorLifetime(t *testing.T) {
@@ -556,35 +566,11 @@ func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
 	if err != nil || countMasks(bufferedMasks) != 2 {
 		t.Fatalf("buffered compound masks = (%+v,%v)", bufferedMasks, err)
 	}
-	allocs := testing.AllocsPerRun(100, func() {
-		var runErr error
-		bufferedMasks, runErr = old.AppendIndexMasksInto(
-			bufferedMasks[:0], &indexWorkspace, "tenant_status", acme, active,
-		)
-		if runErr != nil || countMasks(bufferedMasks) != 2 {
-			panic("buffered index probe failed")
-		}
-	})
-	if allocs != 0 {
-		t.Fatalf("warmed AppendIndexMasksInto allocated %.2f times, want 0", allocs)
-	}
 	bufferedMasks, err = old.AppendIndexCandidateMasksInto(
 		bufferedMasks[:0], &indexWorkspace, "tenant_status", acme, active,
 	)
 	if err != nil || countMasks(bufferedMasks) != 2 {
 		t.Fatalf("buffered compound candidates = (%+v,%v)", bufferedMasks, err)
-	}
-	allocs = testing.AllocsPerRun(100, func() {
-		var runErr error
-		bufferedMasks, runErr = old.AppendIndexCandidateMasksInto(
-			bufferedMasks[:0], &indexWorkspace, "tenant_status", acme, active,
-		)
-		if runErr != nil || countMasks(bufferedMasks) != 2 {
-			panic("buffered index candidate probe failed")
-		}
-	})
-	if allocs != 0 {
-		t.Fatalf("warmed AppendIndexCandidateMasksInto allocated %.2f times, want 0", allocs)
 	}
 	if _, err := store.Put("k00", []byte(`{"id":0,"tenant":"acme","status":"idle"}`)); err != nil {
 		t.Fatal(err)
@@ -677,6 +663,30 @@ func TestFileSnapshotRangeMasksRawOrderedAndBuffered(t *testing.T) {
 	if cap(scratch) < 1024 {
 		t.Fatalf("caller overflow scratch capacity = %d, want at least 1024", cap(scratch))
 	}
+
+	var serialKeys []string
+	scratch, err = snapshot.RangeRawBuffer(scratch[:0], func(key, _ []byte) error {
+		serialKeys = append(serialKeys, string(key))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeReadAhead := store.Stats()
+	var readAheadKeys []string
+	scratch, err = snapshot.RangeRawReadAheadBuffer(scratch[:0], func(key, _ []byte) error {
+		readAheadKeys = append(readAheadKeys, string(key))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(readAheadKeys, ","), strings.Join(serialKeys, ","); got != want {
+		t.Fatalf("read-ahead order = %q, want %q", got, want)
+	}
+	if after := store.Stats(); after.PrefetchQueued != beforeReadAhead.PrefetchQueued {
+		t.Fatalf("buffered read-ahead should use the serial kernel-readahead lane: before=%+v after=%+v", beforeReadAhead, after)
+	}
 	if err := snapshot.RangeMasksRaw(
 		[]StoreMask{{Chunk: 2, Bits: 1}, {Chunk: 2, Bits: 2}},
 		func(_, _ []byte) error { return nil },
@@ -700,15 +710,136 @@ func TestFileSnapshotRangeMasksRawOrderedAndBuffered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestFileStoreExactIndexWorkspaceAllocations(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-index-alloc-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testFileStoreOptions()
+	options.BufferCount = 128
+	options.Indexes = []StoreIndexDefinition{
+		{Name: "tenant_status", Paths: []string{"/tenant", "/status"}},
+	}
+	store, err := CreateFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for row := range 8 {
+		document := fmt.Appendf(nil, `{"tenant":"acme","status":"active","row":%d}`, row)
+		if _, err := store.Put(fmt.Sprintf("k%d", row), document); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	needle := func(src string) Index {
+		needed, err := RequiredIndexEntries([]byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		index, err := BuildIndex([]byte(src), make([]IndexEntry, needed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return index
+	}
+	acme, active := needle(`"acme"`), needle(`"active"`)
+	var workspace FileIndexWorkspace
+	masks := make([]StoreMask, 0, 2)
+	masks, err = snapshot.AppendIndexMasksInto(masks, &workspace, "tenant_status", acme, active)
+	if err != nil || len(masks) == 0 {
+		t.Fatalf("warm exact probe = (%+v,%v)", masks, err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		var runErr error
+		masks, runErr = snapshot.AppendIndexMasksInto(masks[:0], &workspace, "tenant_status", acme, active)
+		if runErr != nil || len(masks) == 0 {
+			panic("exact probe failed")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warmed AppendIndexMasksInto allocated %.2f times, want 0", allocs)
+	}
+	masks, err = snapshot.AppendIndexCandidateMasksInto(masks[:0], &workspace, "tenant_status", acme, active)
+	if err != nil || len(masks) == 0 {
+		t.Fatalf("warm candidate probe = (%+v,%v)", masks, err)
+	}
+	allocs = testing.AllocsPerRun(100, func() {
+		var runErr error
+		masks, runErr = snapshot.AppendIndexCandidateMasksInto(masks[:0], &workspace, "tenant_status", acme, active)
+		if runErr != nil || len(masks) == 0 {
+			panic("candidate probe failed")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warmed AppendIndexCandidateMasksInto allocated %.2f times, want 0", allocs)
+	}
+}
+
+func TestFileSnapshotRangeBufferAllocations(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-range-alloc-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	store, err := CreateFileStore(file, testFileStoreOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for row := range 10 {
+		padding := ""
+		if row == 9 {
+			padding = strings.Repeat("x", 1024)
+		}
+		document := fmt.Appendf(nil, `{"row":%d,"padding":%q}`, row, padding)
+		if _, err := store.Put(fmt.Sprintf("k%02d", row), document); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	masks := []StoreMask{{Chunk: 0, Bits: 1<<0 | 1<<3}, {Chunk: 2, Bits: 1 << 1}}
+	scratch := make([]byte, 0, 2048)
+	visitBytes := 0
+	visit := func(key, value []byte) error {
+		visitBytes += len(key) + len(value)
+		return nil
+	}
+	scratch, err = snapshot.RangeMasksRawBuffer(masks, scratch, visit)
+	if err != nil {
+		t.Fatal(err)
+	}
 	allocs := testing.AllocsPerRun(100, func() {
 		visitBytes = 0
 		var runErr error
-		scratch, runErr = snapshot.RangeMasksRawBuffer(steady, scratch[:0], visit)
+		scratch, runErr = snapshot.RangeMasksRawBuffer(masks, scratch[:0], visit)
 		if runErr != nil || visitBytes == 0 {
-			panic("masked buffered range failed")
+			panic("masked range failed")
 		}
 	})
 	if allocs != 0 {
 		t.Fatalf("warmed RangeMasksRawBuffer allocated %.2f times, want 0", allocs)
+	}
+	allocs = testing.AllocsPerRun(100, func() {
+		visitBytes = 0
+		var runErr error
+		scratch, runErr = snapshot.RangeRawReadAheadBuffer(scratch[:0], visit)
+		if runErr != nil || visitBytes == 0 {
+			panic("read-ahead range failed")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warmed RangeRawReadAheadBuffer allocated %.2f times, want 0", allocs)
 	}
 }

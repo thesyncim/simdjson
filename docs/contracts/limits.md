@@ -267,12 +267,20 @@ on an independently owned `O_DIRECT` descriptor; neither changes nor closes the
 caller descriptor. Try may fall back and reports the result in
 `Stats.DirectReads`; Require returns `ErrStoreDirectIOUnsupported`. Direct reads
 retain the same alignment, checksum, identity, and bounded-cache validation.
+`RangeRawReadAheadBuffer` uses this lane to overlap direct document misses. Its
+window is the minimum of one quarter of `ResidentBytes`, `PrefetchQueue`, four
+requests per read worker, and 64 extents. Buffered files retain the serial scan
+and kernel readahead. `Stats.CacheMisses`, `Stats.CoalescedReads`,
+`Stats.ReadErrors`, `Stats.PrefetchHits`, and the queue counters make the
+choice and pressure observable.
 
 The explicit `SIMDJSON_FILESTORE_100X=1` gate covers 21,347,320 source key+JSON
 bytes with a 200,704-byte cache (106.4x), including cold reopen, eviction,
-update, delete, and mutable TTL. That ratio bounds the page arena only. It does
-not include process baseline, commit buffers, kernel/device memory, or the
-caller's output, and it does not promise that cold reads match resident hits.
+an ordered full read-ahead scan, update, delete, and mutable TTL. The scheduled
+Linux job also sets `GOMEMLIMIT=128MiB`. That ratio bounds the page arena only.
+It does not include process baseline, commit buffers, kernel/device memory, or
+the caller's output, and it does not promise that cold reads match resident
+hits.
 
 The caller owns the `*os.File` and spill directory. `FileStore.Close` does not
 close the file and fails while `FileSnapshot` leases remain. `RangeRaw`,

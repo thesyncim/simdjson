@@ -269,9 +269,11 @@ recoverable if the newest data or root write is torn.
 
 The explicit `SIMDJSON_FILESTORE_100X=1` Linux gate stores 21,347,320 source
 key+JSON bytes behind a 200,704-byte page cache (106.4x), reopens twice, and
-checks distant reads, update, delete, and mutable TTL with direct reads active.
-That is a bounded-residency correctness result, not a claim that cold storage
-has resident-memory latency.
+checks a complete ordered read-ahead scan, distant reads, update, delete, and
+mutable TTL with direct reads active. The scan window is bounded by cache
+bytes, queue depth, and read concurrency. The weekly Linux gate runs it with a
+128 MiB Go memory limit. That is a bounded-residency correctness result, not a
+claim that cold storage has resident-memory latency.
 
 `query.Query.RunFileSnapshot` scans physical chunk leaves in order, builds
 bounded batches in parallel, and externally merges ordered rows or grouped

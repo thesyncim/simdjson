@@ -107,6 +107,12 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 	if o.ResidentBytes == 0 {
 		o.ResidentBytes = 64 << 20
 	}
+	if o.ReadConcurrency == 0 {
+		o.ReadConcurrency = 4
+	}
+	if o.PrefetchQueue == 0 {
+		o.PrefetchQueue = 64
+	}
 	if o.MaxKeyBytes == 0 {
 		o.MaxKeyBytes = 256
 	}
@@ -126,8 +132,10 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 		o.PageSize < 4096 || o.PageSize&(o.PageSize-1) != 0 ||
 		o.MaxPageSize < o.PageSize || o.MaxPageSize&(o.MaxPageSize-1) != 0 || o.MaxPageSize%o.PageSize != 0 ||
 		o.MaxKeyBytes < 1 || o.InlineValueBytes < 1 || o.MaxDocumentBytes < 1 ||
-		o.InlineValueBytes > o.MaxDocumentBytes || uint64(o.MaxPageSize) > uint64(^uint32(0)) {
-		return normalizedFileStoreOptions{}, fmt.Errorf("simdjson: invalid FileStore page, key, value, or backend option")
+		o.InlineValueBytes > o.MaxDocumentBytes || uint64(o.MaxPageSize) > uint64(^uint32(0)) ||
+		o.ReadConcurrency < 1 || o.ReadConcurrency > 32768 ||
+		o.PrefetchQueue < 1 || o.PrefetchQueue > 32768 {
+		return normalizedFileStoreOptions{}, fmt.Errorf("simdjson: invalid FileStore page, key, value, backend, or read option")
 	}
 	if len(o.Indexes) > 64 {
 		return normalizedFileStoreOptions{}, fmt.Errorf("%w: FileStore supports at most 64 indexes", ErrStoreIndexDefinition)
@@ -271,6 +279,9 @@ type FileStoreStats struct {
 	PageReads       uint64
 	ReadBytes       uint64
 	CacheHits       uint64
+	CacheMisses     uint64
+	CoalescedReads  uint64
+	ReadErrors      uint64
 	PrefetchHits    uint64
 	Evictions       uint64
 	PrefetchQueued  uint64
@@ -767,133 +778,6 @@ func (s *FileStore) PrefetchKeys(keys []string) (int, error) {
 	return snapshot.PrefetchKeys(keys)
 }
 
-// RangeRaw visits live rows in ascending chunk/slot order. key and value are
-// borrowed only for the callback; overflow values reuse one bounded buffer.
-// Returning an error stops the scan immediately.
-func (s *FileSnapshot) RangeRaw(fn func(key, value []byte) error) error {
-	_, err := s.RangeRawBuffer(nil, fn)
-	return err
-}
-
-// RangeRawBuffer is RangeRaw with caller-owned overflow storage. The returned
-// slice preserves any grown capacity for the next scan. Inline-only scans and
-// warmed overflow scans allocate nothing when scratch has sufficient capacity.
-func (s *FileSnapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte) error) ([]byte, error) {
-	if s == nil || s.store == nil || s.state == nil {
-		return scratch, ErrFileStoreClosed
-	}
-	if fn == nil {
-		return scratch, nil
-	}
-	state := s.state
-	err := storeio.WalkChunkTree(s.store.cache, state.chunkRoot, storeio.ChunkTreeBounds{
-		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-	}, func(chunk uint32, ref storeio.PageRef) error {
-		return s.rangeFileDocumentPage(state, chunk, ref, ^uint64(0), &scratch, fn)
-	})
-	return scratch, err
-}
-
-// RangeMasksRaw visits only the live stable slots named by ordered masks.
-// Masks must be strictly increasing by Chunk; zero and dead bits are ignored.
-// The callback order is identical to filtering RangeRaw, so query execution
-// can push an exact index bound into page reads without changing LIMIT,
-// grouping, or stable tie semantics. Inline key/value slices borrow one cache
-// lease for the callback. One overflow buffer is reused for the complete call.
-func (s *FileSnapshot) RangeMasksRaw(masks []StoreMask, fn func(key, value []byte) error) error {
-	_, err := s.RangeMasksRawBuffer(masks, nil, fn)
-	return err
-}
-
-// RangeMasksRawBuffer is RangeMasksRaw with caller-owned overflow storage.
-// The returned slice preserves capacity even when iteration stops with an
-// error, allowing a retry loop to remain allocation-free.
-func (s *FileSnapshot) RangeMasksRawBuffer(masks []StoreMask, scratch []byte, fn func(key, value []byte) error) ([]byte, error) {
-	if s == nil || s.store == nil || s.state == nil {
-		return scratch, ErrFileStoreClosed
-	}
-	if fn == nil {
-		return scratch, nil
-	}
-	state := s.state
-	bounds := storeio.ChunkTreeBounds{
-		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-	}
-	var previous uint32
-	for i, mask := range masks {
-		if i != 0 && mask.Chunk <= previous {
-			return scratch, ErrStoreMaskOrder
-		}
-		previous = mask.Chunk
-		if mask.Bits == 0 {
-			continue
-		}
-		ref, ok, err := storeio.LookupChunkTree(s.store.cache, state.chunkRoot, mask.Chunk, bounds)
-		if err != nil {
-			return scratch, err
-		}
-		if !ok {
-			return scratch, ErrStoreMaskChunk
-		}
-		if err := s.rangeFileDocumentPage(state, mask.Chunk, ref, mask.Bits, &scratch, fn); err != nil {
-			return scratch, err
-		}
-	}
-	return scratch, nil
-}
-
-func (s *FileSnapshot) rangeFileDocumentPage(
-	state *fileStoreState,
-	chunk uint32,
-	ref storeio.PageRef,
-	mask uint64,
-	overflow *[]byte,
-	fn func(key, value []byte) error,
-) error {
-	lease, err := s.store.cache.Acquire(ref)
-	if err != nil {
-		return err
-	}
-	view, err := storeio.OpenDocumentPageWithOverflow(
-		lease.Page(), state.root.ChunkHighWater, state.root.NextLogicalID,
-		state.super.FileEnd, state.root.PageSize,
-	)
-	if err != nil {
-		lease.Release()
-		return err
-	}
-	if view.Header().ChunkID != chunk {
-		lease.Release()
-		return storeio.ErrDocumentPageCorrupt
-	}
-	for live := view.Header().Live & mask; live != 0; live &= live - 1 {
-		slot := uint8(bits.TrailingZeros64(live))
-		record, ok := view.Lookup(slot)
-		if !ok {
-			lease.Release()
-			return storeio.ErrDocumentPageCorrupt
-		}
-		value := record.JSON
-		if record.Overflow != (storeio.PageRef{}) {
-			*overflow = (*overflow)[:0]
-			*overflow, err = s.store.appendFileValue(*overflow, state, storeio.DocumentValue{
-				Overflow: record.Overflow, Length: record.JSONLength,
-			}, storeio.KeyLocation{Chunk: chunk, Slot: slot})
-			if err != nil {
-				lease.Release()
-				return err
-			}
-			value = *overflow
-		}
-		if err := fn(record.Key, value); err != nil {
-			lease.Release()
-			return err
-		}
-	}
-	lease.Release()
-	return nil
-}
-
 // Len returns the current durable-state key count.
 func (s *FileStore) Len() uint64 {
 	if s == nil || s.state.Load() == nil {
@@ -939,6 +823,7 @@ func (s *FileStore) Stats() FileStoreStats {
 		CapacityBytes: cache.CapacityBytes, ResidentBytes: cache.ResidentBytes,
 		PinnedPages: cache.PinnedPages, DirtyBytes: cache.DirtyBytes,
 		PageReads: cache.PageReads, ReadBytes: cache.ReadBytes, CacheHits: cache.CacheHits,
+		CacheMisses: cache.Misses, CoalescedReads: cache.Coalesced, ReadErrors: cache.ReadErrors,
 		PrefetchHits: cache.PrefetchHits, Evictions: cache.Evictions,
 		PrefetchQueued: cache.PrefetchQueued, PrefetchDropped: cache.PrefetchDropped,
 		ReadQueueDepth:      cache.QueueDepth,

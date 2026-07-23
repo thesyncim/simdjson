@@ -25,15 +25,7 @@ func TestFileStoreHundredXResidentSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer file.Close()
-	options := FileStoreOptions{
-		Store:    StoreOptions{ChunkDocuments: 1},
-		PageSize: 4096, MaxPageSize: 4096, ResidentBytes: 1 << 20,
-		MaxDocumentBytes: 3072, MaxKeyBytes: 32, InlineValueBytes: 3072,
-		ReadConcurrency: 4, PrefetchQueue: 64, BufferCount: 64,
-		QueueSlots: 16, GroupLimit: 8, Backend: FileStoreBackendPortable,
-		ReadMode: FileStoreReadDirectTry, MaxSnapshotLeases: 16,
-		MaxRetiredExtents: 1 << 15,
-	}
+	options := fileStoreScaleOptions()
 	normalized, err := options.normalized()
 	if err != nil {
 		t.Fatal(err)
@@ -78,6 +70,33 @@ func TestFileStoreHundredXResidentSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
+	scanStarted := time.Now()
+	scanRows := 0
+	var scanBytes uint64
+	scanScratch := make([]byte, 0, 3072)
+	scanSnapshot, err := reopened.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanScratch, err = scanSnapshot.RangeRawReadAheadBuffer(scanScratch, func(key, value []byte) error {
+		scanRows++
+		scanBytes += uint64(len(key) + len(value))
+		return nil
+	})
+	if closeErr := scanSnapshot.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanElapsed := time.Since(scanStarted)
+	if scanRows != records || scanBytes != sourceBytes {
+		t.Fatalf("read-ahead scan = %d rows/%d bytes, want %d/%d", scanRows, scanBytes, records, sourceBytes)
+	}
+	scanStats := reopened.Stats()
+	if scanStats.PrefetchQueued == 0 || scanStats.PrefetchHits+scanStats.CoalescedReads == 0 {
+		t.Fatalf("read-ahead scan performed no overlapping reads: %+v", scanStats)
+	}
 	readBuffer := make([]byte, 0, 3072)
 	for _, row := range []int{records - 1, 0, records / 2, 17, records - 101, 1} {
 		key = fmt.Appendf(key[:0], "row:%08d", row)
@@ -139,10 +158,23 @@ func TestFileStoreHundredXResidentSmoke(t *testing.T) {
 	}
 	var memory runtime.MemStats
 	runtime.ReadMemStats(&memory)
-	t.Logf("records=%d source=%d source_ratio=%.1fx file=%d cache=%d file_ratio=%.1fx build=%s heap_alloc=%d reads=%d evictions=%d direct=%v",
+	t.Logf("records=%d source=%d source_ratio=%.1fx file=%d cache=%d file_ratio=%.1fx elapsed=%s scan=%s scan_mib_s=%.1f heap_alloc=%d reads=%d evictions=%d direct=%v",
 		records, sourceBytes, float64(sourceBytes)/float64(stats.CapacityBytes), stats.FileEnd, stats.CapacityBytes,
 		float64(stats.FileEnd)/float64(stats.CapacityBytes),
-		time.Since(started), memory.HeapAlloc, stats.PageReads, stats.Evictions, stats.DirectReads)
+		time.Since(started), scanElapsed, float64(sourceBytes)/(1<<20)/scanElapsed.Seconds(),
+		memory.HeapAlloc, stats.PageReads, stats.Evictions, stats.DirectReads)
+}
+
+func fileStoreScaleOptions() FileStoreOptions {
+	return FileStoreOptions{
+		Store:    StoreOptions{ChunkDocuments: 1},
+		PageSize: 4096, MaxPageSize: 4096, ResidentBytes: 1 << 20,
+		MaxDocumentBytes: 3072, MaxKeyBytes: 32, InlineValueBytes: 3072,
+		ReadConcurrency: 4, PrefetchQueue: 64, BufferCount: 64,
+		QueueSlots: 16, GroupLimit: 8, Backend: FileStoreBackendPortable,
+		ReadMode: FileStoreReadDirectTry, MaxSnapshotLeases: 16,
+		MaxRetiredExtents: 1 << 15,
+	}
 }
 
 func appendFileStoreScaleDocument(dst []byte, row int, updated bool) []byte {

@@ -375,6 +375,14 @@ unowned `RawValue`. `AppendRaw` is zero-allocation on a resident inline hit
 when the destination has capacity. `RangeRaw` visits chunk/slot order with one
 document lease at a time. `RangeRawBuffer` also accepts and returns the one
 reusable overflow buffer, making warmed overflow scans allocation-free.
+`RangeRawReadAheadBuffer` is the cold `O_DIRECT` scan lane: it discovers a
+bounded chunk-ordered window, submits those extents in physical order, and
+still invokes callbacks in exact chunk/slot order. The window consumes at most
+one quarter of the resident budget, four requests per read worker, 64 extents,
+and the configured prefetch queue. Buffered files stay on the serial lane so
+user-space scheduling does not fight kernel readahead. The prefetch worker
+queue closes under the same admission lock as nonblocking submission, avoiding
+per-wakeup heap objects while making shutdown race-free.
 `RangeMasksRawBuffer` applies strictly ordered sparse stable-slot masks and
 preserves exactly the order a filtered full scan would have produced. Dead and
 zero bits cannot invent rows; a non-zero unknown chunk fails closed instead of
@@ -502,9 +510,10 @@ have separate finite options. This makes a 1 TiB file structurally possible; it
 does not establish acceptable performance. The explicit Linux storage-pressure
 gate now places 21,347,320 source key+JSON bytes behind a 200,704-byte cache
 (106.4x); the physical high-water is 120,057,856 bytes. It reopens twice and
-checks distant reads, update, delete, and a changed TTL under eviction with
-`O_DIRECT` active. On the Docker Linux run used for this phase it completed in
-8.58 seconds. Run it with:
+checks a complete ordered scan, distant reads, update, delete, and a changed TTL
+under eviction with `O_DIRECT` active. In a 256 MiB Docker/Linux container it
+completed in 9.06 seconds; the 21,347,320-byte scan took 287.5 ms (70.8 MiB/s)
+and the Go heap sample was 3.50 MiB. Run it with:
 
 ```text
 SIMDJSON_FILESTORE_100X=1 \
@@ -518,6 +527,13 @@ cold random access pays storage latency, and copy-on-write generations,
 allocator rounding, overflow pages, index cardinality, and free-space headroom
 add disk amplification. A 1 TiB deployment still needs workload-specific RSS,
 page-fault, amplification, latency-percentile, and fragmentation measurements.
+
+The same Linux/ARM64 container, 2,048 inline documents and a 200,704-byte cache
+measured serial direct scans at 61.3-68.4 MiB/s and bounded read-ahead at
+72.3-76.0 MiB/s, with median throughput about 16% higher across three runs.
+Both paths measured 0 B/op and 0 allocs/op after warmup. This is directional
+local evidence, not a portable latency guarantee; the benchmark skips the
+read-ahead sample when direct I/O is not actually active.
 
 ## TTL
 

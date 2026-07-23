@@ -453,15 +453,24 @@ flush tests, allocation checks, long-lived-snapshot reclamation/file-growth
 tests, page corruption tests, crash images that tear data and root writes,
 direct-read descriptor tests, and an explicit greater-than-cache gate. The
 latter stores 21,347,320 source key+JSON bytes behind 200,704 resident page
-bytes (106.4x), reopens twice, probes distant keys, and preserves update,
-delete, and changed TTL. Its Docker Linux run used `O_DIRECT`, reached a
-120,057,856-byte physical high-water, and completed in 8.58 seconds. It runs
-with:
+bytes (106.4x), reopens twice, performs an ordered full scan, probes distant
+keys, and preserves update, delete, and changed TTL. Its 256 MiB Docker/Linux
+run used `O_DIRECT`, reached a 120,057,856-byte physical high-water, and
+completed in 9.06 seconds. The 21,347,320-byte scan took 287.5 ms at
+70.8 MiB/s, with a 3.50 MiB sampled Go heap. It runs with:
 
 ```text
 SIMDJSON_FILESTORE_100X=1 \
   go test . -run '^TestFileStoreHundredXResidentSmoke$' -v -count=1
 ```
+
+Direct full scans use a chunk-ordered read-ahead window bounded by one quarter
+of cache bytes, the configured queue, four requests per worker, and 64 extents.
+Extents are submitted in physical order while callbacks remain logically
+ordered. Buffered files stay serial and use kernel readahead. On the same
+Linux/ARM64 container, a 2,048-document pressure benchmark improved from
+61.3-68.4 MiB/s to 72.3-76.0 MiB/s, about 16% at the three-run medians, with
+0 B/op and 0 allocs/op on both paths.
 
 The full race suite and portable Linux/Windows compile checks are release gates.
 

@@ -188,16 +188,15 @@ type PageCache struct {
 	tombs   int
 	hand    int
 
-	mu          sync.Mutex
-	cond        *sync.Cond
-	closing     atomic.Bool
-	closed      bool
-	activeLoads int
-	stopOnce    sync.Once
-	stop        chan struct{}
-	prefetch    chan PageRef
-	done        chan struct{}
-	workers     sync.WaitGroup
+	mu                sync.Mutex
+	cond              *sync.Cond
+	closing           atomic.Bool
+	closed            bool
+	activeLoads       int
+	prefetchCloseOnce sync.Once
+	prefetch          chan PageRef
+	done              chan struct{}
+	workers           sync.WaitGroup
 
 	pageReads       uint64
 	readBytes       uint64
@@ -232,7 +231,6 @@ func NewPageCache(file *os.File, options PageCacheOptions) (*PageCache, error) {
 		options:  normalized,
 		arena:    arena,
 		frames:   make([]pageCacheFrame, slotCount),
-		stop:     make(chan struct{}),
 		prefetch: make(chan PageRef, normalized.PrefetchQueue),
 		done:     make(chan struct{}),
 	}
@@ -935,29 +933,18 @@ func (c *PageCache) Prefetch(refs []PageRef) (int, error) {
 		previousEnd = ref.Offset + uint64(ref.Length)
 	}
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.closing.Load() || c.closed {
-		c.mu.Unlock()
 		return 0, ErrPageCacheClosed
 	}
-	c.mu.Unlock()
-
 	queued := 0
 	for _, ref := range refs {
 		select {
-		case <-c.stop:
-			return queued, ErrPageCacheClosed
-		default:
-		}
-		select {
 		case c.prefetch <- ref:
 			queued++
-			c.mu.Lock()
 			c.prefetchQueued++
-			c.mu.Unlock()
 		default:
-			c.mu.Lock()
 			c.prefetchDropped += uint64(len(refs) - queued)
-			c.mu.Unlock()
 			return queued, nil
 		}
 	}
@@ -966,18 +953,8 @@ func (c *PageCache) Prefetch(refs []PageRef) (int, error) {
 
 func (c *PageCache) runPrefetch() {
 	defer c.workers.Done()
-	for {
-		select {
-		case <-c.stop:
-			return
-		default:
-		}
-		select {
-		case <-c.stop:
-			return
-		case ref := <-c.prefetch:
-			_, _ = c.load(ref, false, true)
-		}
+	for ref := range c.prefetch {
+		_, _ = c.load(ref, false, true)
 	}
 }
 
@@ -1054,7 +1031,7 @@ func (c *PageCache) Close() error {
 		c.mu.Unlock()
 		return nil
 	}
-	c.stopOnce.Do(func() { close(c.stop) })
+	c.prefetchCloseOnce.Do(func() { close(c.prefetch) })
 	c.cond.Broadcast()
 	c.mu.Unlock()
 	<-c.done

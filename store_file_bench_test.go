@@ -107,6 +107,87 @@ func BenchmarkFileSnapshotRangeRaw(b *testing.B) {
 	}
 }
 
+func BenchmarkFileSnapshotRangeRawPressure(b *testing.B) {
+	const records = 2048
+	file, err := os.CreateTemp(b.TempDir(), "file-store-range-pressure-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer file.Close()
+	options := fileStoreScaleOptions()
+	normalized, err := options.normalized()
+	if err != nil {
+		b.Fatal(err)
+	}
+	options.ResidentBytes = int64(normalized.maxTransactionBytes)
+	store, err := CreateFileStore(file, options)
+	if err != nil {
+		b.Fatal(err)
+	}
+	key := make([]byte, 0, 32)
+	document := make([]byte, 0, 3072)
+	var sourceBytes int64
+	for row := range records {
+		key = fmt.Appendf(key[:0], "row:%08d", row)
+		document = appendFileStoreScaleDocument(document[:0], row, false)
+		sourceBytes += int64(len(key) + len(document))
+		if _, err := store.Put(string(key), document); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		b.Fatal(err)
+	}
+
+	for _, readAhead := range []bool{false, true} {
+		name := "serial"
+		if readAhead {
+			name = "read_ahead"
+		}
+		b.Run(name, func(b *testing.B) {
+			store, err := OpenFileStore(file, options)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer store.Close()
+			snapshot, err := store.Snapshot()
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer snapshot.Close()
+			if readAhead && !store.Stats().DirectReads {
+				b.Skip("read-ahead pressure benchmark requires active O_DIRECT")
+			}
+			visit := func(_, value []byte) error {
+				fileStoreBytesSink = value
+				return nil
+			}
+			var scratch []byte
+			if readAhead {
+				scratch, err = snapshot.RangeRawReadAheadBuffer(scratch[:0], visit)
+			} else {
+				scratch, err = snapshot.RangeRawBuffer(scratch[:0], visit)
+			}
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.SetBytes(sourceBytes)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if readAhead {
+					scratch, err = snapshot.RangeRawReadAheadBuffer(scratch[:0], visit)
+				} else {
+					scratch, err = snapshot.RangeRawBuffer(scratch[:0], visit)
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkFileSnapshotAppendIndexMasks(b *testing.B) {
 	file, err := os.CreateTemp(b.TempDir(), "file-store-index-benchmark-*")
 	if err != nil {
