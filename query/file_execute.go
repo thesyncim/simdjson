@@ -162,7 +162,35 @@ func normalizeFileOptions(opts FileExecutionOptions) (normalizedFileOptions, err
 // time. Returned cells own their bytes and remain valid after the snapshot is
 // closed. The snapshot remains owned by the caller.
 func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecutionOptions) (Result, FileExecutionStats, error) {
-	var result Result
+	return q.runFileSnapshot(Result{}, snapshot, opts)
+}
+
+// RunFileSnapshotInto executes q into caller-owned result storage. Repeated
+// calls reuse the Result's column cells and packed variable-width value arena;
+// once their observed high-water marks fit, result materialization allocates
+// nothing. The returned cells remain valid after snapshot close and until dst
+// is reused or released. dst is single-consumer and must be non-nil.
+func (q *Query) RunFileSnapshotInto(
+	dst *Result,
+	snapshot *simdjson.FileSnapshot,
+	opts FileExecutionOptions,
+) (FileExecutionStats, error) {
+	if dst == nil {
+		return FileExecutionStats{}, fmt.Errorf(
+			"query: RunFileSnapshotInto requires a non-nil Result",
+		)
+	}
+	result, stats, err := q.runFileSnapshot(*dst, snapshot, opts)
+	*dst = result
+	return stats, err
+}
+
+func (q *Query) runFileSnapshot(
+	result Result,
+	snapshot *simdjson.FileSnapshot,
+	opts FileExecutionOptions,
+) (Result, FileExecutionStats, error) {
+	result.fileData = result.fileData[:0]
 	n, err := normalizeFileOptions(opts)
 	if err != nil {
 		return result, FileExecutionStats{}, err
@@ -176,9 +204,8 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 	}
 	stats := FileExecutionStats{Workers: n.workers, RowsTotal: snapshot.Len()}
 	fileWorkspace := opts.Workspace
-	var localWorkspace FileExecutionWorkspace
 	if fileWorkspace == nil {
-		fileWorkspace = &localWorkspace
+		fileWorkspace = new(FileExecutionWorkspace)
 	}
 	directIndex, handled, directErr := p.runDirectFileIndexedCount(&result, snapshot, fileWorkspace)
 	if handled {
@@ -209,6 +236,21 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 		stats.IndexGroups = groupStats.groups
 		return result, stats, directErr
 	}
+	return p.runFileSnapshotBatched(
+		result, snapshot, fileWorkspace, n, stats,
+	)
+}
+
+// runFileSnapshotBatched is kept outside the direct covering dispatcher so
+// goroutine captures in the general executor cannot force the fast path's
+// stats and fallback workspace onto the heap.
+func (p *plan) runFileSnapshotBatched(
+	result Result,
+	snapshot *simdjson.FileSnapshot,
+	fileWorkspace *FileExecutionWorkspace,
+	n normalizedFileOptions,
+	stats FileExecutionStats,
+) (Result, FileExecutionStats, error) {
 	candidateMasks, err := p.fileCandidateMasks(snapshot, &fileWorkspace.index, &fileWorkspace.planner)
 	if err != nil {
 		return result, stats, err
@@ -380,13 +422,13 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 			if err != nil {
 				return result, stats, err
 			}
-			return p.fileGroupResult(merged), stats, nil
+			return p.fileGroupResultInto(result, merged), stats, nil
 		}
 		merged := make([]fileGroup, 0, len(groups))
 		for _, g := range groups {
 			merged = append(merged, *g)
 		}
-		return p.fileGroupResult(merged), stats, nil
+		return p.fileGroupResultInto(result, merged), stats, nil
 	case p.singleRow:
 		if accs == nil {
 			accs = make([]aggAcc, len(p.columns))
@@ -426,7 +468,7 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 		if limit := p.resultLimit(); limit >= 0 && len(rows) > limit {
 			rows = rows[:limit]
 		}
-		return p.fileRowResult(rows), stats, nil
+		return p.fileRowResultInto(result, rows), stats, nil
 	}
 }
 
@@ -730,18 +772,19 @@ func (p *plan) resultLimit() int {
 	return -1
 }
 
-func (p *plan) fileRowResult(rows []fileRow) Result {
-	var result Result
+func (p *plan) fileRowResultInto(result Result, rows []fileRow) Result {
 	prepareResult(&result, p, len(rows))
 	for row := range rows {
 		for col := range p.columns {
-			result.Columns[col].Cells[row] = cellFromScalar(rows[row].values[col])
+			result.Columns[col].Cells[row] = result.ownFileCell(
+				cellFromScalar(rows[row].values[col]),
+			)
 		}
 	}
 	return result
 }
 
-func (p *plan) fileGroupResult(groups []fileGroup) Result {
+func (p *plan) fileGroupResultInto(result Result, groups []fileGroup) Result {
 	if len(p.order) != 0 {
 		slices.SortStableFunc(groups, p.compareFileGroups)
 	} else {
@@ -759,12 +802,16 @@ func (p *plan) fileGroupResult(groups []fileGroup) Result {
 	if p.hasLimit && len(groups) > p.limit {
 		groups = groups[:p.limit]
 	}
-	var result Result
 	prepareResult(&result, p, len(groups))
 	var w Workspace
 	for row := range groups {
 		g := group{scalars: groups[row].scalars, accs: groups[row].accs}
 		p.fillAggregateCells(&result, row, g.accs, &g, &w)
+		for column := range result.Columns {
+			result.Columns[column].Cells[row] = result.ownFileCell(
+				result.Columns[column].Cells[row],
+			)
+		}
 	}
 	return result
 }

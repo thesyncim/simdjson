@@ -227,7 +227,11 @@ func TestFileStoreSynchronousWritersShareDurabilityFence(t *testing.T) {
 	}
 	stats := store.Stats()
 	if stats.DocumentCount != writers || stats.CommittedBatches != writers+1 ||
-		stats.LargestCommitGroup < 2 || stats.DurableGeneration != stats.PublishedGeneration {
+		stats.LargestCommitGroup < 2 ||
+		stats.DurableGeneration != stats.PublishedGeneration ||
+		stats.SuppressedRootWrites == 0 ||
+		stats.SuppressedRootBytes !=
+			stats.SuppressedRootWrites*uint64(options.PageSize) {
 		t.Fatalf("synchronous group commit did not converge: %+v", stats)
 	}
 	if err := store.Close(); err != nil {

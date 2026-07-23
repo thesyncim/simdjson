@@ -278,12 +278,24 @@ is retired only after its final mapping is peeled.
 
 An untouched compact generation also carries a small catalog of physically
 contiguous, value-only scan stripes. Predicate-free covered aggregates bypass
-the chunk tree, JSON, masks, and document I/O. The first insert, replacement,
-or delete atomically clears and retires that clean shortcut, then uses the
-authoritative sidecar/document overlay path. Recompacting restores it. Both
-paths are checksummed, pointer-free on disk, exact-bit deterministic across
-portable and Go-native SIMD reducers, and zero-allocation with warmed
-caller-owned buffers.
+the chunk tree, JSON, masks, and document I/O. A replacement that leaves every
+configured numeric projection unchanged reuses the scan byte-for-byte. A
+changed value or delete in a head-catalog stripe rebuilds only that bounded
+stripe and one mutable catalog page; every other stripe remains shared.
+Inserts, an emptied/oversized stripe, or a target in a later catalog page
+atomically retire the shortcut and use the authoritative sidecar/document
+path. Recompacting restores it. Both paths are checksummed, pointer-free on
+disk, exact-bit deterministic across portable and Go-native SIMD reducers,
+and zero-allocation with warmed caller-owned buffers.
+
+Compact generations also derive aggregate-only categorical covers from
+eligible single-column exact indexes. Low-cardinality one-page covers are
+maintained transactionally across ordinary scalar inserts, updates, and
+deletes; semantic no-ops reuse the page. High-cardinality covers stream across
+bounded linked pages rather than forcing one giant extent. Their first
+document mutation currently retires the immutable chain and falls back to
+certified postings. Neither form adds per-row pointers or duplicates posting
+state.
 
 `FileStore` opens from bounded root/page scratch instead of walking the corpus.
 Its CLOCK arena is divided into 4 KiB allocation quanta: a metadata page uses
@@ -314,6 +326,11 @@ background group-commit window without delaying async publication.
 `Synchronous` waits on each mutation, but waits outside serialized page
 construction so concurrent durable writers can share a fence. Close blocks
 new construction and drains those waiters before releasing I/O resources.
+Within a grouped commit, only the newest state-root page can be selected by the
+newest superblock; earlier state-root writes are therefore suppressed while
+all data pages remain durable for live intermediate snapshots.
+`Stats.SuppressedRootWrites` and `SuppressedRootBytes` expose that saved write
+amplification.
 `Stats.CommitCapacityBytes` reports the complete fixed staging arena, including
 mmap-backed bytes outside Go heap accounting.
 The reusable-extent directory is likewise a fixed pointer-free arena and lives
@@ -482,7 +499,7 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Compact durable bytes, 5M-row capacity smoke | 1.555 GiB (0.813x key+JSON), 31.85% larger than the 1.18 GiB DuckDB checkpoint; the stripe costs 2.39 MiB |
 | Recovered exact filter, 5M-row capacity smoke | 4.376 ms, 540 posting pages, 0 JSON rows/rechecks, 5.60x faster in a cross-OS mechanism smoke, not a machine race |
 | Recovered scalar-object `@>`, 5M-row capacity smoke | 4.486 ms, 540 posting pages, 0 JSON rows/rechecks, 313.9x faster in the same cross-OS capacity smoke |
-| Clean exact-index grouping, 100K rows / 32 groups | 8.88-9.09 us, 0 posting or JSON pages; about 1,470x faster than the former posting-stream lane |
+| Clean exact-index grouping into a reused result, 100K rows / 32 groups | 4.586-4.620 us, 0 B/op, 0 allocs/op, and 0 posting or JSON pages |
 | Real-derived grouping, 128 MiB | CITM 542 ns / Twitter 792 ns, 821.19x / 347.22x faster than retained pinned one-thread DuckDB; one added 4 KiB catalog page per file |
 | Real-derived Twitter, 128 MiB | point 14.76x, filter 2.72x, SUM 2.97x, scalar-object `@>` 91.25x versus pinned one-thread DuckDB; FileStore file 1.48x larger |
 | Dense Store fused 3-predicate bitmap / ordered 4,096-row decode | 410-416 ns / 4.03-4.08 us, 0 allocations |

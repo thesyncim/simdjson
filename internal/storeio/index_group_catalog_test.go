@@ -23,7 +23,10 @@ func TestIndexGroupCatalogRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := OpenIndexGroupCatalog(encoded, 3, 1, 8)
+	view, err := OpenIndexGroupCatalog(
+		encoded, 3, 1, 8, 64*uint64(testSuperblockPageSize), 32,
+		testSuperblockPageSize,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +51,10 @@ func TestIndexGroupCatalogRoundTrip(t *testing.T) {
 		); encodeErr != nil {
 			panic(encodeErr)
 		}
-		if _, openErr := OpenIndexGroupCatalog(page, 3, 1, 8); openErr != nil {
+		if _, openErr := OpenIndexGroupCatalog(
+			page, 3, 1, 8, 64*uint64(testSuperblockPageSize), 32,
+			testSuperblockPageSize,
+		); openErr != nil {
 			panic(openErr)
 		}
 	})
@@ -61,13 +67,101 @@ func TestIndexGroupCatalogRoundTrip(t *testing.T) {
 	if _, err := SealPage(corrupt); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenIndexGroupCatalog(corrupt, 3, 1, 8); !errors.Is(err, ErrIndexGroupCatalogCorrupt) {
+	if _, err := OpenIndexGroupCatalog(
+		corrupt, 3, 1, 8, 64*uint64(testSuperblockPageSize), 32,
+		testSuperblockPageSize,
+	); !errors.Is(err, ErrIndexGroupCatalogCorrupt) {
 		t.Fatalf("resealed count corruption = %v, want %v", err, ErrIndexGroupCatalogCorrupt)
 	}
+	corrupt = append(corrupt[:0], encoded...)
+	lengthAt := PageHeaderSize +
+		IndexGroupCatalogPayloadHeaderSize + 4
+	binary.LittleEndian.PutUint32(
+		corrupt[lengthAt:lengthAt+4], ^uint32(0),
+	)
+	if _, err := SealPage(corrupt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenIndexGroupCatalog(
+		corrupt, 3, 1, 8, 64*uint64(testSuperblockPageSize), 32,
+		testSuperblockPageSize,
+	); !errors.Is(err, ErrIndexGroupCatalogCorrupt) {
+		t.Fatalf(
+			"resealed length corruption = %v, want %v",
+			err, ErrIndexGroupCatalogCorrupt,
+		)
+	}
 	for cut := 0; cut < len(encoded); cut++ {
-		if _, err := OpenIndexGroupCatalog(encoded[:cut], 3, 1, 8); !errors.Is(err, ErrIndexGroupCatalogCorrupt) {
+		if _, err := OpenIndexGroupCatalog(
+			encoded[:cut], 3, 1, 8, 64*uint64(testSuperblockPageSize), 32,
+			testSuperblockPageSize,
+		); !errors.Is(err, ErrIndexGroupCatalogCorrupt) {
 			t.Fatalf("cut %d = %v, want %v", cut, err, ErrIndexGroupCatalogCorrupt)
 		}
+	}
+}
+
+func TestSegmentedIndexGroupCatalogRoundTrip(t *testing.T) {
+	next := PageRef{
+		Offset:    10 * uint64(testSuperblockPageSize),
+		LogicalID: 12, Generation: 7,
+		Length: testSuperblockPageSize, Kind: PageIndexGroupCatalog,
+	}
+	header := IndexGroupCatalogHeader{
+		StoreID: testStoreID, Generation: 7, LogicalID: 11,
+		PageSize: testSuperblockPageSize, CoveredIndexes: 0b11,
+		DocumentCount: 10, Next: next,
+	}
+	entries := []IndexGroupCatalogEntry{
+		{IndexID: 0, Value: []byte(`"a"`), Count: 3, First: 0},
+		{IndexID: 0, Value: []byte(`"b"`), Count: 2, First: 1},
+	}
+	page := make([]byte, testSuperblockPageSize)
+	encoded, err := EncodeSegmentedIndexGroupCatalogPage(
+		page, header, entries, 2, 2, 8,
+		64*uint64(testSuperblockPageSize), 32,
+		testSuperblockPageSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := OpenIndexGroupCatalog(
+		encoded, 2, 2, 8,
+		64*uint64(testSuperblockPageSize), 32,
+		testSuperblockPageSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !view.Segmented() || view.Header() != header ||
+		view.Len() != len(entries) {
+		t.Fatalf(
+			"segmented catalog = (%v,%+v,%d), want (true,%+v,%d)",
+			view.Segmented(), view.Header(), view.Len(),
+			header, len(entries),
+		)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		if _, encodeErr := EncodeSegmentedIndexGroupCatalogPage(
+			page, header, entries, 2, 2, 8,
+			64*uint64(testSuperblockPageSize), 32,
+			testSuperblockPageSize,
+		); encodeErr != nil {
+			panic(encodeErr)
+		}
+		opened, openErr := OpenIndexGroupCatalog(
+			page, 2, 2, 8,
+			64*uint64(testSuperblockPageSize), 32,
+			testSuperblockPageSize,
+		)
+		if openErr != nil || !opened.Segmented() {
+			panic("segmented catalog open")
+		}
+	}); allocs != 0 {
+		t.Fatalf(
+			"segmented catalog warm allocations = %.2f, want zero",
+			allocs,
+		)
 	}
 }
 

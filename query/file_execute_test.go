@@ -87,6 +87,11 @@ func TestRunFileSnapshotParallelSpillDifferential(t *testing.T) {
 
 func TestRunFileSnapshotOptions(t *testing.T) {
 	q := Select(Count())
+	if _, err := q.RunFileSnapshotInto(
+		nil, nil, FileExecutionOptions{},
+	); err == nil {
+		t.Fatal("nil reusable result accepted")
+	}
 	if _, _, err := q.RunFileSnapshot(nil, FileExecutionOptions{}); err == nil {
 		t.Fatal("nil snapshot accepted")
 	}
@@ -342,6 +347,190 @@ func TestRunFileSnapshotIndexCatalogScalarGroups(t *testing.T) {
 		stats.IndexGroupedRows != 6 || stats.IndexGroups != 3 ||
 		stats.Batches != 0 || stats.BufferedBytes != 0 {
 		t.Fatalf("index catalog group stats = %+v", stats)
+	}
+	var reusable Result
+	execution := FileExecutionOptions{
+		Workers: 4, MemoryBytes: 64 << 10, Workspace: &workspace,
+	}
+	if _, err := q.RunFileSnapshotInto(
+		&reusable, snapshot, execution,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var reuseStats FileExecutionStats
+	allocs := testing.AllocsPerRun(100, func() {
+		reuseStats, err = q.RunFileSnapshotInto(
+			&reusable, snapshot, execution,
+		)
+		if err != nil || reusable.RowCount != 3 {
+			panic("reusable index catalog groups")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf(
+			"reusable index catalog result allocations = %.2f, want zero",
+			allocs,
+		)
+	}
+	if gotKey, wantKey := resultKey(reusable), resultKey(want); gotKey != wantKey {
+		t.Fatalf(
+			"reusable index catalog groups mismatch:\n got: %s\nwant: %s",
+			gotKey, wantKey,
+		)
+	}
+	if reuseStats.IndexPostingPages != 0 ||
+		reuseStats.IndexGroupedRows != 6 {
+		t.Fatalf("reusable index catalog stats = %+v", reuseStats)
+	}
+	reusable.Release()
+	if reusable.RowCount != 0 || reusable.Columns != nil {
+		t.Fatalf("released result = %+v", reusable)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A non-first scalar mutation transactionally rewrites the bounded
+	// catalog, so the O(groups) query lane survives ordinary churn.
+	mutated := []byte(`{"profile":{"kind":"b"}}`)
+	if created, err := store.Put("k1", mutated); err != nil || created {
+		t.Fatalf("mutate covered group = (%v,%v)", created, err)
+	}
+	mutatedSet := &simdjson.DocSet{ShapeTapes: true}
+	for row, document := range documents {
+		raw := []byte(document)
+		if row == 1 {
+			raw = mutated
+		}
+		if _, err := mutatedSet.Append(raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	current, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer current.Close()
+	want, err = q.Run(mutatedSet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, stats, err = q.RunFileSnapshot(current, FileExecutionOptions{
+		Workers: 4, MemoryBytes: 64 << 10, Workspace: &workspace,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotKey, wantKey := resultKey(got), resultKey(want); gotKey != wantKey {
+		t.Fatalf(
+			"incremental catalog groups mismatch:\n got: %s\nwant: %s",
+			gotKey, wantKey,
+		)
+	}
+	if stats.RowsTotal != 6 || stats.RowsScanned != 0 ||
+		stats.IndexLookups != 1 || stats.IndexPostingPages != 0 ||
+		stats.IndexCertificateRows != 6 || stats.IndexRecheckRows != 0 ||
+		stats.IndexGroupedRows != 6 || stats.IndexGroups != 4 {
+		t.Fatalf("incremental catalog group stats = %+v", stats)
+	}
+}
+
+func TestRunFileSnapshotSegmentedIndexCatalogScalarGroups(t *testing.T) {
+	const documents = 256
+	builder, err := simdjson.NewStoreBuilder(simdjson.StoreOptions{
+		ChunkDocuments: 8, ShapeTapes: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row := range documents {
+		if err := builder.Append(
+			fmt.Sprintf("k%03d", row),
+			fmt.Appendf(nil, `{"kind":"value-%03d"}`, row),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(
+		t.TempDir(), "query-file-index-segmented-groups-*",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := simdjson.FileStoreOptions{
+		Store: simdjson.StoreOptions{
+			ChunkDocuments: 8, ShapeTapes: true,
+		},
+		Indexes: []simdjson.StoreIndexDefinition{{
+			Name: "kind", Paths: []string{"/kind"},
+		}},
+		PageSize: 4096, MaxPageSize: 4096,
+		MaxKeyBytes: 32, InlineValueBytes: 128,
+		MaxDocumentBytes: 1024, Synchronous: true,
+	}
+	if _, err := source.WriteFileStore(file, options); err != nil {
+		t.Fatal(err)
+	}
+	store, err := simdjson.OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+
+	q := Select(Path("kind"), Count()).
+		GroupBy("kind").
+		OrderBy("kind", Asc)
+	execution := FileExecutionOptions{
+		Workers: 1, MemoryBytes: 64 << 10,
+		Workspace: &FileExecutionWorkspace{},
+	}
+	var result Result
+	stats, err := q.RunFileSnapshotInto(
+		&result, snapshot, execution,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RowCount != documents || stats.RowsScanned != 0 ||
+		stats.IndexPostingPages != 0 ||
+		stats.IndexGroupedRows != documents ||
+		stats.IndexGroups != documents {
+		t.Fatalf(
+			"segmented query = rows %d stats %+v",
+			result.RowCount, stats,
+		)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		stats, err = q.RunFileSnapshotInto(
+			&result, snapshot, execution,
+		)
+		if err != nil || result.RowCount != documents {
+			panic("segmented file query")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf(
+			"segmented query warm allocations = %.2f, want zero",
+			allocs,
+		)
+	}
+	first, ok := result.Columns[0].Cells[0].Text()
+	if !ok || first != "value-000" {
+		t.Fatalf("segmented first group = (%q,%v)", first, ok)
+	}
+	last, ok := result.Columns[0].Cells[documents-1].Text()
+	if !ok || last != "value-255" {
+		t.Fatalf("segmented last group = (%q,%v)", last, ok)
 	}
 }
 
@@ -689,7 +878,7 @@ func BenchmarkRunFileSnapshotParallelAggregate(b *testing.B) {
 	}
 }
 
-func BenchmarkRunFileSnapshotIndexNativeScalarGroups(b *testing.B) {
+func BenchmarkRunFileSnapshotIntoIndexNativeScalarGroups(b *testing.B) {
 	const documents = 100_000
 	builder, err := simdjson.NewStoreBuilder(simdjson.StoreOptions{
 		ChunkDocuments: 8, ShapeTapes: true,
@@ -740,7 +929,10 @@ func BenchmarkRunFileSnapshotIndexNativeScalarGroups(b *testing.B) {
 	execution := FileExecutionOptions{
 		Workers: 1, MemoryBytes: 64 << 20, Workspace: &FileExecutionWorkspace{},
 	}
-	if _, stats, err := query.RunFileSnapshot(snapshot, execution); err != nil {
+	var result Result
+	if stats, err := query.RunFileSnapshotInto(
+		&result, snapshot, execution,
+	); err != nil {
 		b.Fatal(err)
 	} else if stats.RowsScanned != 0 || stats.IndexGroupedRows != documents {
 		b.Fatalf("group benchmark stats = %+v", stats)
@@ -749,9 +941,13 @@ func BenchmarkRunFileSnapshotIndexNativeScalarGroups(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		result, _, err := query.RunFileSnapshot(snapshot, execution)
-		if err != nil || result.RowCount != 32 {
-			b.Fatalf("group benchmark = rows %d err %v", result.RowCount, err)
+		if _, err := query.RunFileSnapshotInto(
+			&result, snapshot, execution,
+		); err != nil || result.RowCount != 32 {
+			b.Fatalf(
+				"group benchmark = rows %d err %v",
+				result.RowCount, err,
+			)
 		}
 	}
 }

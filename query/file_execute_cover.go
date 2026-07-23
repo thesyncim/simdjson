@@ -161,12 +161,12 @@ func (p *plan) runDirectFileAggregate(
 }
 
 // runDirectFileIndexGroups lowers an unfiltered scalar COUNT GROUP BY to a
-// matching single-column exact index. An untouched compact generation can
-// answer from one O(groups) aggregate catalog page. Otherwise stable-slot
-// postings and their exact representatives decide certified rows; missing,
-// container, legacy, and collision-marked rows form a residual bitmap and
-// take the ordinary compiled-pointer path. Both lanes preserve exact group
-// semantics and first-row ordering.
+// matching single-column exact index. A compact generation can answer from
+// bounded O(groups) aggregate catalog pages. Otherwise stable-slot postings
+// and their exact representatives decide certified rows; missing, container,
+// legacy, and collision-marked rows form a residual bitmap and take the
+// ordinary compiled-pointer path. Both lanes preserve exact group semantics
+// and first-row ordering.
 func (p *plan) runDirectFileIndexGroups(
 	dst *Result,
 	snapshot *simdjson.FileSnapshot,
@@ -240,7 +240,9 @@ func (p *plan) runDirectFileIndexGroups(
 			group := &w.fileGroups[id]
 			group.key = ""
 			group.scalars = resize(group.scalars, 1)
-			group.scalars[0] = ownScalar(value)
+			// The scalar borrows the file execution workspace only until
+			// fileGroupResultInto packs it into caller-owned Result storage.
+			group.scalars[0] = value
 			group.accs = resize(group.accs, len(p.columns))
 			clear(group.accs)
 			group.first = first
@@ -285,6 +287,6 @@ func (p *plan) runDirectFileIndexGroups(
 	}
 	w.fileGroups = w.fileGroups[:groupCount]
 	stats.groups = groupCount
-	*dst = p.fileGroupResult(w.fileGroups)
+	*dst = p.fileGroupResultInto(*dst, w.fileGroups)
 	return stats, true, nil
 }

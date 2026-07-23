@@ -81,6 +81,78 @@ func TestFloat64CatalogExactRoundTripAndAllocs(t *testing.T) {
 	}
 }
 
+func TestMutableFloat64CatalogPermitsCopyOnWritePhysicalOrder(t *testing.T) {
+	refs := [testFloat64ScanCatalogCount]PageRef{
+		testFloat64ScanRef(20, testFloat64ScanStripeID, PageFloat64Stripe),
+		testFloat64ScanRef(10, testFloat64ScanStripeID+1, PageFloat64Stripe),
+	}
+	refs[0].Generation = 5
+	next := testFloat64ScanRef(
+		8, testFloat64ScanStripeID+2, PageFloat64Catalog,
+	)
+	header := Float64CatalogHeader{
+		StoreID: testStoreID, Generation: 5,
+		LogicalID: testFloat64ScanCatalogID,
+		PageSize:  testSuperblockPageSize, Next: next,
+	}
+	page := make([]byte, testSuperblockPageSize)
+	if _, err := EncodeFloat64Catalog(
+		page, header, refs[:], testFloat64ScanFileEnd,
+		testFloat64ScanNextLogical, testSuperblockPageSize,
+	); err == nil {
+		t.Fatal("immutable catalog accepted copy-on-write physical order")
+	}
+	page, err := EncodeMutableFloat64Catalog(
+		page, header, refs[:], testFloat64ScanFileEnd,
+		testFloat64ScanNextLogical, testSuperblockPageSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := OpenFloat64Catalog(
+		page, testFloat64ScanFileEnd, testFloat64ScanNextLogical,
+		testSuperblockPageSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !view.Mutable() || view.Header() != header {
+		t.Fatalf(
+			"mutable catalog = (%v,%+v), want (true,%+v)",
+			view.Mutable(), view.Header(), header,
+		)
+	}
+	for index, want := range refs {
+		got, ok := view.RefAt(index)
+		if !ok || got != want {
+			t.Fatalf(
+				"mutable ref %d = (%+v,%v), want %+v",
+				index, got, ok, want,
+			)
+		}
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		if _, encodeErr := EncodeMutableFloat64Catalog(
+			page, header, refs[:], testFloat64ScanFileEnd,
+			testFloat64ScanNextLogical, testSuperblockPageSize,
+		); encodeErr != nil {
+			panic(encodeErr)
+		}
+		opened, openErr := OpenFloat64Catalog(
+			page, testFloat64ScanFileEnd, testFloat64ScanNextLogical,
+			testSuperblockPageSize,
+		)
+		if openErr != nil || !opened.Mutable() {
+			panic("mutable catalog open")
+		}
+	}); allocs != 0 {
+		t.Fatalf(
+			"mutable catalog warm allocations = %.2f, want zero",
+			allocs,
+		)
+	}
+}
+
 func TestFloat64CatalogRejectsResealedCorruption(t *testing.T) {
 	refs := [testFloat64ScanCatalogCount]PageRef{
 		testFloat64ScanRef(10, testFloat64ScanStripeID, PageFloat64Stripe),
@@ -101,6 +173,14 @@ func TestFloat64CatalogRejectsResealedCorruption(t *testing.T) {
 		mutate func([]byte)
 	}{
 		{
+			name: "version",
+			mutate: func(corrupt []byte) {
+				binary.LittleEndian.PutUint32(
+					corrupt[PageHeaderSize:], 99,
+				)
+			},
+		},
+		{
 			name: "count",
 			mutate: func(corrupt []byte) {
 				binary.LittleEndian.PutUint16(corrupt[PageHeaderSize+4:], 3)
@@ -119,6 +199,14 @@ func TestFloat64CatalogRejectsResealedCorruption(t *testing.T) {
 			mutate: func(corrupt []byte) {
 				binary.LittleEndian.PutUint64(
 					corrupt[secondRef+8:], binary.LittleEndian.Uint64(corrupt[firstRef+8:]),
+				)
+			},
+		},
+		{
+			name: "legacy generation",
+			mutate: func(corrupt []byte) {
+				binary.LittleEndian.PutUint64(
+					corrupt[firstRef+16:], 2,
 				)
 			},
 		},

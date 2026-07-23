@@ -89,7 +89,9 @@ func (p TransactionPage) Stage() error {
 			return err
 		}
 	}
-	return p.tx.batch.SetPage(p.index, int64(p.ref.Offset), int(p.ref.Length))
+	return p.tx.batch.setStorePage(
+		p.index, int64(p.ref.Offset), int(p.ref.Length), p.ref.Kind,
+	)
 }
 
 // BeginWriteTransaction acquires bounded worst-case staging capacity.
@@ -119,7 +121,7 @@ func (t *WriteTransaction) Allocate(kind PageKind, length uint32, logicalID uint
 		!validPhysicalPageSize(length) || length < t.options.PageSize || length%t.options.PageSize != 0 {
 		return TransactionPage{}, ErrTooManyPages
 	}
-	if kind != PageDocument && kind != PageOverflow && length != t.options.PageSize {
+	if !variableTransactionExtent(kind) && length != t.options.PageSize {
 		return TransactionPage{}, fmt.Errorf("%w: variable metadata extent", ErrInvalidWrite)
 	}
 	if uint64(length) > uint64(t.committer.bufferSize) {
@@ -155,6 +157,20 @@ func (t *WriteTransaction) Allocate(kind PageKind, length uint32, logicalID uint
 	}
 	t.allocated++
 	return TransactionPage{tx: t, index: index, ref: ref, bytes: buffer[:int(length):int(length)]}, nil
+}
+
+// variableTransactionExtent reports immutable value/accelerator pages whose
+// packed size is intentionally independent of the metadata allocation
+// quantum. Tree nodes and publication roots remain exactly one PageSize so
+// their bounded copy-on-write geometry cannot silently expand.
+func variableTransactionExtent(kind PageKind) bool {
+	switch kind {
+	case PageDocument, PageOverflow, PageFloat64Stripe,
+		PageFloat64Catalog, PageIndexGroupCatalog:
+		return true
+	default:
+		return false
+	}
 }
 
 func (t *WriteTransaction) allocatePhysical(length uint32) (uint64, bool, error) {

@@ -27,11 +27,11 @@ type fileIndexScalarGroupState struct {
 }
 
 // AppendIndexScalarGroupsInto appends exact grouped counts from one frozen
-// single-column exact index. An untouched compact generation may answer from
-// one bounded aggregate page containing O(groups) representatives, counts,
-// and first-row tokens. Otherwise the method streams certified postings and
-// residual receives ordered stable-slot candidates for missing and container
-// values, legacy postings without representatives, and hash collisions.
+// single-column exact index. A compact generation may answer from bounded
+// aggregate pages containing O(groups) representatives, counts, and first-row
+// tokens. Otherwise the method streams certified postings and residual
+// receives ordered stable-slot candidates for missing and container values,
+// legacy postings without representatives, and hash collisions.
 // Feeding residual to RangeMasksRawRowsBuffer and grouping the selected path
 // completes the exact result without reading certified JSON.
 //
@@ -257,66 +257,99 @@ func (s *FileSnapshot) AppendIndexScalarGroupsInto(
 	return dst, residual, true, nil
 }
 
-// appendIndexCatalogScalarGroups serves the untouched compact-generation
-// fast path. The single admitted page is O(groups), and representatives are
-// copied into workspace before the lease is released so results never borrow
-// evictable storage.
+// appendIndexCatalogScalarGroups serves the compact-generation fast path.
+// Representatives stream from bounded linked pages into workspace, so
+// cardinality changes page count rather than one giant allocation. Results
+// never borrow evictable page-cache storage.
 func (s *FileSnapshot) appendIndexCatalogScalarGroups(
 	dst []FileIndexScalarGroup,
 	workspace *FileIndexWorkspace,
 	indexID uint32,
 ) ([]FileIndexScalarGroup, bool, error) {
 	state := s.state
-	if state.root.IndexGroupHead == (storeio.PageRef{}) {
-		return dst, false, nil
-	}
-	lease, err := s.store.cache.Acquire(state.root.IndexGroupHead)
-	if err != nil {
-		return dst, true, err
-	}
-	catalog := storeio.AdmittedIndexGroupCatalog(lease.Page())
-	header := catalog.Header()
-	if header.DocumentCount != state.root.DocumentCount {
-		lease.Release()
-		return dst, true, storeio.ErrIndexGroupCatalogCorrupt
-	}
-	if !catalog.Covered(indexID) {
-		lease.Release()
+	catalogRef := state.root.IndexGroupHead
+	if catalogRef == (storeio.PageRef{}) {
 		return dst, false, nil
 	}
 	total := uint64(0)
-	iterator := catalog.Iterator()
-	for {
-		entry, ok := iterator.Next()
-		if !ok {
-			break
+	var (
+		coveredIndexes uint64
+		previousIndex  uint32
+		havePrevious   bool
+		previousRef    storeio.PageRef
+	)
+	for catalogRef != (storeio.PageRef{}) {
+		lease, err := s.store.cache.Acquire(catalogRef)
+		if err != nil {
+			return dst, true, err
 		}
-		if entry.IndexID < indexID {
-			continue
-		}
-		if entry.IndexID > indexID {
-			break
-		}
-		if !fileIndexCertificateValid(entry.Value, 1) ||
-			len(workspace.groupArena) > int(^uint32(0))-len(entry.Value) ||
-			total > ^uint64(0)-entry.Count {
+		catalog := storeio.AdmittedIndexGroupCatalog(lease.Page())
+		header := catalog.Header()
+		if previousRef == (storeio.PageRef{}) {
+			coveredIndexes = header.CoveredIndexes
+			if header.DocumentCount != state.root.DocumentCount {
+				lease.Release()
+				return dst, true, storeio.ErrIndexGroupCatalogCorrupt
+			}
+			if !catalog.Covered(indexID) {
+				lease.Release()
+				return dst, false, nil
+			}
+		} else if !catalog.Segmented() ||
+			header.CoveredIndexes != coveredIndexes ||
+			header.DocumentCount != state.root.DocumentCount ||
+			header.Generation != previousRef.Generation {
 			lease.Release()
 			return dst, true, storeio.ErrIndexGroupCatalogCorrupt
 		}
-		start := len(workspace.groupArena)
-		workspace.groupArena = append(workspace.groupArena, entry.Value...)
-		workspace.groupState = append(
-			workspace.groupState,
-			fileIndexScalarGroupState{
-				certificateAt: uint32(start),
-				certificateN:  uint32(len(entry.Value)),
-				count:         entry.Count,
-				first:         entry.First,
-			},
-		)
-		total += entry.Count
+		iterator := catalog.Iterator()
+		for {
+			entry, ok := iterator.Next()
+			if !ok {
+				break
+			}
+			if havePrevious && entry.IndexID < previousIndex {
+				lease.Release()
+				return dst, true, storeio.ErrIndexGroupCatalogCorrupt
+			}
+			havePrevious = true
+			previousIndex = entry.IndexID
+			if entry.IndexID != indexID {
+				continue
+			}
+			if !fileIndexCertificateValid(entry.Value, 1) ||
+				len(workspace.groupArena) > int(^uint32(0))-len(entry.Value) ||
+				total > ^uint64(0)-entry.Count {
+				lease.Release()
+				return dst, true, storeio.ErrIndexGroupCatalogCorrupt
+			}
+			start := len(workspace.groupArena)
+			workspace.groupArena = append(
+				workspace.groupArena, entry.Value...,
+			)
+			workspace.groupState = append(
+				workspace.groupState,
+				fileIndexScalarGroupState{
+					certificateAt: uint32(start),
+					certificateN:  uint32(len(entry.Value)),
+					count:         entry.Count,
+					first:         entry.First,
+				},
+			)
+			total += entry.Count
+		}
+		next := header.Next
+		if next != (storeio.PageRef{}) &&
+			(!catalog.Segmented() ||
+				next.LogicalID <= catalogRef.LogicalID ||
+				next.Offset <= catalogRef.Offset) {
+			lease.Release()
+			return dst, true, storeio.ErrIndexGroupCatalogCorrupt
+		}
+		lease.Release()
+		previousRef = catalogRef
+		catalogRef = next
 	}
-	lease.Release()
 	if len(workspace.groupState) == 0 || total != state.root.DocumentCount {
 		return dst, true, storeio.ErrIndexGroupCatalogCorrupt
 	}

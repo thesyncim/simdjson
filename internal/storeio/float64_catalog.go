@@ -8,7 +8,8 @@ import (
 
 const (
 	Float64CatalogPayloadHeaderSize = 64
-	float64CatalogVersion           = uint32(1)
+	float64CatalogVersionV1         = uint32(1)
+	float64CatalogVersion           = uint32(2)
 )
 
 // ErrFloat64CatalogCorrupt reports a checksum-valid compact scan catalog with
@@ -30,6 +31,7 @@ type Float64CatalogView struct {
 	header  Float64CatalogHeader
 	payload []byte
 	count   int
+	version uint32
 }
 
 // EncodeFloat64Catalog writes one ordered scan-catalog page without
@@ -41,6 +43,38 @@ func EncodeFloat64Catalog(
 	fileEnd, nextLogicalID uint64,
 	allocationQuantum uint32,
 ) ([]byte, error) {
+	return encodeFloat64Catalog(
+		dst, header, refs, fileEnd, nextLogicalID, allocationQuantum,
+		float64CatalogVersionV1,
+	)
+}
+
+// EncodeMutableFloat64Catalog writes a catalog whose logical stripe order is
+// stable while replacement extents may have newer generations and arbitrary
+// physical offsets. This is the copy-on-write form used after incrementally
+// rebuilding one dense stripe.
+func EncodeMutableFloat64Catalog(
+	dst []byte,
+	header Float64CatalogHeader,
+	refs []PageRef,
+	fileEnd, nextLogicalID uint64,
+	allocationQuantum uint32,
+) ([]byte, error) {
+	return encodeFloat64Catalog(
+		dst, header, refs, fileEnd, nextLogicalID, allocationQuantum,
+		float64CatalogVersion,
+	)
+}
+
+func encodeFloat64Catalog(
+	dst []byte,
+	header Float64CatalogHeader,
+	refs []PageRef,
+	fileEnd, nextLogicalID uint64,
+	allocationQuantum uint32,
+	version uint32,
+) ([]byte, error) {
+	mutable := version == float64CatalogVersion
 	if len(refs) == 0 || len(refs) > int(^uint16(0)) ||
 		header.StoreID == ([16]byte{}) || header.Generation == 0 ||
 		header.LogicalID <= StateRootLogicalID || header.LogicalID >= nextLogicalID ||
@@ -51,10 +85,14 @@ func EncodeFloat64Catalog(
 			int(header.PageSize)-PageHeaderSize-PageTrailerSize {
 		return nil, fmt.Errorf("%w: float64 catalog header", ErrInvalidWrite)
 	}
-	if err := validateFloat64CatalogNext(header, fileEnd, nextLogicalID, allocationQuantum); err != nil {
+	if err := validateFloat64CatalogNext(
+		header, fileEnd, nextLogicalID, allocationQuantum, mutable,
+	); err != nil {
 		return nil, err
 	}
-	if err := validateFloat64CatalogRefs(refs, header, fileEnd, nextLogicalID, allocationQuantum); err != nil {
+	if err := validateFloat64CatalogRefs(
+		refs, header, fileEnd, nextLogicalID, allocationQuantum, mutable,
+	); err != nil {
 		return nil, err
 	}
 	payload, err := InitPage(dst, PageHeader{
@@ -65,7 +103,7 @@ func EncodeFloat64Catalog(
 	if err != nil {
 		return nil, err
 	}
-	binary.LittleEndian.PutUint32(payload[0:4], float64CatalogVersion)
+	binary.LittleEndian.PutUint32(payload[0:4], version)
 	binary.LittleEndian.PutUint16(payload[4:6], uint16(len(refs)))
 	encodePageRef(payload[8:8+PageRefSize], header.Next)
 	for i, ref := range refs {
@@ -83,13 +121,16 @@ func validateFloat64CatalogNext(
 	header Float64CatalogHeader,
 	fileEnd, nextLogicalID uint64,
 	allocationQuantum uint32,
+	mutable bool,
 ) error {
 	if header.Next == (PageRef{}) {
 		return nil
 	}
 	ref := header.Next
 	if ref.Kind != PageFloat64Catalog || ref.Flags != 0 || ref.Aux != 0 ||
-		ref.Generation != header.Generation || ref.LogicalID <= header.LogicalID ||
+		(!mutable && ref.Generation != header.Generation) ||
+		mutable && (ref.Generation == 0 || ref.Generation > header.Generation) ||
+		ref.LogicalID <= header.LogicalID ||
 		ref.LogicalID >= nextLogicalID || ref.Offset%uint64(allocationQuantum) != 0 ||
 		!validPhysicalPageSize(ref.Length) || ref.Length < allocationQuantum ||
 		ref.Length%allocationQuantum != 0 || uint64(ref.Length) > fileEnd ||
@@ -104,11 +145,13 @@ func validateFloat64CatalogRefs(
 	header Float64CatalogHeader,
 	fileEnd, nextLogicalID uint64,
 	allocationQuantum uint32,
+	mutable bool,
 ) error {
 	var previous PageRef
 	for _, ref := range refs {
 		if !validFloat64CatalogRef(
-			ref, previous, header.Generation, fileEnd, nextLogicalID, allocationQuantum,
+			ref, previous, header.Generation, fileEnd, nextLogicalID,
+			allocationQuantum, mutable,
 		) {
 			return fmt.Errorf("%w: float64 catalog entry", ErrInvalidWrite)
 		}
@@ -121,18 +164,22 @@ func validFloat64CatalogRef(
 	ref, previous PageRef,
 	generation, fileEnd, nextLogicalID uint64,
 	allocationQuantum uint32,
+	mutable bool,
 ) bool {
 	length := uint64(ref.Length)
 	return ref.Kind == PageFloat64Stripe &&
 		ref.Flags == 0 && ref.Aux == 0 &&
-		ref.Generation != 0 && ref.Generation <= generation &&
+		(!mutable && ref.Generation == generation ||
+			mutable &&
+				ref.Generation != 0 && ref.Generation <= generation) &&
 		ref.LogicalID > StateRootLogicalID && ref.LogicalID < nextLogicalID &&
 		validPhysicalPageSize(ref.Length) && ref.Length >= allocationQuantum &&
 		ref.Length%allocationQuantum == 0 &&
 		ref.Offset%uint64(allocationQuantum) == 0 &&
 		length <= fileEnd && ref.Offset <= fileEnd-length &&
 		(previous == (PageRef{}) ||
-			ref.LogicalID > previous.LogicalID && ref.Offset > previous.Offset)
+			ref.LogicalID > previous.LogicalID &&
+				(mutable || ref.Offset > previous.Offset))
 }
 
 // OpenFloat64Catalog verifies a complete catalog page.
@@ -172,7 +219,8 @@ func openFloat64CatalogPayload(
 ) (Float64CatalogView, error) {
 	if pageHeader.Kind != PageFloat64Catalog || pageHeader.Flags != 0 ||
 		len(payload) < Float64CatalogPayloadHeaderSize ||
-		binary.LittleEndian.Uint32(payload[0:4]) != float64CatalogVersion ||
+		(binary.LittleEndian.Uint32(payload[0:4]) != float64CatalogVersionV1 &&
+			binary.LittleEndian.Uint32(payload[0:4]) != float64CatalogVersion) ||
 		!allZero(payload[6:8]) || !pageRefReservedZero(payload[8:8+PageRefSize]) ||
 		!allZero(payload[40:Float64CatalogPayloadHeaderSize]) {
 		return Float64CatalogView{}, fmt.Errorf("%w: header or reserved bytes", ErrFloat64CatalogCorrupt)
@@ -186,7 +234,11 @@ func openFloat64CatalogPayload(
 		LogicalID: pageHeader.LogicalID, PageSize: pageHeader.PageSize,
 		Next: decodePageRef(payload[8 : 8+PageRefSize]),
 	}
-	if err := validateFloat64CatalogNext(header, fileEnd, nextLogicalID, allocationQuantum); err != nil {
+	version := binary.LittleEndian.Uint32(payload[0:4])
+	mutable := version == float64CatalogVersion
+	if err := validateFloat64CatalogNext(
+		header, fileEnd, nextLogicalID, allocationQuantum, mutable,
+	); err != nil {
 		return Float64CatalogView{}, fmt.Errorf("%w: %v", ErrFloat64CatalogCorrupt, err)
 	}
 	var previous PageRef
@@ -197,13 +249,16 @@ func openFloat64CatalogPayload(
 		}
 		ref := decodePageRef(payload[start : start+PageRefSize])
 		if !validFloat64CatalogRef(
-			ref, previous, header.Generation, fileEnd, nextLogicalID, allocationQuantum,
+			ref, previous, header.Generation, fileEnd, nextLogicalID,
+			allocationQuantum, mutable,
 		) {
 			return Float64CatalogView{}, fmt.Errorf("%w: entry bounds or order", ErrFloat64CatalogCorrupt)
 		}
 		previous = ref
 	}
-	return Float64CatalogView{header: header, payload: payload, count: count}, nil
+	return Float64CatalogView{
+		header: header, payload: payload, count: count, version: version,
+	}, nil
 }
 
 // AdmittedFloat64Catalog reconstructs a previously validated catalog.
@@ -218,11 +273,15 @@ func AdmittedFloat64Catalog(src []byte) Float64CatalogView {
 			Next: decodePageRef(payload[8 : 8+PageRefSize]),
 		},
 		payload: payload, count: int(binary.LittleEndian.Uint16(payload[4:6])),
+		version: binary.LittleEndian.Uint32(payload[0:4]),
 	}
 }
 
 func (v Float64CatalogView) Header() Float64CatalogHeader { return v.header }
 func (v Float64CatalogView) Len() int                     { return v.count }
+func (v Float64CatalogView) Mutable() bool {
+	return v.version == float64CatalogVersion
+}
 
 func (v Float64CatalogView) RefAt(index int) (PageRef, bool) {
 	start := Float64CatalogPayloadHeaderSize + index*PageRefSize

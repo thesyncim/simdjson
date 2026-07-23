@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -319,5 +320,426 @@ func TestFileSnapshotBulkIndexScalarGroupCatalog(t *testing.T) {
 	}
 	if !retired {
 		t.Fatalf("document mutation did not retire index group head %+v", head)
+	}
+}
+
+func TestFileSnapshotIndexScalarGroupCatalogSurvivesOrdinaryChurn(t *testing.T) {
+	builder, err := NewStoreBuilder(StoreOptions{
+		ChunkDocuments: 4, ShapeTapes: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	documents := []string{
+		`{"kind":"a","version":0}`,
+		`{"kind":"a","version":0}`,
+		`{"kind":"b","version":0}`,
+		`{"version":0}`,
+	}
+	for row, document := range documents {
+		if err := builder.Append(
+			fmt.Sprintf("k%d", row), []byte(document),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(t.TempDir(), "file-index-group-churn-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := FileStoreOptions{
+		Store: StoreOptions{ChunkDocuments: 4, ShapeTapes: true},
+		Indexes: []StoreIndexDefinition{{
+			Name: "kind", Paths: []string{"/kind"},
+		}},
+		PageSize: 4096, MaxPageSize: 64 << 10, Synchronous: true,
+	}
+	if _, err := source.WriteFileStore(file, options); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSnapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldHead := store.state.Load().root.IndexGroupHead
+
+	if created, err := store.Put(
+		"k1", []byte(`{"kind":"c","version":1}`),
+	); err != nil || created {
+		t.Fatalf("indexed update = (%v,%v)", created, err)
+	}
+	firstHead := store.state.Load().root.IndexGroupHead
+	if firstHead == (storeio.PageRef{}) || firstHead == oldHead {
+		t.Fatalf("incremental catalog head = %+v, old %+v", firstHead, oldHead)
+	}
+	if created, err := store.Put(
+		"k4", []byte(`{"kind":"c","version":0}`),
+	); err != nil || !created {
+		t.Fatalf("indexed insert = (%v,%v)", created, err)
+	}
+	secondHead := store.state.Load().root.IndexGroupHead
+	if secondHead == (storeio.PageRef{}) || secondHead == firstHead {
+		t.Fatalf("insert catalog head = %+v, previous %+v", secondHead, firstHead)
+	}
+	if deleted, err := store.Delete("k4"); err != nil || !deleted {
+		t.Fatalf("indexed delete = (%v,%v)", deleted, err)
+	}
+	thirdHead := store.state.Load().root.IndexGroupHead
+	if thirdHead == (storeio.PageRef{}) || thirdHead == secondHead {
+		t.Fatalf("delete catalog head = %+v, previous %+v", thirdHead, secondHead)
+	}
+	// A document-only change with an equivalent indexed scalar can reuse the
+	// immutable catalog byte-for-byte.
+	if created, err := store.Put(
+		"k0", []byte(`{"kind":"a","version":2}`),
+	); err != nil || created {
+		t.Fatalf("non-indexed update = (%v,%v)", created, err)
+	}
+	if got := store.state.Load().root.IndexGroupHead; got != thirdHead {
+		t.Fatalf("unchanged tuple rewrote catalog: got %+v want %+v", got, thirdHead)
+	}
+
+	assertGroups := func(
+		snapshot *FileSnapshot,
+		want map[string]uint64,
+	) {
+		t.Helper()
+		var workspace FileIndexWorkspace
+		groups, residual, covered, err :=
+			snapshot.AppendIndexScalarGroupsInto(
+				nil, nil, &workspace, "kind",
+			)
+		if err != nil || !covered || len(residual) != 0 {
+			t.Fatalf(
+				"catalog groups = covered %v residual %v err %v",
+				covered, residual, err,
+			)
+		}
+		got := make(map[string]uint64, len(groups))
+		for _, group := range groups {
+			if group.Value.Kind() == document.String {
+				text, ok := group.Value.StringBytes()
+				if !ok {
+					t.Fatal("invalid catalog string")
+				}
+				got[string(text)] += group.Count
+			} else {
+				got[string(group.Value.Bytes())] += group.Count
+			}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("catalog groups = %v, want %v", got, want)
+		}
+		if stats := workspace.LastProbeStats(); stats.PostingPages != 0 ||
+			stats.CertificateRows != snapshot.Len() {
+			t.Fatalf("catalog probe stats = %+v", stats)
+		}
+	}
+	assertGroups(oldSnapshot, map[string]uint64{
+		"a": 2, "b": 1, "null": 1,
+	})
+	current, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertGroups(current, map[string]uint64{
+		"a": 1, "b": 1, "c": 1, "null": 1,
+	})
+	if err := current.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := oldSnapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered, err := reopened.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	assertGroups(recovered, map[string]uint64{
+		"a": 1, "b": 1, "c": 1, "null": 1,
+	})
+}
+
+func TestFileSnapshotSegmentedIndexScalarGroupCatalog(t *testing.T) {
+	const documents = 512
+	builder, err := NewStoreBuilder(StoreOptions{
+		ChunkDocuments: 8, ShapeTapes: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row := range documents {
+		if err := builder.Append(
+			fmt.Sprintf("k%03d", row),
+			fmt.Appendf(nil, `{"kind":"value-%03d"}`, row),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(t.TempDir(), "file-index-group-segments-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := FileStoreOptions{
+		Store: StoreOptions{ChunkDocuments: 8, ShapeTapes: true},
+		Indexes: []StoreIndexDefinition{{
+			Name: "kind", Paths: []string{"/kind"},
+		}},
+		PageSize: 4096, MaxPageSize: 4096,
+		MaxKeyBytes: 32, InlineValueBytes: 128,
+		MaxDocumentBytes: 1024, Synchronous: true,
+	}
+	if _, err := source.WriteFileStore(file, options); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := store.state.Load()
+	var catalogRefs []storeio.PageRef
+	for ref := state.root.IndexGroupHead; ref != (storeio.PageRef{}); {
+		catalogRefs = append(catalogRefs, ref)
+		lease, acquireErr := store.cache.Acquire(ref)
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+		catalog := storeio.AdmittedIndexGroupCatalog(lease.Page())
+		if !catalog.Segmented() {
+			lease.Release()
+			t.Fatalf("catalog page %+v is not segmented", ref)
+		}
+		ref = catalog.Header().Next
+		lease.Release()
+	}
+	if len(catalogRefs) < 2 {
+		t.Fatalf(
+			"high-cardinality catalog pages = %d, want multiple",
+			len(catalogRefs),
+		)
+	}
+
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace FileIndexWorkspace
+	groups, residual, covered, err :=
+		snapshot.AppendIndexScalarGroupsInto(
+			nil, nil, &workspace, "kind",
+		)
+	if err != nil || !covered || len(residual) != 0 ||
+		len(groups) != documents {
+		t.Fatalf(
+			"segmented groups = (%d,%d,%v,%v)",
+			len(groups), len(residual), covered, err,
+		)
+	}
+	if stats := workspace.LastProbeStats(); stats.PostingPages != 0 ||
+		stats.CertificateRows != documents {
+		t.Fatalf("segmented group stats = %+v", stats)
+	}
+	reuse := make([]FileIndexScalarGroup, 0, documents)
+	reuse, _, _, err = snapshot.AppendIndexScalarGroupsInto(
+		reuse[:0], nil, &workspace, "kind",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		var callErr error
+		reuse, _, _, callErr =
+			snapshot.AppendIndexScalarGroupsInto(
+				reuse[:0], nil, &workspace, "kind",
+			)
+		if callErr != nil || len(reuse) != documents {
+			panic("segmented catalog reuse")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf(
+			"segmented catalog warm allocations = %.2f, want zero",
+			allocs,
+		)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if created, err := store.Put(
+		"k001", []byte(`{"kind":"changed"}`),
+	); err != nil || created {
+		t.Fatalf("segmented catalog mutation = (%v,%v)", created, err)
+	}
+	if got := store.state.Load().root.IndexGroupHead; got != (storeio.PageRef{}) {
+		t.Fatalf("segmented mutation retained catalog head %+v", got)
+	}
+	for _, ref := range catalogRefs {
+		retired := false
+		for _, extent := range store.retireScratch {
+			if extent.Offset <= ref.Offset &&
+				uint64(ref.Length) <= extent.Length &&
+				ref.Offset-extent.Offset <=
+					extent.Length-uint64(ref.Length) {
+				retired = true
+				break
+			}
+		}
+		if !retired {
+			t.Fatalf("segmented catalog ref not retired %+v", ref)
+		}
+	}
+	current, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups, residual, covered, err =
+		current.AppendIndexScalarGroupsInto(
+			groups[:0], residual[:0], &workspace, "kind",
+		)
+	if err != nil || !covered || len(residual) != 0 ||
+		len(groups) != documents {
+		t.Fatalf(
+			"post-mutation posting groups = (%d,%d,%v,%v)",
+			len(groups), len(residual), covered, err,
+		)
+	}
+	if stats := workspace.LastProbeStats(); stats.PostingPages == 0 ||
+		stats.CertificateRows != documents {
+		t.Fatalf("post-mutation group stats = %+v", stats)
+	}
+	if err := current.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFileSnapshotPackedIndexScalarGroupCatalogSurvivesMutation(t *testing.T) {
+	const documents = 128
+	builder, err := NewStoreBuilder(StoreOptions{
+		ChunkDocuments: 8, ShapeTapes: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row := range documents {
+		if err := builder.Append(
+			fmt.Sprintf("k%03d", row),
+			fmt.Appendf(
+				nil, `{"kind":"categorical-value-%03d"}`, row,
+			),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(
+		t.TempDir(), "file-index-group-packed-*",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := FileStoreOptions{
+		Store: StoreOptions{ChunkDocuments: 8, ShapeTapes: true},
+		Indexes: []StoreIndexDefinition{{
+			Name: "kind", Paths: []string{"/kind"},
+		}},
+		PageSize: 4096, MaxPageSize: 64 << 10,
+		MaxKeyBytes: 32, InlineValueBytes: 128,
+		MaxDocumentBytes: 1024, Synchronous: true,
+	}
+	if _, err := source.WriteFileStore(file, options); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	head := store.state.Load().root.IndexGroupHead
+	if head.Length <= uint32(options.PageSize) {
+		t.Fatalf(
+			"packed catalog extent = %d, want larger than %d",
+			head.Length, options.PageSize,
+		)
+	}
+	lease, err := store.cache.Acquire(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segmented := storeio.AdmittedIndexGroupCatalog(
+		lease.Page(),
+	).Segmented()
+	lease.Release()
+	if segmented {
+		t.Fatal("single packed catalog unexpectedly segmented")
+	}
+	if created, err := store.Put(
+		"k001", []byte(`{"kind":"categorical-value-002"}`),
+	); err != nil || created {
+		t.Fatalf("packed catalog mutation = (%v,%v)", created, err)
+	}
+	currentHead := store.state.Load().root.IndexGroupHead
+	if currentHead == (storeio.PageRef{}) ||
+		currentHead == head ||
+		currentHead.Length <= uint32(options.PageSize) {
+		t.Fatalf(
+			"maintained packed catalog = %+v, old %+v",
+			currentHead, head,
+		)
+	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	var workspace FileIndexWorkspace
+	groups, residual, covered, err :=
+		snapshot.AppendIndexScalarGroupsInto(
+			nil, nil, &workspace, "kind",
+		)
+	if err != nil || !covered || len(residual) != 0 ||
+		len(groups) != documents-1 {
+		t.Fatalf(
+			"maintained packed groups = (%d,%d,%v,%v)",
+			len(groups), len(residual), covered, err,
+		)
+	}
+	var merged uint64
+	for _, group := range groups {
+		merged += group.Count
+	}
+	if merged != documents {
+		t.Fatalf("maintained packed group rows = %d", merged)
 	}
 }

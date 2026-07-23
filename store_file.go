@@ -271,11 +271,19 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 		return normalizedFileStoreOptions{}, fmt.Errorf("simdjson: FileStore maximum document requires too many transaction pages")
 	}
 	maxTransactionPages := overflowPages + metadataPageLimit
-	// One document and its overflow chain may use maximum-size extents. Every
-	// copied tree/catalog/root page is exactly PageSize. The slot cache can
-	// therefore reserve the actual worst-case dirty bytes instead of charging
-	// MaxPageSize for every metadata page.
+	// One document and its overflow chain may use maximum-size extents. A
+	// categorical cover can replace one packed catalog, while a numeric
+	// projection can replace one packed stripe and catalog. Every tree/root
+	// page remains exactly PageSize. The slot cache therefore reserves the
+	// actual worst-case dirty bytes instead of charging MaxPageSize for every
+	// metadata descriptor.
 	largePages := overflowPages + 1
+	if len(compiled) != 0 {
+		largePages++
+	}
+	if len(columns) != 0 {
+		largePages += 2
+	}
 	metadataPages := maxTransactionPages - largePages
 	maxTransactionBytes := uint64(largePages)*uint64(o.MaxPageSize) +
 		uint64(metadataPages)*uint64(o.PageSize)
@@ -351,6 +359,8 @@ type FileStore struct {
 	indexValueScratch       []byte
 	indexNewCertificate     []byte
 	indexCertificateScratch []byte
+	indexGroupSource        []storeio.IndexGroupCatalogEntry
+	indexGroupEntries       []storeio.IndexGroupCatalogEntry
 	documentValueScratch    []byte
 	retireScratch           []storeio.FreeExtent
 	reusable                []storeio.FreeExtent
@@ -358,6 +368,9 @@ type FileStore struct {
 	reusableBlock           *storemem.Block
 	float64Masks            []uint64
 	float64Values           []float64
+	float64CatalogRefs      []storeio.PageRef
+	float64StripeBytes      []byte
+	float64StripeColumns    []storeio.Float64StripeColumn
 	freeLoaded              bool
 	unpersisted             int
 	appendChunk             uint32
@@ -400,6 +413,10 @@ type FileStoreStats struct {
 	DeviceCommits       uint64
 	CommittedBatches    uint64
 	LargestCommitGroup  uint32
+	// SuppressedRootWrites/Bytes count intermediate state pages omitted when
+	// several generations share one newest durable superblock.
+	SuppressedRootWrites uint64
+	SuppressedRootBytes  uint64
 	// Backend reports the durable write engine.
 	Backend FileStoreBackend
 	// ReadBackend reports the active speculative-read engine. Demand misses
@@ -1064,11 +1081,13 @@ func (s *FileStore) Stats() FileStoreStats {
 		PublishedGeneration: commit.PublishedGeneration, DurableGeneration: commit.DurableGeneration,
 		CommitQueueDepth: commit.QueuedGenerations, DeviceCommits: commit.DeviceCommits,
 		CommittedBatches: commit.CommittedBatches, LargestCommitGroup: commit.LargestGroup,
-		Backend:          FileStoreBackend(commit.Backend),
-		ReadBackend:      FileStoreBackend(cache.ReadBackend),
-		DirectReads:      s.directRead,
-		DirectWrites:     s.directWrite,
-		SnapshotCapacity: leases.Capacity, ActiveSnapshots: leases.Active,
+		SuppressedRootWrites: commit.SuppressedRootWrites,
+		SuppressedRootBytes:  commit.SuppressedRootBytes,
+		Backend:              FileStoreBackend(commit.Backend),
+		ReadBackend:          FileStoreBackend(cache.ReadBackend),
+		DirectReads:          s.directRead,
+		DirectWrites:         s.directWrite,
+		SnapshotCapacity:     leases.Capacity, ActiveSnapshots: leases.Active,
 		OldestSnapshotGeneration: leases.MinimumGeneration,
 		RetiredExtentCapacity:    retired.Capacity, PendingRetiredExtents: retired.Pending,
 		PendingRetiredBytes: retired.PendingBytes, ReusableExtents: uint64(len(s.reusable)),
@@ -1224,7 +1243,8 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 				return false, err
 			}
 		}
-		if len(s.options.indexes) != 0 {
+		if len(s.options.indexes) != 0 ||
+			len(s.options.float64Columns) != 0 {
 			raw, valueErr := s.appendFileDocumentValue(
 				s.indexValueScratch[:0], state, *oldView, oldValue, location,
 			)
@@ -1306,6 +1326,21 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 			liveChunks++
 		}
 	}
+	indexGroupHead, retireIndexGroup, err := s.maintainFileIndexGroups(
+		tx, state, location, oldIndexPointer, &newIndex,
+		documentCount, prospectiveHighWater,
+	)
+	if err != nil {
+		return false, err
+	}
+	float64ScanHead, retireFloat64Scan, err :=
+		s.maintainFileFloat64Scan(
+			tx, state, chunkMutation.Root, location,
+			oldIndexPointer, &newIndex, created,
+		)
+	if err != nil {
+		return false, err
+	}
 	freeRoot, freeChecksum, promoted, err := s.syncFileFreeTree(tx, state)
 	if err != nil {
 		return false, err
@@ -1313,13 +1348,14 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 	nextState, statePage, err := s.stageFileState(
 		tx, state, generation, prospectiveHighWater, documentCount, state.root.TTLCount,
 		liveChunks, chunkMutation.Root, keyRoot, indexRoot, state.ttlRoot,
-		storeio.PageRef{}, storeio.PageRef{}, freeRoot, freeChecksum,
+		float64ScanHead, indexGroupHead, freeRoot, freeChecksum,
 	)
 	if err != nil {
 		return false, err
 	}
 	if err := s.reserveFileRetirements(
-		state, oldRef, oldView, keyMutation, chunkMutation, true,
+		state, oldRef, oldView, keyMutation, chunkMutation,
+		retireFloat64Scan, retireIndexGroup,
 	); err != nil {
 		return false, err
 	}
@@ -1572,7 +1608,8 @@ func (s *FileStore) setDeadlineLocked(state *fileStoreState, key []byte, locatio
 		return false, err
 	}
 	if err := s.reserveFileRetirements(
-		state, storeio.PageRef{}, nil, keyMutation, storeio.ChunkTreeMutation{}, false,
+		state, storeio.PageRef{}, nil, keyMutation, storeio.ChunkTreeMutation{},
+		false, false,
 	); err != nil {
 		return false, err
 	}
@@ -1723,7 +1760,8 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 		}
 	}
 	var oldIndex Index
-	if len(s.options.indexes) != 0 {
+	if len(s.options.indexes) != 0 ||
+		len(s.options.float64Columns) != 0 {
 		raw, valueErr := s.appendFileDocumentValue(
 			s.indexValueScratch[:0], state, *oldView, oldValue, location,
 		)
@@ -1815,6 +1853,20 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 	if live == 0 {
 		liveChunks--
 	}
+	float64ScanHead, retireFloat64Scan, err :=
+		s.maintainFileFloat64Scan(
+			tx, state, chunkRoot, location, &oldIndex, nil, false,
+		)
+	if err != nil {
+		return false, err
+	}
+	indexGroupHead, retireIndexGroup, err := s.maintainFileIndexGroups(
+		tx, state, location, &oldIndex, nil,
+		state.root.DocumentCount-1, state.root.ChunkHighWater,
+	)
+	if err != nil {
+		return false, err
+	}
 	freeRoot, freeChecksum, promoted, err := s.syncFileFreeTree(tx, state)
 	if err != nil {
 		return false, err
@@ -1823,13 +1875,14 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 		tx, state, generation, state.root.ChunkHighWater,
 		state.root.DocumentCount-1, ttlCount, liveChunks,
 		chunkRoot, keyMutation.Root, indexRoot, ttlRoot,
-		storeio.PageRef{}, storeio.PageRef{}, freeRoot, freeChecksum,
+		float64ScanHead, indexGroupHead, freeRoot, freeChecksum,
 	)
 	if err != nil {
 		return false, err
 	}
 	if err := s.reserveFileRetirements(
-		state, oldRef, oldView, keyMutation, chunkMutation, true,
+		state, oldRef, oldView, keyMutation, chunkMutation,
+		retireFloat64Scan, retireIndexGroup,
 	); err != nil {
 		return false, err
 	}
@@ -2321,7 +2374,8 @@ func (s *FileStore) reserveFileRetirements(
 	oldView *fileDocumentChunk,
 	key storeio.KeyTreeMutation,
 	chunk storeio.ChunkTreeMutation,
-	retireCleanAggregates bool,
+	retireFloat64Scan bool,
+	retireIndexGroup bool,
 ) error {
 	appendRef := func(ref storeio.PageRef) error {
 		if ref == (storeio.PageRef{}) {
@@ -2338,13 +2392,13 @@ func (s *FileStore) reserveFileRetirements(
 	if err := appendRef(old.stateRef); err != nil {
 		return err
 	}
-	if retireCleanAggregates && old.root.Float64ScanHead != (storeio.PageRef{}) {
+	if retireFloat64Scan && old.root.Float64ScanHead != (storeio.PageRef{}) {
 		if err := s.appendFloat64ScanRetirements(old); err != nil {
 			return err
 		}
 	}
-	if retireCleanAggregates {
-		if err := appendRef(old.root.IndexGroupHead); err != nil {
+	if retireIndexGroup {
+		if err := s.appendIndexGroupRetirements(old); err != nil {
 			return err
 		}
 	}
@@ -2412,11 +2466,49 @@ func (s *FileStore) reserveFileRetirements(
 	return s.reclaimer.RetireBatch(s.retireScratch)
 }
 
-// appendFloat64ScanRetirements releases the aggregate-only projection whose
-// root is cleared by the first document mutation after a bulk build. Stripe
-// and catalog pages are allocated as one physical run. Adjacent refs are
-// folded into one retirement record so reclamation metadata remains O(1) for
-// a large store. TTL-only publications retain the projection.
+func (s *FileStore) appendIndexGroupRetirements(
+	old *fileStoreState,
+) error {
+	var previous storeio.PageRef
+	for ref := old.root.IndexGroupHead; ref != (storeio.PageRef{}); {
+		lease, err := s.cache.Acquire(ref)
+		if err != nil {
+			return err
+		}
+		catalog := storeio.AdmittedIndexGroupCatalog(lease.Page())
+		next := catalog.Header().Next
+		if previous != (storeio.PageRef{}) &&
+			(ref.Offset <= previous.Offset ||
+				ref.LogicalID <= previous.LogicalID) {
+			lease.Release()
+			return storeio.ErrIndexGroupCatalogCorrupt
+		}
+		lease.Release()
+		length := uint64(ref.Length)
+		if len(s.retireScratch) != 0 {
+			last := &s.retireScratch[len(s.retireScratch)-1]
+			if last.RetiredGeneration == old.root.Generation &&
+				last.Offset <= ^uint64(0)-last.Length &&
+				last.Offset+last.Length == ref.Offset &&
+				last.Length <= ^uint64(0)-length {
+				last.Length += length
+			} else if err := s.appendIndexRetiredRef(old, ref); err != nil {
+				return err
+			}
+		} else if err := s.appendIndexRetiredRef(old, ref); err != nil {
+			return err
+		}
+		previous = ref
+		ref = next
+	}
+	return nil
+}
+
+// appendFloat64ScanRetirements releases a complete aggregate-only projection
+// after an insert or an incremental-rebuild fallback. Bulk stripe and catalog
+// pages are allocated as one physical run. Adjacent refs are folded into one
+// retirement record so reclamation metadata remains O(1) for a large store.
+// TTL-only and projection-neutral publications retain the projection.
 //
 // Authoritative detached PageFloat64Group sidecars are not catalog entries
 // and remain reachable from document refs.
@@ -2444,9 +2536,11 @@ func (s *FileStore) appendFloat64ScanRetirements(old *fileStoreState) error {
 		})
 		return nil
 	}
-	// First append every stripe in physical catalog order. Catalog pages were
-	// allocated after the final stripe, so a second pass can extend the same
-	// retirement range without retaining a ref-sized Go object per page.
+	// First append every stripe in logical catalog order. A fresh bulk build is
+	// also physically ordered and therefore coalesces to one retirement extent.
+	// Mutable catalogs preserve logical order while replacement pages may live
+	// anywhere; appendRef safely retains those outliers as separate extents
+	// without requiring a ref-sized Go object per catalog entry.
 	var previousScanRef storeio.PageRef
 	for pass := 0; pass < 2; pass++ {
 		ref := old.root.Float64ScanHead
@@ -2464,8 +2558,7 @@ func (s *FileStore) appendFloat64ScanRetirements(old *fileStoreState) error {
 						return storeio.ErrFloat64CatalogCorrupt
 					}
 					if previousScanRef != (storeio.PageRef{}) &&
-						(scanRef.Offset <= previousScanRef.Offset ||
-							scanRef.LogicalID <= previousScanRef.LogicalID) {
+						scanRef.LogicalID <= previousScanRef.LogicalID {
 						lease.Release()
 						return storeio.ErrFloat64CatalogCorrupt
 					}
@@ -2481,7 +2574,8 @@ func (s *FileStore) appendFloat64ScanRetirements(old *fileStoreState) error {
 			}
 			next := catalog.Header().Next
 			if next != (storeio.PageRef{}) &&
-				(next.Offset <= ref.Offset || next.LogicalID <= ref.LogicalID) {
+				(next.LogicalID <= ref.LogicalID ||
+					!catalog.Mutable() && next.Offset <= ref.Offset) {
 				lease.Release()
 				return storeio.ErrFloat64CatalogCorrupt
 			}

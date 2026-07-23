@@ -119,6 +119,27 @@ func (b *Batch) PageBuffer(page int) ([]byte, error) {
 
 // SetPage records the initialized prefix and physical offset of one page.
 func (b *Batch) SetPage(page int, offset int64, length int) error {
+	return b.setPage(page, offset, length, 0)
+}
+
+// setStorePage records the kind of a page already verified by
+// TransactionPage.Stage. The marker is private to the durable batching
+// optimizer; generic Batch users retain byte-for-byte write semantics.
+func (b *Batch) setStorePage(
+	page int,
+	offset int64,
+	length int,
+	kind PageKind,
+) error {
+	return b.setPage(page, offset, length, kind)
+}
+
+func (b *Batch) setPage(
+	page int,
+	offset int64,
+	length int,
+	kind PageKind,
+) error {
 	if b == nil || b.state.Load() != batchOwned || page < 0 || page >= len(b.pages) {
 		return ErrBatchState
 	}
@@ -127,6 +148,7 @@ func (b *Batch) SetPage(page int, offset int64, length int) error {
 	}
 	b.pages[page].Offset = offset
 	b.pages[page].Length = uint32(length)
+	b.pages[page].kind = kind
 	return nil
 }
 
@@ -220,13 +242,15 @@ func (b *Batch) Abort() error {
 
 // CommitterStats is a lock-free snapshot of automatic persistence progress.
 type CommitterStats struct {
-	Backend             Backend
-	PublishedGeneration uint64
-	DurableGeneration   uint64
-	QueuedGenerations   uint64
-	DeviceCommits       uint64
-	CommittedBatches    uint64
-	LargestGroup        uint32
+	Backend              Backend
+	PublishedGeneration  uint64
+	DurableGeneration    uint64
+	QueuedGenerations    uint64
+	DeviceCommits        uint64
+	CommittedBatches     uint64
+	LargestGroup         uint32
+	SuppressedRootWrites uint64
+	SuppressedRootBytes  uint64
 }
 
 // Committer turns synchronous Device commits into automatic asynchronous
@@ -269,11 +293,13 @@ type Committer struct {
 	waitMu sync.Mutex
 	wait   *sync.Cond
 
-	commitScratch []Write
-	groupScratch  []*Batch
-	deviceCommits atomic.Uint64
-	batchesDone   atomic.Uint64
-	largestGroup  atomic.Uint32
+	commitScratch        []Write
+	groupScratch         []*Batch
+	deviceCommits        atomic.Uint64
+	batchesDone          atomic.Uint64
+	largestGroup         atomic.Uint32
+	suppressedRootWrites atomic.Uint64
+	suppressedRootBytes  atomic.Uint64
 }
 
 type committerInit struct{ err error }
@@ -526,13 +552,15 @@ func (c *Committer) Stats() CommitterStats {
 	durable := c.durable.Load()
 	queued := c.tail.Load() - c.head.Load()
 	return CommitterStats{
-		Backend:             c.backend,
-		PublishedGeneration: published,
-		DurableGeneration:   durable,
-		QueuedGenerations:   queued,
-		DeviceCommits:       c.deviceCommits.Load(),
-		CommittedBatches:    c.batchesDone.Load(),
-		LargestGroup:        c.largestGroup.Load(),
+		Backend:              c.backend,
+		PublishedGeneration:  published,
+		DurableGeneration:    durable,
+		QueuedGenerations:    queued,
+		DeviceCommits:        c.deviceCommits.Load(),
+		CommittedBatches:     c.batchesDone.Load(),
+		LargestGroup:         c.largestGroup.Load(),
+		SuppressedRootWrites: c.suppressedRootWrites.Load(),
+		SuppressedRootBytes:  c.suppressedRootBytes.Load(),
 	}
 }
 

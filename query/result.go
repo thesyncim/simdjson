@@ -24,6 +24,23 @@ import (
 type Result struct {
 	Columns  []ResultColumn
 	RowCount int
+	fileData []byte
+}
+
+// Release drops all storage retained by r. Reusing r with RunInto or
+// RunFileSnapshotInto normally gives better throughput; Release is useful
+// after an unusually large result should not pin its high-water capacity.
+func (r *Result) Release() {
+	if r == nil {
+		return
+	}
+	for i := range r.Columns {
+		clear(r.Columns[i].Cells)
+		r.Columns[i] = ResultColumn{}
+	}
+	r.Columns = nil
+	r.RowCount = 0
+	r.fileData = nil
 }
 
 // A ResultColumn is one output column: its Header (the projection path or the
@@ -114,6 +131,26 @@ func cellFromScalar(s scalar) Cell {
 	default:
 		return Cell{kind: KindJSON, raw: s.raw}
 	}
+}
+
+// ownFileCell moves the variable-width parts of cell into the Result's
+// reusable packed arena. It is the FileSnapshot ownership boundary: worker,
+// page-cache, and execution-workspace storage may be reused immediately after
+// materialization without leaving a borrowed result.
+func (r *Result) ownFileCell(cell Cell) Cell {
+	if len(cell.raw) != 0 {
+		start := len(r.fileData)
+		r.fileData = append(r.fileData, cell.raw...)
+		cell.raw = r.fileData[start:len(r.fileData):len(r.fileData)]
+	}
+	if len(cell.text) != 0 {
+		start := len(r.fileData)
+		r.fileData = append(r.fileData, cell.text...)
+		cell.text = byteview.String(
+			r.fileData[start:len(r.fileData):len(r.fileData)],
+		)
+	}
+	return cell
 }
 
 // nullCell builds a null result, the value of an aggregate over no rows and of

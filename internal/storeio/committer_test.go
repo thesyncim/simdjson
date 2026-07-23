@@ -406,6 +406,100 @@ func TestCommitterCoalesceWindowGroupsActiveProducer(t *testing.T) {
 	}
 }
 
+func TestCommitterCoalesceSuppressesIntermediateStatePages(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "coalesce-state-pages")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	pageSize := os.Getpagesize()
+	device := newRecordingDevice(12, pageSize)
+	close(device.releaseFirst)
+	committer, err := newCommitter(file, DeviceOptions{
+		Backend: BackendPortable, BufferCount: 12, BufferSize: pageSize,
+	}, CommitterOptions{
+		QueueSlots: 4, MaxPagesPerBatch: 2, GroupLimit: 4,
+		CoalesceDelay: 10 * time.Millisecond,
+	}, func(*os.File, DeviceOptions) (Device, error) { return device, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer committer.Close()
+
+	storeID := [16]byte{1}
+	for generation := uint64(1); generation <= 3; generation++ {
+		batch, beginErr := committer.Begin(2)
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		data, bufferErr := batch.PageBuffer(0)
+		if bufferErr != nil {
+			t.Fatal(bufferErr)
+		}
+		copy(data, []byte{byte(generation)})
+		if err := batch.SetPage(
+			0, int64((generation*2+8)*uint64(pageSize)), 1,
+		); err != nil {
+			t.Fatal(err)
+		}
+		state, bufferErr := batch.PageBuffer(1)
+		if bufferErr != nil {
+			t.Fatal(bufferErr)
+		}
+		if _, initErr := InitPage(state, PageHeader{
+			StoreID: storeID, Generation: generation,
+			LogicalID: StateRootLogicalID,
+			PageSize:  uint32(pageSize), Kind: PageStateRoot,
+		}); initErr != nil {
+			t.Fatal(initErr)
+		}
+		if _, sealErr := SealPage(state[:pageSize]); sealErr != nil {
+			t.Fatal(sealErr)
+		}
+		if err := batch.setStorePage(
+			1, int64((generation*2+9)*uint64(pageSize)),
+			pageSize, PageStateRoot,
+		); err != nil {
+			t.Fatal(err)
+		}
+		root, bufferErr := batch.RootBuffer()
+		if bufferErr != nil {
+			t.Fatal(bufferErr)
+		}
+		root[0] = byte(generation)
+		if err := batch.SetRoot(0, 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := batch.Publish(generation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := committer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	commits := device.snapshot()
+	if len(commits) != 1 || len(commits[0].pages) != 4 {
+		t.Fatalf(
+			"coalesced state-page writes = %+v, want 3 data + 1 state",
+			commits,
+		)
+	}
+	statePages := 0
+	for _, write := range commits[0].pages {
+		if write.kind == PageStateRoot {
+			statePages++
+		}
+	}
+	if statePages != 1 {
+		t.Fatalf("durable state pages = %d, want 1", statePages)
+	}
+	stats := committer.Stats()
+	if stats.SuppressedRootWrites != 2 ||
+		stats.SuppressedRootBytes != 2*uint64(pageSize) {
+		t.Fatalf("suppressed state-page stats = %+v", stats)
+	}
+}
+
 type testPage struct {
 	offset int64
 	data   []byte

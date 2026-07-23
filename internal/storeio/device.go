@@ -102,6 +102,7 @@ type Write struct {
 	Offset int64
 	Length uint32
 	Buffer uint16
+	kind   PageKind
 }
 
 // Device is the internal, single-owner durable page-I/O boundary. Buffer

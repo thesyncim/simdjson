@@ -201,6 +201,11 @@ type fileStoreBulkFloat64StripePlan struct {
 	ref         storeio.PageRef
 }
 
+type fileStoreBulkIndexGroupPlan struct {
+	first, last int
+	ref, next   storeio.PageRef
+}
+
 type fileStoreBulkKeyPlan struct {
 	level       uint8
 	first, last int
@@ -258,6 +263,7 @@ type fileStoreBulkBuild struct {
 	float64ScanRefs      []storeio.PageRef
 	float64ScanDocuments int
 	indexGroupEntries    []storeio.IndexGroupCatalogEntry
+	indexGroupCatalogs   []fileStoreBulkIndexGroupPlan
 	indexGroupRef        storeio.PageRef
 	indexGroupCovered    uint64
 	indexGroupBlocked    uint64
@@ -1335,18 +1341,17 @@ func (b *fileStoreBulkBuild) planPostings() error {
 	return nil
 }
 
-// planIndexGroups condenses low-cardinality, single-column exact indexes into
-// one bounded aggregate-only page. It reuses posting certificates and never
-// adds per-row storage. Columns with containers, uncertified collisions, or a
-// summary that would exceed MaxPageSize simply retain the streaming exact-
-// index execution path.
+// planIndexGroups condenses scalar single-column exact indexes into linked,
+// bounded aggregate-only pages. It reuses posting certificates and never adds
+// per-row storage. High cardinality grows the number of pages, not one giant
+// extent; only a single representative that cannot fit MaxPageSize declines.
+// Containers and uncertified collisions retain the streaming exact-index
+// execution path.
 func (b *fileStoreBulkBuild) planIndexGroups() error {
 	if len(b.rows) == 0 || len(b.options.indexes) == 0 {
 		return nil
 	}
 	b.indexCertificates = slices.Grow(b.indexCertificates, 4*len(b.options.indexes))
-	required := storeio.PageHeaderSize + storeio.PageTrailerSize +
-		storeio.IndexGroupCatalogPayloadHeaderSize
 	maskAt := 0
 	for indexID, exact := range b.options.indexes {
 		for maskAt < len(b.masks) && b.masks[maskAt].key.IndexID < uint32(indexID) {
@@ -1451,36 +1456,71 @@ func (b *fileStoreBulkBuild) planIndexGroups() error {
 			}
 		}
 
-		candidateBytes := 0
 		for _, entry := range b.indexGroupEntries[entryStart:] {
 			size, err := storeio.IndexGroupCatalogEntryEncodedSize(entry)
-			if err != nil || candidateBytes > b.options.MaxPageSize-size {
+			if err != nil ||
+				storeio.PageHeaderSize+storeio.PageTrailerSize+
+					storeio.SegmentedIndexGroupCatalogPayloadHeaderSize+
+					size > b.options.MaxPageSize {
 				eligible = false
 				break
 			}
-			candidateBytes += size
 		}
-		if !eligible || required > b.options.MaxPageSize-candidateBytes {
+		if !eligible {
 			b.indexGroupEntries = b.indexGroupEntries[:entryStart]
 			continue
 		}
-		required += candidateBytes
 		b.indexGroupCovered |= uint64(1) << uint(indexID)
 	}
 	if b.indexGroupCovered == 0 {
 		return nil
 	}
-	size, ok := fileStoreBulkExtent(
-		required, b.options.PageSize, b.options.MaxPageSize,
-	)
-	if !ok {
-		return storeio.ErrInvalidWrite
+	payloadLimit := b.options.MaxPageSize -
+		storeio.PageHeaderSize - storeio.PageTrailerSize
+	for first := 0; first < len(b.indexGroupEntries); {
+		used := storeio.SegmentedIndexGroupCatalogPayloadHeaderSize
+		last := first
+		for last < len(b.indexGroupEntries) {
+			size, err := storeio.IndexGroupCatalogEntryEncodedSize(
+				b.indexGroupEntries[last],
+			)
+			if err != nil {
+				return err
+			}
+			if used > payloadLimit-size {
+				break
+			}
+			used += size
+			last++
+		}
+		if last == first {
+			return storeio.ErrInvalidWrite
+		}
+		size, ok := fileStoreBulkExtent(
+			storeio.PageHeaderSize+storeio.PageTrailerSize+used,
+			b.options.PageSize, b.options.MaxPageSize,
+		)
+		if !ok {
+			return storeio.ErrInvalidWrite
+		}
+		ref, err := b.allocator.allocate(
+			storeio.PageIndexGroupCatalog, size,
+		)
+		if err != nil {
+			return err
+		}
+		if len(b.indexGroupCatalogs) != 0 {
+			b.indexGroupCatalogs[len(b.indexGroupCatalogs)-1].next = ref
+		}
+		b.indexGroupCatalogs = append(
+			b.indexGroupCatalogs,
+			fileStoreBulkIndexGroupPlan{
+				first: first, last: last, ref: ref,
+			},
+		)
+		first = last
 	}
-	ref, err := b.allocator.allocate(storeio.PageIndexGroupCatalog, size)
-	if err != nil {
-		return err
-	}
-	b.indexGroupRef = ref
+	b.indexGroupRef = b.indexGroupCatalogs[0].ref
 	return nil
 }
 
@@ -1707,7 +1747,7 @@ func (b *fileStoreBulkBuild) write(file *os.File) error {
 	if err := b.writeFloat64CatalogPages(file, scratch); err != nil {
 		return err
 	}
-	if err := b.writeIndexGroupCatalogPage(file, scratch); err != nil {
+	if err := b.writeIndexGroupCatalogPages(file, scratch); err != nil {
 		return err
 	}
 	for _, plan := range b.chunks {
@@ -1765,24 +1805,46 @@ func (b *fileStoreBulkBuild) write(file *os.File) error {
 	return file.Sync()
 }
 
-func (b *fileStoreBulkBuild) writeIndexGroupCatalogPage(file *os.File, scratch []byte) error {
-	if b.indexGroupRef == (storeio.PageRef{}) {
-		return nil
-	}
-	page, err := storeio.EncodeIndexGroupCatalogPage(
-		scratch[:b.indexGroupRef.Length],
-		storeio.IndexGroupCatalogHeader{
+func (b *fileStoreBulkBuild) writeIndexGroupCatalogPages(
+	file *os.File,
+	scratch []byte,
+) error {
+	for _, plan := range b.indexGroupCatalogs {
+		header := storeio.IndexGroupCatalogHeader{
 			StoreID: b.storeID, Generation: b.allocator.generation,
-			LogicalID: b.indexGroupRef.LogicalID, PageSize: b.indexGroupRef.Length,
-			CoveredIndexes: b.indexGroupCovered, DocumentCount: uint64(len(b.rows)),
-		},
-		b.indexGroupEntries, uint32(len(b.options.indexes)),
-		uint32(len(b.documents)), uint32(b.options.Store.ChunkDocuments),
-	)
-	if err != nil {
-		return err
+			LogicalID: plan.ref.LogicalID, PageSize: plan.ref.Length,
+			CoveredIndexes: b.indexGroupCovered,
+			DocumentCount:  uint64(len(b.rows)), Next: plan.next,
+		}
+		var page []byte
+		var err error
+		if len(b.indexGroupCatalogs) == 1 {
+			page, err = storeio.EncodeIndexGroupCatalogPage(
+				scratch[:plan.ref.Length], header,
+				b.indexGroupEntries[plan.first:plan.last],
+				uint32(len(b.options.indexes)),
+				uint32(len(b.documents)),
+				uint32(b.options.Store.ChunkDocuments),
+			)
+		} else {
+			page, err = storeio.EncodeSegmentedIndexGroupCatalogPage(
+				scratch[:plan.ref.Length], header,
+				b.indexGroupEntries[plan.first:plan.last],
+				uint32(len(b.options.indexes)),
+				uint32(len(b.documents)),
+				uint32(b.options.Store.ChunkDocuments),
+				b.fileEnd, b.allocator.nextLogical,
+				b.allocator.pageSize,
+			)
+		}
+		if err != nil {
+			return err
+		}
+		if err := writeStorePageAt(file, page, plan.ref.Offset); err != nil {
+			return err
+		}
 	}
-	return writeStorePageAt(file, page, b.indexGroupRef.Offset)
+	return nil
 }
 
 func (b *fileStoreBulkBuild) writeOverflowPages(file *os.File, scratch []byte) error {

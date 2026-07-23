@@ -118,6 +118,7 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 	case storeio.PageIndexGroupCatalog:
 		catalog, err := storeio.OpenAdmittedIndexGroupCatalog(
 			page, v.indexHighWater, v.chunkHighWater.Load(), v.chunkDocuments,
+			v.fileEnd.Load(), v.nextLogicalID.Load(), v.pageSize,
 		)
 		if err != nil {
 			return err

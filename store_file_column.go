@@ -87,15 +87,17 @@ func (s *FileSnapshot) ReduceFloat64PathsInto(dst []Float64Aggregate, paths []st
 	return true, nil
 }
 
-// reduceFloat64ScanChain is the untouched compact-generation fast path. The
-// state-root catalog and contiguous value-only stripes omit the stable-slot
-// tree walk; the first document write clears the head, making the general
-// overlay-aware path above authoritative for mixed base and peeled chunks.
+// reduceFloat64ScanChain is the compact dense-projection fast path. The
+// state-root catalog and value-only stripes omit the stable-slot tree walk.
+// Incremental copy-on-write stripe replacement keeps this path active through
+// ordinary updates/deletes; documented fallback cases clear the head and make
+// the general overlay-aware path above authoritative.
 func (s *FileSnapshot) reduceFloat64ScanChain(dst []Float64Aggregate, ordinals []uint16) error {
 	state := s.state
 	catalogRef := state.root.Float64ScanHead
 	nextChunk := uint32(0)
 	var previousScanRef storeio.PageRef
+	mutableCatalog := false
 	for catalogRef != (storeio.PageRef{}) {
 		lease, err := s.store.cache.Acquire(catalogRef)
 		if err != nil {
@@ -103,6 +105,7 @@ func (s *FileSnapshot) reduceFloat64ScanChain(dst []Float64Aggregate, ordinals [
 		}
 		catalog := storeio.AdmittedFloat64Catalog(lease.Page())
 		header := catalog.Header()
+		mutableCatalog = mutableCatalog || catalog.Mutable()
 		var refs [64]storeio.PageRef
 		for first := 0; first < catalog.Len(); first += len(refs) {
 			count := min(len(refs), catalog.Len()-first)
@@ -120,8 +123,9 @@ func (s *FileSnapshot) reduceFloat64ScanChain(dst []Float64Aggregate, ordinals [
 			}
 			for i := 0; i < count; i++ {
 				if previousScanRef != (storeio.PageRef{}) &&
-					(refs[i].Offset <= previousScanRef.Offset ||
-						refs[i].LogicalID <= previousScanRef.LogicalID) {
+					(refs[i].LogicalID <= previousScanRef.LogicalID ||
+						!mutableCatalog &&
+							refs[i].Offset <= previousScanRef.Offset) {
 					lease.Release()
 					return fmt.Errorf(
 						"%w: float64 catalog global order",
@@ -162,7 +166,8 @@ func (s *FileSnapshot) reduceFloat64ScanChain(dst []Float64Aggregate, ordinals [
 		}
 		next := header.Next
 		if next != (storeio.PageRef{}) &&
-			(next.Offset <= catalogRef.Offset || next.LogicalID <= catalogRef.LogicalID) {
+			(next.LogicalID <= catalogRef.LogicalID ||
+				!catalog.Mutable() && next.Offset <= catalogRef.Offset) {
 			lease.Release()
 			return fmt.Errorf("%w: float64 catalog link order", storeio.ErrFloat64CatalogCorrupt)
 		}

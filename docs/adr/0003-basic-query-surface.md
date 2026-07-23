@@ -61,12 +61,13 @@ collision-free scalar or compound certificate proves the complete stream;
 legacy, missing, oversized, and collision-marked certificates retain the same
 document-recheck fallback.
 For an unfiltered one-column scalar `GROUP BY` with `COUNT(*)`, a compact bulk
-generation may store one bounded aggregate-only catalog derived from the same
-exact certificates. It retains value/count/first-row state per group, not per
-row. After the first document mutation the root drops that cover atomically;
-the executor then groups certified postings and rechecks only residual rows.
-Nested RFC 6901 index paths are eligible. Containers, compound indexes,
-uncertified collisions, and high-cardinality summaries that do not fit the
+generation may store an aggregate-only catalog derived from the same exact
+certificates. It retains value/count/first-row state per group, not per row;
+high cardinality streams across checksummed bounded pages. Ordinary scalar
+mutations maintain a one-page cover transactionally, while a segmented cover
+currently drops atomically and the executor groups certified postings plus
+residual rows. Nested RFC 6901 index paths are eligible. Containers, compound
+indexes, uncertified collisions, and a representative that cannot fit one
 configured extent remain on the fallback without changing semantics.
 
 Projection, aggregation, and grouping consume typed columns directly.
@@ -85,6 +86,13 @@ Computed aggregates no longer grow or borrow an eagerly formatted number arena:
 text encoding is actually requested. The convenience `JSON` accessor may
 allocate for a computed number; its caller-buffered counterpart is the
 zero-allocation transport contract.
+
+`RunFileSnapshotInto` extends the same ownership model to durable execution.
+The caller's `Result` retains reusable column cells and one packed
+variable-width byte arena, so page/workspace storage can be released while
+the result remains valid. Reusing or releasing that Result ends the previous
+cell lifetime. This removes per-group raw/decoded clones from the direct
+catalog path without borrowing the page cache.
 
 ## Correctness and ownership
 

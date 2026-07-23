@@ -285,22 +285,28 @@ The clean state root may additionally name a checksummed catalog of contiguous
 aggregate-only stripes. A stripe stores dense adaptive typed values but no
 stable-slot masks or JSON, and covers ordinary, overflow-backed, and grouped
 chunks alike. Predicate-free numeric aggregates can therefore avoid both the
-chunk tree and document extents. The first document mutation clears this root
-field, coalesces the now-unreachable stripe/catalog run into bounded retirement
-metadata, and uses the authoritative sidecar/document overlay path. TTL-only
-publications retain it. Recovery validates physical and logical ordering,
-exact chunk coverage, per-column
+chunk tree and document extents. A projection-neutral replacement retains this
+root. A changed value or delete reconstructs one head-catalog stripe from
+authoritative sidecars/peeled pages and copy-on-write replaces it plus the
+catalog head, leaving all other stripes shared. Inserts, later-catalog targets,
+empty results, and oversized rebuilt stripes clear the complete chain and use
+the authoritative overlay path. TTL-only publications retain it. Recovery
+validates physical and logical ordering, exact chunk coverage, per-column
 encoding, CRC32C, and root generation before selecting the shortcut.
 
-The same clean state root may name one bounded categorical group catalog
-derived from existing single-column exact indexes. Each covered index stores
-one scalar representative, count, and earliest stable-slot token per semantic
-group; it stores no per-row directory. Missing and explicit null share one
-group. Equivalent number spellings and escaped strings merge by value. A
-covered-index bitmap lets compound, container-valued, uncertified/colliding,
-or high-cardinality indexes decline independently when the complete summary
-does not fit one configured maximum extent. The first document mutation clears
-and retires this derivative; TTL-only publications retain it.
+The same clean state root may name a categorical group catalog derived from
+existing single-column exact indexes. Each covered index stores one scalar
+representative, count, and earliest stable-slot token per semantic group; it
+stores no per-row directory. Missing and explicit null share one group.
+Equivalent number spellings and escaped strings merge by value. Low
+cardinality stays in one mutable bounded page; ordinary scalar churn rewrites
+that page transactionally and semantic no-ops share it. High cardinality
+streams through physically/logically ordered checksummed pages, including an
+index split across pages. A covered-index bitmap lets compound,
+container-valued, uncertified/colliding, or individually oversized
+representatives decline independently. The first mutation over a segmented
+cover retires its coalesced chain and falls back to postings; TTL-only
+publications retain either form.
 
 Values beyond the configured inline extent use a checksummed overflow chain
 whose descriptor binds total length and owner slot. Directory cache size,
@@ -314,7 +320,11 @@ mutation is already serialized, so publication can place a generation/change
 descriptor into a preallocated single-producer ring without another mutex or a
 steady heap allocation. Readers never load that queue or a durability counter.
 The consumer groups adjacent generations and executes the copy-on-write commit
-below once per batch.
+below once per batch. Only the newest state-root page can be selected by the
+newest grouped superblock, so older state-root writes are suppressed and
+counted. Data and directory pages are not deduplicated across generations:
+an intermediate reader-visible snapshot may still require their physical
+versions.
 
 Async mutation returns after reader publication; `DurableGeneration` reports
 the newest crash-safe root and `Flush`/`Close` waits until a requested
@@ -548,12 +558,15 @@ preflights the complete list and fuses distinct columns into one typed-extent
 walk, without admitting JSON rows or launching workers. Numeric masks
 deliberately cannot answer `COUNT(path)`, because present non-numeric values
 must count there. An untouched compact generation reads its contiguous dense
-scan stripes. After the first document mutation the same API walks
-authoritative detached sidecars plus peeled document pages, preserving
-correctness without pretending that a stale clean stripe includes overlays.
+scan stripes. Projection-neutral updates retain them; a changed value or
+delete normally replaces one stripe and its catalog head. The documented
+fallback cases make the same API walk authoritative detached sidecars plus
+peeled document pages, preserving correctness without pretending that a stale
+stripe includes overlays.
 An unfiltered one-column scalar `GROUP BY` with `COUNT(*)` similarly uses a
-matching exact index. Untouched compact generations read the O(groups)
-categorical catalog without posting or document pages. After mutation, exact
+matching exact index. Compact generations read the O(groups), possibly
+segmented categorical catalog without posting or document pages. One-page
+covers survive ordinary scalar churn; after a segmented-cover fallback, exact
 posting certificates provide group representatives and counts while only
 missing, container, legacy, oversized-certificate, or collision rows read JSON.
 Nested RFC 6901 paths are eligible; compound and multi-column grouping stay on

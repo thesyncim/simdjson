@@ -103,6 +103,30 @@ func (c *Committer) run(file *os.File, initialized chan<- committerInit, open de
 			copy(c.commitScratch[writeIndex:], next.pages)
 			latest = next
 		}
+		// Every grouped generation contains a checksummed PageStateRoot, but
+		// the single alternate superblock committed below can name only the
+		// newest one. Earlier state pages are never consulted by live
+		// snapshots (which retain decoded roots), so suppressing them is safe.
+		// Other same-logical-id pages are deliberately retained: an
+		// intermediate snapshot may still need their physical generations.
+		latestState := -1
+		for index := range c.commitScratch {
+			if c.commitScratch[index].kind == PageStateRoot {
+				latestState = index
+			}
+		}
+		if latestState >= 0 {
+			out := c.commitScratch[:0]
+			for index, write := range c.commitScratch {
+				if write.kind == PageStateRoot && index != latestState {
+					c.suppressedRootWrites.Add(1)
+					c.suppressedRootBytes.Add(uint64(write.Length))
+					continue
+				}
+				out = append(out, write)
+			}
+			c.commitScratch = out
+		}
 		slices.SortFunc(c.commitScratch, func(a, b Write) int {
 			if a.Offset < b.Offset {
 				return -1

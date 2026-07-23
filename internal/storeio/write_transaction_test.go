@@ -121,6 +121,47 @@ func TestWriteTransactionValidationAndAbort(t *testing.T) {
 	}
 }
 
+func TestWriteTransactionAllowsPackedAcceleratorExtents(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "write-transaction-packed-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	committer, err := NewCommitter(file, DeviceOptions{
+		Backend: BackendPortable, BufferCount: 8,
+		BufferSize: max(os.Getpagesize(), 2*int(testSuperblockPageSize)),
+	}, CommitterOptions{
+		QueueSlots: 4, MaxPagesPerBatch: 4, GroupLimit: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer committer.Close()
+	tx, err := BeginWriteTransaction(
+		committer, nil, 4, WriteTransactionOptions{
+			StoreID: testStoreID, Generation: 1,
+			PageSize:      testSuperblockPageSize,
+			FileEnd:       2 * uint64(testSuperblockPageSize),
+			NextLogicalID: 2,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []PageKind{
+		PageFloat64Stripe, PageFloat64Catalog, PageIndexGroupCatalog,
+	} {
+		if _, err := tx.Allocate(
+			kind, 2*testSuperblockPageSize, 0,
+		); err != nil {
+			t.Fatalf("Allocate(%v) = %v", kind, err)
+		}
+	}
+	if err := tx.Abort(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWriteTransactionReusesAndRollsBackSafeExtents(t *testing.T) {
 	committer, _, _ := newPortableCommitter(t, 4, 2)
 	defer committer.Close()

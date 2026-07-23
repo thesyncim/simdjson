@@ -76,6 +76,7 @@ raw, ok := view.GetRaw("user:42")
 | `FileSnapshot.RangeRawBuffer` / `RangeRawReadAheadBuffer` / `RangeMasksRawBuffer` | ordered serial, bounded direct-read-ahead, or sparse stable-slot scan | touched document/overflow pages; zero allocation after caller scratch warms |
 | `FileStore.Flush` | wait until the visible generation is crash-safe | queued storage work and durability barriers |
 | `query.RunFileSnapshot` | late-bound persistent-index pushdown, parallel bounded batches, external ordered/group spill | O(candidate input + merge), or full input when unbounded; final result storage is caller-owned |
+| `query.RunFileSnapshotInto` | execute into a reusable caller-owned `Result` | same plan as `RunFileSnapshot`; column cells and packed value bytes reuse their observed high-water capacity |
 
 A non-positive `ExpireDue`, `BackfillIndex`, or `ReclaimIndexes` limit means all
 currently eligible work. Event loops should normally use a positive limit.
@@ -415,6 +416,12 @@ can lag and `Flush` or `Close` fences it. `CommitCoalesce` optionally gives the
 background worker a bounded window to combine adjacent generations under the
 latest root. Publication does not wait for that window; a synchronous caller
 does, so latency-sensitive single-operation durability should leave it zero.
+Only the newest state-root page in such a group can be selected by the newest
+superblock. The worker omits older state-root writes and reports them through
+`Stats.SuppressedRootWrites` and `SuppressedRootBytes`; it deliberately keeps
+every data, directory, posting, and value page because a live snapshot of an
+intermediate reader-visible generation may still reference those physical
+versions.
 Queue and buffer exhaustion applies backpressure. A background device error is
 sticky. On Linux the native backend uses the scoped pure-Go `io_uring`
 substrate for both durable commits and speculative reads; portable positional
@@ -512,30 +519,40 @@ recheck; using it as a final answer is incorrect. TTL stores the deadline beside
 the key and in an ordered persistent tree; replacement preserves the deadline
 and ordinary reads never consult the clock.
 
-Clean bulk generations may also carry one bounded categorical group catalog.
-It is an aggregate-only derivative of existing single-column exact indexes,
-not another per-row index: each covered index stores one exact scalar
-representative, count, and earliest stable-slot token per distinct group.
-Missing paths merge with explicit JSON `null`, matching query semantics.
-Equivalent number spellings and escaped strings merge by value, not source
-spelling. RFC 6901 paths may be nested; eligibility is attached to the exact
-index id rather than restricted to top-level fields.
+Clean bulk generations may also carry a categorical group catalog. It is an
+aggregate-only derivative of existing single-column exact indexes, not another
+per-row index: each covered index stores one exact scalar representative,
+count, and earliest stable-slot token per distinct group. Missing paths merge
+with explicit JSON `null`, matching query semantics. Equivalent number
+spellings and escaped strings merge by value, not source spelling. RFC 6901
+paths may be nested; eligibility is attached to the exact index id rather than
+restricted to top-level fields.
 
-The catalog occupies one power-of-two extent between `PageSize` and
-`MaxPageSize` and has a 64-bit covered-index bitmap. A container-valued row,
-uncertified/colliding posting, compound index, or summary that would exceed the
-configured extent makes only that index ineligible. Its query then streams the
-authoritative exact posting tree and reads JSON solely for missing, container,
-legacy, oversized-certificate, or collision rows.
+Every catalog page is a power-of-two extent between `PageSize` and
+`MaxPageSize`. A low-cardinality cover uses the original self-contained page.
+High cardinality uses a checksummed, physically/logically ordered chain of
+bounded pages, and one index may cross page boundaries. Cardinality therefore
+increases page count rather than demanding one giant extent. The chain shares
+one 64-bit covered-index bitmap and document count; readers validate global
+entry order and the requested index's exact total before returning it. A
+container-valued row, uncertified/colliding posting, compound index, or single
+representative too large for `MaxPageSize` makes only that index ineligible.
+Its query then streams the authoritative exact posting tree and reads JSON
+solely for missing, container, legacy, oversized-certificate, or collision
+rows.
 `AppendIndexScalarGroupsInto` exposes both lanes with caller-owned result,
 residual-mask, and workspace buffers. The compact cover retains O(groups)
 records and no per-row pointers; its warmed Store-layer scan allocates zero.
 
 The group catalog is published in the same checksummed state root as the
-posting tree. TTL-only publications preserve it. The first document update or
-delete atomically clears and retires the page before publishing the changed
-generation, so stale counts are never consulted; later grouping uses postings
-and residual rows until another compact rebuild.
+posting tree. TTL-only publications preserve it. Ordinary scalar inserts,
+updates, and deletes transactionally rewrite a one-page cover in O(groups);
+semantic no-ops reuse it byte-for-byte. The affected index alone declines when
+a new value is a container, the rewritten summary exceeds `MaxPageSize`, or a
+delete removes a still-populated group's recorded earliest row, whose successor
+cannot be reconstructed from aggregate-only state. A mutation over a segmented
+cover currently retires its complete coalesced chain and falls back to postings
+and residual rows. Stale counts are never consulted in either case.
 
 Numeric covering definitions are separately frozen in
 `FileStoreOptions.Float64Columns` as exact RFC 6901 paths. The catalog supports
@@ -558,13 +575,19 @@ The stripe covers every clean bulk-built chunk, including ordinary and
 overflow-backed document pages; it does not depend on document-group
 continuity. A predicate-free aggregate therefore reads the catalog and dense
 value extents directly instead of walking the chunk tree or admitting document
-pages. The authoritative sidecars remain update-safe. The first online
-document mutation atomically clears the clean scan head, retires adjacent
-stripe and catalog pages as one coalesced range, and falls back to the chunk
-tree. A touched chunk is peeled to an ordinary document page while untouched
-chunks continue to share their detached sidecar. The sidecar is retired only
-after its final chunk mapping disappears. Rebuilding a compact generation
-restores the clean scan stripe after widespread churn.
+pages. The authoritative sidecars remain update-safe. A replacement whose
+configured numeric projection is semantically unchanged reuses the scan
+catalog byte-for-byte. A changed value or delete reconstructs the one
+head-catalog stripe containing the touched chunk from authoritative sidecars
+and the peeled document page, then copy-on-write replaces that stripe and one
+mutable catalog page. Untouched stripes remain shared and the dense read path
+gains no overlay branch. Inserts, a target in a later catalog page, an emptied
+stripe, or a rebuilt stripe that exceeds `MaxPageSize` clear and retire the
+complete scan chain before falling back to the chunk tree. A touched chunk is
+peeled to an ordinary document page while untouched chunks continue to share
+their detached sidecar. The sidecar is retired only after its final chunk
+mapping disappears. Rebuilding a compact generation restores the clean scan
+after fallback or widespread churn.
 
 Every typed page is checksummed independently. Admission rejects masks outside
 live rows, invalid adaptive encodings, non-finite general values, non-monotonic
@@ -630,9 +653,16 @@ transient value/validity columns. Multiple numeric paths share one typed-extent
 walk.
 `COUNT(path)`, filtered aggregates, multi-column or non-count grouping, and
 partially covered plans retain the general executor. A reusable
-`FileExecutionWorkspace` retains index-planner and overflow scratch; worker
-batches and returned result cells remain execution-owned. The memory target
-excludes the returned `Result` and cannot make one oversized document smaller.
+`FileExecutionWorkspace` retains index-planner and overflow scratch.
+`RunFileSnapshotInto` additionally reuses a caller-owned `Result`: its column
+cell arrays and packed variable-width byte arena retain their observed
+high-water capacity, and `Result.Release` drops that storage after an
+exceptionally broad query. Direct catalog grouping stops cloning one raw and
+one decoded heap object per group; after warm-up the 100K-row/32-group path
+materializes the complete owned result at zero allocations. Reusing a Result
+invalidates its previous cells. Worker batches remain execution-owned. The
+memory target excludes the returned `Result` and cannot make one oversized
+document smaller.
 Parallel floating aggregation has deterministic batch order but, like other
 parallel engines, may differ in the last rounding bits from a strictly
 row-at-a-time sum.
@@ -653,7 +683,7 @@ Apple M4 Max, stable Go, 1,024 hot documents:
 | 10K-row recovered scalar-object `@>` | 13.08 us, 2 posting pages, 0 JSON rows/rechecks | 230.75x faster than pinned one-thread DuckDB |
 | 5M-row recovered SUM through one clean typed stripe | 1.948 ms, 0 JSON rows | 4.13x faster than retained pinned DuckDB capacity result |
 | 128 MiB real-derived Twitter covered SUM | 51.125 us, 0 JSON rows | 2.97x faster than pinned one-thread DuckDB |
-| 100K-row / 32-group clean exact-index catalog | 8.88-9.09 us, 0 posting or JSON pages | Store-layer catalog scan is warmed zero-allocation; owned 32-group query result is 6,256 B / 69 allocations |
+| 100K-row / 32-group clean exact-index catalog into reused `Result` | 4.586-4.620 us, 0 posting or JSON pages | complete owned result is 0 B/op, 0 allocs/op after warm-up |
 | 128 MiB real-derived CITM / Twitter grouping | 542 ns / 792 ns, 0 posting or JSON pages | 821.19x / 347.22x faster than retained pinned one-thread DuckDB; one 4 KiB catalog page per file |
 
 The 1/64 nested compound fixture is reproducible with
@@ -1097,13 +1127,15 @@ the preceding 4 KiB-page run. The clean-generation typed scan stripe adds
 2,510,848 bytes—0.12% of logical payload—to the file and replaces 10,346
 scattered sidecar/tree reads per warmed reduction with a contiguous 2.4 MiB
 dense integer projection. This closes the numeric aggregate gap without
-weakening mutation correctness: the first document write retires the clean
-projection and uses authoritative sidecars plus peeled pages. TTL-only
-publications retain the stripe. The later categorical catalog similarly
-condenses eligible exact indexes to O(groups) count/first/value records; the
-old 5M grouping row above predates it, while the retained 100K/32-group and
-real-derived reruns provide current evidence without extrapolating a new 5M
-number.
+weakening mutation correctness: projection-neutral replacements reuse the
+scan, and a changed value or delete in its head catalog replaces one stripe
+plus one catalog page from authoritative sidecars and peeled pages. The
+documented fallback cases retire the full projection. TTL-only publications
+retain it. The later categorical catalog similarly condenses eligible exact
+indexes to O(groups) count/first/value records, now across bounded linked pages
+when necessary; the old 5M grouping row above predates it, while the retained
+100K/32-group and real-derived reruns provide current evidence without
+extrapolating a new 5M number.
 
 The measured FileStore engine-plus-largest-query envelope is 504.97 MiB
 (16.21 MiB + 488.76 MiB), but it is still neither process RSS nor directly

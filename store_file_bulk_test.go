@@ -339,9 +339,50 @@ func TestWriteFileStoreBulkGroupsExactDocumentsAndPeelsMutations(t *testing.T) {
 		t.Fatalf("TTL removal changed clean float64 scan head: got %+v, want %+v", got, scanHead)
 	}
 
+	projectionNeutral := []byte(
+		`{"tenant":"changed","status":"metadata-only","score":3,"active":false}`,
+	)
+	if created, err := store.Put(
+		"doc:0003", projectionNeutral,
+	); err != nil || created {
+		t.Fatalf("projection-neutral update = (%v,%v)", created, err)
+	}
+	if got := store.state.Load().root.Float64ScanHead; got != scanHead {
+		t.Fatalf(
+			"projection-neutral update changed scan head: got %+v, want %+v",
+			got, scanHead,
+		)
+	}
+	snapshot, err = store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, covered, err = snapshot.ReduceFloat64Path("/score")
+	if closeErr := snapshot.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil || !covered || total.Count != documents ||
+		total.Sum != float64(documents*(documents-1)/2) {
+		t.Fatalf(
+			"projection-neutral score reduction = (%+v,%v,%v)",
+			total, covered, err,
+		)
+	}
+	historicalScan, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	replacement := []byte(`{"tenant":"new","status":"updated","score":3000,"active":true}`)
 	if created, err := store.Put("doc:0003", replacement); err != nil || created {
 		t.Fatalf("group update = (%v,%v)", created, err)
+	}
+	updatedScanHead := store.state.Load().root.Float64ScanHead
+	if updatedScanHead == (storeio.PageRef{}) || updatedScanHead == scanHead {
+		t.Fatalf(
+			"changed projection scan head = %+v, want a new catalog",
+			updatedScanHead,
+		)
 	}
 	for _, ref := range scanProjectionRefs {
 		retired := false
@@ -353,8 +394,12 @@ func TestWriteFileStoreBulkGroupsExactDocumentsAndPeelsMutations(t *testing.T) {
 				break
 			}
 		}
-		if !retired {
-			t.Fatalf("first mutation did not retire float64 scan ref %+v", ref)
+		wantRetired := ref == scanHead || ref == catalogColumn
+		if retired != wantRetired {
+			t.Fatalf(
+				"changed projection retirement for %+v = %v, want %v",
+				ref, retired, wantRetired,
+			)
 		}
 	}
 	for _, extent := range store.retireScratch {
@@ -368,8 +413,12 @@ func TestWriteFileStoreBulkGroupsExactDocumentsAndPeelsMutations(t *testing.T) {
 		t.Fatalf("group delete = (%v,%v)", deleted, err)
 	}
 	state = store.state.Load()
-	if state.root.Float64ScanHead != (storeio.PageRef{}) {
-		t.Fatalf("mutation retained stale float64 scan head %+v", state.root.Float64ScanHead)
+	if state.root.Float64ScanHead == (storeio.PageRef{}) ||
+		state.root.Float64ScanHead == updatedScanHead {
+		t.Fatalf(
+			"delete scan head = %+v, want another live catalog",
+			state.root.Float64ScanHead,
+		)
 	}
 	peeled, ok, err := storeio.LookupChunkTree(store.cache, state.chunkRoot, 0, storeio.ChunkTreeBounds{
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
@@ -394,6 +443,17 @@ func TestWriteFileStoreBulkGroupsExactDocumentsAndPeelsMutations(t *testing.T) {
 	wantSum := float64(documents*(documents-1)/2 - 3 - 4 + 3000)
 	if err != nil || !covered || total.Count != documents-1 || total.Sum != wantSum {
 		t.Fatalf("mixed detached/peeled reduction = (%+v,%v,%v), want sum %.0f", total, covered, err, wantSum)
+	}
+	total, covered, err = historicalScan.ReduceFloat64Path("/score")
+	if err != nil || !covered || total.Count != documents ||
+		total.Sum != float64(documents*(documents-1)/2) {
+		t.Fatalf(
+			"historical dense reduction = (%+v,%v,%v)",
+			total, covered, err,
+		)
+	}
+	if err := historicalScan.Close(); err != nil {
+		t.Fatal(err)
 	}
 	groupLease, err := store.cache.Acquire(groupRef)
 	if err != nil {
@@ -477,6 +537,33 @@ func TestWriteFileStoreBulkGroupsExactDocumentsAndPeelsMutations(t *testing.T) {
 	got, ok, err = reopened.AppendRaw(buffer[:0], "doc:0010")
 	if err != nil || !ok || !bytes.Contains(got, []byte(`"score":10`)) {
 		t.Fatalf("reopened untouched group = (%q,%v,%v)", got, ok, err)
+	}
+	recoveredSnapshot, err := reopened.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, covered, err = recoveredSnapshot.ReduceFloat64Path("/score")
+	if closeErr := recoveredSnapshot.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil || !covered || total.Count != documents-1 ||
+		total.Sum != wantSum {
+		t.Fatalf(
+			"reopened dense reduction = (%+v,%v,%v), want sum %.0f",
+			total, covered, err, wantSum,
+		)
+	}
+	if created, err := reopened.Put(
+		"doc:insert-after-stripe-cow",
+		[]byte(`{"tenant":"new","status":"inserted","score":7,"active":true}`),
+	); err != nil || !created {
+		t.Fatalf(
+			"insert after mutable stripe catalog = (%v,%v)",
+			created, err,
+		)
+	}
+	if got := reopened.state.Load().root.Float64ScanHead; got != (storeio.PageRef{}) {
+		t.Fatalf("insert retained non-extensible scan catalog %+v", got)
 	}
 }
 

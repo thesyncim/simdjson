@@ -100,12 +100,12 @@ type StateRoot struct {
 	KeyDirectory   PageRef
 	IndexDirectory PageRef
 	TTLDirectory   PageRef
-	// Float64ScanHead names the ordered value-stripe catalog of an untouched
-	// compact generation. It is only a scan accelerator; document mutations
-	// clear it and use the authoritative chunk tree plus peeled document pages.
+	// Float64ScanHead names the ordered value-stripe catalog of a compact or
+	// incrementally maintained generation. It is only a scan accelerator;
+	// documented mutation fallbacks clear it and use the authoritative tree.
 	Float64ScanHead PageRef
-	// IndexGroupHead names a bounded aggregate-only categorical cover of an
-	// untouched compact generation. Exact postings remain authoritative.
+	// IndexGroupHead names bounded aggregate-only categorical cover pages.
+	// Exact postings remain authoritative.
 	IndexGroupHead PageRef
 }
 
