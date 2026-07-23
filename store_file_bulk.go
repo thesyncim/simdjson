@@ -193,8 +193,11 @@ type fileStoreBulkKeyChild struct {
 }
 
 type fileStoreBulkPostingMask struct {
-	key  storeio.IndexDirectoryKey
-	bits uint64
+	key        storeio.IndexDirectoryKey
+	bits       uint64
+	certStart  uint32
+	certLength uint16
+	collision  bool
 }
 
 type fileStoreBulkPostingPlan struct {
@@ -226,17 +229,18 @@ type fileStoreBulkBuild struct {
 	allocator fileStoreBulkAllocator
 	fileEnd   uint64
 
-	overflows []fileStoreBulkOverflowPlan
-	documents []fileStoreBulkDocumentPlan
-	chunks    []storeChunkDirectoryPlan
-	keys      []fileStoreBulkKeyPlan
-	keyOrder  []int
-	postings  []fileStoreBulkPostingPlan
-	masks     []fileStoreBulkPostingMask
-	indexes   []fileStoreBulkIndexPlan
-	indexRows []storeio.IndexDirectoryEntry
-	ttls      []fileStoreBulkTTLPlan
-	ttlRows   []storeio.TTLKey
+	overflows         []fileStoreBulkOverflowPlan
+	documents         []fileStoreBulkDocumentPlan
+	chunks            []storeChunkDirectoryPlan
+	keys              []fileStoreBulkKeyPlan
+	keyOrder          []int
+	postings          []fileStoreBulkPostingPlan
+	masks             []fileStoreBulkPostingMask
+	indexes           []fileStoreBulkIndexPlan
+	indexRows         []storeio.IndexDirectoryEntry
+	indexCertificates []byte
+	ttls              []fileStoreBulkTTLPlan
+	ttlRows           []storeio.TTLKey
 
 	chunkRoot storeio.PageRef
 	keyRoot   storeio.PageRef
@@ -250,6 +254,40 @@ func (b *fileStoreBulkBuild) sourceRow(row int) (*storeChunk, string, []byte) {
 	entry := b.rows[row]
 	chunk := b.source.chunks.get(entry.sourceChunk)
 	return chunk, chunk.key(int(entry.sourceSlot)), chunk.docs.rawAt(int(chunk.ord[entry.sourceSlot]))
+}
+
+func (b *fileStoreBulkBuild) sourceFloat64(row, column int) (float64, bool, error) {
+	entry := b.rows[row]
+	chunk := b.source.chunks.get(entry.sourceChunk)
+	sourceRow := [1]int{int(chunk.ord[entry.sourceSlot])}
+	var storage [1]RawValue
+	values, err := chunk.docs.AppendPointerRows(
+		storage[:0], sourceRow[:], b.options.float64Columns[column].pointer,
+	)
+	if err != nil || len(values) != 1 {
+		return 0, false, err
+	}
+	value, ok := values[0].Float64()
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, false, nil
+	}
+	return value, true, nil
+}
+
+func (b *fileStoreBulkBuild) documentFloat64Bytes(first, last int) (int, error) {
+	bytes := len(b.options.float64Columns) * 8
+	for column := range b.options.float64Columns {
+		for row := first; row < last; row++ {
+			_, ok, err := b.sourceFloat64(row, column)
+			if err != nil {
+				return 0, err
+			}
+			if ok {
+				bytes += 8
+			}
+		}
+	}
+	return bytes, nil
 }
 
 func (b *fileStoreBulkBuild) targetLocation(row int) storeio.KeyLocation {
@@ -306,6 +344,9 @@ func (b *fileStoreBulkBuild) plan() error {
 		IndexMaxDepth: uint32(max(b.options.Store.IndexOptions.MaxDepth, 0)),
 		FreeChunkHint: freeChunkHint, ChunkDirectory: b.chunkRoot, KeyDirectory: b.keyRoot,
 		IndexDirectory: b.indexRoot, TTLDirectory: b.ttlRoot,
+	}
+	if len(b.options.float64Columns) != 0 {
+		b.root.Options |= storeio.StateOptionFloat64Columns
 	}
 	return nil
 }
@@ -396,6 +437,11 @@ func (b *fileStoreBulkBuild) planDocuments() error {
 			_, key, raw := b.sourceRow(row)
 			required += len(key) + len(raw)
 		}
+		float64Bytes, err := b.documentFloat64Bytes(first, last)
+		if err != nil {
+			return err
+		}
+		required += float64Bytes
 		// InlineValueBytes is the ordinary online-write threshold, not a
 		// format limit. A compact generation instead keeps complete values in
 		// the document extent while the chunk fits, avoiding a 64 KiB overflow
@@ -577,7 +623,7 @@ func (b *fileStoreBulkBuild) planPostings() error {
 		chunk, _, _ := b.sourceRow(row)
 		location := b.targetLocation(row)
 		for indexID, exact := range b.options.indexes {
-			hash, ok, scratch, err := fileStoreBulkTupleHash(
+			hash, ok, values, scratch, err := fileStoreBulkTupleHash(
 				exact, chunk, int(b.rows[row].sourceSlot), textScratch[:0],
 			)
 			textScratch = scratch
@@ -587,12 +633,27 @@ func (b *fileStoreBulkBuild) planPostings() error {
 			if !ok {
 				continue
 			}
-			b.masks = append(b.masks, fileStoreBulkPostingMask{
+			mask := fileStoreBulkPostingMask{
 				key: storeio.IndexDirectoryKey{
 					IndexID: uint32(indexID), TupleHash: hash, Chunk: location.Chunk,
 				},
 				bits: uint64(1) << location.Slot,
-			})
+			}
+			maxCertificate := b.options.PageSize - storeio.PageHeaderSize -
+				storeio.PageTrailerSize - storeio.PostingPagePayloadHeaderSize -
+				storeio.PostingSegmentHeaderSize - 16
+			certificateStart := len(b.indexCertificates)
+			certificates, certified := appendFileIndexCertificate(
+				b.indexCertificates, values[:exact.n], maxCertificate,
+			)
+			certificateLength := len(certificates) - certificateStart
+			if certified && certificateStart <= int(^uint32(0)) &&
+				certificateLength <= int(^uint16(0)) {
+				b.indexCertificates = certificates
+				mask.certStart = uint32(certificateStart)
+				mask.certLength = uint16(certificateLength)
+			}
+			b.masks = append(b.masks, mask)
 		}
 	}
 	slices.SortFunc(b.masks, func(a, c fileStoreBulkPostingMask) int {
@@ -604,6 +665,16 @@ func (b *fileStoreBulkBuild) planPostings() error {
 			last := &out[len(out)-1]
 			if compareFileStoreBulkIndexKey(last.key, entry.key) == 0 {
 				last.bits |= entry.bits
+				if last.certLength != 0 && entry.certLength != 0 {
+					left := b.indexCertificates[last.certStart : last.certStart+uint32(last.certLength) : last.certStart+uint32(last.certLength)]
+					right := b.indexCertificates[entry.certStart : entry.certStart+uint32(entry.certLength) : entry.certStart+uint32(entry.certLength)]
+					columns := int(b.options.indexes[last.key.IndexID].n)
+					if !fileIndexCertificatesEqual(left, right, columns) {
+						last.collision = true
+					}
+				} else {
+					last.certStart, last.certLength, last.collision = 0, 0, false
+				}
 				continue
 			}
 			out = append(out, entry)
@@ -628,7 +699,8 @@ func (b *fileStoreBulkBuild) planPostings() error {
 			if err != nil {
 				return err
 			}
-			next := used + storeio.PostingSegmentHeaderSize + encoded
+			next := used + storeio.PostingSegmentHeaderSize + encoded +
+				int(b.masks[last].certLength)
 			if next > payloadLimit {
 				break
 			}
@@ -662,10 +734,10 @@ func (b *fileStoreBulkBuild) planPostings() error {
 // fileStoreBulkTupleHash extracts directly from compact Store chunks. It
 // avoids widening shape tapes into one cached classic Index per row while
 // producing the same process-independent hash used by FileStore probes.
-func fileStoreBulkTupleHash(exact *storeExactIndex, chunk *storeChunk, slot int, textScratch []byte) (uint64, bool, []byte, error) {
+func fileStoreBulkTupleHash(exact *storeExactIndex, chunk *storeChunk, slot int, textScratch []byte) (uint64, bool, [StoreIndexMaxColumns]RawValue, []byte, error) {
 	var values [StoreIndexMaxColumns]RawValue
 	if !storeIndexExtractValues(chunk, slot, exact, &values) {
-		return 0, false, textScratch, nil
+		return 0, false, values, textScratch, nil
 	}
 	hash := uint64(14695981039346656037)
 	for _, raw := range values[:exact.n] {
@@ -696,17 +768,17 @@ func fileStoreBulkTupleHash(exact *storeExactIndex, chunk *storeChunk, slot int,
 			} else {
 				text, ok, err := raw.AppendText(textScratch[:0])
 				if err != nil || !ok {
-					return 0, false, textScratch, err
+					return 0, false, values, textScratch, err
 				}
 				textScratch = text
 				hash = fileIndexHashBytes(hash, text)
 			}
 		default:
-			return 0, false, textScratch, nil
+			return 0, false, values, textScratch, nil
 		}
 		hash = fileIndexHashBytes(hash, []byte{0xfe})
 	}
-	return hash, true, textScratch, nil
+	return hash, true, values, textScratch, nil
 }
 
 func compareFileStoreBulkIndexKey(a, b storeio.IndexDirectoryKey) int {
@@ -953,6 +1025,8 @@ func (b *fileStoreBulkBuild) writeOverflowPages(file *os.File, scratch []byte) e
 
 func (b *fileStoreBulkBuild) writeDocumentPages(file *os.File, scratch []byte) error {
 	var storage [storeMaxChunkDocuments]storeio.DocumentRecord
+	masks := make([]uint64, len(b.options.float64Columns))
+	values := make([]float64, len(b.options.float64Columns)*64)
 	for _, plan := range b.documents {
 		rows := storage[:plan.last-plan.first]
 		for i := range rows {
@@ -967,10 +1041,25 @@ func (b *fileStoreBulkBuild) writeDocumentPages(file *os.File, scratch []byte) e
 			}
 			rows[i] = record
 		}
-		page, err := storeio.EncodeDocumentPageWithOverflow(scratch[:plan.ref.Length], storeio.DocumentPageHeader{
+		clear(masks)
+		for column := range b.options.float64Columns {
+			for i := range rows {
+				value, ok, err := b.sourceFloat64(plan.first+i, column)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					continue
+				}
+				masks[column] |= uint64(1) << uint(i)
+				values[column*64+i] = value
+			}
+		}
+		page, err := storeio.EncodeDocumentPageWithColumns(scratch[:plan.ref.Length], storeio.DocumentPageHeader{
 			StoreID: b.storeID, Generation: b.allocator.generation, LogicalID: plan.ref.LogicalID,
 			PageSize: plan.ref.Length, ChunkID: plan.chunk, Live: plan.live,
-		}, rows, b.allocator.nextLogical, b.fileEnd, b.allocator.pageSize)
+		}, rows, storeio.DocumentFloat64Columns{Masks: masks, Values: values},
+			b.allocator.nextLogical, b.fileEnd, b.allocator.pageSize)
 		if err != nil {
 			return err
 		}
@@ -1044,8 +1133,14 @@ func (b *fileStoreBulkBuild) writePostingPages(file *os.File, scratch []byte) er
 		for i := 0; i < count; i++ {
 			mask := b.masks[plan.first+i]
 			entries[i] = storeio.PostingEntry{Chunk: mask.key.Chunk, Bits: mask.bits}
+			certificate := b.indexCertificates[mask.certStart : mask.certStart+uint32(mask.certLength) : mask.certStart+uint32(mask.certLength)]
+			flags := uint16(0)
+			if mask.collision {
+				flags |= storeio.PostingSegmentCollision
+			}
 			segments[i] = storeio.PostingSegment{
-				StreamID: uint32(i + 1), TupleHash: mask.key.TupleHash, Entries: entries[i : i+1],
+				StreamID: uint32(i + 1), TupleHash: mask.key.TupleHash,
+				Flags: flags, Certificate: certificate, Entries: entries[i : i+1],
 			}
 		}
 		page, err := storeio.EncodePostingPage(scratch[:b.options.PageSize], storeio.PostingPageHeader{

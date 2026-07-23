@@ -9,6 +9,7 @@ import (
 	"math/bits"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -79,6 +80,11 @@ type FileStoreOptions struct {
 	// Indexes are frozen exact scalar definitions maintained from the first
 	// durable generation. Their order assigns stable on-disk index IDs.
 	Indexes []StoreIndexDefinition
+	// Float64Columns are frozen RFC 6901 paths stored beside each document
+	// micro-page as typed covering columns. Predicate-free numeric aggregates
+	// can reduce these values without parsing JSON. Missing, non-numeric, and
+	// non-finite values are omitted from the column.
+	Float64Columns []string
 
 	PageSize      int
 	MaxPageSize   int
@@ -120,7 +126,15 @@ type normalizedFileStoreOptions struct {
 	maxTransactionPages int
 	maxTransactionBytes uint64
 	indexes             []*storeExactIndex
+	float64Columns      []fileStoreFloat64Column
 	indexCatalogHash    uint64
+}
+
+const fileStoreMaxFloat64Columns = 256
+
+type fileStoreFloat64Column struct {
+	spec    string
+	pointer CompiledPointer
 }
 
 func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
@@ -177,6 +191,11 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 	if len(o.Indexes) > 64 {
 		return normalizedFileStoreOptions{}, fmt.Errorf("%w: FileStore supports at most 64 indexes", ErrStoreIndexDefinition)
 	}
+	if len(o.Float64Columns) > fileStoreMaxFloat64Columns {
+		return normalizedFileStoreOptions{}, fmt.Errorf(
+			"simdjson: FileStore supports at most %d float64 columns", fileStoreMaxFloat64Columns,
+		)
+	}
 	compiled := make([]*storeExactIndex, len(o.Indexes))
 	definitions := make([]StoreIndexDefinition, len(o.Indexes))
 	seenIndexes := make(map[string]struct{}, len(o.Indexes))
@@ -201,12 +220,41 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 		}
 	}
 	o.Indexes = definitions
-	if len(compiled) == 0 {
+	columns := make([]fileStoreFloat64Column, len(o.Float64Columns))
+	columnSpecs := make([]string, len(o.Float64Columns))
+	seenColumns := make(map[string]struct{}, len(o.Float64Columns))
+	for i, spec := range o.Float64Columns {
+		owned := strings.Clone(spec)
+		if _, exists := seenColumns[owned]; exists {
+			return normalizedFileStoreOptions{}, fmt.Errorf(
+				"%w: duplicate float64 column %q", ErrStoreIndexDefinition, owned,
+			)
+		}
+		pointer, compileErr := CompilePointer(owned)
+		if compileErr != nil {
+			return normalizedFileStoreOptions{}, fmt.Errorf(
+				"%w: float64 column %d: %v", ErrStoreIndexDefinition, i, compileErr,
+			)
+		}
+		seenColumns[owned] = struct{}{}
+		columns[i] = fileStoreFloat64Column{spec: owned, pointer: pointer}
+		columnSpecs[i] = owned
+	}
+	o.Float64Columns = columnSpecs
+	if len(columns) != 0 {
+		catalogHash = fileIndexHashBytes(catalogHash, []byte{0xfc, 0x64})
+		for _, column := range columns {
+			catalogHash = fileIndexHashBytes(catalogHash, []byte(column.spec))
+			catalogHash = fileIndexHashBytes(catalogHash, []byte{0})
+		}
+	}
+	if len(compiled) == 0 && len(columns) == 0 {
 		catalogHash = 0
 	}
 	maxRowBytes := o.MaxKeyBytes + max(o.InlineValueBytes, storeio.DocumentOverflowDescriptorSize)
 	worstDocumentPage := storeio.PageHeaderSize + storeio.PageTrailerSize + storeio.DocumentPagePayloadHeaderSize +
-		o.Store.ChunkDocuments*storeio.DocumentPageRecordSize + o.Store.ChunkDocuments*maxRowBytes
+		o.Store.ChunkDocuments*storeio.DocumentPageRecordSize + o.Store.ChunkDocuments*maxRowBytes +
+		len(columns)*(8+o.Store.ChunkDocuments*8)
 	if worstDocumentPage > o.MaxPageSize {
 		return normalizedFileStoreOptions{}, fmt.Errorf("simdjson: FileStore MaxPageSize cannot hold configured chunk/key/inline bounds")
 	}
@@ -248,7 +296,7 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 	}
 	return normalizedFileStoreOptions{
 		FileStoreOptions: o, maxTransactionPages: maxTransactionPages, maxTransactionBytes: maxTransactionBytes,
-		indexes: compiled, indexCatalogHash: catalogHash,
+		indexes: compiled, float64Columns: columns, indexCatalogHash: catalogHash,
 	}, nil
 }
 
@@ -288,26 +336,31 @@ type FileStore struct {
 	closeDone      bool
 	state          atomic.Pointer[fileStoreState]
 
-	committer   *storeio.Committer
-	cache       *storeio.PageCache
-	readFile    *os.File
-	writeFile   *os.File
-	directRead  bool
-	directWrite bool
-	leases      *storeio.GenerationLeases
-	reclaimer   *storeio.ExtentReclaimer
+	committer     *storeio.Committer
+	cache         *storeio.PageCache
+	readFile      *os.File
+	writeFile     *os.File
+	directRead    bool
+	directWrite   bool
+	leases        *storeio.GenerationLeases
+	reclaimer     *storeio.ExtentReclaimer
+	pageValidator *fileStorePageValidator
 
-	parseScratch      []IndexEntry
-	oldParseScratch   []IndexEntry
-	indexValueScratch []byte
-	retireScratch     []storeio.FreeExtent
-	reusable          []storeio.FreeExtent
-	reuseJournal      []storeio.ReuseEdit
-	reusableBlock     *storemem.Block
-	freeLoaded        bool
-	unpersisted       int
-	appendChunk       uint32
-	appendLive        uint64
+	parseScratch            []IndexEntry
+	oldParseScratch         []IndexEntry
+	indexValueScratch       []byte
+	indexNewCertificate     []byte
+	indexCertificateScratch []byte
+	retireScratch           []storeio.FreeExtent
+	reusable                []storeio.FreeExtent
+	reuseJournal            []storeio.ReuseEdit
+	reusableBlock           *storemem.Block
+	float64Masks            []uint64
+	float64Values           []float64
+	freeLoaded              bool
+	unpersisted             int
+	appendChunk             uint32
+	appendLive              uint64
 }
 
 // FileStoreStats is a point-in-time resource and I/O accounting snapshot.
@@ -368,6 +421,9 @@ type FileStoreStats struct {
 	// ReusableExternalBytes is the portion of ReusableCapacityBytes outside
 	// the Go heap on this platform.
 	ReusableExternalBytes uint64
+	// Float64ScratchBytes is the fixed pointer-free writer scratch used to
+	// rebuild typed covering columns during one chunk replacement.
+	Float64ScratchBytes   uint64
 	PendingRetiredExtents uint64
 	PendingRetiredBytes   uint64
 	ReusableExtents       uint64
@@ -468,6 +524,7 @@ func OpenFileStore(file *os.File, options FileStoreOptions) (*FileStore, error) 
 		keyRoot: root.KeyDirectory, chunkRoot: root.ChunkDirectory,
 		indexRoot: root.IndexDirectory, ttlRoot: root.TTLDirectory, freeRoot: freeRoot,
 	}
+	store.pageValidator.update(state)
 	store.state.Store(state)
 	store.appendChunk = root.ChunkHighWater
 	if err := store.restoreAppendChunk(state); err != nil {
@@ -503,12 +560,14 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 		}
 		return nil, err
 	}
+	pageValidator := newFileStorePageValidator(uint32(options.PageSize))
 	cache, err := storeio.NewPageCache(readFile, storeio.PageCacheOptions{
 		PageSize: options.PageSize, MaxPageSize: options.MaxPageSize,
 		ResidentBytes: options.ResidentBytes, StoreID: storeID,
 		PrefetchQueue: options.PrefetchQueue, ReadConcurrency: options.ReadConcurrency,
 		ReadQueueDepth: options.ReadQueueDepth,
 		Backend:        storeio.Backend(options.Backend),
+		Validate:       pageValidator.validate,
 	})
 	if err != nil {
 		if readFile != file {
@@ -592,6 +651,9 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 		reusable:      reusableArena[:0],
 		reuseJournal:  make([]storeio.ReuseEdit, 0, options.maxTransactionPages),
 		reusableBlock: reusableBlock,
+		float64Masks:  make([]uint64, len(options.float64Columns)),
+		float64Values: make([]float64, len(options.float64Columns)*64),
+		pageValidator: pageValidator,
 	}, nil
 }
 
@@ -612,6 +674,9 @@ func (s *FileStore) createInitialState() error {
 		StoreID: s.cacheStoreID(), Generation: 1, PageSize: uint32(s.options.PageSize),
 		NextLogicalID: tx.NextLogicalID(), ChunkDocuments: uint32(s.options.Store.ChunkDocuments),
 		IndexCount: uint32(len(s.options.indexes)), IndexCatalogHash: s.options.indexCatalogHash,
+	}
+	if len(s.options.float64Columns) != 0 {
+		root.Options |= storeio.StateOptionFloat64Columns
 	}
 	if _, err := storeio.EncodeStateRootPage(statePage.Bytes(), root, tx.FileEnd()); err != nil {
 		_ = tx.Abort()
@@ -634,7 +699,9 @@ func (s *FileStore) createInitialState() error {
 		StateLength: statePage.Ref().Length, StateChecksum: storeio.PageChecksum(statePage.Bytes()),
 		FileEnd: tx.FileEnd(), PageSize: uint32(s.options.PageSize),
 	}
-	s.state.Store(&fileStoreState{root: root, super: super, stateRef: statePage.Ref()})
+	state := &fileStoreState{root: root, super: super, stateRef: statePage.Ref()}
+	s.pageValidator.update(state)
+	s.state.Store(state)
 	s.freeLoaded = true
 	return nil
 }
@@ -652,19 +719,48 @@ type FileSnapshot struct {
 	once  sync.Once
 }
 
-// FileIndexWorkspace retains the transient directory, document, and tape
-// buffers used to collision-recheck one durable exact-index probe. Its zero
-// value is ready to use. Reusing one workspace with AppendIndexMasksInto makes
-// a warmed probe allocation-free when caller dst and the observed candidate
-// and document high-water marks fit retained capacity.
+// FileIndexWorkspace retains the transient directory entries, ordered posting
+// decisions, document bytes, and tape used by one durable exact-index probe.
+// Its zero value is ready to use. Consecutive directory entries that share one
+// packed posting page are decoded under one page lease. Reusing one workspace
+// with AppendIndexMasksInto makes a warmed probe allocation-free when caller
+// dst and the observed candidate and document high-water marks fit retained
+// capacity.
 //
 // A workspace is single-consumer and must not be used concurrently. Release
 // drops retained storage when a rare broad probe should not pin its high-water
 // capacity.
 type FileIndexWorkspace struct {
 	directory []storeio.IndexDirectoryEntry
+	postings  []fileIndexProbePosting
 	document  []byte
 	tape      []IndexEntry
+	lastProbe FileIndexProbeStats
+}
+
+// FileIndexProbeStats reports the physical work of the most recent exact or
+// candidate-only probe performed with a FileIndexWorkspace. CandidateRows is
+// the number of stable-slot bits read from posting pages. CertificateRows were
+// decided from a collision-free scalar or compound-tuple representative
+// without opening the documents; DocumentRecheckRows required exact
+// comparison against stored JSON. PostingPages counts distinct consecutive
+// physical posting-page leases. MatchedRows is populated only by an exact
+// probe.
+type FileIndexProbeStats struct {
+	CandidateRows       uint64
+	CertificateRows     uint64
+	DocumentRecheckRows uint64
+	MatchedRows         uint64
+	CandidateChunks     int
+	PostingPages        int
+}
+
+// LastProbeStats returns value-only counters for the most recent probe.
+func (w *FileIndexWorkspace) LastProbeStats() FileIndexProbeStats {
+	if w == nil {
+		return FileIndexProbeStats{}
+	}
+	return w.lastProbe
 }
 
 // Release drops all storage retained by the workspace.
@@ -673,8 +769,10 @@ func (w *FileIndexWorkspace) Release() {
 		return
 	}
 	w.directory = nil
+	w.postings = nil
 	w.document = nil
 	w.tape = nil
+	w.lastProbe = FileIndexProbeStats{}
 }
 
 // Snapshot acquires an explicit generation lease.
@@ -751,13 +849,10 @@ func (s *FileSnapshot) AppendRaw(dst []byte, key string) ([]byte, bool, error) {
 	if err != nil {
 		return dst, false, err
 	}
-	view, err := storeio.OpenDocumentPageWithOverflow(
-		lease.Page(), state.root.ChunkHighWater, state.root.NextLogicalID,
-		state.super.FileEnd, state.root.PageSize,
-	)
-	if err != nil {
+	view := storeio.AdmittedDocumentPage(lease.Page())
+	if view.Header().ChunkID != location.Chunk {
 		lease.Release()
-		return dst, false, err
+		return dst, false, storeio.ErrDocumentPageCorrupt
 	}
 	value, ok := view.LookupStringValue(location.Slot, key)
 	if !ok {
@@ -962,6 +1057,7 @@ func (s *FileStore) Stats() FileStoreStats {
 		OldestSnapshotGeneration: leases.MinimumGeneration,
 		RetiredExtentCapacity:    retired.Capacity, PendingRetiredExtents: retired.Pending,
 		PendingRetiredBytes: retired.PendingBytes, ReusableExtents: uint64(len(s.reusable)),
+		Float64ScratchBytes: uint64(len(s.float64Masks))*8 + uint64(len(s.float64Values))*8,
 	}
 	if s.reusableBlock != nil {
 		stats.ReusableCapacityBytes = uint64(s.reusableBlock.Len())
@@ -1132,7 +1228,11 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 	if err != nil {
 		return false, err
 	}
-	documentSize, err := s.fileDocumentPageSize(rows)
+	columns, err := s.buildFileFloat64Columns(state, oldView, location.Slot, &newIndex, true)
+	if err != nil {
+		return false, err
+	}
+	documentSize, err := s.fileDocumentPageSize(rows, columns)
 	if err != nil {
 		return false, err
 	}
@@ -1144,10 +1244,10 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 	if err != nil {
 		return false, err
 	}
-	if _, err := storeio.EncodeDocumentPageWithOverflow(documentPage.Bytes(), storeio.DocumentPageHeader{
+	if _, err := storeio.EncodeDocumentPageWithColumns(documentPage.Bytes(), storeio.DocumentPageHeader{
 		StoreID: s.storeID, Generation: generation, LogicalID: documentPage.Ref().LogicalID,
 		PageSize: documentPage.Ref().Length, ChunkID: location.Chunk, Live: live,
-	}, rows, tx.NextLogicalID(), tx.FileEnd(), uint32(s.options.PageSize)); err != nil {
+	}, rows, columns, tx.NextLogicalID(), tx.FileEnd(), uint32(s.options.PageSize)); err != nil {
 		return false, err
 	}
 	if err := documentPage.Stage(); err != nil {
@@ -1208,6 +1308,7 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 	abort = false
 	s.finalizeReusable(promoted)
 	s.snapshotGate.Lock()
+	s.pageValidator.update(nextState)
 	s.state.Store(nextState)
 	s.snapshotGate.Unlock()
 	if location.Chunk >= state.root.ChunkHighWater || location.Chunk == s.appendChunk {
@@ -1457,6 +1558,7 @@ func (s *FileStore) setDeadlineLocked(state *fileStoreState, key []byte, locatio
 	abort = false
 	s.finalizeReusable(promoted)
 	s.snapshotGate.Lock()
+	s.pageValidator.update(nextState)
 	s.state.Store(nextState)
 	s.snapshotGate.Unlock()
 	return true, nil
@@ -1615,7 +1717,11 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 			FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
 		})
 	} else {
-		documentSize, sizeErr := s.fileDocumentPageSize(rows)
+		columns, coverErr := s.buildFileFloat64Columns(state, oldView, location.Slot, nil, false)
+		if coverErr != nil {
+			return false, coverErr
+		}
+		documentSize, sizeErr := s.fileDocumentPageSize(rows, columns)
 		if sizeErr != nil {
 			return false, sizeErr
 		}
@@ -1623,10 +1729,10 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 		if allocateErr != nil {
 			return false, allocateErr
 		}
-		if _, encodeErr := storeio.EncodeDocumentPageWithOverflow(documentPage.Bytes(), storeio.DocumentPageHeader{
+		if _, encodeErr := storeio.EncodeDocumentPageWithColumns(documentPage.Bytes(), storeio.DocumentPageHeader{
 			StoreID: s.storeID, Generation: generation, LogicalID: documentPage.Ref().LogicalID,
 			PageSize: documentPage.Ref().Length, ChunkID: location.Chunk, Live: live,
-		}, rows, tx.NextLogicalID(), tx.FileEnd(), uint32(s.options.PageSize)); encodeErr != nil {
+		}, rows, columns, tx.NextLogicalID(), tx.FileEnd(), uint32(s.options.PageSize)); encodeErr != nil {
 			return false, encodeErr
 		}
 		if stageErr := documentPage.Stage(); stageErr != nil {
@@ -1698,6 +1804,7 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 	abort = false
 	s.finalizeReusable(promoted)
 	s.snapshotGate.Lock()
+	s.pageValidator.update(nextState)
 	s.state.Store(nextState)
 	s.snapshotGate.Unlock()
 	if location.Chunk == s.appendChunk {
@@ -1947,13 +2054,10 @@ func (s *FileStore) loadFileChunk(state *fileStoreState, chunkID uint32) (storei
 	if err != nil {
 		return storeio.PageRef{}, nil, nil, err
 	}
-	view, err := storeio.OpenDocumentPageWithOverflow(
-		lease.Page(), state.root.ChunkHighWater, state.root.NextLogicalID,
-		state.super.FileEnd, state.root.PageSize,
-	)
-	if err != nil {
+	view := storeio.AdmittedDocumentPage(lease.Page())
+	if view.Header().ChunkID != chunkID {
 		lease.Release()
-		return storeio.PageRef{}, nil, nil, err
+		return storeio.PageRef{}, nil, nil, storeio.ErrDocumentPageCorrupt
 	}
 	return ref, &view, &lease, nil
 }
@@ -1990,7 +2094,62 @@ func (s *FileStore) buildFileRows(old *storeio.DocumentPageView, target uint8, r
 	return storage[:position], live, nil
 }
 
-func (s *FileStore) fileDocumentPageSize(rows []storeio.DocumentRecord) (uint32, error) {
+func (s *FileStore) buildFileFloat64Columns(state *fileStoreState, old *storeio.DocumentPageView, target uint8, replacement *Index, keep bool) (storeio.DocumentFloat64Columns, error) {
+	if state == nil || state.root.Options&storeio.StateOptionFloat64Columns == 0 {
+		return storeio.DocumentFloat64Columns{}, nil
+	}
+	if len(s.float64Masks) != len(s.options.float64Columns) ||
+		len(s.float64Values) != len(s.options.float64Columns)*64 {
+		return storeio.DocumentFloat64Columns{}, storeio.ErrDocumentPageCorrupt
+	}
+	clear(s.float64Masks)
+	if old != nil {
+		if old.Float64ColumnCount() != len(s.options.float64Columns) {
+			return storeio.DocumentFloat64Columns{}, storeio.ErrDocumentPageCorrupt
+		}
+		for column := range s.options.float64Columns {
+			view, ok := old.Float64Column(column)
+			if !ok {
+				return storeio.DocumentFloat64Columns{}, storeio.ErrDocumentPageCorrupt
+			}
+			iterator := view.Iterator()
+			for {
+				slot, value, present := iterator.Next()
+				if !present {
+					break
+				}
+				if slot == target {
+					continue
+				}
+				s.float64Masks[column] |= uint64(1) << slot
+				s.float64Values[column*64+int(slot)] = value
+			}
+		}
+	}
+	if keep {
+		if replacement == nil {
+			return storeio.DocumentFloat64Columns{}, storeio.ErrDocumentPageCorrupt
+		}
+		for column, definition := range s.options.float64Columns {
+			node, ok, err := replacement.PointerCompiled(definition.pointer)
+			if err != nil {
+				return storeio.DocumentFloat64Columns{}, err
+			}
+			if !ok {
+				continue
+			}
+			value, ok := node.Raw().Float64()
+			if !ok || math.IsNaN(value) || math.IsInf(value, 0) {
+				continue
+			}
+			s.float64Masks[column] |= uint64(1) << target
+			s.float64Values[column*64+int(target)] = value
+		}
+	}
+	return storeio.DocumentFloat64Columns{Masks: s.float64Masks, Values: s.float64Values}, nil
+}
+
+func (s *FileStore) fileDocumentPageSize(rows []storeio.DocumentRecord, columns storeio.DocumentFloat64Columns) (uint32, error) {
 	needed := storeio.PageHeaderSize + storeio.PageTrailerSize + storeio.DocumentPagePayloadHeaderSize + len(rows)*storeio.DocumentPageRecordSize
 	for _, row := range rows {
 		needed += len(row.Key)
@@ -1999,6 +2158,9 @@ func (s *FileStore) fileDocumentPageSize(rows []storeio.DocumentRecord) (uint32,
 		} else {
 			needed += storeio.DocumentOverflowDescriptorSize
 		}
+	}
+	for _, mask := range columns.Masks {
+		needed += 8 + bits.OnesCount64(mask)*8
 	}
 	size := s.options.PageSize
 	for size < needed && size < s.options.MaxPageSize {
@@ -2017,6 +2179,7 @@ func (s *FileStore) stageFileState(tx *storeio.WriteTransaction, old *fileStoreS
 	}
 	root := storeio.StateRoot{
 		StoreID: s.storeID, Generation: generation, PageSize: uint32(s.options.PageSize),
+		Options:       old.root.Options,
 		DocumentCount: documentCount, TTLCount: ttlCount, NextLogicalID: tx.NextLogicalID(),
 		ChunkHighWater: chunkHighWater, LiveChunks: liveChunks,
 		ChunkDocuments: uint32(s.options.Store.ChunkDocuments),
@@ -2195,6 +2358,27 @@ func fileIndexTupleHash(exact *storeExactIndex, index Index) (uint64, bool, erro
 	return hash, true, nil
 }
 
+func fileIndexTuplesEqual(exact *storeExactIndex, left, right Index) (bool, error) {
+	if exact == nil || exact.n == 0 {
+		return false, nil
+	}
+	for column := range int(exact.n) {
+		leftNode, leftOK, err := left.PointerCompiled(exact.paths[column])
+		if err != nil {
+			return false, err
+		}
+		rightNode, rightOK, err := right.PointerCompiled(exact.paths[column])
+		if err != nil {
+			return false, err
+		}
+		if !leftOK || !rightOK ||
+			!fileIndexRawValuesEqual(leftNode.Raw(), rightNode.Raw()) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func fileIndexNeedleHash(exact *storeExactIndex, values []Index) (uint64, error) {
 	if len(values) != int(exact.n) {
 		return 0, ErrStoreIndexArity
@@ -2269,16 +2453,49 @@ func (s *FileStore) updateFileIndexes(tx *storeio.WriteTransaction, state *fileS
 			}
 		}
 		if oldOK && newOK && oldHash == newHash {
+			equal, equalErr := fileIndexTuplesEqual(exact, *oldIndex, *newIndex)
+			if equalErr != nil {
+				return storeio.PageRef{}, equalErr
+			}
+			if equal {
+				continue
+			}
+			newCertificate, certificateErr := s.fileIndexCertificate(
+				s.indexNewCertificate[:0], exact, *newIndex,
+			)
+			if certificateErr != nil {
+				return storeio.PageRef{}, certificateErr
+			}
+			s.indexNewCertificate = newCertificate
+			root, err = s.mutateFilePosting(
+				tx, state, root, uint32(indexID), oldHash, location, true,
+				newCertificate,
+			)
+			if err != nil {
+				return storeio.PageRef{}, err
+			}
 			continue
 		}
 		if oldOK {
-			root, err = s.mutateFilePosting(tx, state, root, uint32(indexID), oldHash, location, false)
+			root, err = s.mutateFilePosting(
+				tx, state, root, uint32(indexID), oldHash, location, false, nil,
+			)
 			if err != nil {
 				return storeio.PageRef{}, err
 			}
 		}
 		if newOK {
-			root, err = s.mutateFilePosting(tx, state, root, uint32(indexID), newHash, location, true)
+			newCertificate, certificateErr := s.fileIndexCertificate(
+				s.indexNewCertificate[:0], exact, *newIndex,
+			)
+			if certificateErr != nil {
+				return storeio.PageRef{}, certificateErr
+			}
+			s.indexNewCertificate = newCertificate
+			root, err = s.mutateFilePosting(
+				tx, state, root, uint32(indexID), newHash, location, true,
+				newCertificate,
+			)
 			if err != nil {
 				return storeio.PageRef{}, err
 			}
@@ -2287,7 +2504,40 @@ func (s *FileStore) updateFileIndexes(tx *storeio.WriteTransaction, state *fileS
 	return root, nil
 }
 
-func (s *FileStore) mutateFilePosting(tx *storeio.WriteTransaction, state *fileStoreState, root storeio.PageRef, indexID uint32, tupleHash uint64, location storeio.KeyLocation, present bool) (storeio.PageRef, error) {
+func (s *FileStore) fileIndexCertificate(dst []byte, exact *storeExactIndex, index Index) ([]byte, error) {
+	if exact == nil || exact.n == 0 {
+		return nil, nil
+	}
+	var values [StoreIndexMaxColumns]RawValue
+	for column := range int(exact.n) {
+		node, ok, err := index.PointerCompiled(exact.paths[column])
+		if err != nil || !ok {
+			return nil, err
+		}
+		values[column] = node.Raw()
+	}
+	maxCertificate := s.options.PageSize - storeio.PageHeaderSize -
+		storeio.PageTrailerSize - storeio.PostingPagePayloadHeaderSize -
+		storeio.PostingSegmentHeaderSize - 16
+	certificate, ok := appendFileIndexCertificate(
+		dst, values[:exact.n], maxCertificate,
+	)
+	if !ok {
+		return nil, nil
+	}
+	return certificate, nil
+}
+
+func (s *FileStore) mutateFilePosting(
+	tx *storeio.WriteTransaction,
+	state *fileStoreState,
+	root storeio.PageRef,
+	indexID uint32,
+	tupleHash uint64,
+	location storeio.KeyLocation,
+	present bool,
+	newCertificate []byte,
+) (storeio.PageRef, error) {
 	key := storeio.IndexDirectoryKey{IndexID: indexID, TupleHash: tupleHash, Chunk: location.Chunk}
 	bounds := storeio.IndexTreeBounds{
 		FileEnd: tx.FileEnd(), NextLogicalID: tx.NextLogicalID(), IndexHighWater: uint32(len(s.options.indexes)),
@@ -2297,6 +2547,8 @@ func (s *FileStore) mutateFilePosting(tx *storeio.WriteTransaction, state *fileS
 		return storeio.PageRef{}, err
 	}
 	mask := uint64(0)
+	collision := false
+	s.indexCertificateScratch = s.indexCertificateScratch[:0]
 	if found {
 		lease, acquireErr := s.cache.Acquire(posting.Page)
 		if acquireErr != nil {
@@ -2314,6 +2566,18 @@ func (s *FileStore) mutateFilePosting(tx *storeio.WriteTransaction, state *fileS
 		}
 		iterator := segment.Iterator()
 		entry, ok := iterator.Next()
+		if len(segment.Certificate()) != 0 {
+			certificate := RawValue{src: segment.Certificate()}
+			exact := s.options.indexes[indexID]
+			if !fileIndexCertificateValid(certificate.Bytes(), int(exact.n)) {
+				lease.Release()
+				return storeio.PageRef{}, storeio.ErrPostingPageCorrupt
+			}
+			s.indexCertificateScratch = append(
+				s.indexCertificateScratch, segment.Certificate()...,
+			)
+		}
+		collision = segment.Header().Flags&storeio.PostingSegmentCollision != 0
 		lease.Release()
 		if !ok || entry.Chunk != location.Chunk {
 			return storeio.PageRef{}, storeio.ErrPostingPageCorrupt
@@ -2322,6 +2586,24 @@ func (s *FileStore) mutateFilePosting(tx *storeio.WriteTransaction, state *fileS
 	}
 	bit := uint64(1) << location.Slot
 	if present {
+		if len(newCertificate) == 0 {
+			s.indexCertificateScratch = s.indexCertificateScratch[:0]
+			collision = false
+		} else if len(s.indexCertificateScratch) == 0 {
+			if found && mask != 0 {
+				// An older posting without a representative cannot prove that
+				// its existing bits equal the new value.
+				collision = true
+			}
+			s.indexCertificateScratch = append(
+				s.indexCertificateScratch, newCertificate...,
+			)
+		} else if !fileIndexCertificatesEqual(
+			s.indexCertificateScratch, newCertificate,
+			int(s.options.indexes[indexID].n),
+		) {
+			collision = true
+		}
 		mask |= bit
 	} else {
 		mask &^= bit
@@ -2355,7 +2637,14 @@ func (s *FileStore) mutateFilePosting(tx *storeio.WriteTransaction, state *fileS
 		return storeio.PageRef{}, err
 	}
 	entries := [1]storeio.PostingEntry{{Chunk: location.Chunk, Bits: mask}}
-	segments := [1]storeio.PostingSegment{{StreamID: 1, TupleHash: tupleHash, Entries: entries[:]}}
+	flags := uint16(0)
+	if collision {
+		flags |= storeio.PostingSegmentCollision
+	}
+	segments := [1]storeio.PostingSegment{{
+		StreamID: 1, TupleHash: tupleHash, Flags: flags,
+		Certificate: s.indexCertificateScratch, Entries: entries[:],
+	}}
 	if _, err := storeio.EncodePostingPage(page.Bytes(), storeio.PostingPageHeader{
 		StoreID: s.storeID, Generation: tx.Generation(), LogicalID: page.Ref().LogicalID,
 		PageSize: page.Ref().Length, IndexID: indexID,
@@ -2419,13 +2708,10 @@ func (s *FileStore) restoreAppendChunk(state *fileStoreState) error {
 	if err != nil {
 		return err
 	}
-	view, err := storeio.OpenDocumentPageWithOverflow(
-		lease.Page(), state.root.ChunkHighWater, state.root.NextLogicalID,
-		state.super.FileEnd, state.root.PageSize,
-	)
+	view := storeio.AdmittedDocumentPage(lease.Page())
 	lease.Release()
-	if err != nil {
-		return err
+	if view.Header().ChunkID != last {
+		return storeio.ErrDocumentPageCorrupt
 	}
 	limit := ^uint64(0)
 	if state.root.ChunkDocuments < 64 {

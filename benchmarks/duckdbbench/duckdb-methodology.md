@@ -141,10 +141,10 @@ minimum repetition. The report uses DuckDB's `latency`, not shell wall time.
 | label | heap Store | durable FileStore | DuckDB |
 |---|---|---|---|
 | point | `Snapshot.Get` plus compiled pointer | copied JSON plus structural index and compiled pointer | key ART lookup plus `json_extract_string` |
-| filter | exact bitmap candidates plus scalar recheck | persistent exact candidates plus scalar recheck | `count(*) where filter_value = ?` |
-| sum | compiled numeric column reduction | bounded page scan and numeric reduction | `sum(metric)` |
+| filter | exact bitmap candidates plus scalar recheck | collision-free exact certificate + bitmap; document recheck fallback | `count(*) where filter_value = ?` |
+| sum | compiled numeric column reduction | persistent typed cover when configured; JSON/page fallback otherwise | `sum(metric)` |
 | group | compiled grouped count | bounded page scan and grouped count | SQL `group by filter_value` |
-| contain | structural JSON containment | persistent exact candidates plus structural recheck | `json_contains(doc, ?::JSON)` |
+| contain | structural JSON containment | scalar-leaf object lowering + exact certificate; structural fallback | `json_contains(doc, ?::JSON)` |
 
 The filter is deliberately low cardinality in clustered synthetic data. DuckDB
 documents ART as a point/high-selectivity structure and may choose a vectorized
@@ -164,8 +164,10 @@ checksummed data/root durability fence. DuckDB wraps each individual SQL
 statement in its own explicit `BEGIN`/`COMMIT`; the reported per-operation
 latency sums transaction start, mutation, and commit profiles. The durable
 ratio is therefore FileStore versus one DuckDB transaction per key, not a SQL
-batch versus a Go loop. FileStore closes and reopens after the mutation sequence
-and accepts cardinality only from the recovered root.
+batch versus a Go loop. This aligns transaction boundaries, not operating
+system, container, filesystem, or storage-stack durability latency. FileStore
+closes and reopens after the mutation sequence and accepts cardinality only
+from the recovered root.
 
 ## Verification
 
@@ -189,6 +191,7 @@ After load and both indexes, the runner executes `CHECKPOINT` and records:
 - byte length of `store.duckdb.wal`, normally zero after checkpoint;
 - profiler `system_peak_buffer_memory`;
 - profiler `system_peak_temp_dir_size`; and
+- database byte length after the mutation smoke; and
 - WAL bytes after the mutation smoke.
 
 Store records settled `runtime.MemStats.HeapAlloc` delta with input and caller
@@ -211,8 +214,9 @@ engine-accounting views, not process RSS.
 FileStore file length is recorded after flushed close and compared directly
 with DuckDB's checkpointed database length over the same logical payload and
 index contract. Copy-on-write high water after mutations and already reusable
-extent bytes are also reported. A reusable extent remains allocated file space,
-so it is not subtracted from disk usage.
+extent bytes are also reported beside DuckDB's post-mutation database and WAL
+bytes. A reusable extent remains allocated file space, so it is not subtracted
+from disk usage.
 
 After the checkpoint, DuckDB runs the representative point, filter, aggregate,
 group, and containment working set in one process and records the current

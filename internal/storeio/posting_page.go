@@ -10,9 +10,14 @@ import (
 const (
 	PostingPagePayloadHeaderSize = 32
 	PostingSegmentHeaderSize     = 48
-	postingPageVersion           = uint32(1)
+	postingPageVersionV1         = uint32(1)
+	postingPageVersion           = uint32(2)
 	postingPageKnownFlags        = uint16(0)
-	postingSegmentKnownFlags     = uint16(0)
+	// PostingSegmentCollision marks a certificate whose hash stream contains
+	// more than one exact scalar or compound tuple. Readers must recheck its
+	// documents.
+	PostingSegmentCollision  = uint16(1 << 0)
+	postingSegmentKnownFlags = PostingSegmentCollision
 )
 
 // ErrPostingPageCorrupt reports a checksum-valid common page whose packed
@@ -38,11 +43,12 @@ type PostingLink struct {
 // comes from the exact value dictionary after full canonical tuple comparison;
 // TupleHash is an accelerator and is never an equality boundary.
 type PostingSegment struct {
-	StreamID  uint32
-	TupleHash uint64
-	Flags     uint16
-	Next      PostingLink
-	Entries   []PostingEntry
+	StreamID    uint32
+	TupleHash   uint64
+	Flags       uint16
+	Next        PostingLink
+	Certificate []byte
+	Entries     []PostingEntry
 }
 
 // PostingPageHeader identifies one immutable physical page that packs several
@@ -74,13 +80,15 @@ type PostingPageView struct {
 	header  PostingPageHeader
 	payload []byte
 	count   uint16
+	version uint32
 }
 
 // PostingSegmentView is one admitted segment inside a PostingPageView.
 type PostingSegmentView struct {
-	header  PostingSegmentHeader
-	entries []byte
-	count   uint16
+	header      PostingSegmentHeader
+	certificate []byte
+	entries     []byte
+	count       uint16
 }
 
 // PostingIterator decodes an already-admitted segment without allocation.
@@ -131,7 +139,8 @@ func EncodePostingPage(dst []byte, header PostingPageHeader, segments []PostingS
 		for _, entry := range segment.Entries {
 			rows += uint32(bits.OnesCount64(entry.Bits))
 		}
-		encodedLength, _ := PostingEntriesEncodedSize(segment.Entries)
+		entriesLength, _ := PostingEntriesEncodedSize(segment.Entries)
+		encodedLength := len(segment.Certificate) + entriesLength
 		binary.LittleEndian.PutUint32(record[0:4], segment.StreamID)
 		binary.LittleEndian.PutUint32(record[4:8], segment.Entries[0].Chunk)
 		binary.LittleEndian.PutUint32(record[8:12], segment.Entries[len(segment.Entries)-1].Chunk)
@@ -143,8 +152,11 @@ func EncodePostingPage(dst []byte, header PostingPageHeader, segments []PostingS
 		binary.LittleEndian.PutUint16(record[40:42], uint16(len(segment.Entries)))
 		binary.LittleEndian.PutUint16(record[42:44], segment.Next.Segment)
 		binary.LittleEndian.PutUint16(record[44:46], segment.Flags)
+		binary.LittleEndian.PutUint16(record[46:48], uint16(len(segment.Certificate)))
 
 		position := dataPosition
+		copy(payload[position:position+len(segment.Certificate)], segment.Certificate)
+		position += len(segment.Certificate)
 		previous := segment.Entries[0].Chunk
 		for entryIndex, entry := range segment.Entries {
 			delta := entry.Chunk - previous
@@ -180,8 +192,9 @@ func OpenPostingPage(src []byte, nextLogicalID uint64, indexHighWater uint32) (P
 	if err != nil {
 		return PostingPageView{}, fmt.Errorf("%w: %w", ErrPostingPageCorrupt, err)
 	}
+	version := binary.LittleEndian.Uint32(payload[0:4])
 	if pageHeader.Kind != PageIndexPosting || len(payload) < PostingPagePayloadHeaderSize ||
-		binary.LittleEndian.Uint32(payload[0:4]) != postingPageVersion ||
+		version != postingPageVersionV1 && version != postingPageVersion ||
 		!allZero(payload[20:PostingPagePayloadHeaderSize]) {
 		return PostingPageView{}, fmt.Errorf("%w: header, version, or reserved bytes", ErrPostingPageCorrupt)
 	}
@@ -206,7 +219,7 @@ func OpenPostingPage(src []byte, nextLogicalID uint64, indexHighWater uint32) (P
 	previousStream := uint32(0)
 	dataPosition := dataStart
 	for i := 0; i < int(count); i++ {
-		segment, entries, entryCount, decodeErr := decodePostingSegment(payload, i, dataStart)
+		segment, _, entries, entryCount, decodeErr := decodePostingSegment(payload, i, dataStart, version)
 		if decodeErr != nil || segment.StreamID <= previousStream ||
 			segment.Flags&^postingSegmentKnownFlags != 0 || segment.Rows == 0 ||
 			dataPosition != int(binary.LittleEndian.Uint32(postingSegmentRecord(payload, i)[32:36])) ||
@@ -229,12 +242,12 @@ func OpenPostingPage(src []byte, nextLogicalID uint64, indexHighWater uint32) (P
 			return PostingPageView{}, fmt.Errorf("%w: posting count, rows, or tail", ErrPostingPageCorrupt)
 		}
 		previousStream = segment.StreamID
-		dataPosition += len(entries)
+		dataPosition += int(binary.LittleEndian.Uint32(postingSegmentRecord(payload, i)[36:40]))
 	}
 	if dataPosition != len(payload) {
 		return PostingPageView{}, fmt.Errorf("%w: non-canonical data packing", ErrPostingPageCorrupt)
 	}
-	return PostingPageView{header: header, payload: payload, count: count}, nil
+	return PostingPageView{header: header, payload: payload, count: count, version: version}, nil
 }
 
 // Header returns the value-only page identity.
@@ -248,11 +261,17 @@ func (v PostingPageView) SegmentAt(rank int) (PostingSegmentView, bool) {
 	if rank < 0 || rank >= int(v.count) {
 		return PostingSegmentView{}, false
 	}
-	header, entries, count, err := decodePostingSegment(v.payload, rank, PostingPagePayloadHeaderSize+int(v.count)*PostingSegmentHeaderSize)
+	header, certificate, entries, count, err := decodePostingSegment(
+		v.payload, rank,
+		PostingPagePayloadHeaderSize+int(v.count)*PostingSegmentHeaderSize,
+		v.version,
+	)
 	if err != nil {
 		return PostingSegmentView{}, false
 	}
-	return PostingSegmentView{header: header, entries: entries, count: count}, true
+	return PostingSegmentView{
+		header: header, certificate: certificate, entries: entries, count: count,
+	}, true
 }
 
 // Lookup resolves one exact-value stream id with binary search over the packed
@@ -279,6 +298,12 @@ func (v PostingSegmentView) Header() PostingSegmentHeader { return v.header }
 
 // Len returns the number of chunk masks in this segment.
 func (v PostingSegmentView) Len() int { return int(v.count) }
+
+// Certificate returns the capacity-clipped exact scalar or compound-tuple
+// representative for this hash stream. Empty means the writer could not
+// encode a certificate and readers must recheck documents. The slice borrows
+// the posting page.
+func (v PostingSegmentView) Certificate() []byte { return v.certificate }
 
 // Iterator returns an independent zero-allocation decoder.
 func (v PostingSegmentView) Iterator() PostingIterator {
@@ -374,6 +399,8 @@ func validatePostingPageWrite(header PostingPageHeader, segments []PostingSegmen
 	for _, segment := range segments {
 		if segment.StreamID == 0 || segment.StreamID <= previousStream ||
 			segment.Flags&^postingSegmentKnownFlags != 0 ||
+			len(segment.Certificate) > int(^uint16(0)) ||
+			segment.Flags&PostingSegmentCollision != 0 && len(segment.Certificate) == 0 ||
 			!validPostingLink(segment.Next, header.LogicalID, nextLogicalID) {
 			return 0, fmt.Errorf("%w: posting segment identity or flags", ErrInvalidWrite)
 		}
@@ -381,7 +408,7 @@ func validatePostingPageWrite(header PostingPageHeader, segments []PostingSegmen
 		if err != nil {
 			return 0, err
 		}
-		encodedBytes += length
+		encodedBytes += len(segment.Certificate) + length
 		previousStream = segment.StreamID
 	}
 	payloadLength := uint64(PostingPagePayloadHeaderSize) + uint64(len(segments))*PostingSegmentHeaderSize + uint64(encodedBytes)
@@ -413,15 +440,20 @@ func postingSegmentRecord(payload []byte, rank int) []byte {
 	return payload[start : start+PostingSegmentHeaderSize]
 }
 
-func decodePostingSegment(payload []byte, rank, dataStart int) (PostingSegmentHeader, []byte, uint16, error) {
+func decodePostingSegment(payload []byte, rank, dataStart int, version uint32) (PostingSegmentHeader, []byte, []byte, uint16, error) {
 	record := postingSegmentRecord(payload, rank)
-	if !allZero(record[46:48]) {
-		return PostingSegmentHeader{}, nil, 0, ErrPostingPageCorrupt
+	certificateLength := uint16(0)
+	if version == postingPageVersionV1 {
+		if !allZero(record[46:48]) {
+			return PostingSegmentHeader{}, nil, nil, 0, ErrPostingPageCorrupt
+		}
+	} else {
+		certificateLength = binary.LittleEndian.Uint16(record[46:48])
 	}
 	offset := binary.LittleEndian.Uint32(record[32:36])
 	length := binary.LittleEndian.Uint32(record[36:40])
 	if offset < uint32(dataStart) || uint64(offset)+uint64(length) > uint64(len(payload)) || length == 0 {
-		return PostingSegmentHeader{}, nil, 0, ErrPostingPageCorrupt
+		return PostingSegmentHeader{}, nil, nil, 0, ErrPostingPageCorrupt
 	}
 	header := PostingSegmentHeader{
 		StreamID:   binary.LittleEndian.Uint32(record[0:4]),
@@ -436,11 +468,17 @@ func decodePostingSegment(payload []byte, rank, dataStart int) (PostingSegmentHe
 		Flags: binary.LittleEndian.Uint16(record[44:46]),
 	}
 	count := binary.LittleEndian.Uint16(record[40:42])
-	if header.StreamID == 0 || count == 0 || header.LastChunk < header.FirstChunk {
-		return PostingSegmentHeader{}, nil, 0, ErrPostingPageCorrupt
+	if header.StreamID == 0 || count == 0 || header.LastChunk < header.FirstChunk ||
+		uint32(certificateLength) >= length ||
+		header.Flags&PostingSegmentCollision != 0 && certificateLength == 0 {
+		return PostingSegmentHeader{}, nil, nil, 0, ErrPostingPageCorrupt
 	}
 	end := int(uint64(offset) + uint64(length))
-	return header, payload[int(offset):end:end], count, nil
+	certificateEnd := int(offset) + int(certificateLength)
+	return header,
+		payload[int(offset):certificateEnd:certificateEnd],
+		payload[certificateEnd:end:end],
+		count, nil
 }
 
 func postingEntryEncodedSize(delta uint32, mask uint64) int {

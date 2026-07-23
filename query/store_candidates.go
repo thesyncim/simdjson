@@ -36,7 +36,7 @@ func (p *compiledPredicate) storeCandidates(snapshot simdjson.Snapshot, paths []
 		if p.op != Eq {
 			return nil, false, false, nil
 		}
-		path := paths[p.col].indexPath()
+		path := p.indexPath(paths)
 		for _, index := range indexes {
 			if index.Kind != simdjson.StoreIndexExact || index.State != simdjson.StoreIndexReady || index.ColumnCount != 1 || index.Columns[0] != path {
 				continue
@@ -52,23 +52,10 @@ func (p *compiledPredicate) storeCandidates(snapshot simdjson.Snapshot, paths []
 		}
 		return nil, false, false, nil
 	case predContains:
-		if p.containIndexPath == "" {
+		if p.containPlan == nil {
 			return nil, false, false, nil
 		}
-		for _, index := range indexes {
-			if index.Kind != simdjson.StoreIndexExact || index.State != simdjson.StoreIndexReady || index.ColumnCount != 1 || index.Columns[0] != p.containIndexPath {
-				continue
-			}
-			out := w.nextStoreMasks()
-			out, err := snapshot.AppendIndexMasks(out, index.Name, p.containIndexNeedle)
-			if err != nil {
-				return nil, false, false, err
-			}
-			w.storeIndexProbes++
-			w.keepStoreMasks(out)
-			return out, true, true, nil
-		}
-		return nil, false, false, nil
+		return p.containPlan.storeCandidates(snapshot, paths, indexes, w)
 	case predAnd:
 		return p.storeAndCandidates(snapshot, paths, indexes, w)
 	case predOr:
@@ -164,7 +151,7 @@ func (p *compiledPredicate) coveredEquality(paths []compiledPath, compound simdj
 	if compound.ColumnCount < 2 || p.kind != predCmp || p.op != Eq {
 		return false
 	}
-	path := paths[p.col].indexPath()
+	path := p.indexPath(paths)
 	for i := 0; i < int(compound.ColumnCount); i++ {
 		if compound.Columns[i] == path {
 			return true
@@ -198,7 +185,7 @@ func (p *compiledPredicate) bestCompoundIndex(paths []compiledPath, indexes []si
 }
 
 func (p *compiledPredicate) findEquality(path string, paths []compiledPath) (simdjson.Index, bool) {
-	if p.kind == predCmp && p.op == Eq && paths[p.col].indexPath() == path {
+	if p.kind == predCmp && p.op == Eq && p.indexPath(paths) == path {
 		return p.needle, true
 	}
 	if p.kind == predAnd {

@@ -33,8 +33,14 @@ func testPostingSegments() []PostingSegment {
 				{Chunk: 1000, Bits: uint64(1) << 63},
 			},
 		},
-		{StreamID: 11, TupleHash: 0x55, Entries: []PostingEntry{{Chunk: 21, Bits: 1}}},
-		{StreamID: 99, TupleHash: 0xaa, Entries: []PostingEntry{{Chunk: 31, Bits: 3}}},
+		{
+			StreamID: 11, TupleHash: 0x55, Certificate: []byte(`"cat"`),
+			Entries: []PostingEntry{{Chunk: 21, Bits: 1}},
+		},
+		{
+			StreamID: 99, TupleHash: 0xaa, Flags: PostingSegmentCollision,
+			Certificate: []byte(`"first"`), Entries: []PostingEntry{{Chunk: 31, Bits: 3}},
+		},
 	}
 }
 
@@ -42,6 +48,7 @@ func clonePostingSegments(src []PostingSegment) []PostingSegment {
 	dst := append([]PostingSegment(nil), src...)
 	for i := range dst {
 		dst[i].Entries = append([]PostingEntry(nil), src[i].Entries...)
+		dst[i].Certificate = append([]byte(nil), src[i].Certificate...)
 	}
 	return dst
 }
@@ -81,7 +88,9 @@ func TestPostingPagePackedStreamsRoundTripAndLookup(t *testing.T) {
 		}
 		gotHeader := segment.Header()
 		if gotHeader.StreamID != want.StreamID || gotHeader.TupleHash != want.TupleHash ||
-			gotHeader.Next != want.Next || segment.Len() != len(want.Entries) {
+			gotHeader.Next != want.Next || gotHeader.Flags != want.Flags ||
+			segment.Len() != len(want.Entries) ||
+			string(segment.Certificate()) != string(want.Certificate) {
 			t.Fatalf("segment %d header = %+v, want stream/hash/next/count from %+v", i, gotHeader, want)
 		}
 		it := segment.Iterator()
@@ -113,7 +122,7 @@ func TestPostingPagePackedStreamsRoundTripAndLookup(t *testing.T) {
 		if sizeErr != nil {
 			t.Fatal(sizeErr)
 		}
-		encodedBytes += size
+		encodedBytes += size + len(segment.Certificate)
 	}
 	_, payload, err := OpenPage(page)
 	if err != nil {
@@ -184,6 +193,9 @@ func TestPostingPageRejectsInvalidWrites(t *testing.T) {
 			(*segments)[1].StreamID = (*segments)[0].StreamID
 		}},
 		{"segment flags", func(_ *PostingPageHeader, segments *[]PostingSegment, _ *uint64, _ *uint32) { (*segments)[0].Flags = 1 }},
+		{"collision without certificate", func(_ *PostingPageHeader, segments *[]PostingSegment, _ *uint64, _ *uint32) {
+			(*segments)[0].Flags = PostingSegmentCollision
+		}},
 		{"link same page", func(h *PostingPageHeader, segments *[]PostingSegment, _ *uint64, _ *uint32) {
 			(*segments)[0].Next.LogicalID = h.LogicalID
 		}},
@@ -233,7 +245,7 @@ func TestPostingPageRejectsResealedSemanticCorruption(t *testing.T) {
 		name   string
 		mutate func([]byte)
 	}{
-		{"version", func(p []byte) { binary.LittleEndian.PutUint32(p[PageHeaderSize:PageHeaderSize+4], 2) }},
+		{"version", func(p []byte) { binary.LittleEndian.PutUint32(p[PageHeaderSize:PageHeaderSize+4], 3) }},
 		{"index", func(p []byte) {
 			binary.LittleEndian.PutUint32(p[PageHeaderSize+4:PageHeaderSize+8], testPostingIndexHighWater)
 		}},

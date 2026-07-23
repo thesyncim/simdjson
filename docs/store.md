@@ -69,8 +69,9 @@ raw, ok := view.GetRaw("user:42")
 | `FileStore.SetDeadline` / `Persist` / `ExpireDue` | mutate the persistent deadline tree | copied key/TTL paths; due work is caller-bounded by `limit` |
 | `FileStore.Snapshot` / `FileSnapshot.Close` | acquire/release a generation lease | O(1); the lease fences physical extent reuse |
 | `FileSnapshot.AppendRaw` | copy exact JSON into caller storage | key-tree lookup + touched document/overflow pages |
-| `FileSnapshot.AppendIndexMasks/Into` | probe a frozen exact index with mandatory document recheck | posting chunks + collision candidates; `Into` reuses caller workspace |
+| `FileSnapshot.AppendIndexMasks/Into` | probe a frozen exact index with collision-safe certification or document recheck | posting chunks + uncertified/colliding candidates; `Into` reuses caller workspace |
 | `FileSnapshot.AppendIndexCandidateMasksInto` | append a hash-bounded superset for an engine that will recheck | index/posting pages only; never a final answer |
+| `FileSnapshot.ReduceFloat64Path` / `ReduceFloat64PathsInto` | reduce frozen numeric covers without parsing JSON | one ordered document-page walk; fused paths and warmed caller buffers allocate zero |
 | `FileSnapshot.RangeRawBuffer` / `RangeRawReadAheadBuffer` / `RangeMasksRawBuffer` | ordered serial, bounded direct-read-ahead, or sparse stable-slot scan | touched document/overflow pages; zero allocation after caller scratch warms |
 | `FileStore.Flush` | wait until the visible generation is crash-safe | queued storage work and durability barriers |
 | `query.RunFileSnapshot` | late-bound persistent-index pushdown, parallel bounded batches, external ordered/group spill | O(candidate input + merge), or full input when unbounded; final result storage is caller-owned |
@@ -366,8 +367,30 @@ are path-copied; unchanged pages remain shared. The commit device writes data
 pages, executes a data-integrity barrier, writes the alternate superblock, and
 executes the final barrier. Recovery accepts the newest root only after its
 state and top-level page graph validate, otherwise it uses the previous root.
-Crash-image tests cover partially written data and root prefixes and require
+Crash-image tests stop the sorted data phase immediately before, inside, and
+after every changed physical page, then tear every byte prefix of the root
+record. They verify primary JSON, TTL, and exact-index state and require
 recovery to return one whole generation, never a mixture.
+
+The acknowledgement boundary matters:
+
+- with `Synchronous`, a successful mutation has crossed both storage barriers;
+- without it, publication is reader-visible but only generations at or below
+  `DurableGeneration` are crash-safe; `Flush` and `Close` wait for that bound;
+- after interruption, recovery selects the newest generation whose
+  superblock, state root, and top-level directory identities validate, or the
+  preceding valid generation;
+- corruption discovered below the bounded open-time roots fails the operation
+  closed when that page is admitted; open does not spend O(database) I/O
+  proving every cold leaf.
+
+This is a single-file failure-atomic contract, not replication or archival
+recovery. It still depends on the operating system and storage device honoring
+the requested data-integrity barriers. Destruction of both root copies,
+firmware that lies about flush completion, media loss, and rollback to an
+arbitrary historical point require external replicas or backups. Deterministic
+tearing is a release gate; longer real-device power-cut and recovery-fuzz
+campaigns remain additional evidence rather than a completed guarantee.
 
 `BenchmarkPageCacheBlockAllocatorPressure` fills a 1,048,576-quantum
 (4 GiB at 4 KiB) geometry, then repeatedly releases and reacquires maximum
@@ -445,10 +468,15 @@ and physically orders document extents before submitting bounded read-ahead.
 
 Exact index definitions are frozen in `FileStoreOptions.Indexes`; their catalog
 hash is part of the durable root. Each mutation updates the affected
-`(index, tuple hash, chunk)` posting page in the same transaction. A probe first
-finds candidate masks and then reopens every candidate document for mandatory
-exact scalar recheck, so hash collisions and alternate escaped spellings cannot
-produce a false result. `AppendIndexMasksInto` retains the directory, copied
+`(index, tuple hash, chunk)` posting page in the same transaction. Posting
+format v2 may carry one validated scalar or compound-tuple representative.
+When every bit in a stream has the same exact tuple, one semantic comparison
+between the query and that certificate proves the complete bitmap. If a second
+tuple shares the 64-bit hash, the writer sets a sticky collision flag and the
+probe reopens the candidate documents. Missing certificates in version-one
+pages take the same fallback. Correctness therefore never depends on collision
+probability, and alternate string escapes or equivalent JSON number spellings
+compare by value. `AppendIndexMasksInto` retains the directory, copied
 document, and parse-tape high-water marks in a caller-owned
 `FileIndexWorkspace`; with sufficient output capacity and resident pages, a
 warmed probe allocates zero bytes. `AppendIndexCandidateMasksInto` intentionally
@@ -457,24 +485,70 @@ recheck; using it as a final answer is incorrect. TTL stores the deadline beside
 the key and in an ordered persistent tree; replacement preserves the deadline
 and ordinary reads never consult the clock.
 
+Numeric covering definitions are separately frozen in
+`FileStoreOptions.Float64Columns` as exact RFC 6901 paths. The catalog supports
+at most 256 paths and participates in the same durable catalog hash, so reopen
+fails closed when the order or spelling changes. Document-page format v2
+appends, for each configured path, one stable-slot validity mask and only its
+finite `float64` values. Version-one pages remain readable for stores without
+covers. Missing, null, non-numeric, NaN, and infinity have no set bit.
+`Store.WriteFileStore`, online `Put`, and `Delete` maintain the typed section in
+the same page generation as the JSON; a torn or stale cover can never be
+selected independently. Encoding rejects masks outside live rows and
+non-finite values, while open verifies exact section length, live-mask
+containment, finite bits, checksum, and the frozen column count.
+The page cache performs common framing/CRC32C and complete document-schema
+validation once, before publishing a loaded frame. Hot point reads, scans,
+index rechecks, and covering reductions then use an admitted borrowed view
+instead of checksumming and decoding the immutable page again. Each consumer
+still checks that the document's encoded `ChunkID` matches the selecting
+chunk-tree edge, closing the cross-tree substitution case even when a forged
+page carries a valid checksum and an otherwise in-range chunk id.
+
+`ReduceFloat64PathsInto` preflights every requested path before reading a
+document page and fuses all configured paths into one ordered page walk.
+Returning `false` therefore means no partial scan occurred and a query engine
+can choose one coherent fallback. A warmed scan with caller-owned aggregate and
+path slices allocates zero bytes. The on-page covers are pointer-free and add
+at most `8 + 8*ChunkDocuments` bytes per path and document page; the writer's
+fixed pointer-free scratch is reported by `Stats.Float64ScratchBytes`.
+Co-location makes update/delete publication simple and keeps point locality,
+but a cold cover scan still admits the containing document pages. It is not a
+claim of column-only device I/O for data far beyond RAM.
+
 `query.RunFileSnapshot` late-binds the frozen catalog before starting workers.
 It chooses the widest matching compound equality index, avoids redundant
 overlapping single-column probes, and can intersect `AND` or union a completely
 bounded `OR`. File `NOT` currently stays on the full-scan lane because its
 complement universe would require an independently fallible page walk. An index
 read or validation error is returned; corruption never silently changes the
-plan into a scan. Hash-bounded candidate masks drive `RangeMasksRawBuffer`, then
-the ordinary predicate is evaluated again over every survivor. This single
-document pass supplies the mandatory collision recheck while preserving source
-order, LIMIT ties, and grouped first-row ordering.
+plan into a scan. Row-producing plans use hash-bounded candidate masks to drive
+`RangeMasksRawBuffer`, then evaluate the ordinary predicate over every
+survivor. This single document pass supplies exact recheck while preserving
+source order, LIMIT ties, and grouped first-row ordering. A fully indexed
+`COUNT(*)` instead asks the exact probe for final masks: certificates decide
+non-colliding streams and only ambiguous streams reopen documents.
 
 Selected raw pages enter bounded arenas, build batch-local indexes in parallel,
 and merge in source order. Projection ordering and group state spill as sorted
 temporary runs after the configured memory frontier; multi-pass merge opens at
 most 32 runs. Temporary files are removed on success and error.
 `FileExecutionStats` exposes `RowsTotal`, `RowsScanned`, `IndexBounded`,
-`IndexLookups`, `CandidateRows`, and `CandidateChunks`, so plan selection is
-observable rather than inferred from latency. A reusable
+`IndexLookups`, `IndexPostingPages`, `IndexCertificateRows`,
+`IndexRecheckRows`, `CandidateRows`, `CandidateChunks`, and
+`CoveringColumns`, so plan selection is observable rather than inferred from
+latency. Consecutive directory entries that select one packed posting page
+share one lease and decode. Exact `COUNT(*)` over a fully indexed
+equality or object-containment predicate popcounts final masks directly.
+Containment compilation can flatten a nested object made entirely of scalar
+leaves into exact path equalities, including a matching compound index.
+Duplicate needle members retain last-wins semantics. Arrays and empty objects
+are not flattened because their structure is part of the answer. An unfiltered
+single-row aggregate made only of `COUNT(*)` and configured
+`SUM`/`AVG`/`MIN`/`MAX` paths bypasses workers, JSON admission, parsing, and
+transient value/validity columns. Multiple numeric paths share one page walk.
+`COUNT(path)`, filtered aggregates, grouping, and partially covered plans retain
+the general executor. A reusable
 `FileExecutionWorkspace` retains index-planner and overflow scratch; worker
 batches and returned result cells remain execution-owned. The memory target
 excludes the returned `Result` and cannot make one oversized document smaller.
@@ -492,8 +566,11 @@ Apple M4 Max, stable Go, 1,024 hot documents:
 | candidate-only routing for the same probe | 2.31-2.42 us | 0 B/op, 0 allocs/op |
 | durable compound equality, 16/1,024 rows scanned | 113.0-114.2 us | 169.8 KB/op, 152 allocs/op |
 | identical unindexed predicate, 1,024/1,024 rows scanned | 664.8-665.3 us | 2.091 MB/op, 2,565 allocs/op |
-| file aggregate, one worker | 745 us, 148 MB/s | 2.42 MB/op, 4,478 allocs/op |
-| file aggregate, four workers | 414 us, 267 MB/s | 2.42 MB/op, 4,481 allocs/op |
+| legacy JSON file aggregate, one worker | 745 us, 148 MB/s | 2.42 MB/op, 4,478 allocs/op |
+| legacy JSON file aggregate, four workers | 414 us, 267 MB/s | 2.42 MB/op, 4,481 allocs/op |
+| 10K-row recovered exact filter | 12.25 us, 2 posting pages, 0 JSON rows/rechecks | 13.73x faster than pinned one-thread DuckDB |
+| 10K-row recovered scalar-object `@>` | 11.83 us, 2 posting pages, 0 JSON rows/rechecks | 254.59x faster than pinned one-thread DuckDB |
+| 10K-row recovered SUM through one frozen cover | 116.9 us, 0 JSON rows | 1.31x faster than pinned one-thread DuckDB |
 
 The 1/64 nested compound fixture is reproducible with
 `BenchmarkRunFileSnapshotPersistentIndexPushdown`; its three samples were
@@ -864,27 +941,74 @@ eligible single-column ART indexes over one deterministic NDJSON corpus. Every
 lane is correctness-gated. The frozen 10,000-document M4 Max run measured
 4.85 MiB of heap-Store-accounted resident state (1.25x logical key+JSON), a
 3.26 MiB checkpointed DuckDB file (0.84x), and 4.00 MiB of warm
-DuckDB-managed buffers. The current durable path writes the same data and one
-exact index as a 5.58 MiB
-FileStore (1.43x payload), 71% larger than DuckDB's 3.26 MiB checkpoint. Its
-conservatively accounted warm state is about 5.85 MiB, roughly 46% above
-DuckDB's engine-managed warm buffers, though those accounting domains are not
-process-RSS equivalents. Compact creation takes 28.89 ms including StoreBuilder
-work and both FileStore durability fences. DuckDB reports 18.77 ms load plus
-7.07 ms index construction but does not retain checkpoint latency,
+DuckDB-managed buffers. The current durable path writes the same data, one
+exact index, and one numeric cover as a 5.59 MiB
+FileStore (1.44x payload), 71% larger than DuckDB's 3.26 MiB checkpoint. Its
+conservatively accounted warm state is about 5.84 MiB; DuckDB reports 4.00 MiB
+of engine-managed warm buffers. Those accounting domains are not process-RSS
+equivalents and are therefore not reduced to a percentage comparison. Compact
+creation takes 29.65 ms including StoreBuilder work and both FileStore
+durability fences. DuckDB reports 18.12 ms load plus 7.76 ms index construction
+but does not retain checkpoint latency,
 so the report does not manufacture a durable-load ratio.
 
-Recovered FileStore point lookup is 12.6x faster and structural containment
-5.8x faster than the frozen DuckDB run. FileStore's indexed/rechecked filter
-is still about 4.4x slower, numeric scan reduction about 39x slower, grouping
-about 21x slower, and individually double-fenced update/delete about 9.4x/18.6x
-slower. Predicate-free file queries no longer build transient postings or
-shape tapes, and already index-bounded predicates do not build a second
-per-batch index; that reduced the measured aggregate/group path by roughly 3x.
-The remaining analytical gap requires persistent typed covering columns rather
-than another JSON rescan, while the mutation gap is dominated by intentionally
-strict per-operation durability and copy-on-write metadata. The report gives
-each ratio instead of averaging unlike operations into one score.
+After the same 256 updates and deletes, FileStore's high-water is 7.78 MiB
+with 2.22 MiB already reusable; DuckDB's database is 5.76 MiB with a zero-byte
+WAL. Both post-mutation file sizes stay visible in the frozen report.
+
+With the pinned SIMD build, recovered FileStore point lookup is 14.2x faster.
+The exact filter and equivalent one-member object `@>` each acquire two packed
+posting pages, certify all 84 matches, and admit zero JSON rows; they measure
+12.25 us and 11.83 us, respectively 13.73x and 254.59x faster than the fresh
+DuckDB run. The predicate-free covered SUM measures 116.9 us versus DuckDB's
+153.1 us, a 1.31x lead. The numeric cover fit existing 4 KiB page slack in this
+corpus; posting certificates bring FileStore to 5.59 MiB. That is a measured
+fixture result, not a zero-space guarantee. Grouping remains about 19.2x
+slower, and individually double-fenced update/delete about 9.0x/15.4x slower.
+The remaining analytical gap is categorical/group covering and column-only
+cold I/O, while the mutation gap is dominated by strict per-operation
+durability and copy-on-write metadata. The report gives each ratio instead of
+averaging unlike operations into one score.
+
+### Five-million-row capacity smoke
+
+A separate one-repetition capacity smoke used the same deterministic
+four-shape corpus at 5,000,000 rows: 53,888,890 key bytes plus 2,000,153,357
+JSON bytes (1.91 GiB), digest
+`19f8307d4d296e8a6ac7f32fa87df2a395b4ef882fb120d15ec40e3856dd2416`.
+The Store side ran on an Apple M4 Max and the pinned DuckDB 1.5.4 image ran
+single-threaded in Linux/arm64 Docker. Cross-OS, one-repetition numbers are
+capacity and mechanism evidence, not a publication-quality machine race.
+
+| Measure | recovered FileStore | DuckDB | Direct interpretation |
+| --- | ---: | ---: | --- |
+| Durable file | 2.72 GiB (1.42x payload) | 1.18 GiB (0.62x) | FileStore is 2.31x larger |
+| File after 256 updates and deletes | 2.73 GiB (5.10 MiB reusable) | 1.21 GiB, 0 B WAL | FileStore is 2.26x larger |
+| Engine-accounted warm state | 9.02 MiB, excluding caller query state below | 998.25 MiB warm buffers | different accounting domains; not process RSS |
+| Largest caller query buffer | 488.76 MiB | 1.94 GiB peak buffers | different ownership domains |
+| Recovery/open | 260.8 us | not isolated | FileStore reads bounded roots, not the corpus |
+| Keyed point read | 11.08 us | 129.83 us | FileStore 11.71x faster |
+| Exact filter, 38,800 matches | 4.029 ms | 24.486 ms | FileStore 6.08x faster |
+| Scalar-object `@>`, 38,800 matches | 3.919 ms | 1.408 s | FileStore 359.28x faster |
+| Covered `SUM`, 5M inputs | 1.880 s | 8.051 ms | FileStore 233.5x slower |
+| `GROUP BY`, 5M inputs | 2.894 s | 35.825 ms | FileStore 80.8x slower |
+| Durable update / operation | 9.177 ms | 1.444 ms | FileStore 6.35x slower |
+| Durable delete / operation | 8.930 ms | 589.2 us | FileStore 15.2x slower |
+
+The exact filter and containment probes opened 540 packed posting pages,
+certified every matching stable slot, and performed zero document rechecks.
+Posting-page coalescing reduced the same FileStore filter from 45.30 ms to
+4.03 ms and containment from 45.65 ms to 3.92 ms by sharing one immutable page
+lease and decode across consecutive streams. The remaining full-column gap is
+not hidden: numeric covers are update-safe but co-located with document pages,
+so a cold 5M-row reduction reads far more bytes than DuckDB's columnar scan.
+Grouping still decodes JSON. Closing those gaps requires separate immutable
+column/group extents with the same generation and checksum contract, not a
+misleading micro-optimization claim.
+
+The measured FileStore engine-plus-largest-query envelope is 497.78 MiB
+(9.02 MiB + 488.76 MiB), but it is still neither process RSS nor directly
+comparable with DuckDB's buffer-manager counters.
 
 These are mechanism measurements, not a claim that the systems are equivalent.
 Store timings are direct in-process calls. DuckDB latency includes SQL parsing,

@@ -239,6 +239,8 @@ store, err := simdjson.CreateFileStore(file, simdjson.FileStoreOptions{
 	Indexes: []simdjson.StoreIndexDefinition{
 		{Name: "tenant", Paths: []string{"/tenant"}},
 	},
+	// Frozen numeric covers make predicate-free aggregates parser-free.
+	Float64Columns: []string{"/score"},
 })
 if err != nil {
 	return err
@@ -261,6 +263,10 @@ exact indexes plus TTL directories bottom-up, and publishes one mutable
 generation with two durability fences. Packed posting pages are immutable
 bases; the first update to one stream redirects that stream to an isolated
 copy-on-write page, so unrelated streams sharing the base cannot be retired.
+Explicit `Float64Columns` are built in the same bulk pass. Their finite numeric
+values and stable-slot masks live inside each document micro-page, so an online
+insert, replacement, or delete publishes JSON, exact indexes, and covers in one
+copy-on-write generation.
 
 `FileStore` opens from bounded root/page scratch instead of walking the corpus.
 Its CLOCK arena is divided into 4 KiB allocation quanta: a metadata page uses
@@ -298,6 +304,13 @@ outside the Go heap on supported Unix systems; `ReusableCapacityBytes` and
 `ReusableExternalBytes` keep that capacity visible.
 Snapshot leases fence physical reuse, while the previous durable generation
 remains recoverable if the newest data or root write is torn.
+Synchronous success means both data and alternate-root barriers completed;
+asynchronous callers must use `DurableGeneration`, `Flush`, or `Close` for the
+same acknowledgement. Recovery validates bounded roots and falls back one
+whole generation, while cold lower-tree corruption fails closed on admission.
+This contract still assumes the filesystem and device honor flush completion;
+replication, backups, and point-in-time restore are outside this single-file
+engine.
 
 The explicit `SIMDJSON_FILESTORE_100X=1` Linux gate stores 21,347,320 source
 key+JSON bytes behind a 200,704-byte page cache (106.4x), reopens twice, and
@@ -330,7 +343,16 @@ universal throughput result.
 
 `query.Query.RunFileSnapshot` late-binds the frozen exact-index catalog.
 Equality and supported containment predicates read candidate chunks and
-recheck complete predicates; unbounded plans scan chunk leaves in order.
+ordinary row-producing plans recheck complete predicates; fully certified
+`COUNT(*)` plans popcount exact masks without opening JSON. Unbounded plans
+scan chunk leaves in order.
+An unfiltered scalar `COUNT(*)` plus `SUM`/`AVG`/`MIN`/`MAX` plan uses frozen
+numeric covers when every aggregate path is configured. Multiple paths fuse
+into one page walk; missing, null, non-numeric, and non-finite cells are
+skipped with the ordinary numeric semantics. `RowsScanned` remains zero and
+`CoveringColumns` reports the physical lane. `COUNT(path)`, predicates, and
+partially covered plans stay on the JSON executor because a numeric cover
+cannot represent present non-numeric values.
 Execution builds bounded batches in parallel and externally merges ordered
 rows or grouped state through temporary spill files with a 32-run fan-in.
 `MemoryBytes` bounds working state, not the caller-owned final result or one
@@ -392,10 +414,16 @@ caller-bounded and never performs a hidden full-store completion scan; declared
 roots are reclaimed automatically with their last snapshot.
 
 Durable `FileStore` queries bind their frozen nested or compound definitions at
-execution time. Exact masks drive sparse document-page reads before the same
-predicate is rechecked; index corruption is returned rather than hidden by a
-fallback. `FileExecutionStats` reports total versus scanned rows, probe count,
-and candidate chunks. `FileIndexWorkspace`, caller-buffered masked ranges, and
+execution time. Collision-free posting certificates can prove scalar and
+compound exact masks without opening JSON; a hash collision, legacy posting,
+or oversized representative falls back to exact document recheck. Nested
+object `@>` needles made entirely of scalar leaves lower to exact path
+conjunctions, while arrays and empty objects keep structural evaluation. Index
+corruption is returned rather than hidden by a fallback.
+`FileExecutionStats` reports total versus scanned, certificate-decided, and
+document-rechecked rows, probe count, physical posting-page groups, and
+candidate chunks.
+`FileIndexWorkspace`, caller-buffered masked ranges, and
 `query.FileExecutionWorkspace` retain hot probe and overflow scratch explicitly.
 
 The complete API, ownership rules, expiration semantics, tuning table,
@@ -430,6 +458,11 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Indexed Snapshot compound point query | 2.82 ns/input doc, 0 allocations |
 | Durable exact-index probe / candidate-only routing | 19.35-19.40 us / 2.31-2.42 us, 0 allocations |
 | Durable nested compound query, 1/64 selectivity | 113.0-114.2 us vs 664.8-665.3 us full scan; 170 KB vs 2.09 MB transient |
+| Recovered exact filter, 10K rows | 12.25 us, 2 posting pages, 0 JSON rows/rechecks, 13.73x faster than pinned one-thread DuckDB |
+| Recovered scalar-object `@>`, 10K rows | 11.83 us, 2 posting pages, 0 JSON rows/rechecks, 254.59x faster than pinned one-thread DuckDB |
+| Recovered durable SUM, 10K rows / one typed cover | 116.9 us, 0 JSON rows, 1.31x faster than pinned one-thread DuckDB |
+| Recovered exact filter, 5M-row capacity smoke | 4.029 ms, 540 posting pages, 0 JSON rows/rechecks, 6.08x faster in a cross-OS one-repetition mechanism smoke, not a machine race |
+| Recovered scalar-object `@>`, 5M-row capacity smoke | 3.919 ms, 540 posting pages, 0 JSON rows/rechecks, 359.28x faster in the same cross-OS capacity smoke |
 | Dense Store fused 3-predicate bitmap / ordered 4,096-row decode | 410-416 ns / 4.03-4.08 us, 0 allocations |
 | Change an existing TTL | 45 ns, 0 allocations |
 | Dense bitmap Boolean pass on M4 Max | 75-80 GB/s, 0 allocations; NEON did not beat scalar and is not dispatched |

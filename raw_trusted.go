@@ -66,6 +66,17 @@ func (p CompiledPointer) ScanFirstRawTrustedOptions(src []byte, opts Options) (R
 	return s.find(0, 0, p)
 }
 
+// getRawTrusted resolves p with GetRaw's last-duplicate semantics over input
+// that a stronger owner has already validated. It is intentionally internal:
+// FileStore uses it only after page-cache admission has validated every inline
+// JSON document. Unlike ScanFirstRawTrusted it consumes later duplicates, but
+// it still skips JSON grammar and UTF-8 checks already paid at admission.
+func (p CompiledPointer) getRawTrusted(src []byte) (RawValue, bool, error) {
+	s := trustedSeeker{src: src, maxDepth: defaultMaxDepth, lastWins: true}
+	s.i = skipSpace(src, 0)
+	return s.find(0, 0, p)
+}
+
 // trustedSeeker is rawSeeker's non-validating counterpart. It mirrors the
 // validating seeker's traversal structure exactly — same member loops, same
 // consume-then-continue handling of matched members whose subtree does not
@@ -84,6 +95,7 @@ type trustedSeeker struct {
 	i        int
 	maxDepth int
 	done     bool
+	lastWins bool
 }
 
 func (s *trustedSeeker) find(depth, tokenIndex int, pointer CompiledPointer) (RawValue, bool, error) {
@@ -125,7 +137,9 @@ func (s *trustedSeeker) capture(depth int) (RawValue, bool, error) {
 		// JSON never puts at a value position.
 		return RawValue{}, false, nil
 	}
-	s.done = true
+	if !s.lastWins {
+		s.done = true
+	}
 	return RawValue{src: s.src[start:s.i]}, true, nil
 }
 
@@ -145,12 +159,17 @@ func (s *trustedSeeker) findArray(depth, tokenIndex int, pointer CompiledPointer
 		return RawValue{}, false, nil
 	}
 
+	var selected RawValue
+	var selectedOK bool
 	for elem := 0; ; elem++ {
 		s.i = skipSpace(s.src, s.i)
 		if indexOK && elem == index {
 			raw, ok, err := s.find(depth, tokenIndex+1, pointer)
 			if err != nil || s.done {
 				return raw, ok, err
+			}
+			if s.lastWins {
+				selected, selectedOK = raw, ok
 			}
 			// The target under this element is absent. Keep consuming the
 			// array so the enclosing loops stay positioned; the result is
@@ -160,6 +179,9 @@ func (s *trustedSeeker) findArray(depth, tokenIndex int, pointer CompiledPointer
 		}
 		s.i = skipSpace(s.src, s.i)
 		if s.i >= len(s.src) {
+			if s.lastWins {
+				return selected, selectedOK, nil
+			}
 			return RawValue{}, false, nil
 		}
 		switch s.src[s.i] {
@@ -167,6 +189,9 @@ func (s *trustedSeeker) findArray(depth, tokenIndex int, pointer CompiledPointer
 			s.i++
 		case ']':
 			s.i++
+			if s.lastWins {
+				return selected, selectedOK, nil
+			}
 			return RawValue{}, false, nil
 		default:
 			return RawValue{}, false, nil
@@ -181,13 +206,21 @@ func (s *trustedSeeker) findObject(depth, tokenIndex int, pointer CompiledPointe
 	token := pointer.tokens[tokenIndex].text
 
 	s.i++
+	var last RawValue
+	var lastOK bool
 	for {
 		s.i = skipSpace(s.src, s.i)
 		if s.i >= len(s.src) {
+			if s.lastWins {
+				return last, lastOK, nil
+			}
 			return RawValue{}, false, nil
 		}
 		if s.src[s.i] == '}' {
 			s.i++
+			if s.lastWins {
+				return last, lastOK, nil
+			}
 			return RawValue{}, false, nil
 		}
 		if s.src[s.i] != '"' {
@@ -203,7 +236,12 @@ func (s *trustedSeeker) findObject(depth, tokenIndex int, pointer CompiledPointe
 		s.i = skipSpace(s.src, s.i)
 		if matched {
 			raw, ok, err := s.find(depth, tokenIndex+1, pointer)
-			if err != nil || s.done {
+			if err != nil {
+				return RawValue{}, false, err
+			}
+			if s.lastWins {
+				last, lastOK = raw, ok
+			} else if s.done {
 				return raw, ok, err
 			}
 			// The target under this member is absent, but a later duplicate
@@ -215,6 +253,9 @@ func (s *trustedSeeker) findObject(depth, tokenIndex int, pointer CompiledPointe
 		}
 		s.i = skipSpace(s.src, s.i)
 		if s.i >= len(s.src) {
+			if s.lastWins {
+				return last, lastOK, nil
+			}
 			return RawValue{}, false, nil
 		}
 		switch s.src[s.i] {
@@ -222,6 +263,9 @@ func (s *trustedSeeker) findObject(depth, tokenIndex int, pointer CompiledPointe
 			s.i++
 		case '}':
 			s.i++
+			if s.lastWins {
+				return last, lastOK, nil
+			}
 			return RawValue{}, false, nil
 		default:
 			return RawValue{}, false, nil

@@ -252,9 +252,14 @@ multiple of it. Keys and JSON are rejected above `MaxKeyBytes` and
 `MaxDocumentBytes`; values above `InlineValueBytes` use bounded overflow pages.
 Chunk ids remain `uint32`, physical offsets and file high-water are bounded by
 signed OS file offsets, and persistent logical ids are `uint64`. At most 64
-one-to-four-column exact indexes may be frozen into a file. Reopening with a
-different effective catalog or format options fails instead of interpreting
-old bytes under new semantics.
+one-to-four-column exact indexes and 256 RFC 6901 `Float64Columns` may be
+frozen into a file. Cover order and spelling are part of the durable catalog
+hash. Reopening with a different effective catalog or format options fails
+instead of interpreting old bytes under new semantics. Each cover adds one
+eight-byte stable-slot mask plus eight bytes per finite numeric cell to its
+document page. `MaxPageSize` validation includes the worst-case configured
+cover section. Writer scratch is fixed at `columns * (8 + 64*8)` bytes and
+reported as `Float64ScratchBytes`.
 
 Opening reads bounded root/page scratch and does not scale heap with corpus
 cardinality. This is not a promise that every operation fits one page: one
@@ -266,12 +271,25 @@ result necessarily consumes output-proportional memory. Spill merge opens at
 most 32 runs at once and removes its temporary files on return.
 
 Durable exact-index planning can reduce admitted JSON rows but does not weaken
-validation: tuple hashes select candidates and the indexed paths plus complete
-predicate are rechecked. `FileExecutionStats.RowsTotal` and `RowsScanned`
-separate logical cardinality from physical JSON work. `FileIndexWorkspace` and
-`FileExecutionWorkspace` are caller-retained high-water storage and are
-single-consumer. Call `Release` after an exceptional broad probe if retaining
-that capacity is undesirable.
+validation. A posting certificate may decide an entire bitmap only when its
+validated scalar or compound tuple has no collision flag; otherwise indexed
+paths are rechecked against stored documents. Version-one postings and
+oversized representatives always take the recheck path.
+`FileExecutionStats.RowsTotal`, `RowsScanned`, `IndexPostingPages`,
+`IndexCertificateRows`, and `IndexRecheckRows` separate logical cardinality
+from physical posting and JSON work.
+`FileIndexWorkspace` and `FileExecutionWorkspace` are caller-retained
+high-water storage and are single-consumer. Call `Release` after an exceptional
+broad probe if retaining that capacity is undesirable.
+
+An unfiltered scalar aggregate over configured numeric covers can report
+`RowsScanned == 0` and a non-zero `CoveringColumns`. The engine preflights all
+paths, then fuses their reductions over one page walk. `COUNT(path)`, filtered
+aggregates, grouping, and partially covered plans do not use this lane.
+`ReduceFloat64PathsInto` requires equal-length caller buffers and supports no
+more than 256 paths; warmed calls allocate zero. Covers are co-located with
+document bytes, so a cold reduction still reads the containing document pages
+and remains bounded by the ordinary cache and I/O queues.
 
 `ReadMode` controls cache misses independently from the commit backend.
 `FileStoreReadBuffered` uses the caller descriptor. On Linux,

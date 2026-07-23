@@ -57,14 +57,27 @@ func fmtRatio(competitorNS, storeNS float64) string {
 	if competitorNS <= 0 || storeNS <= 0 {
 		return "n/a"
 	}
-	return fmt.Sprintf("%.2fx", competitorNS/storeNS)
+	return fmtMultiplier(competitorNS / storeNS)
 }
 
 func fmtPayloadRatio(bytes, logical int64) string {
 	if bytes <= 0 || logical <= 0 {
 		return "n/a"
 	}
-	return fmt.Sprintf("%.2fx", float64(bytes)/float64(logical))
+	return fmtMultiplier(float64(bytes) / float64(logical))
+}
+
+// fmtMultiplier retains useful information below one percent instead of
+// rendering a real 0.004x ratio as the misleading value 0.00x.
+func fmtMultiplier(value float64) string {
+	switch {
+	case value < 0.01:
+		return fmt.Sprintf("%.4fx", value)
+	case value < 0.1:
+		return fmt.Sprintf("%.3fx", value)
+	default:
+		return fmt.Sprintf("%.2fx", value)
+	}
 }
 
 func fmtDigest(digest string) string {
@@ -188,9 +201,9 @@ func BuildReport(res OursResults, logs map[string]DuckDBLog) string {
 	w("\n")
 
 	w("## Durable storage\n\n")
-	w("FileStore and DuckDB consume the same logical key+JSON payload and both columns are crash-recoverable file bytes. FileStore bytes come from one compact generation that writes live documents, directories, the frozen exact index, and both durability barriers without retaining ingestion history. DuckDB bytes are measured after both ART indexes and `CHECKPOINT`. The disk ratio is DuckDB/FileStore, so greater than 1 means FileStore used fewer bytes. Post-mutation bytes expose copy-on-write high water, while reusable bytes are already tracked free extents—not live data.\n\n")
-	w("| corpus | FileStore file | FileStore/payload | DuckDB file | DuckDB/payload | disk ratio | FileStore after mutations | reusable extents | DuckDB WAL |\n")
-	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	w("FileStore and DuckDB consume the same logical key+JSON payload and both columns are crash-recoverable file bytes. FileStore bytes come from one compact generation that writes live documents, directories, the frozen exact index, the configured numeric cover, and both durability barriers without retaining ingestion history. DuckDB bytes are measured after both ART indexes and `CHECKPOINT`. The disk ratio is DuckDB/FileStore, so greater than 1 means FileStore used fewer bytes. Post-mutation sizes expose both engines' file high-water after the same operation count; FileStore reusable bytes are already tracked free extents, not live data.\n\n")
+	w("| corpus | FileStore file | FileStore/payload | DuckDB file | DuckDB/payload | disk ratio | FileStore after mutations | reusable extents | DuckDB after mutations | DuckDB WAL after mutations |\n")
+	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, corpus := range corpora {
 		m := corpus.Manifest
 		fileBytes, postMutation, reusable := int64(-1), int64(-1), int64(-1)
@@ -199,16 +212,22 @@ func BuildReport(res OursResults, logs map[string]DuckDBLog) string {
 			postMutation = store.PostMutationFileBytes
 			reusable = int64(store.ReusableBytes)
 		}
-		duckFile, wal := int64(-1), int64(-1)
+		duckFile, duckPostMutation, walPostMutation := int64(-1), int64(-1), int64(-1)
 		if log := logFor(m.Name); log != nil {
 			duckFile = log.Values["database_bytes"]
-			wal = log.Values["wal_bytes"]
+			if value, ok := log.Values["database_bytes_after_mutations"]; ok {
+				duckPostMutation = value
+			}
+			if value, ok := log.Values["wal_bytes_after_mutations"]; ok {
+				walPostMutation = value
+			}
 		}
-		w("| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
+		w("| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
 			m.Name, fmtMeasuredBytes(fileBytes), fmtPayloadRatio(fileBytes, m.LogicalBytes()),
 			fmtMeasuredBytes(duckFile), fmtPayloadRatio(duckFile, m.LogicalBytes()),
 			fmtRatio(float64(duckFile), float64(fileBytes)), fmtMeasuredBytes(postMutation),
-			fmtMeasuredBytes(reusable), fmtMeasuredBytes(wal))
+			fmtMeasuredBytes(reusable), fmtMeasuredBytes(duckPostMutation),
+			fmtMeasuredBytes(walPostMutation))
 	}
 	w("\n")
 
@@ -324,9 +343,9 @@ func BuildReport(res OursResults, logs map[string]DuckDBLog) string {
 	w("\n")
 
 	w("## Durable warm reads\n\n")
-	w("These FileStore reads come from a recovered bounded-cache snapshot. Point includes key lookup, exact JSON copy-out, structural indexing, and nested projection. Whole-corpus queries use one worker and persistent exact-index pushdown when applicable; an already bounded predicate and a predicate-free aggregate do not rebuild transient per-batch postings. Ratio is DuckDB/FileStore latency; greater than 1 means FileStore completed sooner.\n\n")
-	w("| corpus | scenario | FileStore | DuckDB | ratio | DuckDB rows scanned |\n")
-	w("|---|---|---:|---:|---:|---:|\n")
+	w("These FileStore reads come from a recovered bounded-cache snapshot. Point includes key lookup, exact JSON copy-out, structural indexing, and nested projection. Whole-corpus queries use one worker and persistent exact-index pushdown when applicable. Filter and scalar-leaf object containment lanes are accepted only when collision-free posting certificates decide every candidate without opening JSON; ambiguous or older postings fall back to exact document recheck. The SUM lane is accepted only when the query reports one persistent typed covering column; it admits no JSON rows. Ratio is DuckDB/FileStore latency; greater than 1 means FileStore completed sooner.\n\n")
+	w("| corpus | scenario | FileStore lane | FileStore | DuckDB | ratio | DuckDB rows scanned |\n")
+	w("|---|---|---|---:|---:|---:|---:|\n")
 	for _, corpus := range corpora {
 		m, store, log := corpus.Manifest, corpus.FileStore, logFor(corpus.Manifest.Name)
 		if store == nil {
@@ -347,11 +366,25 @@ func BuildReport(res OursResults, logs map[string]DuckDBLog) string {
 			if !row.run {
 				continue
 			}
+			lane := "JSON"
+			if row.label == "filter" {
+				lane = fmt.Sprintf(
+					"exact certificate + bitmap (%d posting pages, 0 JSON rows)",
+					store.FilterIndexPostingPages,
+				)
+			} else if row.label == "sum" && store.SumCovers == 1 {
+				lane = "typed cover (0 JSON rows)"
+			} else if row.label == "contain" {
+				lane = fmt.Sprintf(
+					"exact certificate + bitmap (%d posting pages, 0 JSON rows)",
+					store.ContainIndexPostingPages,
+				)
+			}
 			var duckNS float64
 			if log != nil {
 				duckNS, _ = log.QueryNS(row.label)
 			}
-			w("| %s | %s | %s | %s | %s | %s |\n", m.Name, row.label,
+			w("| %s | %s | %s | %s | %s | %s | %s |\n", m.Name, row.label, lane,
 				fmtNS(float64(row.ours)), fmtNS(duckNS),
 				fmtRatio(duckNS, float64(row.ours)), profileRows(log, row.label))
 		}
@@ -359,7 +392,7 @@ func BuildReport(res OursResults, logs map[string]DuckDBLog) string {
 	w("\n")
 
 	w("## Per-key mutations\n\n")
-	w("Each operation is an independent publication/transaction commit. The deterministic smoke updates up to 256 keys to the same valid JSON object while clearing the indexed scalar, then deletes those keys. Heap Store is retained as an in-memory publication diagnostic. FileStore waits for its double-root durability fence on every operation; DuckDB uses one explicit transaction per operation, making the durable ratio semantically aligned. FileStore cardinality is verified only after close and recovery.\n\n")
+	w("Each operation is an independent publication/transaction commit. The deterministic smoke updates up to 256 keys to the same valid JSON object while clearing the indexed scalar, then deletes those keys. Heap Store is retained as an in-memory publication diagnostic. FileStore waits for its double-root durability fence on every operation; DuckDB uses one explicit transaction per operation. The transaction boundary is aligned, but different operating-system, container, filesystem, and storage stacks are not durability-latency equivalent. FileStore cardinality is verified only after close and recovery.\n\n")
 	w("| corpus | operations | heap update/op | durable FileStore update/op | DuckDB update/op | durable ratio | heap delete/op | durable FileStore delete/op | DuckDB delete/op | durable ratio | mutation reopen |\n")
 	w("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, corpus := range corpora {
@@ -386,7 +419,8 @@ func BuildReport(res OursResults, logs map[string]DuckDBLog) string {
 	w("## Interpretation boundaries\n\n")
 	w("- Store timings are in-process Go calls. DuckDB timings are the engine-reported `latency` field and include SQL parsing, binding, optimization, and execution, but exclude container startup and result formatting.\n")
 	w("- Both engines use one execution thread. Warmups precede profiled queries; reports use the minimum repetition on both read paths. Raw profile streams remain the audit artifact.\n")
-	w("- DuckDB stores exact JSON physically as its `JSON`/`VARCHAR` representation and also materializes the filter and numeric fields. Heap Store retains exact JSON plus its structural representation and exact index; FileStore retains exact JSON and persistent exact postings but currently reconstructs transient columns for scans.\n")
+	w("- The environment section is authoritative. When operating systems or container boundaries differ, latency is mechanism evidence rather than a same-machine race.\n")
+	w("- DuckDB stores exact JSON physically as its `JSON`/`VARCHAR` representation and also materializes the filter and numeric fields. Heap Store retains exact JSON plus its structural representation and exact index. FileStore retains exact JSON, persistent exact postings, and the explicitly configured numeric cover measured by SUM; non-covered scans still reconstruct transient columns.\n")
 	w("- DuckDB's ART index scan is eligible only for a single plain column and is intended for point or very selective predicates. A low-cardinality filter can remain a vectorized scan; the report exposes rows scanned instead of pretending the ART served it.\n")
 	w("- DuckDB's compound and expression indexes are valid storage objects but are not eligible for ART index scans today, so this harness does not create a decorative compound index.\n")
 	w("- DuckDB is an embedded analytical database with ACID transactions, checkpoint/WAL persistence, vectorized SQL, and snapshot isolation. FileStore provides automatic checksummed copy-on-write persistence and immutable reader generations, but has a narrower embedded JSON API and different transaction semantics. Results apply only to the listed operations.\n")

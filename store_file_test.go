@@ -1,8 +1,11 @@
 package simdjson
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 	"os"
 	"strings"
@@ -77,6 +80,16 @@ func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
 	options.CommitCoalesce = time.Second + 1
 	if _, err := options.normalized(); err == nil {
 		t.Fatal("invalid commit coalescing window accepted")
+	}
+	options = testFileStoreOptions()
+	options.Float64Columns = []string{"/score", "/score"}
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("duplicate float64 covering column accepted")
+	}
+	options = testFileStoreOptions()
+	options.Float64Columns = []string{"not-an-rfc6901-pointer"}
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("invalid float64 covering path accepted")
 	}
 }
 
@@ -628,6 +641,24 @@ func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
 	if err != nil || countMasks(masks) != 4 {
 		t.Fatalf("active masks = (%+v,%v), count %d", masks, err, countMasks(masks))
 	}
+	certifiedSnapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var certifiedWorkspace FileIndexWorkspace
+	masks, err = certifiedSnapshot.AppendIndexMasksInto(
+		masks[:0], &certifiedWorkspace, "status", active,
+	)
+	if err != nil || countMasks(masks) != 4 {
+		t.Fatalf("certified active masks = (%+v,%v)", masks, err)
+	}
+	if stats := certifiedWorkspace.LastProbeStats(); stats.CertificateRows != 4 ||
+		stats.DocumentRecheckRows != 0 || stats.MatchedRows != 4 {
+		t.Fatalf("online certificate stats = %+v", stats)
+	}
+	if err := certifiedSnapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
 	compound, err := store.AppendIndexMasks(nil, "tenant_status", acme, active)
 	if err != nil || countMasks(compound) != 2 {
 		t.Fatalf("compound masks = (%+v,%v), count %d", compound, err, countMasks(compound))
@@ -679,6 +710,23 @@ func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
 	if err != nil || countMasks(masks) != 2 {
 		t.Fatalf("reopened active masks = (%+v,%v), count %d", masks, err, countMasks(masks))
 	}
+	reopenedSnapshot, err := reopened.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	masks, err = reopenedSnapshot.AppendIndexMasksInto(
+		masks[:0], &certifiedWorkspace, "status", active,
+	)
+	if err != nil || countMasks(masks) != 2 {
+		t.Fatalf("reopened certified active masks = (%+v,%v)", masks, err)
+	}
+	if stats := certifiedWorkspace.LastProbeStats(); stats.CertificateRows != 2 ||
+		stats.DocumentRecheckRows != 0 || stats.MatchedRows != 2 {
+		t.Fatalf("reopened certificate stats = %+v", stats)
+	}
+	if err := reopenedSnapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -686,6 +734,62 @@ func TestFileStoreExactIndexesMaintainProbeAndReopen(t *testing.T) {
 	wrong.Indexes = []StoreIndexDefinition{{Name: "status", Paths: []string{"/tenant"}}, options.Indexes[1]}
 	if _, err := OpenFileStore(file, wrong); err == nil {
 		t.Fatal("OpenFileStore accepted a mismatched index catalog")
+	}
+}
+
+func TestFileIndexTupleCertificateSemantics(t *testing.T) {
+	leftValues := []RawValue{
+		{src: []byte(`"active"`)},
+		{src: []byte(`1`)},
+	}
+	rightValues := []RawValue{
+		{src: []byte(`"ac\u0074ive"`)},
+		{src: []byte(`1.0`)},
+	}
+	left, ok := appendFileIndexCertificate(nil, leftValues, 4096)
+	if !ok || !fileIndexCertificateValid(left, 2) {
+		t.Fatalf("left certificate = (%x,%v)", left, ok)
+	}
+	right, ok := appendFileIndexCertificate(nil, rightValues, 4096)
+	if !ok || !fileIndexCertificateValid(right, 2) {
+		t.Fatalf("right certificate = (%x,%v)", right, ok)
+	}
+	if !fileIndexCertificatesEqual(left, right, 2) {
+		t.Fatal("semantically equal tuple certificates compared unequal")
+	}
+	needle := func(src string) Index {
+		needed, err := RequiredIndexEntries([]byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		index, err := BuildIndex([]byte(src), make([]IndexEntry, needed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return index
+	}
+	if !fileIndexCertificateMatches(
+		left, []Index{needle(`"ac\u0074ive"`), needle(`1e0`)}, 2,
+	) {
+		t.Fatal("tuple certificate did not match equivalent query scalars")
+	}
+	different, ok := appendFileIndexCertificate(
+		nil, []RawValue{{src: []byte(`"active"`)}, {src: []byte(`2`)}}, 4096,
+	)
+	if !ok || fileIndexCertificatesEqual(left, different, 2) {
+		t.Fatal("different tuple certificates compared equal")
+	}
+	corrupt := append([]byte(nil), left...)
+	corrupt[4] = 0xff
+	corrupt[5] = 0xff
+	if fileIndexCertificateValid(corrupt, 2) ||
+		fileIndexCertificateMatches(corrupt, []Index{needle(`"active"`), needle(`1`)}, 2) {
+		t.Fatal("malformed tuple certificate was accepted")
+	}
+	prefix := []byte("prefix")
+	if got, ok := appendFileIndexCertificate(prefix, leftValues, 4); ok ||
+		string(got) != "prefix" {
+		t.Fatalf("bounded certificate append = (%q,%v)", got, ok)
 	}
 }
 
@@ -848,6 +952,12 @@ func TestFileStoreExactIndexWorkspaceAllocations(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("warmed AppendIndexMasksInto allocated %.2f times, want 0", allocs)
 	}
+	if stats := workspace.LastProbeStats(); stats != (FileIndexProbeStats{
+		CandidateRows: 8, CertificateRows: 8,
+		MatchedRows: 8, CandidateChunks: 2, PostingPages: 2,
+	}) {
+		t.Fatalf("exact probe stats = %+v", stats)
+	}
 	masks, err = snapshot.AppendIndexCandidateMasksInto(masks[:0], &workspace, "tenant_status", acme, active)
 	if err != nil || len(masks) == 0 {
 		t.Fatalf("warm candidate probe = (%+v,%v)", masks, err)
@@ -861,6 +971,320 @@ func TestFileStoreExactIndexWorkspaceAllocations(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("warmed AppendIndexCandidateMasksInto allocated %.2f times, want 0", allocs)
+	}
+	if stats := workspace.LastProbeStats(); stats != (FileIndexProbeStats{
+		CandidateRows: 8, CandidateChunks: 2, PostingPages: 2,
+	}) {
+		t.Fatalf("candidate probe stats = %+v", stats)
+	}
+}
+
+func TestFileStoreFloat64ColumnsMutationSnapshotReopenAndAllocations(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-float64-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testFileStoreOptions()
+	options.Float64Columns = []string{"/score", "/nested/value"}
+	store, err := CreateFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, document := range map[string]string{
+		"k0": `{"score":1.5,"nested":{"value":10}}`,
+		"k1": `{"score":2,"nested":{"value":"not numeric"}}`,
+		"k2": `{"score":"not numeric","nested":{"value":-3}}`,
+		"k3": `{"score":1e999,"nested":null}`,
+	} {
+		if _, err := store.Put(key, []byte(document)); err != nil {
+			t.Fatalf("Put(%s): %v", key, err)
+		}
+	}
+	if got := store.Stats().Float64ScratchBytes; got != 2*(8+64*8) {
+		t.Fatalf("Float64ScratchBytes = %d, want %d", got, 2*(8+64*8))
+	}
+	old, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAggregate := func(snapshot *FileSnapshot, path string, want Float64Aggregate) {
+		t.Helper()
+		got, covered, err := snapshot.ReduceFloat64Path(path)
+		if err != nil || !covered || got != want {
+			t.Fatalf("ReduceFloat64Path(%q) = (%+v,%v,%v), want (%+v,true,nil)", path, got, covered, err, want)
+		}
+	}
+	assertAggregate(old, "/score", Float64Aggregate{Count: 2, Sum: 3.5, Min: 1.5, Max: 2})
+	assertAggregate(old, "/nested/value", Float64Aggregate{Count: 2, Sum: 7, Min: -3, Max: 10})
+	if !old.HasFloat64Path("/nested/value") || old.HasFloat64Path("/missing") {
+		t.Fatal("covering-column catalog lookup mismatch")
+	}
+	if got, covered, err := old.ReduceFloat64Path("/missing"); err != nil || covered || got != (Float64Aggregate{}) {
+		t.Fatalf("unconfigured reduction = (%+v,%v,%v), want zero,false,nil", got, covered, err)
+	}
+
+	if created, err := store.Put("k0", []byte(`{"score":4}`)); err != nil || created {
+		t.Fatalf("update k0 = (%v,%v), want (false,nil)", created, err)
+	}
+	if deleted, err := store.Delete("k1"); err != nil || !deleted {
+		t.Fatalf("delete k1 = (%v,%v), want (true,nil)", deleted, err)
+	}
+	if created, err := store.Put("k4", []byte(`{"score":-1,"nested":{"value":8}}`)); err != nil || !created {
+		t.Fatalf("insert k4 = (%v,%v), want (true,nil)", created, err)
+	}
+	current, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAggregate(current, "/score", Float64Aggregate{Count: 2, Sum: 3, Min: -1, Max: 4})
+	assertAggregate(current, "/nested/value", Float64Aggregate{Count: 2, Sum: 5, Min: -3, Max: 8})
+	paths := []string{"/score", "/nested/value"}
+	totals := make([]Float64Aggregate, len(paths))
+	if covered, err := current.ReduceFloat64PathsInto(totals, paths); err != nil || !covered ||
+		totals[0] != (Float64Aggregate{Count: 2, Sum: 3, Min: -1, Max: 4}) ||
+		totals[1] != (Float64Aggregate{Count: 2, Sum: 5, Min: -3, Max: 8}) {
+		t.Fatalf("fused covering reductions = (%+v,%v,%v)", totals, covered, err)
+	}
+	// Copy-on-write publication keeps the old page and its typed columns
+	// coherent for readers that already hold the preceding generation.
+	assertAggregate(old, "/score", Float64Aggregate{Count: 2, Sum: 3.5, Min: 1.5, Max: 2})
+
+	if _, _, err := current.ReduceFloat64Path("/score"); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		got, covered, runErr := current.ReduceFloat64Path("/score")
+		if runErr != nil || !covered || got.Count != 2 || got.Sum != 3 {
+			panic("covered reduction failed")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warmed ReduceFloat64Path allocated %.2f times, want 0", allocs)
+	}
+	allocs = testing.AllocsPerRun(100, func() {
+		covered, runErr := current.ReduceFloat64PathsInto(totals, paths)
+		if runErr != nil || !covered || totals[0].Sum != 3 || totals[1].Sum != 5 {
+			panic("fused covered reduction failed")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warmed ReduceFloat64PathsInto allocated %.2f times, want 0", allocs)
+	}
+	if err := current.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedSnapshot, err := reopened.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAggregate(reopenedSnapshot, "/score", Float64Aggregate{Count: 2, Sum: 3, Min: -1, Max: 4})
+	assertAggregate(reopenedSnapshot, "/nested/value", Float64Aggregate{Count: 2, Sum: 5, Min: -3, Max: 8})
+	if err := reopenedSnapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wrong := options
+	wrong.Float64Columns = []string{"/score"}
+	if _, err := OpenFileStore(file, wrong); err == nil {
+		t.Fatal("OpenFileStore accepted a mismatched float64 covering catalog")
+	}
+}
+
+func recoveredFileDocumentRef(t *testing.T, file *os.File, options FileStoreOptions, chunk uint32) storeio.PageRef {
+	t.Helper()
+	rootScratch := make([]byte, options.PageSize)
+	super, root, _, err := storeio.RecoverStateRoot(file, uint32(options.PageSize), rootScratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := root.ChunkDirectory
+	for {
+		page := make([]byte, ref.Length)
+		if _, err := file.ReadAt(page, int64(ref.Offset)); err != nil {
+			t.Fatal(err)
+		}
+		view, err := storeio.OpenChunkDirectoryPage(page, super.FileEnd, root.NextLogicalID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		child, ok := view.Lookup(chunk)
+		if !ok {
+			t.Fatalf("chunk %d is absent from the recovered directory", chunk)
+		}
+		if view.Header().Shift == 0 {
+			return child
+		}
+		ref = child
+	}
+}
+
+func TestFileStoreFloat64ColumnRejectsResealedCorruptionOnAdmission(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-float64-corrupt-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testFileStoreOptions()
+	options.Float64Columns = []string{"/score"}
+	store, err := CreateFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("key", []byte(`{"score":1.5}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	documentRef := recoveredFileDocumentRef(t, file, options, 0)
+	page := make([]byte, documentRef.Length)
+	if _, err := file.ReadAt(page, int64(documentRef.Offset)); err != nil {
+		t.Fatal(err)
+	}
+	payloadStart := storeio.PageHeaderSize
+	count := int(page[payloadStart+20])
+	dataStart := payloadStart + storeio.DocumentPagePayloadHeaderSize +
+		count*storeio.DocumentPageRecordSize
+	dataLength := int(binary.LittleEndian.Uint32(page[payloadStart+16 : payloadStart+20]))
+	valueOffset := dataStart + dataLength + 8 // Skip the first column's stable-slot mask.
+	if valueOffset+8 > len(page) {
+		t.Fatal("encoded float64 covering value is outside the document page")
+	}
+	binary.LittleEndian.PutUint64(page[valueOffset:valueOffset+8], math.Float64bits(math.Inf(1)))
+	if _, err := storeio.SealPage(page); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(page, int64(documentRef.Offset)); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenFileStore(file, options)
+	if reopened != nil {
+		_ = reopened.Close()
+		t.Fatal("OpenFileStore returned a store for a corrupt append document page")
+	}
+	if !errors.Is(err, storeio.ErrDocumentPageCorrupt) {
+		t.Fatalf("OpenFileStore resealed covering corruption = %v, want document corruption", err)
+	}
+}
+
+func TestFileStoreRejectsResealedInvalidInlineJSONOnAdmission(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-json-corrupt-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testFileStoreOptions()
+	store, err := CreateFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := []byte(`{"ok":true}`)
+	if _, err := store.Put("key", document); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	documentRef := recoveredFileDocumentRef(t, file, options, 0)
+	page := make([]byte, documentRef.Length)
+	if _, err := file.ReadAt(page, int64(documentRef.Offset)); err != nil {
+		t.Fatal(err)
+	}
+	position := bytes.Index(page, document)
+	if position < 0 {
+		t.Fatal("inline JSON is absent from recovered document page")
+	}
+	copy(page[position:], `{"ok":xxxx}`)
+	if _, err := storeio.SealPage(page); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(page, int64(documentRef.Offset)); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenFileStore(file, options)
+	if reopened != nil {
+		_ = reopened.Close()
+		t.Fatal("OpenFileStore returned a store for invalid inline JSON")
+	}
+	if !errors.Is(err, storeio.ErrDocumentPageCorrupt) {
+		t.Fatalf("OpenFileStore resealed invalid JSON = %v, want document corruption", err)
+	}
+}
+
+func TestFileSnapshotRejectsResealedCrossChunkDocument(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "file-store-cross-chunk-corrupt-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := testFileStoreOptions()
+	store, err := CreateFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row := range options.Store.ChunkDocuments + 1 {
+		if _, err := store.Put(fmt.Sprintf("key-%d", row), []byte(`{"ok":true}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	documentRef := recoveredFileDocumentRef(t, file, options, 0)
+	page := make([]byte, documentRef.Length)
+	if _, err := file.ReadAt(page, int64(documentRef.Offset)); err != nil {
+		t.Fatal(err)
+	}
+	// Chunk one exists, so the typed page validator accepts this in-range
+	// identity. The selecting chunk-tree edge must still reject the mismatch.
+	binary.LittleEndian.PutUint32(page[storeio.PageHeaderSize+4:storeio.PageHeaderSize+8], 1)
+	if _, err := storeio.SealPage(page); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(page, int64(documentRef.Offset)); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	snapshot, err := reopened.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	if _, _, err := snapshot.AppendRaw(nil, "key-0"); !errors.Is(err, storeio.ErrDocumentPageCorrupt) {
+		t.Fatalf("AppendRaw cross-chunk document = %v, want document corruption", err)
 	}
 }
 

@@ -215,14 +215,7 @@ func (s *FileSnapshot) rangeFileDocumentPage(
 	if err != nil {
 		return err
 	}
-	view, err := storeio.OpenDocumentPageWithOverflow(
-		lease.Page(), state.root.ChunkHighWater, state.root.NextLogicalID,
-		state.super.FileEnd, state.root.PageSize,
-	)
-	if err != nil {
-		lease.Release()
-		return err
-	}
+	view := storeio.AdmittedDocumentPage(lease.Page())
 	if view.Header().ChunkID != chunk {
 		lease.Release()
 		return storeio.ErrDocumentPageCorrupt

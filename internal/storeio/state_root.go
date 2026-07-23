@@ -34,12 +34,16 @@ const (
 	StateOptionPostings
 	StateOptionValueDict
 	StateOptionHashKeys
+	// StateOptionFloat64Columns means every live document page carries the
+	// complete configured float64 covering-column catalog.
+	StateOptionFloat64Columns
 )
 
 const stateRootKnownOptions = StateOptionShapeTapes |
 	StateOptionPostings |
 	StateOptionValueDict |
-	StateOptionHashKeys
+	StateOptionHashKeys |
+	StateOptionFloat64Columns
 
 // ErrStateRootCorrupt reports a common page that passed basic framing but does
 // not encode a valid Store state root.
@@ -215,10 +219,11 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 	if fileEnd < uint64(superblockCopies)*pageSize || fileEnd > maxSuperblockFileOffset || fileEnd%pageSize != 0 {
 		return fmt.Errorf("%w: state file high-water mark", ErrInvalidWrite)
 	}
+	hasCatalog := root.IndexCount != 0 || root.Options&StateOptionFloat64Columns != 0
 	if root.ChunkDocuments == 0 || root.ChunkDocuments > 64 ||
 		root.LiveChunks > root.ChunkHighWater || root.TTLCount > root.DocumentCount ||
 		root.FreeChunkHint > root.ChunkHighWater || root.NextLogicalID <= StateRootLogicalID ||
-		(root.IndexCount == 0) != (root.IndexCatalogHash == 0) {
+		hasCatalog != (root.IndexCatalogHash != 0) {
 		return fmt.Errorf("%w: state counts", ErrInvalidWrite)
 	}
 	if root.LiveChunks == 0 {

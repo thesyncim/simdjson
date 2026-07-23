@@ -218,6 +218,7 @@ SQL
 	done
 	duckdb /out/store.duckdb <"$out/delete.sql" >/dev/null 2>"$out/delete.profiles.jsons"
 	after_deletes=$(duckdb -csv -noheader /out/store.duckdb "SELECT count(*) FROM docs;")
+	database_bytes_after_mutations=$(wc -c <"$db" | tr -d ' ')
 	wal_after_mutations=0
 	if [[ -f $db.wal ]]; then
 		wal_after_mutations=$(wc -c <"$db.wal" | tr -d ' ')
@@ -238,6 +239,7 @@ CURRENT_BUFFER_BYTES $current_buffer_bytes
 CURRENT_ART_BYTES $current_art_bytes
 CURRENT_TEMP_BYTES $current_temp_bytes
 MUTATION_OPS $mutation_ops
+DATABASE_BYTES_AFTER_MUTATIONS $database_bytes_after_mutations
 WAL_BYTES_AFTER_MUTATIONS $wal_after_mutations
 RESULT docs $result_docs
 RESULT extract_hits $result_extract

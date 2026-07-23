@@ -59,7 +59,7 @@ func writeDuckDBRun(t *testing.T, dir string, m Manifest) {
 	facts := "IMAGE duckdb/duckdb:1.5.4@sha256:test\n" +
 		"VERSION v1.5.4 test\nPLATFORM linux/arm64\nCORPUS_SHA256 " + m.NDJSONSHA256 + "\n" +
 		"THREADS 1\nDOCS 10\nSOURCE_BYTES " + strconv.FormatInt(m.SourceBytes, 10) + "\nKEY_BYTES " + strconv.FormatInt(m.KeyBytes, 10) + "\nDATABASE_BYTES 8192\nWAL_BYTES 0\nCURRENT_BUFFER_BYTES 6144\nCURRENT_ART_BYTES 1024\nCURRENT_TEMP_BYTES 0\n" +
-		"MUTATION_OPS 2\nWAL_BYTES_AFTER_MUTATIONS 1024\n" +
+		"MUTATION_OPS 2\nDATABASE_BYTES_AFTER_MUTATIONS 9216\nWAL_BYTES_AFTER_MUTATIONS 1024\n" +
 		"RESULT docs 10\nRESULT extract_hits 10\nRESULT filter 2\n" +
 		"RESULT group 3\nRESULT contain 2\nRESULT sum 55\nRESULT after_deletes 8\n"
 	if err := os.WriteFile(filepath.Join(dir, "facts.log"), []byte(facts), 0o644); err != nil {
@@ -151,8 +151,10 @@ func TestBuildReportKeepsAccountingDomainsSeparate(t *testing.T) {
 		GroupNS: 4000, ContainNS: 5000, MutationOps: 2, UpdateNSOp: 800,
 		DeleteNSOp: 600, AfterDeletes: 8, PostMutationFileBytes: 3072,
 		ReusableBytes: 512, MutationReopenNS: 50_000, DocsObserved: 10,
-		ExtractHits: 10, FilterCount: 2, SumObserved: 55, GroupCount: 3,
-		ContainCount: 2,
+		ExtractHits: 10, FilterCount: 2, SumObserved: 55, SumCovers: 1, GroupCount: 3,
+		ContainCount: 2, FilterIndexPostingPages: 1,
+		FilterIndexCertificateRows: 2, ContainIndexPostingPages: 1,
+		ContainIndexCertificateRows: 2,
 	}
 	report := BuildReport(OursResults{GoVersion: "go-test", GOARCH: "test", Corpora: []OursCorpus{{
 		Manifest: m, Store: store, FileStore: fileStore,
@@ -160,11 +162,19 @@ func TestBuildReportKeepsAccountingDomainsSeparate(t *testing.T) {
 	for _, want := range []string{
 		"Store and DuckDB comparison", "Correctness gate", "Heap Store memory",
 		"Durable storage", "disk ratio", "Durable bounded memory", "admitted cache",
-		"Durable warm reads", "Per-key mutations", "mutation reopen", "verified",
+		"Durable warm reads", "exact certificate + bitmap (1 posting pages, 0 JSON rows)",
+		"typed cover (0 JSON rows)", "Per-key mutations", "mutation reopen", "verified",
+		"DuckDB after mutations", "9.00 KiB",
 	} {
 		if !strings.Contains(report, want) {
 			t.Fatalf("report missing %q:\n%s", want, report)
 		}
+	}
+	if got := fmtRatio(8.051e6, 1.880e9); got != "0.0043x" {
+		t.Fatalf("small ratio = %q, want 0.0043x", got)
+	}
+	if got := fmtPayloadRatio(9<<20, 2<<30); got != "0.0044x" {
+		t.Fatalf("small payload ratio = %q, want 0.0044x", got)
 	}
 }
 

@@ -34,14 +34,19 @@ conversion.
 
 `internal/storeio` owns the attached-Store durability boundary: bounded commit
 queues and devices, double-superblock recovery, common page framing, packed
-key/chunk/index/TTL/free/document/overflow payloads, copy-on-write tree
+key/chunk/index/TTL/free/document/overflow payloads, typed document-page
+covering sections, collision-safe scalar/compound posting certificates,
+copy-on-write tree
 mutations, generation leases, extent reclamation, the quantum-slot CLOCK page
 cache, its pointer-free buddy span allocator, independent Linux
 direct-read/direct-write descriptors, one pure-Go native read/commit substrate,
 and checksum kernels. Cache bytes live in one anonymous arena; the native read
 issuer targets reserved spans in that arena directly. Lookup entries,
 free-span links, and one-cache-line slot controls are pointer-free, and
-resident pages synchronize per frame.
+resident pages synchronize per frame. Document frames cross a one-time typed
+admission boundary after common CRC32C verification; readers thereafter use
+borrowed admitted views and separately bind the page's `ChunkID` to the
+selecting chunk-tree edge.
 Persistent formats use byte offsets, fixed-width values, and stable logical ids
 rather than Go pointers or runtime layouts. The public `FileStore` composes
 those mechanisms without exposing physical references. Store-specific SIMD
@@ -84,6 +89,7 @@ bounds and lifetime are already established by typed state.
 | `FileSnapshot` | Pins one durable root generation and therefore all physical extents reachable from it. | Call `Close`; `FileStore.Close` fails while leases remain. |
 | `FileSnapshot.AppendRaw` | Copies from a scoped page lease into caller-owned capacity. | The returned bytes are independent of cache eviction and snapshot close. |
 | `FileSnapshot.RangeRaw` callback | Key/value views borrow the current page or reused overflow buffer. | Invalid when the callback returns; copy anything retained. |
+| `FileSnapshot.ReduceFloat64PathsInto` | Writes aggregates into caller storage while borrowing one verified document page at a time. | Results own values; path and destination slices remain caller-owned. |
 | `query.RunFileSnapshot` result | Owns copied projection/group bytes and formatted aggregates. | Independent of snapshot close; final result memory scales with result cardinality. |
 
 Borrowing avoids a copy; it never hides a pointer. Compiled plans contain no
@@ -112,7 +118,9 @@ so sharing cannot accumulate dead layout history. TTL and index-lifecycle
 cursors remain writer-only. Reader state contains only immutable index metadata
 and declared-index roots. A declared posting addresses one bounded chunk
 through a stable-slot `uint64`; Boolean planning therefore combines 64 rows at
-a time before `ord[slot]` maps survivors into the dense `DocSet`. Nested keys
+a time before `ord[slot]` maps survivors into the dense `DocSet`. Durable
+posting certificates can prove one exact tuple stream without a document read;
+colliding or legacy streams retain semantic recheck. Nested keys
 reuse compiled-pointer/shape extraction instead of a parallel decoder.
 `Snapshot.GetRaw` never locks, reads a clock, checks a tombstone, or consults
 mutable metadata. `Snapshot.Get` retains the existing `DocSet.Doc` contract:

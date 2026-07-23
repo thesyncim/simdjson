@@ -38,9 +38,12 @@ type FileExecutionOptions struct {
 // zero value is ready to use. It does not own worker batches or returned
 // Result cells, whose cardinality depends on each execution.
 type FileExecutionWorkspace struct {
-	planner  Workspace
-	index    simdjson.FileIndexWorkspace
-	overflow []byte
+	planner    Workspace
+	index      simdjson.FileIndexWorkspace
+	overflow   []byte
+	reductions []simdjson.Float64Aggregate
+	coverPaths []string
+	accs       []aggAcc
 }
 
 // Release drops storage retained by durable index planning.
@@ -51,28 +54,39 @@ func (w *FileExecutionWorkspace) Release() {
 	w.planner = Workspace{}
 	w.index.Release()
 	w.overflow = nil
+	w.reductions = nil
+	w.coverPaths = nil
+	w.accs = nil
 }
 
 // FileExecutionStats describes the physical work performed by
 // [Query.RunFileSnapshot]. RowsTotal is the snapshot cardinality while
 // RowsScanned is the number of JSON documents admitted to execution after
-// persistent-index pushdown. An IndexBounded execution still rechecks the
-// complete predicate. BufferedBytes is the largest measured batch or in-memory
-// merge frontier; it excludes the caller-owned final Result.
+// persistent-index pushdown. IndexCertificateRows were decided from a
+// collision-free posting representative without opening JSON;
+// IndexRecheckRows required exact document comparison. An ordinary
+// IndexBounded execution still evaluates the complete predicate. BufferedBytes
+// is the largest measured batch or in-memory merge frontier; it excludes the
+// caller-owned final Result. CoveringColumns counts distinct typed columns
+// reduced without admitting JSON.
 type FileExecutionStats struct {
-	Workers         int
-	RowsTotal       uint64
-	RowsScanned     uint64
-	Batches         uint64
-	PeakBatchRows   int
-	PeakBatchBytes  int64
-	BufferedBytes   int64
-	SpillRuns       uint64
-	SpilledBytes    int64
-	IndexBounded    bool
-	IndexLookups    int
-	CandidateRows   uint64
-	CandidateChunks int
+	Workers              int
+	RowsTotal            uint64
+	RowsScanned          uint64
+	Batches              uint64
+	PeakBatchRows        int
+	PeakBatchBytes       int64
+	BufferedBytes        int64
+	SpillRuns            uint64
+	SpilledBytes         int64
+	IndexBounded         bool
+	IndexLookups         int
+	IndexPostingPages    int
+	IndexCertificateRows uint64
+	IndexRecheckRows     uint64
+	CandidateRows        uint64
+	CandidateChunks      int
+	CoveringColumns      int
 }
 
 const (
@@ -156,6 +170,22 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 	var localWorkspace FileExecutionWorkspace
 	if fileWorkspace == nil {
 		fileWorkspace = &localWorkspace
+	}
+	directIndex, handled, directErr := p.runDirectFileIndexedCount(&result, snapshot, fileWorkspace)
+	if handled {
+		stats.IndexBounded = directIndex.bounded
+		stats.IndexLookups = directIndex.lookups
+		stats.IndexPostingPages = directIndex.postingPages
+		stats.IndexCertificateRows = directIndex.certificates
+		stats.IndexRecheckRows = directIndex.rechecks
+		stats.CandidateRows = directIndex.rows
+		stats.CandidateChunks = directIndex.chunks
+		return result, stats, directErr
+	}
+	coveringColumns, handled, directErr := p.runDirectFileAggregate(&result, snapshot, fileWorkspace)
+	if handled {
+		stats.CoveringColumns = coveringColumns
+		return result, stats, directErr
 	}
 	candidateMasks, err := p.fileCandidateMasks(snapshot, &fileWorkspace.index, &fileWorkspace.planner)
 	if err != nil {

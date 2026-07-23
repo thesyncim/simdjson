@@ -210,16 +210,19 @@ document page, and returns a scoped view. Explicit exact-index probes produce
 page masks without scanning rejected JSON. The general query executor
 late-binds the frozen catalog, chooses the widest compound equality bound,
 combines bounded `AND` and fully bounded `OR` plans, and rechecks the complete
-predicate over every candidate. Unbounded plans retain the ordered physical
-chunk scan. Direct sequential scans and key prefetch submit bounded, physically
-ordered work rather than relying on demand faults.
+predicate over every candidate for row-producing plans. A fully indexed
+`COUNT(*)` consumes certified exact masks directly and reopens documents only
+for ambiguous streams. Unbounded plans retain the ordered physical chunk scan.
+Direct sequential scans and key prefetch submit bounded, physically ordered
+work rather than relying on demand faults.
 
 Chunk-directory levels use implemented 64-way packed CHAMP nodes with one
 occupancy word and densely ranked fixed-width physical references rather than
 Go pointers. Admitted pages are found in the bounded cache; cold references
 enter its read workers. Posting keys are ordered by index, tuple hash, and
 logical chunk and carry one native 64-bit mask. Every exact probe that returns
-rows visits candidate documents to verify complete scalar values.
+rows verifies complete scalar values either from a collision-free posting
+certificate or, for an ambiguous stream, from the candidate documents.
 
 The implemented document payload makes slot identity implicit in one 64-bit
 live word and stores only cumulative key and JSON ends: eight directory bytes
@@ -228,6 +231,12 @@ bitmap probe and popcount; complete key comparison remains mandatory on a
 fingerprint hit. Metadata nodes use a 4 KiB allocation quantum, while a
 document `PageRef` can name a larger power-of-two extent. This covers ordinary
 variable-size chunks without forcing every sparse node to the maximum size.
+Format v2 may append a frozen set of typed float64 covers to that same
+micro-page: one stable-slot mask per RFC 6901 path followed by only the finite
+values selected by the mask. JSON bounds remain capacity-clipped before the
+cover section. Mutation and recovery therefore cannot observe a cover from a
+different document generation, and the retained format adds no Go pointer per
+row or key.
 Values beyond the configured inline extent use a checksummed overflow chain
 whose descriptor binds total length and owner slot. Directory cache size,
 prefetch depth, and overflow threshold are `FileStoreOptions`; none changes
@@ -342,7 +351,12 @@ delta. `FileStore` uses a different durable representation: its frozen catalog
 hash is in the state root, a copy-on-write index tree maps
 `(index id, tuple hash, chunk)` to one stable-slot posting page, and each
 mutation updates affected postings in the same transaction as the document and
-key roots. Probes always reopen candidate documents for exact tuple recheck.
+key roots. Posting v2 stores an optional validated scalar or compound-tuple
+certificate. A certificate with no collision flag proves every bit in that
+stream after one semantic query comparison. Encountering a distinct tuple with
+the same hash sets a sticky flag; missing, legacy, oversized, or colliding
+certificates retain exact document recheck. The bitmap is never trusted merely
+because its 64-bit hash matched.
 The file query planner late-binds those definitions, selects one widest
 compound probe before overlapping singles, and routes ordered candidate masks
 into sparse document-page reads. Its routing masks are explicitly a hash-bounded
@@ -350,6 +364,12 @@ superset; every survivor executes the original predicate, so that single
 document pass is also the mandatory collision check. Planner statistics expose
 total, candidate, and scanned rows; an index I/O or validation error fails the
 query instead of silently selecting a different physical plan.
+
+For a fully indexed `COUNT(*)`, the planner asks for final masks instead.
+Collision-free certificates decide those streams directly; only ambiguous
+streams admit and recheck documents. Consecutive streams stored in one packed
+posting page share one lease and decode, while their ordered decisions remain
+independent.
 
 Key, chunk, exact-index, TTL, free, document, and overflow pages are all
 attached to public `FileStore` mutation batches. `Put`, `Delete`, deadline
@@ -443,14 +463,25 @@ I/O rather than demand-paged writable mappings.
 ## Query and TTL consequences
 
 Declared nested and compound indexes keep the same scalar fingerprint and
-mandatory exact-recheck semantics. `FileSnapshot.AppendIndexMasks` returns the
-same sparse `(chunk, mask)` interchange form as heap snapshots.
+exact-answer semantics. Collision-free certificates avoid document I/O;
+ambiguous streams recheck. `FileSnapshot.AppendIndexMasks` returns the same
+sparse `(chunk, mask)` interchange form as heap snapshots.
 `RunFileSnapshot` late-binds that catalog for equality and supported
-containment predicates, prefers the widest compound bound, intersects `AND`,
-unions only a completely bounded `OR`, then performs mandatory full-predicate
-recheck while preserving source order. `NOT`, range predicates, and any
+containment predicates, lowers scalar-leaf object containment to exact nested
+equalities, prefers the widest compound bound, intersects `AND`, and unions
+only a completely bounded `OR`. Fully certified `COUNT(*)` popcounts the masks
+without admitting JSON. Arrays, empty objects, `NOT`, range predicates, and any
 partially unbounded `OR` retain the physical scan because complementing an
 approximate candidate universe would be unsafe.
+
+The planner also recognizes an unfiltered scalar aggregate containing only
+`COUNT(*)` and numeric aggregates whose paths are all frozen covers. It
+preflights the complete list and fuses distinct columns into one page walk,
+without admitting JSON rows or launching workers. Numeric masks deliberately
+cannot answer `COUNT(path)`, because present non-numeric values must count
+there. Co-locating covers is the update-safe first tier; cold analytical scans
+still read document extents, so separate packed column extents remain a future
+larger-than-RAM optimization rather than a claimed property here.
 
 TTL is publication-based and persistent. A deadline is stored beside its key
 and in an ordered copy-on-write TTL tree. Changing or removing it updates both
@@ -470,7 +501,8 @@ The implementation now has deterministic randomized mutation/TTL parity
 against heap `Store`, retained-snapshot and reopen continuation tests, exact
 index update/delete/reopen tests, bounded fan-in spill differentials, async
 flush tests, allocation checks, long-lived-snapshot reclamation/file-growth
-tests, page corruption tests, crash images that tear data and root writes,
+tests, page corruption tests, crash images spanning every changed-page
+boundary and every root-record byte,
 direct read/write descriptor tests, concurrent direct reader/writer pressure,
 an explicit greater-than-cache gate, direct arena-read completion tests, and
 native/portable queue-depth pressure sweeps. The
@@ -521,8 +553,8 @@ release gates are:
 - working-set, read/write amplification, and fragmentation sweeps below, near,
   and above physical RAM;
 - cold NVMe workloads, not only container-backed direct I/O;
-- longer crash/power-loss campaigns on real filesystems in addition to
-  deterministic image tearing; and
+- device/firmware power-loss campaigns and long recovery fuzzing in addition
+  to deterministic write-boundary tearing; and
 - persistent range/ordered indexes, safe `NOT` complements, and persisted
   cardinality estimates for a pre-probe cost model. The current crossover
   fixture rejects an arbitrary 10-25% cutoff: exact equality remained useful

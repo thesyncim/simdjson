@@ -52,11 +52,14 @@ front end to the same typed plan, not a second executor.
 
 ## Execution
 
-Dense predicates and columns stream over compact tapes. A selective posting
-probe runs first and sparse row gathers materialize only candidates. The
-executor switches to sparse gathering only below its measured crossover, then
-rechecks the complete compiled predicate over every candidate. A posting hash
-collision can therefore increase work but cannot admit a false result.
+Dense predicates and columns stream over compact tapes. A selective DocSet or
+heap-Store posting probe runs first and sparse row gathers materialize only
+candidates. Those hash-bounded routes recheck the complete compiled predicate,
+so a collision can increase work but cannot admit a false result. A
+FileStore's persistent exact probe can instead return final masks when a
+collision-free scalar or compound certificate proves the complete stream;
+legacy, missing, oversized, and collision-marked certificates retain the same
+document-recheck fallback.
 
 Projection, aggregation, and grouping consume typed columns directly.
 Shape-taped rows are read at their native narrow or wide width and are not

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 )
 
@@ -12,7 +13,8 @@ const (
 	DocumentPagePayloadHeaderSize  = 32
 	DocumentPageRecordSize         = 8
 	DocumentOverflowDescriptorSize = PageRefSize + 8
-	documentPageVersion            = uint32(1)
+	documentPageVersionV1          = uint32(1)
+	documentPageVersion            = uint32(2)
 	documentPageKnownFlags         = uint8(0)
 	documentPageOverflowBit        = uint32(1 << 31)
 )
@@ -53,14 +55,26 @@ type DocumentValue struct {
 	Length   uint64
 }
 
+// DocumentFloat64Columns is the pointer-minimal input for typed covering
+// columns. Masks has one stable-slot validity word per column. Values is a
+// dense column-major matrix with exactly 64 float64 values per mask; only
+// values selected by a mask are encoded. Callers retain both slices.
+type DocumentFloat64Columns struct {
+	Masks  []uint64
+	Values []float64
+}
+
 // DocumentPageView is an admitted, checksum-verified micro-page. One borrowed
 // payload slice represents all rows; it does not create a pointer per key or
 // document.
 type DocumentPageView struct {
-	header    DocumentPageHeader
-	payload   []byte
-	dataStart int
-	count     uint8
+	header       DocumentPageHeader
+	payload      []byte
+	dataStart    int
+	dataEnd      int
+	float64Start int
+	count        uint8
+	float64Count uint16
 }
 
 // EncodeDocumentPage writes one complete stable-slot micro-page into caller
@@ -70,23 +84,33 @@ type DocumentPageView struct {
 // deterministic page initialization clears dst before copying. No allocation
 // is performed when rows and dst are caller-owned.
 func EncodeDocumentPage(dst []byte, header DocumentPageHeader, rows []DocumentRecord, nextLogicalID uint64) ([]byte, error) {
-	return encodeDocumentPage(dst, header, rows, nextLogicalID, 0, 0, false)
+	return encodeDocumentPage(dst, header, rows, DocumentFloat64Columns{}, nextLogicalID, 0, 0, false)
 }
 
 // EncodeDocumentPageWithOverflow writes a document page that may reference
 // overflow chains. Each overflow row has an empty JSON, a non-zero Overflow,
 // and its complete JSONLength. Inline rows leave those fields zero.
 func EncodeDocumentPageWithOverflow(dst []byte, header DocumentPageHeader, rows []DocumentRecord, nextLogicalID, fileEnd uint64, allocationQuantum uint32) ([]byte, error) {
-	return encodeDocumentPage(dst, header, rows, nextLogicalID, fileEnd, allocationQuantum, true)
+	return encodeDocumentPage(dst, header, rows, DocumentFloat64Columns{}, nextLogicalID, fileEnd, allocationQuantum, true)
 }
 
-func encodeDocumentPage(dst []byte, header DocumentPageHeader, rows []DocumentRecord, nextLogicalID, fileEnd uint64, allocationQuantum uint32, allowOverflow bool) ([]byte, error) {
-	dataLength, err := validateDocumentPageWrite(header, rows, nextLogicalID, fileEnd, allocationQuantum, allowOverflow)
+// EncodeDocumentPageWithColumns writes overflow-capable rows plus float64
+// covering columns into the same immutable extent. Keeping typed data beside
+// its stable-slot JSON makes document replacement, index maintenance, and
+// column publication one copy-on-write generation.
+func EncodeDocumentPageWithColumns(dst []byte, header DocumentPageHeader, rows []DocumentRecord, columns DocumentFloat64Columns, nextLogicalID, fileEnd uint64, allocationQuantum uint32) ([]byte, error) {
+	return encodeDocumentPage(dst, header, rows, columns, nextLogicalID, fileEnd, allocationQuantum, true)
+}
+
+func encodeDocumentPage(dst []byte, header DocumentPageHeader, rows []DocumentRecord, columns DocumentFloat64Columns, nextLogicalID, fileEnd uint64, allocationQuantum uint32, allowOverflow bool) ([]byte, error) {
+	dataLength, float64Length, err := validateDocumentPageWrite(
+		header, rows, columns, nextLogicalID, fileEnd, allocationQuantum, allowOverflow,
+	)
 	if err != nil {
 		return nil, err
 	}
 	count := len(rows)
-	payloadLength := DocumentPagePayloadHeaderSize + count*DocumentPageRecordSize + dataLength
+	payloadLength := DocumentPagePayloadHeaderSize + count*DocumentPageRecordSize + dataLength + float64Length
 	payload, err := InitPage(dst, PageHeader{
 		StoreID:       header.StoreID,
 		Generation:    header.Generation,
@@ -98,7 +122,11 @@ func encodeDocumentPage(dst []byte, header DocumentPageHeader, rows []DocumentRe
 	if err != nil {
 		return nil, err
 	}
-	binary.LittleEndian.PutUint32(payload[0:4], documentPageVersion)
+	version := documentPageVersionV1
+	if len(columns.Masks) != 0 {
+		version = documentPageVersion
+	}
+	binary.LittleEndian.PutUint32(payload[0:4], version)
 	binary.LittleEndian.PutUint32(payload[4:8], header.ChunkID)
 	binary.LittleEndian.PutUint64(payload[8:16], header.Live)
 	binary.LittleEndian.PutUint32(payload[16:20], uint32(dataLength))
@@ -128,6 +156,23 @@ func encodeDocumentPage(dst []byte, header DocumentPageHeader, rows []DocumentRe
 		}
 	}
 	payload[24] = overflowCount
+	if len(columns.Masks) != 0 {
+		binary.LittleEndian.PutUint16(payload[25:27], uint16(len(columns.Masks)))
+		binary.LittleEndian.PutUint32(payload[28:32], uint32(float64Length))
+		cursor := dataStart + dataLength
+		for column, mask := range columns.Masks {
+			binary.LittleEndian.PutUint64(payload[cursor:cursor+8], mask)
+			cursor += 8
+			base := column * 64
+			for slots := mask; slots != 0; slots &= slots - 1 {
+				slot := bits.TrailingZeros64(slots)
+				binary.LittleEndian.PutUint64(
+					payload[cursor:cursor+8], math.Float64bits(columns.Values[base+slot]),
+				)
+				cursor += 8
+			}
+		}
+	}
 	page := dst[:int(header.PageSize)]
 	if _, err := sealInitializedPage(page); err != nil {
 		return nil, err
@@ -154,11 +199,49 @@ func openDocumentPage(src []byte, chunkHighWater uint32, nextLogicalID, fileEnd 
 	if err != nil {
 		return DocumentPageView{}, fmt.Errorf("%w: %w", ErrDocumentPageCorrupt, err)
 	}
-	if pageHeader.Kind != PageDocument || len(payload) < DocumentPagePayloadHeaderSize ||
-		binary.LittleEndian.Uint32(payload[0:4]) != documentPageVersion ||
-		binary.LittleEndian.Uint16(payload[22:24]) != DocumentPageRecordSize ||
-		!allZero(payload[25:DocumentPagePayloadHeaderSize]) {
+	return openDocumentPagePayload(
+		pageHeader, payload, chunkHighWater, nextLogicalID, fileEnd, allocationQuantum, allowOverflow,
+	)
+}
+
+// OpenAdmittedDocumentPageWithOverflow validates the typed document payload of
+// a page already admitted by PageCache. Admission has verified common framing,
+// identity, bounds, and CRC32C; this function deliberately does not checksum
+// the immutable cache bytes a second time. It still validates every document,
+// overflow descriptor, and covering-column invariant before returning a view.
+func OpenAdmittedDocumentPageWithOverflow(src []byte, chunkHighWater uint32, nextLogicalID, fileEnd uint64, allocationQuantum uint32) (DocumentPageView, error) {
+	pageHeader, ok := decodePageHeader(src)
+	if !ok || len(src) != int(pageHeader.PageSize) {
+		return DocumentPageView{}, fmt.Errorf("%w: admitted common header", ErrDocumentPageCorrupt)
+	}
+	payloadEnd := PageHeaderSize + int(pageHeader.PayloadLength)
+	payload := src[PageHeaderSize:payloadEnd:payloadEnd]
+	return openDocumentPagePayload(
+		pageHeader, payload, chunkHighWater, nextLogicalID, fileEnd, allocationQuantum, true,
+	)
+}
+
+func openDocumentPagePayload(pageHeader PageHeader, payload []byte, chunkHighWater uint32, nextLogicalID, fileEnd uint64, allocationQuantum uint32, allowOverflow bool) (DocumentPageView, error) {
+	if pageHeader.Kind != PageDocument || len(payload) < DocumentPagePayloadHeaderSize {
+		return DocumentPageView{}, fmt.Errorf("%w: header or payload size", ErrDocumentPageCorrupt)
+	}
+	version := binary.LittleEndian.Uint32(payload[0:4])
+	if version != documentPageVersionV1 && version != documentPageVersion ||
+		binary.LittleEndian.Uint16(payload[22:24]) != DocumentPageRecordSize {
 		return DocumentPageView{}, fmt.Errorf("%w: header, version, or reserved bytes", ErrDocumentPageCorrupt)
+	}
+	float64Count := uint16(0)
+	float64Length := uint64(0)
+	if version == documentPageVersionV1 {
+		if !allZero(payload[25:DocumentPagePayloadHeaderSize]) {
+			return DocumentPageView{}, fmt.Errorf("%w: version-one reserved bytes", ErrDocumentPageCorrupt)
+		}
+	} else {
+		float64Count = binary.LittleEndian.Uint16(payload[25:27])
+		float64Length = uint64(binary.LittleEndian.Uint32(payload[28:32]))
+		if float64Count == 0 || payload[27] != 0 || float64Length < uint64(float64Count)*8 {
+			return DocumentPageView{}, fmt.Errorf("%w: float64 covering header", ErrDocumentPageCorrupt)
+		}
 	}
 	header := DocumentPageHeader{
 		StoreID:    pageHeader.StoreID,
@@ -175,7 +258,9 @@ func openDocumentPage(src []byte, chunkHighWater uint32, nextLogicalID, fileEnd 
 	if err := validateDocumentPageHeader(header, count, chunkHighWater, nextLogicalID); err != nil {
 		return DocumentPageView{}, fmt.Errorf("%w: %v", ErrDocumentPageCorrupt, err)
 	}
-	if dataStart+dataLength != uint64(len(payload)) {
+	dataEnd := dataStart + dataLength
+	float64End := dataEnd + float64Length
+	if float64End != uint64(len(payload)) {
 		return DocumentPageView{}, fmt.Errorf("%w: payload length", ErrDocumentPageCorrupt)
 	}
 	var previousEnd uint32
@@ -206,11 +291,33 @@ func openDocumentPage(src []byte, chunkHighWater uint32, nextLogicalID, fileEnd 
 	if uint64(previousEnd) != dataLength || overflowCount != payload[24] {
 		return DocumentPageView{}, fmt.Errorf("%w: unreferenced packed data", ErrDocumentPageCorrupt)
 	}
+	cursor := int(dataEnd)
+	for range int(float64Count) {
+		if cursor+8 > int(float64End) {
+			return DocumentPageView{}, fmt.Errorf("%w: truncated float64 mask", ErrDocumentPageCorrupt)
+		}
+		mask := binary.LittleEndian.Uint64(payload[cursor : cursor+8])
+		cursor += 8
+		if mask&^header.Live != 0 {
+			return DocumentPageView{}, fmt.Errorf("%w: float64 mask outside live rows", ErrDocumentPageCorrupt)
+		}
+		valueBytes := bits.OnesCount64(mask) * 8
+		if cursor+valueBytes > int(float64End) {
+			return DocumentPageView{}, fmt.Errorf("%w: truncated float64 values", ErrDocumentPageCorrupt)
+		}
+		for end := cursor + valueBytes; cursor < end; cursor += 8 {
+			value := math.Float64frombits(binary.LittleEndian.Uint64(payload[cursor : cursor+8]))
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return DocumentPageView{}, fmt.Errorf("%w: non-finite float64 cover", ErrDocumentPageCorrupt)
+			}
+		}
+	}
+	if cursor != int(float64End) {
+		return DocumentPageView{}, fmt.Errorf("%w: unreferenced float64 data", ErrDocumentPageCorrupt)
+	}
 	return DocumentPageView{
-		header:    header,
-		payload:   payload,
-		dataStart: int(dataStart),
-		count:     uint8(count),
+		header: header, payload: payload, dataStart: int(dataStart), dataEnd: int(dataEnd),
+		float64Start: int(dataEnd), count: uint8(count), float64Count: float64Count,
 	}, nil
 }
 
@@ -222,6 +329,12 @@ func AdmittedDocumentPage(src []byte) DocumentPageView {
 	payloadEnd := PageHeaderSize + int(pageHeader.PayloadLength)
 	payload := src[PageHeaderSize:payloadEnd:payloadEnd]
 	count := int(payload[20])
+	dataStart := DocumentPagePayloadHeaderSize + count*DocumentPageRecordSize
+	dataEnd := dataStart + int(binary.LittleEndian.Uint32(payload[16:20]))
+	float64Count := uint16(0)
+	if binary.LittleEndian.Uint32(payload[0:4]) == documentPageVersion {
+		float64Count = binary.LittleEndian.Uint16(payload[25:27])
+	}
 	return DocumentPageView{
 		header: DocumentPageHeader{
 			StoreID: pageHeader.StoreID, Generation: pageHeader.Generation,
@@ -229,8 +342,8 @@ func AdmittedDocumentPage(src []byte) DocumentPageView {
 			ChunkID: binary.LittleEndian.Uint32(payload[4:8]),
 			Live:    binary.LittleEndian.Uint64(payload[8:16]), Flags: payload[21],
 		},
-		payload: payload, dataStart: DocumentPagePayloadHeaderSize + count*DocumentPageRecordSize,
-		count: uint8(count),
+		payload: payload, dataStart: dataStart, dataEnd: dataEnd,
+		float64Start: dataEnd, count: uint8(count), float64Count: float64Count,
 	}
 }
 
@@ -239,6 +352,101 @@ func (v DocumentPageView) Header() DocumentPageHeader { return v.header }
 
 // Len returns the number of live rows.
 func (v DocumentPageView) Len() int { return int(v.count) }
+
+// Float64ColumnCount returns the number of typed covering columns stored in
+// this page. Version-one pages return zero.
+func (v DocumentPageView) Float64ColumnCount() int { return int(v.float64Count) }
+
+// DocumentFloat64ColumnView is one borrowed stable-slot numeric column.
+type DocumentFloat64ColumnView struct {
+	mask   uint64
+	values []byte
+}
+
+// Mask returns the stable slots with a finite numeric value.
+func (v DocumentFloat64ColumnView) Mask() uint64 { return v.mask }
+
+// Lookup returns one covered value by stable slot.
+func (v DocumentFloat64ColumnView) Lookup(slot uint8) (float64, bool) {
+	if slot >= 64 {
+		return 0, false
+	}
+	bit := uint64(1) << slot
+	if v.mask&bit == 0 {
+		return 0, false
+	}
+	rank := bits.OnesCount64(v.mask & (bit - 1))
+	offset := rank * 8
+	return math.Float64frombits(binary.LittleEndian.Uint64(v.values[offset : offset+8])), true
+}
+
+// DocumentFloat64Iterator walks covered values in stable-slot order.
+type DocumentFloat64Iterator struct {
+	slots  uint64
+	values []byte
+	offset int
+}
+
+// Iterator returns an allocation-free stable-slot iterator.
+func (v DocumentFloat64ColumnView) Iterator() DocumentFloat64Iterator {
+	return DocumentFloat64Iterator{slots: v.mask, values: v.values}
+}
+
+// Next returns the next stable slot and value.
+func (i *DocumentFloat64Iterator) Next() (uint8, float64, bool) {
+	if i == nil || i.slots == 0 {
+		return 0, 0, false
+	}
+	slot := uint8(bits.TrailingZeros64(i.slots))
+	value := math.Float64frombits(binary.LittleEndian.Uint64(i.values[i.offset : i.offset+8]))
+	i.slots &= i.slots - 1
+	i.offset += 8
+	return slot, value, true
+}
+
+// DocumentFloat64ValueIterator walks only the densely packed values. It is
+// the reduction path: callers that do not need stable slot identities avoid
+// one trailing-zero count and one mask update per value while retaining the
+// exact stable-slot order used by Iterator.
+type DocumentFloat64ValueIterator struct {
+	values []byte
+	offset int
+}
+
+// Values returns an allocation-free dense value iterator.
+func (v DocumentFloat64ColumnView) Values() DocumentFloat64ValueIterator {
+	return DocumentFloat64ValueIterator{values: v.values}
+}
+
+// Next returns the next covered value in stable-slot order.
+func (i *DocumentFloat64ValueIterator) Next() (float64, bool) {
+	if i == nil || i.offset == len(i.values) {
+		return 0, false
+	}
+	value := math.Float64frombits(binary.LittleEndian.Uint64(i.values[i.offset : i.offset+8]))
+	i.offset += 8
+	return value, true
+}
+
+// Float64Column returns one borrowed typed covering column.
+func (v DocumentPageView) Float64Column(column int) (DocumentFloat64ColumnView, bool) {
+	if column < 0 || column >= int(v.float64Count) {
+		return DocumentFloat64ColumnView{}, false
+	}
+	cursor := v.float64Start
+	for current := 0; current < int(v.float64Count); current++ {
+		mask := binary.LittleEndian.Uint64(v.payload[cursor : cursor+8])
+		cursor += 8
+		valueBytes := bits.OnesCount64(mask) * 8
+		if current == column {
+			return DocumentFloat64ColumnView{
+				mask: mask, values: v.payload[cursor : cursor+valueBytes : cursor+valueBytes],
+			}, true
+		}
+		cursor += valueBytes
+	}
+	return DocumentFloat64ColumnView{}, false
+}
 
 // Lookup returns the row at stable slot. It uses one bitmap probe, one popcount
 // rank, and at most three cumulative-end loads; no scan or allocation occurs.
@@ -274,7 +482,7 @@ func (v DocumentPageView) LookupJSON(slot uint8) ([]byte, bool) {
 	}
 	start := v.dataStart + int(keyEnd)
 	end := v.dataStart + int(jsonEnd)
-	if start >= end || end > len(v.payload) {
+	if start >= end || end > v.dataEnd {
 		return nil, false
 	}
 	return v.payload[start:end:end], true
@@ -305,7 +513,7 @@ func (v DocumentPageView) LookupKey(slot uint8, key []byte) ([]byte, bool) {
 	keyStart := v.dataStart + int(rowStart)
 	jsonStart := v.dataStart + int(keyEnd)
 	end := v.dataStart + int(jsonEnd)
-	if keyStart > jsonStart || jsonStart >= end || end > len(v.payload) ||
+	if keyStart > jsonStart || jsonStart >= end || end > v.dataEnd ||
 		!bytes.Equal(v.payload[keyStart:jsonStart], key) {
 		return nil, false
 	}
@@ -337,7 +545,7 @@ func (v DocumentPageView) LookupString(slot uint8, key string) ([]byte, bool) {
 	keyStart := v.dataStart + int(rowStart)
 	jsonStart := v.dataStart + int(keyEnd)
 	end := v.dataStart + int(jsonEnd)
-	if keyStart > jsonStart || jsonStart >= end || end > len(v.payload) ||
+	if keyStart > jsonStart || jsonStart >= end || end > v.dataEnd ||
 		string(v.payload[keyStart:jsonStart]) != key {
 		return nil, false
 	}
@@ -410,7 +618,7 @@ func (v DocumentPageView) recordAt(rank int, slot uint8) (DocumentRecord, bool) 
 	keyStart := v.dataStart + int(start)
 	jsonStart := v.dataStart + int(keyEnd)
 	end := v.dataStart + int(recordEnd)
-	if keyStart > jsonStart || jsonStart >= end || end > len(v.payload) {
+	if keyStart > jsonStart || jsonStart >= end || end > v.dataEnd {
 		return DocumentRecord{}, false
 	}
 	if encodedEnd&documentPageOverflowBit != 0 {
@@ -441,40 +649,59 @@ func (v DocumentPageView) valueAt(rank int) (DocumentValue, bool) {
 	return DocumentValue{Inline: record.JSON, Length: uint64(len(record.JSON))}, true
 }
 
-func validateDocumentPageWrite(header DocumentPageHeader, rows []DocumentRecord, nextLogicalID, fileEnd uint64, allocationQuantum uint32, allowOverflow bool) (int, error) {
+func validateDocumentPageWrite(header DocumentPageHeader, rows []DocumentRecord, columns DocumentFloat64Columns, nextLogicalID, fileEnd uint64, allocationQuantum uint32, allowOverflow bool) (int, int, error) {
 	if err := validateDocumentPageHeader(header, len(rows), header.ChunkID+1, nextLogicalID); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	live := header.Live
 	dataLength := uint64(0)
 	for _, row := range rows {
 		slot := uint8(bits.TrailingZeros64(live))
 		if row.Slot != slot {
-			return 0, fmt.Errorf("%w: rows do not match stable slots", ErrInvalidWrite)
+			return 0, 0, fmt.Errorf("%w: rows do not match stable slots", ErrInvalidWrite)
 		}
 		rowLength := len(row.JSON)
 		if row.Overflow == (PageRef{}) {
 			if rowLength == 0 || row.JSONLength != 0 {
-				return 0, fmt.Errorf("%w: inline document value", ErrInvalidWrite)
+				return 0, 0, fmt.Errorf("%w: inline document value", ErrInvalidWrite)
 			}
 		} else {
 			if !allowOverflow || rowLength != 0 || row.JSONLength == 0 ||
 				!validDocumentOverflowRef(header, row.Overflow, fileEnd, nextLogicalID, allocationQuantum) {
-				return 0, fmt.Errorf("%w: overflow document value", ErrInvalidWrite)
+				return 0, 0, fmt.Errorf("%w: overflow document value", ErrInvalidWrite)
 			}
 			rowLength = DocumentOverflowDescriptorSize
 		}
 		dataLength += uint64(len(row.Key)) + uint64(rowLength)
 		if dataLength >= uint64(documentPageOverflowBit) {
-			return 0, fmt.Errorf("%w: document data length", ErrInvalidWrite)
+			return 0, 0, fmt.Errorf("%w: document data length", ErrInvalidWrite)
 		}
 		live &= live - 1
 	}
-	payloadLength := uint64(DocumentPagePayloadHeaderSize+len(rows)*DocumentPageRecordSize) + dataLength
-	if payloadLength > uint64(header.PageSize)-PageHeaderSize-PageTrailerSize {
-		return 0, fmt.Errorf("%w: document payload does not fit", ErrInvalidWrite)
+	if len(columns.Masks) > math.MaxUint16 ||
+		len(columns.Masks) == 0 && len(columns.Values) != 0 ||
+		len(columns.Masks) != 0 && len(columns.Values) != len(columns.Masks)*64 {
+		return 0, 0, fmt.Errorf("%w: float64 covering shape", ErrInvalidWrite)
 	}
-	return int(dataLength), nil
+	float64Length := uint64(0)
+	for column, mask := range columns.Masks {
+		if mask&^header.Live != 0 {
+			return 0, 0, fmt.Errorf("%w: float64 mask outside live rows", ErrInvalidWrite)
+		}
+		float64Length += 8 + uint64(bits.OnesCount64(mask))*8
+		base := column * 64
+		for slots := mask; slots != 0; slots &= slots - 1 {
+			value := columns.Values[base+bits.TrailingZeros64(slots)]
+			if math.IsNaN(value) || math.IsInf(value, 0) {
+				return 0, 0, fmt.Errorf("%w: non-finite float64 cover", ErrInvalidWrite)
+			}
+		}
+	}
+	payloadLength := uint64(DocumentPagePayloadHeaderSize+len(rows)*DocumentPageRecordSize) + dataLength + float64Length
+	if payloadLength > uint64(header.PageSize)-PageHeaderSize-PageTrailerSize {
+		return 0, 0, fmt.Errorf("%w: document payload does not fit", ErrInvalidWrite)
+	}
+	return int(dataLength), int(float64Length), nil
 }
 
 func validDocumentOverflowRef(header DocumentPageHeader, ref PageRef, fileEnd, nextLogicalID uint64, allocationQuantum uint32) bool {

@@ -1,8 +1,10 @@
 package simdjson
 
 import (
+	"bytes"
 	"math/bits"
 
+	"github.com/thesyncim/simdjson/document"
 	"github.com/thesyncim/simdjson/internal/storeio"
 )
 
@@ -25,19 +27,20 @@ func (s *FileSnapshot) AppendIndexes(dst []StoreIndexInfo) []StoreIndexInfo {
 	return dst
 }
 
-// AppendIndexMasks appends exact, collision-rechecked stable-slot masks for a
-// frozen FileStore index. Directory and posting pages are read on demand; only
-// candidate document pages are parsed for the mandatory equality recheck.
+// AppendIndexMasks appends exact stable-slot masks for a frozen FileStore
+// index. A collision-free posting certificate decides the complete stream
+// without opening JSON. Legacy, missing, oversized, or collision-marked
+// certificates fall back to exact document recheck.
 func (s *FileSnapshot) AppendIndexMasks(dst []StoreMask, name string, values ...Index) ([]StoreMask, error) {
 	var workspace FileIndexWorkspace
 	return s.AppendIndexMasksInto(dst, &workspace, name, values...)
 }
 
 // AppendIndexMasksInto is AppendIndexMasks with reusable transient storage.
-// Exact tuple hashes remain candidate filters: every named document is parsed
-// and every indexed path is compared before its stable-slot bit is returned.
-// With sufficient dst and workspace capacity, a warmed cache-hit probe
-// allocates nothing.
+// A tuple hash alone is never a final answer: the probe either verifies the
+// stream's exact scalar/compound certificate or compares every candidate
+// document. With sufficient dst and workspace capacity, a warmed cache-hit
+// probe allocates nothing.
 func (s *FileSnapshot) AppendIndexMasksInto(dst []StoreMask, workspace *FileIndexWorkspace, name string, values ...Index) ([]StoreMask, error) {
 	if s == nil || s.store == nil || s.state == nil {
 		return dst, ErrFileStoreClosed
@@ -46,15 +49,27 @@ func (s *FileSnapshot) AppendIndexMasksInto(dst []StoreMask, workspace *FileInde
 		var local FileIndexWorkspace
 		workspace = &local
 	}
+	workspace.lastProbe = FileIndexProbeStats{}
 	probe, err := s.prepareFileIndexProbe(workspace, name, values)
 	if err != nil {
 		return dst, err
 	}
-	for _, directoryEntry := range workspace.directory {
-		posting, err := s.fileIndexPosting(probe, directoryEntry)
-		if err != nil {
-			return dst, err
+	if err := s.loadFileIndexPostings(workspace, probe, values, true); err != nil {
+		return dst, err
+	}
+	for _, decision := range workspace.postings {
+		posting := decision.posting
+		workspace.lastProbe.CandidateRows += uint64(bits.OnesCount64(posting.Bits))
+		workspace.lastProbe.CandidateChunks++
+		if decision.flags&fileIndexProbeCertified != 0 {
+			workspace.lastProbe.CertificateRows += uint64(bits.OnesCount64(posting.Bits))
+			if decision.flags&fileIndexProbeCertificateMatch != 0 {
+				workspace.lastProbe.MatchedRows += uint64(bits.OnesCount64(posting.Bits))
+				dst = append(dst, StoreMask{Chunk: posting.Chunk, Bits: posting.Bits})
+			}
+			continue
 		}
+		workspace.lastProbe.DocumentRecheckRows += uint64(bits.OnesCount64(posting.Bits))
 		documentRef, ok, lookupErr := storeio.LookupChunkTree(s.store.cache, probe.state.chunkRoot, posting.Chunk, storeio.ChunkTreeBounds{
 			FileEnd: probe.state.super.FileEnd, NextLogicalID: probe.state.root.NextLogicalID,
 		})
@@ -68,13 +83,10 @@ func (s *FileSnapshot) AppendIndexMasksInto(dst []StoreMask, workspace *FileInde
 		if acquireErr != nil {
 			return dst, acquireErr
 		}
-		documentPage, openErr := storeio.OpenDocumentPageWithOverflow(
-			documentLease.Page(), probe.state.root.ChunkHighWater, probe.state.root.NextLogicalID,
-			probe.state.super.FileEnd, probe.state.root.PageSize,
-		)
-		if openErr != nil {
+		documentPage := storeio.AdmittedDocumentPage(documentLease.Page())
+		if documentPage.Header().ChunkID != posting.Chunk {
 			documentLease.Release()
-			return dst, openErr
+			return dst, storeio.ErrDocumentPageCorrupt
 		}
 		verified := uint64(0)
 		for bitsLeft := posting.Bits; bitsLeft != 0; bitsLeft &= bitsLeft - 1 {
@@ -93,28 +105,46 @@ func (s *FileSnapshot) AppendIndexMasksInto(dst []StoreMask, workspace *FileInde
 				documentLease.Release()
 				return dst, err
 			}
-			needed, countErr := RequiredIndexEntries(workspace.document)
-			if countErr != nil {
-				documentLease.Release()
-				return dst, countErr
-			}
-			if cap(workspace.tape) < needed {
-				workspace.tape = make([]IndexEntry, needed)
-			}
-			index, buildErr := BuildIndexOptions(
-				workspace.document, workspace.tape[:needed],
-				s.store.options.Store.IndexOptions,
-			)
-			if buildErr != nil {
-				documentLease.Release()
-				return dst, buildErr
-			}
 			matches := true
-			for column := 0; column < int(probe.exact.n); column++ {
-				node, found, pointerErr := index.PointerCompiled(probe.exact.paths[column])
-				if pointerErr != nil || !found || !node.Contains(values[column].Root()) || !values[column].Root().Contains(node) {
-					matches = false
-					break
+			if probe.exact.n == 1 {
+				var raw RawValue
+				var found bool
+				var pointerErr error
+				if value.Overflow == (storeio.PageRef{}) {
+					raw, found, pointerErr = probe.exact.paths[0].getRawTrusted(workspace.document)
+				} else {
+					raw, found, pointerErr = probe.exact.paths[0].GetRaw(workspace.document)
+				}
+				if pointerErr != nil {
+					documentLease.Release()
+					return dst, pointerErr
+				}
+				matches = found && fileIndexRawScalarEqual(raw, values[0].Root())
+			} else {
+				needed, countErr := RequiredIndexEntries(workspace.document)
+				if countErr != nil {
+					documentLease.Release()
+					return dst, countErr
+				}
+				if cap(workspace.tape) < needed {
+					workspace.tape = make([]IndexEntry, needed)
+				}
+				index, buildErr := BuildIndexOptions(
+					workspace.document, workspace.tape[:needed],
+					s.store.options.Store.IndexOptions,
+				)
+				if buildErr != nil {
+					documentLease.Release()
+					return dst, buildErr
+				}
+				for column := 0; column < int(probe.exact.n); column++ {
+					node, found, pointerErr := index.PointerCompiled(probe.exact.paths[column])
+					if pointerErr != nil || !found ||
+						!node.Contains(values[column].Root()) ||
+						!values[column].Root().Contains(node) {
+						matches = false
+						break
+					}
 				}
 			}
 			if matches {
@@ -123,10 +153,54 @@ func (s *FileSnapshot) AppendIndexMasksInto(dst []StoreMask, workspace *FileInde
 		}
 		documentLease.Release()
 		if verified != 0 {
+			workspace.lastProbe.MatchedRows += uint64(bits.OnesCount64(verified))
 			dst = append(dst, StoreMask{Chunk: posting.Chunk, Bits: verified})
 		}
 	}
 	return dst, nil
+}
+
+// fileIndexRawScalarEqual is the collision verifier for a single-column exact
+// index. The raw seeker has already validated the complete document and
+// resolved duplicate keys with last-wins semantics. Comparing the borrowed
+// scalar directly avoids constructing a full document tape while retaining
+// the same exact value relation as mutual Node.Contains.
+func fileIndexRawScalarEqual(raw RawValue, needle Node) bool {
+	return fileIndexRawValuesEqual(raw, needle.Raw())
+}
+
+func fileIndexRawValuesEqual(left, right RawValue) bool {
+	if left.Kind() != right.Kind() {
+		return false
+	}
+	switch left.Kind() {
+	case document.Invalid:
+		return false
+	case document.Null:
+		return true
+	case document.Bool:
+		leftValue, leftOK := left.Bool()
+		rightValue, rightOK := right.Bool()
+		return leftOK && rightOK && leftValue == rightValue
+	case document.Number:
+		leftNumber, leftOK := left.NumberBytes()
+		rightNumber, rightOK := right.NumberBytes()
+		return leftOK && rightOK && jsonNumberEqual(leftNumber, rightNumber)
+	case document.String:
+		leftRaw := left.Bytes()
+		rightRaw := right.Bytes()
+		leftFlags := uint8(0)
+		if bytes.IndexByte(leftRaw, '\\') >= 0 {
+			leftFlags = tapeFlagEscaped
+		}
+		rightFlags := uint8(0)
+		if bytes.IndexByte(rightRaw, '\\') >= 0 {
+			rightFlags = tapeFlagEscaped
+		}
+		return rawJSONStringEqual(leftRaw, leftFlags, rightRaw, rightFlags)
+	default:
+		return false
+	}
 }
 
 // AppendIndexCandidateMasks appends hash-bounded stable-slot candidates
@@ -150,15 +224,18 @@ func (s *FileSnapshot) AppendIndexCandidateMasksInto(dst []StoreMask, workspace 
 		var local FileIndexWorkspace
 		workspace = &local
 	}
+	workspace.lastProbe = FileIndexProbeStats{}
 	probe, err := s.prepareFileIndexProbe(workspace, name, values)
 	if err != nil {
 		return dst, err
 	}
-	for _, directoryEntry := range workspace.directory {
-		posting, err := s.fileIndexPosting(probe, directoryEntry)
-		if err != nil {
-			return dst, err
-		}
+	if err := s.loadFileIndexPostings(workspace, probe, nil, false); err != nil {
+		return dst, err
+	}
+	for _, decision := range workspace.postings {
+		posting := decision.posting
+		workspace.lastProbe.CandidateRows += uint64(bits.OnesCount64(posting.Bits))
+		workspace.lastProbe.CandidateChunks++
 		dst = append(dst, StoreMask{Chunk: posting.Chunk, Bits: posting.Bits})
 	}
 	return dst, nil
@@ -170,6 +247,16 @@ type fileIndexProbe struct {
 	indexID uint32
 	hash    uint64
 }
+
+type fileIndexProbePosting struct {
+	posting storeio.PostingEntry
+	flags   uint8
+}
+
+const (
+	fileIndexProbeCertified uint8 = 1 << iota
+	fileIndexProbeCertificateMatch
+)
 
 func (s *FileSnapshot) prepareFileIndexProbe(workspace *FileIndexWorkspace, name string, values []Index) (fileIndexProbe, error) {
 	indexID := -1
@@ -209,30 +296,102 @@ func (s *FileSnapshot) prepareFileIndexProbe(workspace *FileIndexWorkspace, name
 	return probe, nil
 }
 
-func (s *FileSnapshot) fileIndexPosting(probe fileIndexProbe, directoryEntry storeio.IndexDirectoryEntry) (storeio.PostingEntry, error) {
-	postingLease, err := s.store.cache.Acquire(directoryEntry.Posting.Page)
-	if err != nil {
-		return storeio.PostingEntry{}, err
-	}
-	postingPage, err := storeio.OpenPostingPage(
-		postingLease.Page(), probe.state.root.NextLogicalID, probe.state.root.IndexCount,
-	)
-	if err != nil {
+// loadFileIndexPostings coalesces consecutive directory entries that select
+// the same immutable packed page. The retained decisions preserve directory
+// order and let exact fallbacks release the posting lease before opening a
+// document page. Online delta pages naturally form one-entry groups.
+func (s *FileSnapshot) loadFileIndexPostings(
+	workspace *FileIndexWorkspace,
+	probe fileIndexProbe,
+	values []Index,
+	verifyCertificate bool,
+) error {
+	workspace.postings = workspace.postings[:0]
+	for first := 0; first < len(workspace.directory); {
+		ref := workspace.directory[first].Posting.Page
+		postingLease, err := s.store.cache.Acquire(ref)
+		if err != nil {
+			return err
+		}
+		postingPage, err := storeio.OpenPostingPage(
+			postingLease.Page(), probe.state.root.NextLogicalID,
+			probe.state.root.IndexCount,
+		)
+		if err != nil {
+			postingLease.Release()
+			return err
+		}
+		workspace.lastProbe.PostingPages++
+		last := first
+		for last < len(workspace.directory) &&
+			workspace.directory[last].Posting.Page == ref {
+			posting, certified, certificateMatch, postingErr :=
+				fileIndexPostingFromPage(
+					probe, postingPage, workspace.directory[last],
+					values, verifyCertificate,
+				)
+			if postingErr != nil {
+				postingLease.Release()
+				return postingErr
+			}
+			flags := uint8(0)
+			if certified {
+				flags |= fileIndexProbeCertified
+			}
+			if certificateMatch {
+				flags |= fileIndexProbeCertificateMatch
+			}
+			workspace.postings = append(workspace.postings, fileIndexProbePosting{
+				posting: posting, flags: flags,
+			})
+			last++
+		}
 		postingLease.Release()
-		return storeio.PostingEntry{}, err
+		first = last
 	}
+	return nil
+}
+
+func fileIndexPostingFromPage(
+	probe fileIndexProbe,
+	postingPage storeio.PostingPageView,
+	directoryEntry storeio.IndexDirectoryEntry,
+	values []Index,
+	verifyCertificate bool,
+) (storeio.PostingEntry, bool, bool, error) {
 	segment, ok := postingPage.SegmentAt(int(directoryEntry.Posting.Segment))
 	if !ok || postingPage.Header().IndexID != probe.indexID || segment.Header().TupleHash != probe.hash {
-		postingLease.Release()
-		return storeio.PostingEntry{}, storeio.ErrPostingPageCorrupt
+		return storeio.PostingEntry{}, false, false, storeio.ErrPostingPageCorrupt
 	}
 	iterator := segment.Iterator()
 	posting, ok := iterator.Next()
-	postingLease.Release()
-	if !ok || posting.Chunk != directoryEntry.Key.Chunk {
-		return storeio.PostingEntry{}, storeio.ErrPostingPageCorrupt
+	certified := false
+	certificateMatch := false
+	if verifyCertificate &&
+		segment.Header().Flags&storeio.PostingSegmentCollision == 0 &&
+		len(segment.Certificate()) != 0 {
+		certificate := RawValue{src: segment.Certificate()}
+		if !fileIndexCertificateValid(certificate.Bytes(), int(probe.exact.n)) {
+			return storeio.PostingEntry{}, false, false, storeio.ErrPostingPageCorrupt
+		}
+		certified = true
+		certificateMatch = fileIndexCertificateMatches(
+			certificate.Bytes(), values, int(probe.exact.n),
+		)
 	}
-	return posting, nil
+	if !ok || posting.Chunk != directoryEntry.Key.Chunk {
+		return storeio.PostingEntry{}, false, false, storeio.ErrPostingPageCorrupt
+	}
+	return posting, certified, certificateMatch, nil
+}
+
+func fileIndexCertificateScalar(raw RawValue) bool {
+	switch raw.Kind() {
+	case document.Null, document.Bool, document.Number, document.String:
+		return true
+	default:
+		return false
+	}
 }
 
 // AppendIndexMasks acquires a temporary snapshot and returns exact masks. Hot

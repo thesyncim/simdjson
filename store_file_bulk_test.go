@@ -56,6 +56,7 @@ func TestWriteFileStoreBulkPreservesDocumentsIndexesTTLAndMutation(t *testing.T)
 		{Name: "status", Paths: []string{"/meta/status"}},
 		{Name: "tenant_status", Paths: []string{"/meta/tenant", "/meta/status"}},
 	}
+	options.Float64Columns = []string{"/id"}
 	file, err := os.CreateTemp(t.TempDir(), "file-store-bulk-*")
 	if err != nil {
 		t.Fatal(err)
@@ -75,6 +76,18 @@ func TestWriteFileStoreBulkPreservesDocumentsIndexesTTLAndMutation(t *testing.T)
 	}
 	if got := store.Stats().DocumentCount; got != documents {
 		t.Fatalf("bulk document count = %d, want %d", got, documents)
+	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	idAggregate, covered, err := snapshot.ReduceFloat64Path("/id")
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err != nil || !covered ||
+		idAggregate != (Float64Aggregate{Count: documents, Sum: 300, Min: 0, Max: documents - 1}) {
+		t.Fatalf("bulk id reduction = (%+v,%v,%v)", idAggregate, covered, err)
 	}
 	for _, row := range []int{0, 9, documents - 1} {
 		key := fmt.Sprintf("k%02d", row)
@@ -107,13 +120,35 @@ func TestWriteFileStoreBulkPreservesDocumentsIndexesTTLAndMutation(t *testing.T)
 		return count
 	}
 	active, acme := needle(`"active"`), needle(`"acme"`)
-	masks, err := store.AppendIndexMasks(nil, "status", active)
+	indexSnapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var indexWorkspace FileIndexWorkspace
+	masks, err := indexSnapshot.AppendIndexMasksInto(
+		nil, &indexWorkspace, "status", active,
+	)
 	if err != nil || countMasks(masks) != 9 {
 		t.Fatalf("bulk active masks = (%+v,%v), count %d", masks, err, countMasks(masks))
 	}
-	masks, err = store.AppendIndexMasks(masks[:0], "tenant_status", acme, active)
+	if stats := indexWorkspace.LastProbeStats(); stats.CertificateRows != 9 ||
+		stats.DocumentRecheckRows != 0 || stats.PostingPages == 0 ||
+		stats.PostingPages >= stats.CandidateChunks {
+		t.Fatalf("bulk coalesced status probe stats = %+v", stats)
+	}
+	masks, err = indexSnapshot.AppendIndexMasksInto(
+		masks[:0], &indexWorkspace, "tenant_status", acme, active,
+	)
 	if err != nil || countMasks(masks) != 5 {
 		t.Fatalf("bulk compound masks = (%+v,%v), count %d", masks, err, countMasks(masks))
+	}
+	if stats := indexWorkspace.LastProbeStats(); stats.CertificateRows != 5 ||
+		stats.DocumentRecheckRows != 0 || stats.PostingPages == 0 ||
+		stats.PostingPages >= stats.CandidateChunks {
+		t.Fatalf("bulk coalesced compound probe stats = %+v", stats)
+	}
+	if err := indexSnapshot.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	if created, err := store.Put("k00", []byte(`{"id":0,"meta":{"tenant":"acme","status":"idle"}}`)); err != nil || created {
@@ -132,6 +167,18 @@ func TestWriteFileStoreBulkPreservesDocumentsIndexesTTLAndMutation(t *testing.T)
 	defer reopened.Close()
 	if _, ok, err := reopened.AppendRaw(nil, "k03"); err != nil || ok {
 		t.Fatalf("reopened deleted k03 = (%v,%v)", ok, err)
+	}
+	snapshot, err = reopened.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	idAggregate, covered, err = snapshot.ReduceFloat64Path("/id")
+	if closeErr := snapshot.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil || !covered ||
+		idAggregate != (Float64Aggregate{Count: documents - 1, Sum: 297, Min: 0, Max: documents - 1}) {
+		t.Fatalf("reopened bulk id reduction = (%+v,%v,%v)", idAggregate, covered, err)
 	}
 	masks, err = reopened.AppendIndexMasks(masks[:0], "status", active)
 	if err != nil || countMasks(masks) != 7 {

@@ -46,6 +46,15 @@ type OursFileStore struct {
 	GroupNS   int64 `json:"group_ns,omitempty"`
 	ContainNS int64 `json:"contain_ns,omitempty"`
 
+	FilterRowsScanned           uint64 `json:"filter_rows_scanned,omitempty"`
+	FilterIndexPostingPages     int    `json:"filter_index_posting_pages,omitempty"`
+	FilterIndexCertificateRows  uint64 `json:"filter_index_certificate_rows,omitempty"`
+	FilterIndexRecheckRows      uint64 `json:"filter_index_recheck_rows,omitempty"`
+	ContainRowsScanned          uint64 `json:"contain_rows_scanned,omitempty"`
+	ContainIndexPostingPages    int    `json:"contain_index_posting_pages,omitempty"`
+	ContainIndexCertificateRows uint64 `json:"contain_index_certificate_rows,omitempty"`
+	ContainIndexRecheckRows     uint64 `json:"contain_index_recheck_rows,omitempty"`
+
 	MutationOps           int    `json:"mutation_ops,omitempty"`
 	UpdateNSOp            int64  `json:"update_ns_op,omitempty"`
 	DeleteNSOp            int64  `json:"delete_ns_op,omitempty"`
@@ -64,6 +73,7 @@ type OursFileStore struct {
 	ExtractHits  int   `json:"extract_hits"`
 	FilterCount  int   `json:"filter_count,omitempty"`
 	SumObserved  int64 `json:"sum_observed,omitempty"`
+	SumCovers    int   `json:"sum_covering_columns,omitempty"`
 	GroupCount   int   `json:"group_count,omitempty"`
 	ContainCount int   `json:"contain_count,omitempty"`
 }
@@ -106,6 +116,9 @@ func fileStoreBenchOptions(m Manifest, maxDocumentBytes int, synchronous bool) s
 	worstDocumentPage := storeio.PageHeaderSize + storeio.PageTrailerSize +
 		storeio.DocumentPagePayloadHeaderSize + chunkDocuments*storeio.DocumentPageRecordSize +
 		chunkDocuments*(maxKeyBytes+max(inlineBytes, storeio.DocumentOverflowDescriptorSize))
+	if m.SumField != "" {
+		worstDocumentPage += 8 + chunkDocuments*8
+	}
 	maxPageSize := 4096
 	for maxPageSize < worstDocumentPage {
 		maxPageSize <<= 1
@@ -116,6 +129,13 @@ func fileStoreBenchOptions(m Manifest, maxDocumentBytes int, synchronous bool) s
 	// silently accepting a corpus-dependent default.
 	if needed := int64(maxDocumentBytes)*2 + 1<<20; needed > residentBytes {
 		residentBytes = needed
+	}
+	maxRetiredExtents := 512
+	if m.Docs >= 1_000_000 {
+		// The fixed arena must cover the benchmark's 256 durable updates plus
+		// 256 deletes at the deeper million-row tree height. This remains an
+		// explicit pointer-free capacity, not corpus-cardinality metadata.
+		maxRetiredExtents = 4096
 	}
 	options := simdjson.FileStoreOptions{
 		// Eight stable slots keep this write-heavy 400-byte corpus in one 4 KiB
@@ -134,12 +154,15 @@ func fileStoreBenchOptions(m Manifest, maxDocumentBytes int, synchronous bool) s
 		MaxDocumentBytes:  maxDocumentBytes,
 		Backend:           simdjson.FileStoreBackendPortable,
 		Synchronous:       synchronous,
-		MaxRetiredExtents: 512,
+		MaxRetiredExtents: maxRetiredExtents,
 	}
 	if m.ContainKey != "" {
 		options.Indexes = []simdjson.StoreIndexDefinition{{
 			Name: duckDBBenchStoreIndex, Paths: []string{"/" + m.ContainKey},
 		}}
+	}
+	if m.SumField != "" {
+		options.Float64Columns = []string{"/" + m.SumField}
 	}
 	return options
 }
@@ -353,6 +376,10 @@ func MeasureFileStoreCorpus(dir string, m Manifest, reps int) (OursFileStore, er
 		}
 		observeFileQueryBuffer(&v, stats)
 		v.FilterCount = int(countValue(result))
+		v.FilterRowsScanned = stats.RowsScanned
+		v.FilterIndexPostingPages = stats.IndexPostingPages
+		v.FilterIndexCertificateRows = stats.IndexCertificateRows
+		v.FilterIndexRecheckRows = stats.IndexRecheckRows
 
 		group := query.Select(query.Path(m.ContainKey), query.Count()).GroupBy(m.ContainKey)
 		result, stats, v.GroupNS, err = runFileQuery(group, snapshot, reps, &workspace)
@@ -370,6 +397,10 @@ func MeasureFileStoreCorpus(dir string, m Manifest, reps int) (OursFileStore, er
 		}
 		observeFileQueryBuffer(&v, stats)
 		v.ContainCount = int(countValue(result))
+		v.ContainRowsScanned = stats.RowsScanned
+		v.ContainIndexPostingPages = stats.IndexPostingPages
+		v.ContainIndexCertificateRows = stats.IndexCertificateRows
+		v.ContainIndexRecheckRows = stats.IndexRecheckRows
 	}
 	if m.SumField != "" {
 		sum := query.Select(query.Sum(m.SumField))
@@ -378,6 +409,7 @@ func MeasureFileStoreCorpus(dir string, m Manifest, reps int) (OursFileStore, er
 			return v, err
 		}
 		observeFileQueryBuffer(&v, stats)
+		v.SumCovers = stats.CoveringColumns
 		if f, valid := result.Columns[0].Cells[0].Float64(); valid {
 			v.SumObserved = int64(f)
 		}
@@ -495,15 +527,38 @@ func (v OursFileStore) Verify(m Manifest) []string {
 		if v.FilterCount != m.ContainExpected {
 			bad = append(bad, fmt.Sprintf("filter count %d, want %d", v.FilterCount, m.ContainExpected))
 		}
+		if v.FilterRowsScanned != 0 ||
+			(m.ContainExpected > 0 && v.FilterIndexPostingPages == 0) ||
+			v.FilterIndexRecheckRows != 0 ||
+			v.FilterIndexCertificateRows != uint64(m.ContainExpected) {
+			bad = append(bad, fmt.Sprintf(
+				"filter lane scanned=%d pages=%d rechecked=%d certified=%d, want 0/>0/0/%d",
+				v.FilterRowsScanned, v.FilterIndexPostingPages, v.FilterIndexRecheckRows,
+				v.FilterIndexCertificateRows, m.ContainExpected,
+			))
+		}
 		if v.GroupCount != m.GroupExpected {
 			bad = append(bad, fmt.Sprintf("group count %d, want %d", v.GroupCount, m.GroupExpected))
 		}
 		if v.ContainCount != m.ContainExpected {
 			bad = append(bad, fmt.Sprintf("contain count %d, want %d", v.ContainCount, m.ContainExpected))
 		}
+		if v.ContainRowsScanned != 0 ||
+			(m.ContainExpected > 0 && v.ContainIndexPostingPages == 0) ||
+			v.ContainIndexRecheckRows != 0 ||
+			v.ContainIndexCertificateRows != uint64(m.ContainExpected) {
+			bad = append(bad, fmt.Sprintf(
+				"contain lane scanned=%d pages=%d rechecked=%d certified=%d, want 0/>0/0/%d",
+				v.ContainRowsScanned, v.ContainIndexPostingPages, v.ContainIndexRecheckRows,
+				v.ContainIndexCertificateRows, m.ContainExpected,
+			))
+		}
 	}
 	if m.SumField != "" && v.SumObserved != m.SumExpected {
 		bad = append(bad, fmt.Sprintf("sum %d, want %d", v.SumObserved, m.SumExpected))
+	}
+	if m.SumField != "" && v.SumCovers != 1 {
+		bad = append(bad, fmt.Sprintf("sum covering columns %d, want 1", v.SumCovers))
 	}
 	if v.AfterDeletes != m.Docs-v.MutationOps {
 		bad = append(bad, fmt.Sprintf("recovered deletes %d, want %d", v.AfterDeletes, m.Docs-v.MutationOps))

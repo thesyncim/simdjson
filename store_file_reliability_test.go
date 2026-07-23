@@ -2,6 +2,7 @@ package simdjson
 
 import (
 	"fmt"
+	"math/bits"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -192,8 +193,7 @@ func TestFileStoreCrashImagesRecoverWholeGeneration(t *testing.T) {
 
 	pageSize := options.PageSize
 	dataStart := 2 * pageSize
-	dataLength := max(len(before), len(after)) - dataStart
-	dataCuts := distinctCrashCuts(dataLength)
+	dataCuts := changedPageCrashCuts(before, after, dataStart, pageSize)
 	for _, cut := range dataCuts {
 		image := make([]byte, max(len(before), len(after)))
 		copy(image, before)
@@ -203,7 +203,7 @@ func TestFileStoreCrashImagesRecoverWholeGeneration(t *testing.T) {
 	}
 
 	rootOffset := int((newGeneration-1)&1) * pageSize
-	for _, cut := range distinctCrashCuts(storeio.SuperblockSize) {
+	for cut := 0; cut <= storeio.SuperblockSize; cut++ {
 		image := append([]byte(nil), after...)
 		copy(image[rootOffset:rootOffset+pageSize], before[rootOffset:rootOffset+pageSize])
 		copy(image[rootOffset:rootOffset+cut], after[rootOffset:rootOffset+cut])
@@ -212,17 +212,47 @@ func TestFileStoreCrashImagesRecoverWholeGeneration(t *testing.T) {
 	}
 }
 
-func distinctCrashCuts(length int) []int {
-	candidates := []int{0, 1, length / 4, length / 2, length - 1, length}
-	var cuts []int
-	for _, cut := range candidates {
+// changedPageCrashCuts models the sorted positional-write phase used by both
+// commit devices. Each returned prefix stops immediately before, inside, or
+// after one changed physical page. Unchanged holes do not multiply the test
+// matrix, and the final cut represents the completed data barrier.
+func changedPageCrashCuts(before, after []byte, start, quantum int) []int {
+	length := max(len(before), len(after)) - start
+	cuts := make([]int, 0, 16)
+	appendCut := func(cut int) {
 		if cut < 0 || cut > length {
-			continue
+			return
 		}
 		if len(cuts) == 0 || cuts[len(cuts)-1] != cut {
 			cuts = append(cuts, cut)
 		}
 	}
+	appendCut(0)
+	for blockStart := 0; blockStart < length; blockStart += quantum {
+		blockEnd := min(blockStart+quantum, length)
+		changed := false
+		for offset := blockStart; offset < blockEnd; offset++ {
+			absolute := start + offset
+			var oldByte, newByte byte
+			if absolute < len(before) {
+				oldByte = before[absolute]
+			}
+			if absolute < len(after) {
+				newByte = after[absolute]
+			}
+			if oldByte != newByte {
+				changed = true
+				break
+			}
+		}
+		if changed {
+			appendCut(blockStart)
+			appendCut(blockStart + 1)
+			appendCut(blockEnd - 1)
+			appendCut(blockEnd)
+		}
+	}
+	appendCut(length)
 	return cuts
 }
 
@@ -250,10 +280,12 @@ func assertCrashImage(t *testing.T, image []byte, options FileStoreOptions, oldG
 		if string(got) != oldValue {
 			t.Fatalf("%s recovered old generation with mixed value %q", name, got)
 		}
+		assertRecoveredIndexCounts(t, store, name, 12, 0)
 	case newGeneration:
 		if string(got) != newValue {
 			t.Fatalf("%s recovered new generation with mixed value %q", name, got)
 		}
+		assertRecoveredIndexCounts(t, store, name, 11, 1)
 	default:
 		t.Fatalf("%s recovered generation %d, want %d or %d", name, store.Generation(), oldGeneration, newGeneration)
 	}
@@ -266,6 +298,38 @@ func assertCrashImage(t *testing.T, image []byte, options FileStoreOptions, oldG
 	}
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func assertRecoveredIndexCounts(t *testing.T, store *FileStore, name string, oldCount, newCount int) {
+	t.Helper()
+	needle := func(src []byte) Index {
+		needed, err := RequiredIndexEntries(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		index, err := BuildIndex(src, make([]IndexEntry, needed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return index
+	}
+	count := func(value string) int {
+		masks, err := store.AppendIndexMasks(nil, "status", needle([]byte(value)))
+		if err != nil {
+			t.Fatalf("%s index probe %s: %v", name, value, err)
+		}
+		rows := 0
+		for _, mask := range masks {
+			rows += bits.OnesCount64(mask.Bits)
+		}
+		return rows
+	}
+	if got := count(`"old"`); got != oldCount {
+		t.Fatalf("%s old index count = %d, want %d", name, got, oldCount)
+	}
+	if got := count(`"new"`); got != newCount {
+		t.Fatalf("%s new index count = %d, want %d", name, got, newCount)
 	}
 }
 

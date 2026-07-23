@@ -3,6 +3,7 @@ package storeio
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -133,6 +134,194 @@ func TestDocumentPageAllStableSlots(t *testing.T) {
 		if !ok || got.Slot != uint8(slot) || len(got.Key) != 1 || got.Key[0] != byte(slot) || string(got.JSON) != "0" {
 			t.Fatalf("slot %d = (%+v,%v)", slot, got, ok)
 		}
+	}
+}
+
+func TestDocumentPageFloat64ColumnsSparseRoundTrip(t *testing.T) {
+	const live = uint64(1)<<0 | uint64(1)<<5 | uint64(1)<<63
+	header := testDocumentPageHeader(live)
+	rows := testDocumentRows()
+	masks := []uint64{
+		uint64(1)<<0 | uint64(1)<<63,
+		uint64(1) << 5,
+	}
+	values := make([]float64, len(masks)*64)
+	values[0] = -12.5
+	values[63] = 1.25e100
+	values[64+5] = 42
+	page := make([]byte, testSuperblockPageSize)
+	encoded, err := EncodeDocumentPageWithColumns(
+		page, header, rows, DocumentFloat64Columns{Masks: masks, Values: values},
+		testDocumentNextLogicalID, uint64(32*testSuperblockPageSize), testSuperblockPageSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := OpenDocumentPageWithOverflow(
+		encoded, header.ChunkID+1, testDocumentNextLogicalID,
+		uint64(32*testSuperblockPageSize), testSuperblockPageSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted, err := OpenAdmittedDocumentPageWithOverflow(
+		encoded, header.ChunkID+1, testDocumentNextLogicalID,
+		uint64(32*testSuperblockPageSize), testSuperblockPageSize,
+	)
+	if err != nil || admitted.Float64ColumnCount() != len(masks) {
+		t.Fatalf("OpenAdmittedDocumentPageWithOverflow = (columns %d,%v)", admitted.Float64ColumnCount(), err)
+	}
+	if got := view.Float64ColumnCount(); got != len(masks) {
+		t.Fatalf("Float64ColumnCount = %d, want %d", got, len(masks))
+	}
+	first, ok := view.Float64Column(0)
+	if !ok || first.Mask() != masks[0] {
+		t.Fatalf("Float64Column(0) = (%+v,%v), want mask %#x", first, ok, masks[0])
+	}
+	for _, test := range []struct {
+		slot uint8
+		want float64
+		ok   bool
+	}{
+		{0, -12.5, true},
+		{5, 0, false},
+		{63, 1.25e100, true},
+		{64, 0, false},
+	} {
+		got, present := first.Lookup(test.slot)
+		if present != test.ok || present && got != test.want {
+			t.Fatalf("Lookup(%d) = (%g,%v), want (%g,%v)", test.slot, got, present, test.want, test.ok)
+		}
+	}
+	iterator := first.Iterator()
+	for _, want := range []struct {
+		slot  uint8
+		value float64
+	}{{0, -12.5}, {63, 1.25e100}} {
+		slot, value, present := iterator.Next()
+		if !present || slot != want.slot || value != want.value {
+			t.Fatalf("Next = (%d,%g,%v), want (%d,%g,true)", slot, value, present, want.slot, want.value)
+		}
+	}
+	if _, _, present := iterator.Next(); present {
+		t.Fatal("iterator returned a value after its mask was exhausted")
+	}
+	valuesIterator := first.Values()
+	for _, want := range []float64{-12.5, 1.25e100} {
+		value, present := valuesIterator.Next()
+		if !present || value != want {
+			t.Fatalf("dense Next = (%g,%v), want (%g,true)", value, present, want)
+		}
+	}
+	if _, present := valuesIterator.Next(); present {
+		t.Fatal("dense iterator returned a value after its values were exhausted")
+	}
+	second, ok := view.Float64Column(1)
+	if !ok {
+		t.Fatal("Float64Column(1) missed")
+	}
+	if got, present := second.Lookup(5); !present || got != 42 {
+		t.Fatalf("second.Lookup(5) = (%g,%v), want (42,true)", got, present)
+	}
+	if _, ok := view.Float64Column(-1); ok {
+		t.Fatal("Float64Column(-1) succeeded")
+	}
+	if _, ok := view.Float64Column(len(masks)); ok {
+		t.Fatal("Float64Column(count) succeeded")
+	}
+	for _, row := range rows {
+		json, ok := view.LookupJSON(row.Slot)
+		if !ok || string(json) != string(row.JSON) || cap(json) != len(json) {
+			t.Fatalf("LookupJSON(%d) = (%q,%v) cap=%d, want %q", row.Slot, json, ok, cap(json), row.JSON)
+		}
+	}
+}
+
+func TestDocumentPageFloat64ColumnsRejectInvalidWrite(t *testing.T) {
+	header := testDocumentPageHeader(1)
+	rows := []DocumentRecord{{Slot: 0, Key: []byte("k"), JSON: []byte(`{"n":1}`)}}
+	validValues := make([]float64, 64)
+	validValues[0] = 1
+	for _, test := range []struct {
+		name    string
+		columns DocumentFloat64Columns
+	}{
+		{"values without masks", DocumentFloat64Columns{Values: validValues}},
+		{"missing dense values", DocumentFloat64Columns{Masks: []uint64{1}}},
+		{"mask outside live", DocumentFloat64Columns{Masks: []uint64{2}, Values: validValues}},
+		{"nan", func() DocumentFloat64Columns {
+			values := append([]float64(nil), validValues...)
+			values[0] = math.NaN()
+			return DocumentFloat64Columns{Masks: []uint64{1}, Values: values}
+		}()},
+		{"infinity", func() DocumentFloat64Columns {
+			values := append([]float64(nil), validValues...)
+			values[0] = math.Inf(1)
+			return DocumentFloat64Columns{Masks: []uint64{1}, Values: values}
+		}()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			page := make([]byte, testSuperblockPageSize)
+			if _, err := EncodeDocumentPageWithColumns(
+				page, header, rows, test.columns, testDocumentNextLogicalID,
+				uint64(32*testSuperblockPageSize), testSuperblockPageSize,
+			); !errors.Is(err, ErrInvalidWrite) {
+				t.Fatalf("EncodeDocumentPageWithColumns = %v, want %v", err, ErrInvalidWrite)
+			}
+		})
+	}
+}
+
+func TestDocumentPageFloat64ColumnsRejectResealedCorruption(t *testing.T) {
+	header := testDocumentPageHeader(1)
+	rows := []DocumentRecord{{Slot: 0, Key: []byte("k"), JSON: []byte(`{"n":1}`)}}
+	values := make([]float64, 64)
+	values[0] = 1
+	page := make([]byte, testSuperblockPageSize)
+	encoded, err := EncodeDocumentPageWithColumns(
+		page, header, rows, DocumentFloat64Columns{Masks: []uint64{1}, Values: values},
+		testDocumentNextLogicalID, uint64(32*testSuperblockPageSize), testSuperblockPageSize,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := PageHeaderSize
+	dataStart := payload + DocumentPagePayloadHeaderSize + DocumentPageRecordSize
+	dataLength := int(binary.LittleEndian.Uint32(encoded[payload+16 : payload+20]))
+	columnStart := dataStart + dataLength
+	for _, test := range []struct {
+		name   string
+		mutate func([]byte)
+	}{
+		{"zero columns", func(p []byte) { clear(p[payload+25 : payload+27]) }},
+		{"reserved", func(p []byte) { p[payload+27] = 1 }},
+		{"short section", func(p []byte) {
+			binary.LittleEndian.PutUint32(p[payload+28:payload+32], 8)
+		}},
+		{"mask outside live", func(p []byte) {
+			binary.LittleEndian.PutUint64(p[columnStart:columnStart+8], 2)
+		}},
+		{"non-finite", func(p []byte) {
+			binary.LittleEndian.PutUint64(p[columnStart+8:columnStart+16], math.Float64bits(math.Inf(-1)))
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			corrupt := append([]byte(nil), encoded...)
+			test.mutate(corrupt)
+			resealTestPage(corrupt)
+			if _, err := OpenDocumentPageWithOverflow(
+				corrupt, header.ChunkID+1, testDocumentNextLogicalID,
+				uint64(32*testSuperblockPageSize), testSuperblockPageSize,
+			); !errors.Is(err, ErrDocumentPageCorrupt) {
+				t.Fatalf("OpenDocumentPageWithOverflow = %v, want %v", err, ErrDocumentPageCorrupt)
+			}
+			if _, err := OpenAdmittedDocumentPageWithOverflow(
+				corrupt, header.ChunkID+1, testDocumentNextLogicalID,
+				uint64(32*testSuperblockPageSize), testSuperblockPageSize,
+			); !errors.Is(err, ErrDocumentPageCorrupt) {
+				t.Fatalf("OpenAdmittedDocumentPageWithOverflow = %v, want %v", err, ErrDocumentPageCorrupt)
+			}
+		})
 	}
 }
 

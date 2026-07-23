@@ -161,15 +161,15 @@ func floatLiteral(f float64) literal {
 // carries its posting probe (postNone when unpostable), the descriptor
 // candidates.go uses to prune candidate rows through DocSet.Postings.
 type compiledPredicate struct {
-	kind               predKind
-	col                int
-	op                 Op
-	lit                scalar
-	needle             simdjson.Index
-	probe              postProbe
-	containIndexPath   string
-	containIndexNeedle simdjson.Index
-	kids               []*compiledPredicate
+	kind        predKind
+	col         int
+	op          Op
+	lit         scalar
+	needle      simdjson.Index
+	probe       postProbe
+	boundPath   string
+	containPlan *compiledPredicate
+	kids        []*compiledPredicate
 }
 
 // compilePredicate resolves a predicate tree, registering every path it reads
@@ -224,8 +224,6 @@ func compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error
 			return nil, probeErr
 		} else if ok {
 			base := reg.paths[col].indexPath()
-			cp.containIndexPath = base + "/" + escapePointerSegment(key)
-			cp.containIndexNeedle = value
 			// DocSet postings address one top-level field. A root-object
 			// containment predicate can therefore use the same derived scalar
 			// equality as a sound candidate bound; nested forms are handled by
@@ -233,6 +231,12 @@ func compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error
 			if base == "" {
 				cp.probe = postProbe{kind: postEq, path: key, needle: value}
 			}
+		}
+		cp.containPlan, err = scalarObjectContainmentPlan(
+			needle, reg.paths[col].indexPath(),
+		)
+		if err != nil {
+			return nil, err
 		}
 		return cp, nil
 	case predExists:
@@ -266,15 +270,112 @@ func compilePredicate(p Predicate, reg *pathRegistry) (*compiledPredicate, error
 	}
 }
 
+const maxIndexedContainmentLeaves = 64
+
+type scalarContainmentLeaf struct {
+	path string
+	raw  []byte
+}
+
+// scalarObjectContainmentPlan lowers an object needle made entirely of
+// non-container leaves to exact path equalities. Object containment is exactly
+// the conjunction of those leaves under the core's last-duplicate rule.
+// Arrays and empty objects carry structural information that equality indexes
+// cannot prove, so the rewrite is deliberately all-or-nothing.
+func scalarObjectContainmentPlan(needle simdjson.Index, base string) (*compiledPredicate, error) {
+	leaves := make([]scalarContainmentLeaf, 0, 4)
+	if !appendScalarContainmentLeaves(&leaves, needle.Root(), base) ||
+		len(leaves) == 0 || len(leaves) > maxIndexedContainmentLeaves {
+		return nil, nil
+	}
+	kids := make([]*compiledPredicate, 0, len(leaves))
+	for _, leaf := range leaves {
+		value, err := buildNeedleIndex(leaf.raw)
+		if err != nil {
+			return nil, err
+		}
+		kids = append(kids, &compiledPredicate{
+			kind: predCmp, col: -1, op: Eq, needle: value,
+			boundPath: leaf.path,
+		})
+	}
+	if len(kids) == 1 {
+		return kids[0], nil
+	}
+	return &compiledPredicate{kind: predAnd, kids: kids}, nil
+}
+
+// indexPath returns the declared-index spelling for a comparison leaf.
+// Scalar containment lowering sets boundPath without registering a value
+// column: the derived equality exists only to choose an exact index and must
+// never turn an array-shaped containment non-match into a JSON Pointer error.
+func (p *compiledPredicate) indexPath(paths []compiledPath) string {
+	if p.boundPath != "" {
+		return p.boundPath
+	}
+	return paths[p.col].indexPath()
+}
+
+func appendScalarContainmentLeaves(dst *[]scalarContainmentLeaf, node simdjson.Node, base string) bool {
+	count, ok := node.ObjectLen()
+	if !ok || count == 0 {
+		return false
+	}
+	type effectiveMember struct {
+		key   string
+		value simdjson.Node
+	}
+	members := make([]effectiveMember, 0, count)
+	positions := make(map[string]int, count)
+	iterator, _ := node.ObjectIter()
+	for {
+		key, value, ok := iterator.Next()
+		if !ok {
+			break
+		}
+		decoded, textOK := key.AppendText(nil)
+		if !textOK {
+			return false
+		}
+		name := string(decoded)
+		if position, exists := positions[name]; exists {
+			members[position].value = value
+			continue
+		}
+		positions[name] = len(members)
+		members = append(members, effectiveMember{key: name, value: value})
+	}
+	for _, member := range members {
+		path := base + "/" + escapePointerSegment(member.key)
+		switch member.value.Kind() {
+		case document.Object:
+			if !appendScalarContainmentLeaves(dst, member.value, path) {
+				return false
+			}
+		case document.Array, document.Invalid:
+			return false
+		default:
+			*dst = append(*dst, scalarContainmentLeaf{
+				path: path, raw: member.value.Raw().Bytes(),
+			})
+			if len(*dst) > maxIndexedContainmentLeaves {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // singleScalarObjectContainmentProbe recognizes the exact implication
 //
 //	container @> {key: scalar}  =>  container/key = scalar
 //
-// for a one-member object needle. The derived equality is safe as a candidate
-// bound because JSON object containment resolves that member through the same
-// last-key and exact-scalar semantics as an exact index. Containers and wider
-// objects remain on the general structural path. Compilation may allocate for
-// an escaped key or the tiny scalar tape; execution does not.
+// for a one-member object needle. The derived equality is safe as a DocSet
+// posting bound because JSON object containment resolves that member through
+// the same last-key and exact-scalar semantics as an exact index. Declared
+// Store indexes use scalarObjectContainmentPlan for wider nested scalar
+// objects. Compilation may allocate for an escaped key or the tiny scalar
+// tape; execution does not.
 func singleScalarObjectContainmentProbe(needle simdjson.Index) (string, simdjson.Index, bool, error) {
 	root := needle.Root()
 	count, ok := root.ObjectLen()

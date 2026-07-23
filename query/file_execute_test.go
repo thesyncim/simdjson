@@ -1,6 +1,7 @@
 package query
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -94,6 +95,93 @@ func TestRunFileSnapshotOptions(t *testing.T) {
 	}
 	if _, _, err := q.RunFileSnapshot(nil, FileExecutionOptions{MemoryBytes: 1024}); err == nil {
 		t.Fatal("undersized memory target accepted")
+	}
+}
+
+func TestRunFileSnapshotPersistentFloat64CoveringAggregates(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "query-file-cover-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	store, err := simdjson.CreateFileStore(file, simdjson.FileStoreOptions{
+		Store:          simdjson.StoreOptions{ChunkDocuments: 4},
+		Float64Columns: []string{"/score", "/nested/value"},
+		Synchronous:    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	set := &simdjson.DocSet{ShapeTapes: true}
+	for row, document := range []string{
+		`{"score":1.5,"nested":{"value":10}}`,
+		`{"score":2,"nested":{"value":"text"}}`,
+		`{"score":"text","nested":{"value":-3}}`,
+		`{"other":7}`,
+		`{"score":-1,"nested":{"value":8}}`,
+	} {
+		raw := []byte(document)
+		if _, err := set.Append(raw); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Put(fmt.Sprintf("k%d", row), raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	run := func(q *Query) (Result, FileExecutionStats) {
+		t.Helper()
+		want, err := q.Run(set)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, stats, err := q.RunFileSnapshot(snapshot, FileExecutionOptions{
+			Workers: 3, BatchRows: 2, MemoryBytes: 64 << 10,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotKey, wantKey := resultKey(got), resultKey(want); gotKey != wantKey {
+			t.Fatalf("covering aggregate mismatch:\n got: %s\nwant: %s", gotKey, wantKey)
+		}
+		return got, stats
+	}
+
+	_, stats := run(Select(
+		Count(), Sum("score"), Avg("score"), Min("score"), Max("score"),
+		Sum("nested.value"), Max("nested.value"),
+	))
+	if stats.CoveringColumns != 2 || stats.RowsTotal != uint64(set.Len()) ||
+		stats.RowsScanned != 0 || stats.Batches != 0 || stats.BufferedBytes != 0 {
+		t.Fatalf("covering aggregate stats = %+v", stats)
+	}
+	_, stats = run(Select(Sum("score"), Max("score")))
+	if stats.CoveringColumns != 1 || stats.RowsScanned != 0 {
+		t.Fatalf("duplicate covering aggregate stats = %+v", stats)
+	}
+	result, stats := run(Select(Sum("score")).Limit(0))
+	if result.RowCount != 0 || stats.CoveringColumns != 0 || stats.RowsScanned != 0 {
+		t.Fatalf("LIMIT 0 covering result = rows %d stats %+v", result.RowCount, stats)
+	}
+
+	// COUNT(path) includes present non-numeric values, and an unconfigured
+	// numeric path has no cover. Both shapes must remain on the JSON executor.
+	_, stats = run(Select(Count("score")))
+	if stats.CoveringColumns != 0 || stats.RowsScanned != uint64(set.Len()) {
+		t.Fatalf("COUNT(path) incorrectly used numeric cover: %+v", stats)
+	}
+	_, stats = run(Select(Sum("other")))
+	if stats.CoveringColumns != 0 || stats.RowsScanned != uint64(set.Len()) {
+		t.Fatalf("unconfigured SUM incorrectly used cover: %+v", stats)
+	}
+	_, stats = run(Select(Sum("score")).Where(Cmp("other", Ge, 0)))
+	if stats.CoveringColumns != 0 || stats.RowsScanned != uint64(set.Len()) {
+		t.Fatalf("filtered SUM incorrectly used unfiltered cover: %+v", stats)
 	}
 }
 
@@ -199,6 +287,63 @@ func TestRunFileSnapshotPersistentCompoundIndexPushdown(t *testing.T) {
 		t.Fatalf("empty compound pushdown stats = %+v", stats)
 	}
 
+	result, stats := run(Select(Count()).Where(Cmp("tenant", Eq, "acme")))
+	if result.RowCount != 1 || !countIs(result.Columns[0].Cells[0], 64) ||
+		!stats.IndexBounded || stats.IndexLookups != 1 ||
+		stats.CandidateRows != 64 || stats.CandidateChunks != 64 ||
+		stats.IndexPostingPages == 0 ||
+		stats.IndexCertificateRows != 64 || stats.IndexRecheckRows != 0 ||
+		stats.RowsScanned != 0 || stats.Batches != 0 {
+		t.Fatalf("direct exact count = result %s stats %+v", resultKey(result), stats)
+	}
+
+	result, stats = run(Select(Count()).Where(Contains("", `{"tenant":"acme"}`)))
+	if result.RowCount != 1 || !countIs(result.Columns[0].Cells[0], 64) ||
+		!stats.IndexBounded || stats.IndexLookups != 1 ||
+		stats.CandidateRows != 64 || stats.IndexCertificateRows != 64 ||
+		stats.IndexRecheckRows != 0 ||
+		stats.RowsScanned != 0 || stats.Batches != 0 {
+		t.Fatalf("direct root containment count = result %s stats %+v", resultKey(result), stats)
+	}
+
+	result, stats = run(Select(Count()).Where(Contains("profile.geo", `{"country":"PT"}`)))
+	if result.RowCount != 1 || !countIs(result.Columns[0].Cells[0], 32) ||
+		!stats.IndexBounded || stats.IndexLookups != 1 ||
+		stats.CandidateRows != 32 || stats.IndexCertificateRows != 32 ||
+		stats.IndexRecheckRows != 0 ||
+		stats.RowsScanned != 0 || stats.Batches != 0 {
+		t.Fatalf("direct nested containment count = result %s stats %+v", resultKey(result), stats)
+	}
+
+	result, stats = run(Select(Count()).Where(Contains(
+		"", `{"tenant":"acme","profile":{"geo":{"country":"PT"}}}`,
+	)))
+	if result.RowCount != 1 || !countIs(result.Columns[0].Cells[0], 32) ||
+		!stats.IndexBounded || stats.IndexLookups != 1 ||
+		stats.CandidateRows != 32 || stats.IndexCertificateRows != 32 ||
+		stats.IndexRecheckRows != 0 || stats.RowsScanned != 0 {
+		t.Fatalf("compound containment count = result %s stats %+v", resultKey(result), stats)
+	}
+
+	result, stats = run(Select(Count()).Where(Contains(
+		"", `{"tenant":"absent","tenant":"acme"}`,
+	)))
+	if result.RowCount != 1 || !countIs(result.Columns[0].Cells[0], 64) ||
+		!stats.IndexBounded || stats.IndexLookups != 1 ||
+		stats.IndexCertificateRows != 64 || stats.IndexRecheckRows != 0 ||
+		stats.RowsScanned != 0 {
+		t.Fatalf("last-wins containment count = result %s stats %+v", resultKey(result), stats)
+	}
+
+	_, stats = run(Select(Count()).Where(Contains(
+		"", `{"profile":{"geo":{}}}`,
+	)))
+	if stats.IndexBounded || stats.IndexLookups != 0 ||
+		stats.IndexCertificateRows != 0 || stats.IndexRecheckRows != 0 ||
+		stats.RowsScanned != 512 {
+		t.Fatalf("empty-object containment incorrectly flattened: %+v", stats)
+	}
+
 	_, stats = run(
 		Select(Path("id")).Where(Or(
 			Cmp("tenant", Eq, "acme"),
@@ -293,13 +438,20 @@ func TestRunFileSnapshotIndexCorruptionFailsClosed(t *testing.T) {
 		}
 		ref = child.Ref
 	}
-	var corrupt [1]byte
-	corruptOffset := int64(posting.Offset) + storeio.PageHeaderSize
-	if _, err := file.ReadAt(corrupt[:], corruptOffset); err != nil {
+	corrupt := make([]byte, posting.Length)
+	if _, err := file.ReadAt(corrupt, int64(posting.Offset)); err != nil {
 		t.Fatal(err)
 	}
-	corrupt[0] ^= 0xff
-	if _, err := file.WriteAt(corrupt[:], corruptOffset); err != nil {
+	certificate := []byte(`"active"`)
+	position := bytes.Index(corrupt, certificate)
+	if position < 0 {
+		t.Fatal("posting certificate is absent")
+	}
+	copy(corrupt[position:], `xxxxxxxx`)
+	if _, err := storeio.SealPage(corrupt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(corrupt, int64(posting.Offset)); err != nil {
 		t.Fatal(err)
 	}
 	if err := file.Sync(); err != nil {
@@ -319,8 +471,8 @@ func TestRunFileSnapshotIndexCorruptionFailsClosed(t *testing.T) {
 	_, stats, err := Select(Count()).Where(Cmp("status", Eq, "active")).RunFileSnapshot(
 		snapshot, FileExecutionOptions{Workers: 1},
 	)
-	if !errors.Is(err, storeio.ErrPageCorrupt) {
-		t.Fatalf("corrupt index query error = %v, want %v", err, storeio.ErrPageCorrupt)
+	if !errors.Is(err, storeio.ErrPostingPageCorrupt) {
+		t.Fatalf("corrupt index query error = %v, want %v", err, storeio.ErrPostingPageCorrupt)
 	}
 	if stats.RowsScanned != 0 {
 		t.Fatalf("corrupt index silently scanned %d rows", stats.RowsScanned)
