@@ -636,8 +636,7 @@ func openDocumentGroupPayload(pageHeader PageHeader, payload []byte, chunkHighWa
 		lengths[i] = uint64(binary.LittleEndian.Uint32(payload[16+i*4 : 20+i*4]))
 	}
 	if lengths[0] != uint64(chunkCount*DocumentGroupChunkSize) ||
-		lengths[1] != uint64(rowCount*DocumentGroupRecordSize) ||
-		binary.LittleEndian.Uint16(payload[44:46]) > math.MaxUint16 {
+		lengths[1] != uint64(rowCount*DocumentGroupRecordSize) {
 		return DocumentGroupView{}, fmt.Errorf("%w: directory lengths", ErrDocumentGroupCorrupt)
 	}
 	offsets := [8]uint64{DocumentGroupPayloadHeaderSize}

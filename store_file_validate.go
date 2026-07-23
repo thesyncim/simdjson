@@ -23,7 +23,10 @@ type fileStorePageValidator struct {
 
 func newFileStorePageValidator(pageSize uint32) *fileStorePageValidator {
 	v := &fileStorePageValidator{pageSize: pageSize}
-	v.groupScratch.New = func() any { return make([]byte, 0, pageSize) }
+	v.groupScratch.New = func() any {
+		scratch := make([]byte, 0, pageSize)
+		return &scratch
+	}
 	return v
 }
 
@@ -67,10 +70,12 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 		if err != nil {
 			return err
 		}
-		scratch := v.groupScratch.Get().([]byte)
+		pooled := v.groupScratch.Get().(*[]byte)
+		scratch := (*pooled)[:0]
 		defer func() {
 			clear(scratch)
-			v.groupScratch.Put(scratch[:0])
+			*pooled = scratch[:0]
+			v.groupScratch.Put(pooled)
 		}()
 		header := group.Header()
 		for ordinal := uint32(0); ordinal < uint32(header.ChunkCount); ordinal++ {
