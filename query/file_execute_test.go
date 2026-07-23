@@ -457,3 +457,133 @@ func BenchmarkRunFileSnapshotPersistentIndexPushdown(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkRunFileSnapshotIndexSelectivityCrossover keeps the indexed and
+// unindexed predicates semantically identical while varying only posting
+// density. It supplies evidence for deciding whether the planner should gain a
+// sparse-read cutoff: above the crossover, walking many index-selected extents
+// loses to the ordered full scan even though the index is logically usable.
+func BenchmarkRunFileSnapshotIndexSelectivityCrossover(b *testing.B) {
+	file, err := os.CreateTemp(b.TempDir(), "query-file-index-selectivity-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer file.Close()
+	storeOptions := simdjson.FileStoreOptions{
+		Store: simdjson.StoreOptions{ChunkDocuments: 64, ShapeTapes: true},
+		Indexes: []simdjson.StoreIndexDefinition{
+			{Name: "class", Paths: []string{"/indexed"}},
+			{Name: "p75", Paths: []string{"/p75_indexed"}},
+			{Name: "p88", Paths: []string{"/p88_indexed"}},
+			{Name: "p94", Paths: []string{"/p94_indexed"}},
+			{Name: "p97", Paths: []string{"/p97_indexed"}},
+			{Name: "all", Paths: []string{"/all_indexed"}},
+		},
+		Synchronous: false, ResidentBytes: 64 << 20,
+	}
+	if os.Getenv("SIMDJSON_BENCH_DIRECT") == "1" {
+		storeOptions.ReadMode = simdjson.FileStoreReadDirectRequire
+		storeOptions.ReadConcurrency = 4
+		storeOptions.PrefetchQueue = 64
+	}
+	store, err := simdjson.CreateFileStore(file, storeOptions)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer store.Close()
+	const rows = 2048
+	counts := map[string]int{}
+	var sourceBytes int64
+	for i := range rows {
+		remainder := i & 127
+		class := "p53"
+		switch {
+		case remainder < 1:
+			class = "p01"
+		case remainder < 5:
+			class = "p03"
+		case remainder < 13:
+			class = "p06"
+		case remainder < 29:
+			class = "p13"
+		case remainder < 61:
+			class = "p25"
+		}
+		counts[class]++
+		p75 := remainder < 96
+		p88 := remainder < 112
+		p94 := remainder < 120
+		p97 := remainder < 124
+		doc := []byte(fmt.Sprintf(
+			`{"id":%d,"indexed":%q,"scan":%q,"p75_indexed":%t,"p75_scan":%t,"p88_indexed":%t,"p88_scan":%t,"p94_indexed":%t,"p94_scan":%t,"p97_indexed":%t,"p97_scan":%t,"all_indexed":"all","all_scan":"all","padding":%q}`,
+			i, class, class, p75, p75, p88, p88, p94, p94, p97, p97, strings.Repeat("x", i&63),
+		))
+		sourceBytes += int64(len(doc))
+		if _, err := store.Put(fmt.Sprintf("key-%05d", i), doc); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := store.Flush(); err != nil {
+		b.Fatal(err)
+	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer snapshot.Close()
+	var workspace FileExecutionWorkspace
+	opts := FileExecutionOptions{
+		Workers: 1, BatchRows: 128, BatchBytes: 1 << 20,
+		MemoryBytes: 64 << 20, Workspace: &workspace,
+	}
+	for _, selection := range []struct {
+		name        string
+		literal     any
+		indexedPath string
+		scanPath    string
+		count       int
+	}{
+		{name: "p01", literal: "p01", indexedPath: "indexed", scanPath: "scan", count: counts["p01"]},
+		{name: "p03", literal: "p03", indexedPath: "indexed", scanPath: "scan", count: counts["p03"]},
+		{name: "p06", literal: "p06", indexedPath: "indexed", scanPath: "scan", count: counts["p06"]},
+		{name: "p13", literal: "p13", indexedPath: "indexed", scanPath: "scan", count: counts["p13"]},
+		{name: "p25", literal: "p25", indexedPath: "indexed", scanPath: "scan", count: counts["p25"]},
+		{name: "p53", literal: "p53", indexedPath: "indexed", scanPath: "scan", count: counts["p53"]},
+		{name: "p75", literal: true, indexedPath: "p75_indexed", scanPath: "p75_scan", count: rows * 3 / 4},
+		{name: "p88", literal: true, indexedPath: "p88_indexed", scanPath: "p88_scan", count: rows * 7 / 8},
+		{name: "p94", literal: true, indexedPath: "p94_indexed", scanPath: "p94_scan", count: rows * 15 / 16},
+		{name: "p97", literal: true, indexedPath: "p97_indexed", scanPath: "p97_scan", count: rows * 31 / 32},
+		{name: "p100", literal: "all", indexedPath: "all_indexed", scanPath: "all_scan", count: rows},
+	} {
+		for _, test := range []struct {
+			name string
+			path string
+		}{
+			{name: "index", path: selection.indexedPath},
+			{name: "scan", path: selection.scanPath},
+		} {
+			q := Select(Count()).Where(Cmp(test.path, Eq, selection.literal))
+			name := fmt.Sprintf("%s/%s", selection.name, test.name)
+			b.Run(name, func(b *testing.B) {
+				result, stats, err := q.RunFileSnapshot(snapshot, opts)
+				if err != nil || result.RowCount != 1 || len(result.Columns) != 1 || len(result.Columns[0].Cells) != 1 {
+					b.Fatalf("warm run = result %+v, stats %+v, err %v", result, stats, err)
+				}
+				count, countOK := result.Columns[0].Cells[0].Int64()
+				if !countOK || count != int64(selection.count) {
+					b.Fatalf("warm run = result %+v, stats %+v, err %v", result, stats, err)
+				}
+				b.SetBytes(sourceBytes)
+				b.ReportAllocs()
+				b.ReportMetric(float64(stats.RowsScanned), "rows_scanned/op")
+				b.ResetTimer()
+				for range b.N {
+					result, _, err = q.RunFileSnapshot(snapshot, opts)
+					if err != nil || result.RowCount != 1 {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
