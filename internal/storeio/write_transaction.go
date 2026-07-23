@@ -116,12 +116,14 @@ func BeginWriteTransaction(committer *Committer, cache *PageCache, maxPages int,
 // logical identity; non-zero rewrites that logical page at the new generation.
 func (t *WriteTransaction) Allocate(kind PageKind, length uint32, logicalID uint64) (TransactionPage, error) {
 	if t == nil || !t.active || t.allocated >= len(t.batch.pages) || !validPageKind(kind) ||
-		!validPhysicalPageSize(length) || length < t.options.PageSize || length%t.options.PageSize != 0 ||
-		uint64(length) > uint64(t.committer.bufferSize) {
+		!validPhysicalPageSize(length) || length < t.options.PageSize || length%t.options.PageSize != 0 {
 		return TransactionPage{}, ErrTooManyPages
 	}
 	if kind != PageDocument && kind != PageOverflow && length != t.options.PageSize {
 		return TransactionPage{}, fmt.Errorf("%w: variable metadata extent", ErrInvalidWrite)
+	}
+	if uint64(length) > uint64(t.committer.bufferSize) {
+		return TransactionPage{}, ErrTooManyPages
 	}
 	if logicalID == 0 {
 		logicalID = t.nextID
