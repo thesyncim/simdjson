@@ -351,6 +351,85 @@ func TestPageCacheFrameControlIsPointerFree(t *testing.T) {
 	if frameType.Size() > 64 {
 		t.Fatalf("pageCacheFrame is %d bytes, want at most one cache line", frameType.Size())
 	}
+	linkType := reflect.TypeFor[pageCacheBlockLink]()
+	if !visit(linkType) {
+		t.Fatalf("pageCacheBlockLink contains GC-visible pointer-bearing state: %v", linkType)
+	}
+	if linkType.Size() != 12 {
+		t.Fatalf("pageCacheBlockLink is %d bytes, want 12", linkType.Size())
+	}
+}
+
+func TestPageCacheBlockAllocatorSplitsMergesAndHandlesPartialZone(t *testing.T) {
+	blocks := newPageCacheBlocks(37, 16)
+	var slots [37]bool
+	alloc := func(span int) int {
+		t.Helper()
+		index, ok := blocks.take(span)
+		if !ok {
+			t.Fatalf("take(%d) failed", span)
+		}
+		if index%span != 0 {
+			t.Fatalf("take(%d) = %d, want aligned start", span, index)
+		}
+		for slot := index; slot < index+span; slot++ {
+			if slots[slot] {
+				t.Fatalf("take(%d) overlaps slot %d", span, slot)
+			}
+			slots[slot] = true
+		}
+		return index
+	}
+	free := func(index, span int) {
+		t.Helper()
+		for slot := index; slot < index+span; slot++ {
+			if !slots[slot] {
+				t.Fatalf("put(%d,%d) frees empty slot %d", index, span, slot)
+			}
+			slots[slot] = false
+		}
+		blocks.put(index, span)
+	}
+
+	first := alloc(16)
+	second := alloc(16)
+	tail4 := alloc(4)
+	tail1 := alloc(1)
+	if _, ok := blocks.take(1); ok {
+		t.Fatal("take from exhausted allocator succeeded")
+	}
+	free(second, 16)
+	free(tail1, 1)
+	free(first, 16)
+	free(tail4, 4)
+
+	pair := newPageCacheBlocks(16, 16)
+	first, _ = pair.take(1)
+	second, _ = pair.take(1)
+	pair.put(first, 1)
+	pair.put(second, 1)
+	if merged, ok := pair.take(2); !ok || merged != min(first, second) {
+		t.Fatalf("merged take = (%d,%v), want (%d,true)", merged, ok, min(first, second))
+	}
+}
+
+func TestPageCacheBlockAllocatorCoalescesFragmentedSmallExtents(t *testing.T) {
+	blocks := newPageCacheBlocks(32, 16)
+	allocated := make([]int, 32)
+	for index := range allocated {
+		var ok bool
+		allocated[index], ok = blocks.take(1)
+		if !ok {
+			t.Fatalf("take slot %d failed", index)
+		}
+	}
+	for _, index := range allocated[8:16] {
+		blocks.put(index, 1)
+	}
+	index, ok := blocks.take(8)
+	if want := allocated[8]; !ok || index != want {
+		t.Fatalf("coalesced take = (%d,%v), want (%d,true)", index, ok, want)
+	}
 }
 
 func TestPageCacheConcurrentHitsAndEvictions(t *testing.T) {
@@ -675,6 +754,33 @@ func BenchmarkPageCacheResidentAcquire(b *testing.B) {
 			b.Fatal(err)
 		}
 		lease.Release()
+	}
+}
+
+func BenchmarkPageCacheBlockAllocatorPressure(b *testing.B) {
+	const (
+		slots = 1 << 20 // 4 GiB at the ordinary 4 KiB allocation quantum.
+		span  = 16
+	)
+	blocks := newPageCacheBlocks(slots, span)
+	allocated := make([]int, slots/span)
+	for index := range allocated {
+		var ok bool
+		allocated[index], ok = blocks.take(span)
+		if !ok {
+			b.Fatalf("fill take %d failed", index)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := range b.N {
+		slot := iteration & (len(allocated) - 1)
+		blocks.put(allocated[slot], span)
+		var ok bool
+		allocated[slot], ok = blocks.take(span)
+		if !ok {
+			b.Fatal("pressure take failed")
+		}
 	}
 }
 

@@ -19,7 +19,7 @@ import (
 //	SIMDJSON_FILESTORE_100X=1 go test . -run '^TestFileStoreHundredXResidentSmoke$' -v -count=1
 func TestFileStoreHundredXResidentSmoke(t *testing.T) {
 	if os.Getenv("SIMDJSON_FILESTORE_100X") != "1" {
-		t.Skip("set SIMDJSON_FILESTORE_100X=1 to run the above-RAM storage gate")
+		t.Skip("set SIMDJSON_FILESTORE_100X=1 to run the resident-pressure gate")
 	}
 	const records = 10_000
 	file, err := os.CreateTemp(t.TempDir(), "file-store-100x-*")
@@ -244,8 +244,12 @@ func fileStoreScaleOptions() FileStoreOptions {
 }
 
 func appendFileStoreScaleDocument(dst []byte, row int, updated bool) []byte {
+	return appendFileStoreScaleDocumentPayload(dst, row, updated, 2048)
+}
+
+func appendFileStoreScaleDocumentPayload(dst []byte, row int, updated bool, payloadBytes int) []byte {
 	dst = fmt.Appendf(dst, `{"id":%d,"nested":{"group":%d,"state":"s%d"},"payload":"`, row, row%64, row%8)
-	for range 2048 {
+	for range payloadBytes {
 		dst = append(dst, byte('a'+row%26))
 	}
 	dst = append(dst, `","updated":`...)

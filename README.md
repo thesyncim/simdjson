@@ -256,10 +256,13 @@ raw, ok, err := snapshot.AppendRaw(nil, "event:42")
 `FileStore` opens from bounded root/page scratch instead of walking the corpus.
 Its CLOCK arena is divided into 4 KiB allocation quanta: a metadata page uses
 one slot and a larger document uses only its exact contiguous span, rather than
-every page paying the maximum extent size. The resident lookup directory and
-one-cache-line frame records are pointer-free, while independent hot pages use
-independent locks. Read workers, prefetch and commit queues, active snapshots,
-and retired extents all have explicit capacities reported by `Stats`.
+every page paying the maximum extent size. A pointer-free buddy allocator
+splits and coalesces those power-of-two spans without rescanning the arena on
+each miss; pressure performs at most one CLOCK pass instead of repeated
+whole-cache scans. The resident lookup directory and one-cache-line frame
+records are pointer-free, while independent hot pages use independent locks.
+Read workers, prefetch and commit queues, active snapshots, and retired extents
+all have explicit capacities reported by `Stats`.
 Direct read and write modes reopen independent Linux `O_DIRECT` descriptors
 when supported and report the actual choices through `Stats.DirectReads` and
 `Stats.DirectWrites`; neither changes or closes the caller's descriptor.
@@ -278,6 +281,18 @@ cache bytes, queue depth, and read concurrency. A 256 MiB Linux container with
 a 128 MiB Go limit sampled 17.0 MiB RSS, 18.1 MiB peak RSS, and 3.50 MiB Go
 heap while scanning at 78.0 MiB/s. That is a bounded-residency correctness
 result, not a claim that cold storage has resident-memory latency.
+
+The separate physical gate compiles outside a 64 MiB Linux cgroup, requires
+direct reads and writes, and stores one nested exact index with 2,137 large
+documents. Its live key+JSON source was 6,713,852,053 bytes (121.2x the
+55,414,784-byte cgroup peak); allocated filesystem blocks were 6,920,364,032
+bytes (124.9x peak), and the file high-water was 6,923,669,504 bytes. It
+reopened, probed distant keys and the nested index, then updated, deleted, and
+changed TTL under eviction in 12.17 seconds on the measured Docker/Linux ARM64
+volume. Run `scripts/run-filestore-physical-scale.sh`; it needs roughly 10 GiB
+free for the default gate. The large-value fixture makes a physical 100x run
+practical and proves the memory boundary, not equal cold-read latency or a
+universal throughput result.
 
 `query.Query.RunFileSnapshot` late-binds the frozen exact-index catalog.
 Equality and supported containment predicates read candidate chunks and

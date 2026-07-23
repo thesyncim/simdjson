@@ -2,13 +2,13 @@
 
 Status: accepted and implemented for a separate attached `FileStore` surface.
 Transient heap construction and mapped checkpoints remain on `Store`;
-incremental durability uses explicit page I/O, bounded CLOCK residency,
-copy-on-write key/chunk/index/TTL/free trees, overflow extents, alternating
-superblocks, snapshot generation leases, and persistent reclamation. Parallel
-file scans, direct writes, and external query spill are implemented. Online
-file-index DDL, distributed execution, and equal-latency performance at 100x
-physical RAM remain out of scope or unproven. Extends ADR 0004 without changing
-heap `Store` borrowing.
+incremental durability uses explicit page I/O, bounded CLOCK residency with
+buddy span allocation, copy-on-write key/chunk/index/TTL/free trees, overflow
+extents, alternating superblocks, snapshot generation leases, and persistent
+reclamation. Parallel file scans, direct writes, external query spill, and a
+100x physical-memory correctness gate are implemented. Online file-index DDL,
+distributed execution, and equal cold/resident latency remain out of scope.
+Extends ADR 0004 without changing heap `Store` borrowing.
 
 ## Decision
 
@@ -154,12 +154,12 @@ size is therefore no longer a Go-heap or eager-open requirement. It remains
 bounded by the on-disk ids/offsets and configured maximum key/document sizes.
 
 This establishes a controllable working set, not a universal 100x-RAM latency
-claim. A cold random read pays device latency. A corpus 100 times the resident
-budget is useful only when the hot key/index/page set fits that budget or the
-workload has scan locality. The explicit correctness gate now covers source
-key+JSON bytes at 106.4x the configured page cache and is described below;
-end-to-end performance above physical RAM remains a release benchmark rather
-than an assertion in the API contract.
+claim. A cold random read pays device latency. A corpus 100 times physical
+memory is useful only when the hot key/index/page set fits that budget or the
+workload has scan locality. One gate covers source key+JSON at 106.4x the
+configured page cache; a second cgroup-constrained gate covers live source and
+allocated filesystem blocks at more than 100x complete process memory. Both are
+described below. Neither changes the API contract into a cold-latency promise.
 
 Residency separates four temperature classes:
 
@@ -173,10 +173,16 @@ The page manager, rather than virtual mapping size, owns a fixed resident-byte
 budget and CLOCK replacement. Its anonymous arena is divided by `PageSize`; a
 4 KiB metadata node occupies one slot while a 16 KiB document occupies four.
 Whole extents are admitted and evicted together. Lookup uses a pointer-free
-atomic table and one pointer-free 64-byte control record per slot. The resident
-hit path locks only the selected frame; the global lock is reserved for misses,
-admission, eviction, and statistics. Cold references retain physical offset,
-length, logical id, and generation and enter bounded read workers.
+atomic table and one pointer-free 64-byte control record per slot. Intrusive
+pointer-free buddy lists split and coalesce free power-of-two spans without
+rescanning the arena. The resident hit path locks only the selected frame; the
+global lock is reserved for misses, admission, eviction, and statistics. Cold
+references retain physical offset, length, logical id, and generation and
+enter bounded read workers.
+On M4 Max, a filled 1,048,576-quantum allocator geometry measured
+3.73-3.77 ns per maximum-span release/reacquire with zero allocations; this is
+control-plane evidence, not device-I/O latency.
+
 `FileStore.Stats` exposes resident/dirty bytes, reads, cache/prefetch hits,
 evictions, queue depths, durable generation, snapshots, retired extents, and
 reusable extents.
@@ -475,6 +481,19 @@ SIMDJSON_FILESTORE_100X=1 \
   go test . -run '^TestFileStoreHundredXResidentSmoke$' -v -count=1
 ```
 
+The physical-memory gate builds its Linux test binary before entering a
+64 MiB cgroup, requires `O_DIRECT` on both lanes, and checks `st_blocks` so a
+sparse logical file cannot pass. The measured ARM64 Docker volume stored 2,137
+large documents and one nested exact index: 6,713,852,053 live source bytes,
+6,923,669,504 bytes at file high-water, and 6,920,364,032 allocated bytes
+under a 55,414,784-byte cgroup peak. The source/peak and allocated/peak ratios
+were 121.2x and 124.9x. Reopen, distant and nested-index probes, update,
+delete, and mutable TTL completed under eviction in 12.17 seconds:
+
+```text
+scripts/run-filestore-physical-scale.sh
+```
+
 Direct full scans use a chunk-ordered read-ahead window bounded by one quarter
 of cache bytes, the configured queue, four requests per worker, and 64 extents.
 Extents are submitted in physical order while callbacks remain logically
@@ -485,12 +504,12 @@ Linux/ARM64 container, a 2,048-document pressure benchmark improved from
 
 The full race suite and portable Linux/Windows compile checks are release gates.
 
-Still required before advertising equal-latency performance at 100x physical
-RAM:
+The physical 100x correctness boundary is now demonstrated. Equal cold and
+resident latency is not a credible storage contract. Remaining performance and
+release gates are:
 
 - working-set, read/write amplification, and fragmentation sweeps below, near,
-  and above physical RAM; the gate now records RSS and faults at one
-  constrained-cache point;
+  and above physical RAM;
 - cold NVMe workloads, not only container-backed direct I/O;
 - longer crash/power-loss campaigns on real filesystems in addition to
   deterministic image tearing; and

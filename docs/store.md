@@ -329,12 +329,13 @@ generic `io.Writer` receives it.
 ## Attached `FileStore`
 
 `FileStore` implements the explicit-I/O path that the mapped checkpoint does
-not: a bounded CLOCK page cache, bounded asynchronous read/prefetch queues,
-copy-on-write mutations, alternating durable roots, persistent free extents,
-and generation leases. `CreateFileStore` requires an empty caller-owned file;
-`OpenFileStore` reads only the two superblocks and referenced root pages. It
-does not enumerate keys, chunks, postings, TTL records, or free extents during
-open. The free tree is loaded lazily when a writer first needs it.
+not: a bounded CLOCK page cache with a buddy span allocator, bounded
+asynchronous read/prefetch queues, copy-on-write mutations, alternating durable
+roots, persistent free extents, and generation leases. `CreateFileStore`
+requires an empty caller-owned file; `OpenFileStore` reads only the two
+superblocks and referenced root pages. It does not enumerate keys, chunks,
+postings, TTL records, or free extents during open. The free tree is loaded
+lazily when a writer first needs it.
 
 Every page carries Store identity, kind, logical id, generation, exact bounds,
 and CRC32C. Metadata uses 4 KiB pages. Document and overflow extents may use
@@ -344,13 +345,21 @@ contiguous slots. Four 4 KiB directories plus one 16 KiB document therefore
 fit in a 32 KiB budget; the former maximum-frame layout admitted only two such
 logical pages. The lookup table and 64-byte frame controls contain no Go
 pointers. A resident hit locks only its own frame, so independent pages do not
-serialize on the admission/eviction lock. Key, chunk, exact-index, TTL, and
-free trees are path-copied; unchanged pages remain shared. The commit device
-writes data pages, executes a data-integrity barrier, writes the alternate
-superblock, and executes the final barrier. Recovery accepts the newest root
-only after its state and top-level page graph validate, otherwise it uses the
-previous root. Crash-image tests cover partially written data and root prefixes
-and require recovery to return one whole generation, never a mixture.
+serialize on the admission/eviction lock. Free power-of-two spans use intrusive
+pointer-free buddy lists. Admission splits or coalesces without scanning the
+arena; under pressure it performs at most one CLOCK pass instead of a whole
+free-span scan after every victim. Key, chunk, exact-index, TTL, and free trees
+are path-copied; unchanged pages remain shared. The commit device writes data
+pages, executes a data-integrity barrier, writes the alternate superblock, and
+executes the final barrier. Recovery accepts the newest root only after its
+state and top-level page graph validate, otherwise it uses the previous root.
+Crash-image tests cover partially written data and root prefixes and require
+recovery to return one whole generation, never a mixture.
+
+`BenchmarkPageCacheBlockAllocatorPressure` fills a 1,048,576-quantum
+(4 GiB at 4 KiB) geometry, then repeatedly releases and reacquires maximum
+16-quantum spans. M4 Max measured 3.73-3.77 ns/op and zero allocations. This
+isolates span control from CLOCK victim selection and device latency.
 
 Mutation is single-writer. With `Synchronous`, `Put`, `Delete`, TTL changes, and
 expiry wait for durability. Without it they return after the bounded committer
@@ -540,14 +549,30 @@ SIMDJSON_FILESTORE_100X=1 \
 ```
 
 This proves bounded-cache correctness and measures total process residency for
-source data above the configured resident page budget. It is not an
-equal-latency claim or a substitute for a physical-RAM crossover test on the
-target device. Directory and posting pages compete with documents for the same
-cache, cold random access pays storage latency, and copy-on-write generations,
-allocator rounding, overflow pages, index cardinality, and free-space headroom
-add disk amplification. A 1 TiB deployment still needs workload-specific
-working-set sweeps, amplification, latency-percentile, and fragmentation
-measurements.
+source data above the configured resident page budget. The separate physical
+gate compiles before entering a 64 MiB cgroup and checks allocated blocks, not
+only logical file length:
+
+```text
+scripts/run-filestore-physical-scale.sh
+```
+
+The measured Linux/ARM64 Docker run stored 2,137 large documents with one
+nested exact index: 6,713,852,053 live key+JSON bytes and 6,920,364,032
+allocated file bytes under a 55,414,784-byte complete cgroup peak, or 121.2x
+and 124.9x peak. File high-water was 6,923,669,504 bytes. Required direct
+reads and writes remained active through reopen, distant and nested-index
+probes, update, delete, and changed TTL; the complete run took 12.17 seconds
+and recorded 2,211 page reads and 2,161 evictions. The synthetic 3 MiB-value
+fixture deliberately keeps row count manageable, so it is a residency and
+correctness proof rather than a small-row latency result.
+
+Neither gate is an equal-latency claim. Directory and posting pages compete
+with documents for the same cache, cold random access pays storage latency,
+and copy-on-write generations, allocator rounding, overflow pages, index
+cardinality, and free-space headroom add disk amplification. A 1 TiB
+deployment still needs workload-specific working-set sweeps, amplification,
+latency-percentile, and fragmentation measurements.
 
 On the same Linux/ARM64 Docker host, 1 KiB asynchronous replacement updates
 with a final durability fence measured 0.34-0.37 ms through the direct

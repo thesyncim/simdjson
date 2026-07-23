@@ -185,6 +185,7 @@ type PageCache struct {
 	arena   []byte
 	frames  []pageCacheFrame
 	table   []atomic.Uint32
+	blocks  pageCacheBlocks
 	tombs   int
 	hand    int
 
@@ -231,6 +232,7 @@ func NewPageCache(file *os.File, options PageCacheOptions) (*PageCache, error) {
 		options:  normalized,
 		arena:    arena,
 		frames:   make([]pageCacheFrame, slotCount),
+		blocks:   newPageCacheBlocks(slotCount, normalized.MaxPageSize/normalized.PageSize),
 		prefetch: make(chan PageRef, normalized.PrefetchQueue),
 		done:     make(chan struct{}),
 	}
@@ -624,7 +626,7 @@ func (c *PageCache) load(ref PageRef, pin, prefetch bool) (PageLease, error) {
 }
 
 func (c *PageCache) reserveLocked(span int) (int, bool) {
-	if start, ok := c.emptySpanLocked(span); ok {
+	if start, ok := c.blocks.take(span); ok {
 		return start, true
 	}
 	for scanned := 0; scanned < len(c.frames)*2; scanned++ {
@@ -650,26 +652,8 @@ func (c *PageCache) reserveLocked(span int) (int, bool) {
 		c.resetExtentLocked(index)
 		frame.lock.Unlock()
 		c.evictions++
-		if start, ok := c.emptySpanLocked(span); ok {
+		if start, ok := c.blocks.take(span); ok {
 			return start, true
-		}
-	}
-	return 0, false
-}
-
-func (c *PageCache) emptySpanLocked(span int) (int, bool) {
-	if span <= 0 || span > len(c.frames) {
-		return 0, false
-	}
-	run := 0
-	for index := range c.frames {
-		if c.frames[index].state == pageCacheEmpty {
-			run++
-			if run == span {
-				return index - span + 1, true
-			}
-		} else {
-			run = 0
 		}
 	}
 	return 0, false
@@ -728,6 +712,7 @@ func (c *PageCache) resetExtentLocked(index int) {
 		tail.referenced = false
 		tail.prefetched = false
 	}
+	c.blocks.put(index, span)
 	if c.hand > index && c.hand < index+span {
 		c.hand = index
 	}

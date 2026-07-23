@@ -228,11 +228,13 @@ slice length.
 `Length/PageSize` contiguous slots, so small metadata no longer pays
 `MaxPageSize`; the minimum accepted budget is the exact worst-case dirty
 transaction byte bound. The lookup table and 64-byte slot controls contain no
-Go pointers. `BufferCount` and `QueueSlots` bound commit data/descriptors;
-`ReadConcurrency` and `PrefetchQueue` bound read work; `MaxSnapshotLeases` and
-`MaxRetiredExtents` bound lifetime/reclamation metadata. Exhaustion returns an
-error or applies queue backpressure rather than growing without limit. `Stats`
-reports current use and pressure.
+Go pointers. The buddy free-span directory is also pointer-free and bounded by
+cache quanta plus maximum page size; allocation splits or coalesces one
+power-of-two span without an arena scan. `BufferCount` and `QueueSlots` bound
+commit data/descriptors; `ReadConcurrency` and `PrefetchQueue` bound read work;
+`MaxSnapshotLeases` and `MaxRetiredExtents` bound lifetime/reclamation
+metadata. Exhaustion returns an error or applies queue backpressure rather than
+growing without limit. `Stats` reports current use and pressure.
 
 `PageSize` is a power of two at least 4 KiB. `MaxPageSize` is a power-of-two
 multiple of it. Keys and JSON are rejected above `MaxKeyBytes` and
@@ -288,6 +290,18 @@ Linux run used direct reads and writes, a 256 MiB container, and
 `GOMEMLIMIT=128MiB`; it sampled 17.0 MiB current RSS, 18.1 MiB peak RSS, and
 3.50 MiB Go heap. The page ratio still does not include caller output or imply
 that cold reads match resident hits.
+
+`scripts/run-filestore-physical-scale.sh` is the distinct physical-memory gate.
+It compiles before entering a 64 MiB cgroup, requires Linux direct reads and
+writes, checks allocated filesystem blocks rather than logical sparse size,
+and defaults to a 100x ratio. The measured ARM64 Docker run stored
+6,713,852,053 live source bytes and 6,920,364,032 allocated file bytes while
+the complete cgroup peak was 55,414,784 bytes: 121.2x and 124.9x respectively.
+It also reopened, probed a nested exact index, updated, deleted,
+and changed TTL under eviction. This proves that corpus residency is bounded;
+one maximum document, caller copy-out, fixed staging buffers, runtime state,
+and final query output still count toward the cgroup, and cold misses still pay
+device latency.
 
 The caller owns the `*os.File` and spill directory. `FileStore.Close` does not
 close the file and fails while `FileSnapshot` leases remain. `RangeRaw`,

@@ -36,13 +36,14 @@ conversion.
 queues and devices, double-superblock recovery, common page framing, packed
 key/chunk/index/TTL/free/document/overflow payloads, copy-on-write tree
 mutations, generation leases, extent reclamation, the quantum-slot CLOCK page
-cache, independent Linux direct-read/direct-write descriptors, and checksum
-kernels. Cache bytes live in one anonymous arena; its lookup entries and
-one-cache-line slot controls are pointer-free, and resident pages synchronize
-per frame. Persistent formats use byte offsets, fixed-width values, and stable
-logical ids rather than Go pointers or runtime layouts. The public `FileStore`
-composes those mechanisms without exposing physical references. Store-specific
-SIMD stays in this internal package; the public `simd` package does not acquire
+cache, its pointer-free buddy span allocator, independent Linux
+direct-read/direct-write descriptors, and checksum kernels. Cache bytes live
+in one anonymous arena; lookup entries, free-span links, and one-cache-line
+slot controls are pointer-free, and resident pages synchronize per frame.
+Persistent formats use byte offsets, fixed-width values, and stable logical ids
+rather than Go pointers or runtime layouts. The public `FileStore` composes
+those mechanisms without exposing physical references. Store-specific SIMD
+stays in this internal package; the public `simd` package does not acquire
 database I/O policy.
 
 The pre-v1 `simd` package retains decimal classification, eight-digit parsing,
