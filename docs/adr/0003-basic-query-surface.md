@@ -2,6 +2,10 @@
 
 Status: accepted and implemented. Builds on ADR 0002.
 
+ADR 0007 supersedes this ADR's future front-end and transport direction. The
+single-table builder and optional SQL adapter described here remain the
+implemented compatibility surface until the compact document plan is built.
+
 ## Context
 
 `DocSet` exposes the fast primitives, but applications should not have to
@@ -46,9 +50,10 @@ can therefore encode schema/path bytes once, then carry ordinals, type tags,
 constants, bitmap batches, and typed cells without making SQL or formatted
 strings its intermediate representation.
 
-This ADR intentionally does not freeze a network byte layout before versioning,
-limits, ownership, and compatibility rules exist. A decoder will be another
-front end to the same typed plan, not a second executor.
+ADR 0007 now freezes the higher-level contract: compact document syntax and a
+pure-Go builder compile to one minimal binary prepared plan, while SQL becomes
+an optional compatibility adapter. Its decoder remains another front end to
+the typed executor, not a second executor.
 
 ## Execution
 
@@ -123,19 +128,14 @@ Sorted sparse posting lists use linear merge/intersection. Native dense masks
 may use the internal SIMD Boolean kernel. Transient sparse-to-dense conversion
 is intentionally rejected until a complete build/combine/decode benchmark wins.
 
-## Competitive boundary
+## Measurement boundary
 
-The comparable DuckDB surface stores exact JSON, materializes the same scalar
-paths, and builds single-column ART indexes for key and exact filter lookup.
-Both sides use one execution lane and must reproduce generator-owned counts and
-aggregates. Store timing is a direct in-process call; DuckDB's profiled latency
-also includes SQL parse, bind, optimization, and execution. Durable file, WAL,
-buffer peak, and Store live heap remain separate accounting domains.
-
-The reproducible setup is
-[`benchmarks/duckdbbench/duckdb-methodology.md`](../../benchmarks/duckdbbench/duckdb-methodology.md).
-Machine-specific ratios belong in generated benchmark reports, not as timeless
-API promises in this ADR.
+Query evidence uses generator-owned counts, aggregates, result digests, and
+allocation checks. Timings are direct in-process calls over explicitly labelled
+heap or recovered bounded-cache state. Durable file bytes, live heap, admitted
+cache, commit staging, caller workspaces, and process RSS remain separate
+accounting domains. Machine-specific values belong in reproducible benchmark
+output, not as timeless API promises in this ADR.
 
 ## Non-goals
 

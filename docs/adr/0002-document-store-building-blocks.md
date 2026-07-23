@@ -10,10 +10,10 @@ predicates, and restart without reparsing. Building those features outside the
 repository would duplicate the tape, shape, interner, and containment logic and
 would lose the existing correctness and unsafe-code gates.
 
-The comparison target is DuckDB's embedded JSON, projected-column, and ART
-index path. This is an operation-by-operation mechanism comparison, not a
-claim that an analytical SQL engine and this JSON API have identical storage,
-durability, or concurrency semantics.
+The substrate is evaluated against explicit JSON-store contracts: exact byte
+reconstruction, bounded allocation, indexed selectivity, durable recovery,
+mutation amplification, and stable throughput across synthetic and real
+corpora.
 
 ## Decision
 
@@ -33,8 +33,8 @@ Keep the multi-document substrate in this repository:
 - versioned `DocSet` serialization stores sources, tapes, shapes, dictionaries,
   and postings in a reopenable image. Formats remain unstable before v1.
 
-The root module keeps no third-party dependency. The comparison runner remains
-in the nested benchmark module and uses a pinned official DuckDB image.
+The root module keeps no third-party dependency. Corpus and benchmark-only
+dependencies remain isolated in nested modules.
 
 ## Required invariants
 
@@ -67,10 +67,12 @@ list-to-bitmap build plus result decode outweighed the faster Boolean kernel.
 
 ## API boundary
 
-This ADR owns storage and execution primitives. ADR 0003 owns the SQL-shaped
-read interface. ADR 0004 owns keyed mutation, snapshots, TTL, and online index
-lifecycle. Joins, distributed planning, serving, durability policy, and
-replication remain outside the library.
+This ADR owns storage and execution primitives. ADR 0003 owns the currently
+implemented SQL-shaped read interface. ADR 0004 owns keyed mutation, snapshots,
+TTL, and online index lifecycle. ADR 0007 accepts the compact document-query
+and binary prepared-plan direction, including a bounded join path. Distributed
+planning, serving policy, replication, and cross-collection transaction
+semantics remain outside this storage ADR.
 
 ## Evidence and acceptance
 
@@ -80,12 +82,10 @@ and forced-GC tests, portable/SIMD parity, race and `checkptr` runs, and
 allocation benchmarks.
 
 Machine-specific results belong in reproducible benchmark output rather than
-in this decision record. The current commands and comparison boundary are in:
+in this decision record. The current commands and measurement boundary are in:
 
 - [`benchmarks/README.md`](../../benchmarks/README.md) for local benchmark
   methodology;
-- [`benchmarks/duckdbbench/duckdb-methodology.md`](../../benchmarks/duckdbbench/duckdb-methodology.md)
-  for the embedded DuckDB comparison; and
 - [`docs/store.md`](../store.md) for mutable Store behavior and measurements.
 
 ## Consequences

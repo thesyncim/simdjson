@@ -281,18 +281,21 @@ correctness, scan density, and space reclamation do not require regrouping
 after online churn, but recovering its best compression after widespread
 updates requires creating another compact generation.
 
-The clean state root may additionally name a checksummed catalog of contiguous
-aggregate-only stripes. A stripe stores dense adaptive typed values but no
-stable-slot masks or JSON, and covers ordinary, overflow-backed, and grouped
-chunks alike. Predicate-free numeric aggregates can therefore avoid both the
-chunk tree and document extents. A projection-neutral replacement retains this
-root. A changed value or delete reconstructs one head-catalog stripe from
-authoritative sidecars/peeled pages and copy-on-write replaces it plus the
-catalog head, leaving all other stripes shared. Inserts, later-catalog targets,
-empty results, and oversized rebuilt stripes clear the complete chain and use
-the authoritative overlay path. TTL-only publications retain it. Recovery
-validates physical and logical ordering, exact chunk coverage, per-column
-encoding, CRC32C, and root generation before selecting the shortcut.
+The clean state root may additionally name a checksummed 64-way ordered
+directory of contiguous aggregate-only stripes. A stripe stores dense adaptive
+typed values but no stable-slot masks or JSON, and covers ordinary,
+overflow-backed, and grouped chunks alike. Predicate-free numeric aggregates
+can therefore avoid both the chunk tree and document extents. Directory nodes
+are fixed metadata pages; leaves map chunk lower bounds to stripes and branches
+map them to immutable children. A projection-neutral replacement retains this
+root. A changed value or delete reconstructs one stripe from authoritative
+sidecars/peeled pages and copy-on-write replaces its bounded root-to-leaf path,
+leaving all other stripes and subtrees shared. An insert does the same when
+the existing stripe still fits. Out-of-range inserts, empty results, and
+oversized rebuilt stripes clear the complete accelerator and use the
+authoritative overlay path. TTL-only publications retain it. Recovery validates
+directory levels and lower bounds, exact chunk coverage, per-column encoding,
+CRC32C, and root generation before selecting the shortcut.
 
 The same clean state root may name a categorical group catalog derived from
 existing single-column exact indexes. Each covered index stores one scalar
@@ -559,10 +562,10 @@ walk, without admitting JSON rows or launching workers. Numeric masks
 deliberately cannot answer `COUNT(path)`, because present non-numeric values
 must count there. An untouched compact generation reads its contiguous dense
 scan stripes. Projection-neutral updates retain them; a changed value or
-delete normally replaces one stripe and its catalog head. The documented
-fallback cases make the same API walk authoritative detached sidecars plus
-peeled document pages, preserving correctness without pretending that a stale
-stripe includes overlays.
+delete normally replaces one stripe and its ordered-directory path. The
+documented fallback cases make the same API walk authoritative detached
+sidecars plus peeled document pages, preserving correctness without pretending
+that a stale stripe includes overlays.
 An unfiltered one-column scalar `GROUP BY` with `COUNT(*)` similarly uses a
 matching exact index. Compact generations read the O(groups), possibly
 segmented categorical catalog without posting or document pages. One-page

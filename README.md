@@ -313,17 +313,20 @@ pages are immutable bases. The first update peels only the affected logical
 chunk into an ordinary copy-on-write page; the shared document or typed extent
 is retired only after its final mapping is peeled.
 
-An untouched compact generation also carries a small catalog of physically
-contiguous, value-only scan stripes. Predicate-free covered aggregates bypass
-the chunk tree, JSON, masks, and document I/O. A replacement that leaves every
-configured numeric projection unchanged reuses the scan byte-for-byte. A
-changed value or delete in a head-catalog stripe rebuilds only that bounded
-stripe and one mutable catalog page; every other stripe remains shared.
-Inserts, an emptied/oversized stripe, or a target in a later catalog page
-atomically retire the shortcut and use the authoritative sidecar/document
-path. Recompacting restores it. Both paths are checksummed, pointer-free on
-disk, exact-bit deterministic across portable and Go-native SIMD reducers,
-and zero-allocation with warmed caller-owned buffers.
+An untouched compact generation also carries physically contiguous,
+value-only scan stripes under a 64-way ordered copy-on-write directory.
+Predicate-free covered aggregates bypass the chunk tree, JSON, masks, and
+document I/O. Directory nodes stay at the 4 KiB metadata quantum while stripes
+pack up to `MaxPageSize`. A replacement that leaves every configured numeric
+projection unchanged reuses the scan byte-for-byte. A changed value or delete
+in any covered stripe rebuilds only that stripe and its bounded root-to-leaf
+directory path; every other stripe and subtree remains shared. An insert uses
+the same path when its chunk is already covered and the rebuilt stripe still
+fits. An out-of-range insert, emptied stripe, or oversized rebuild atomically
+retires the shortcut and uses the authoritative sidecar/document path.
+Recompacting restores it. Both paths are checksummed, pointer-free on disk,
+exact-bit deterministic across portable and Go-native SIMD reducers, and
+zero-allocation with warmed caller-owned buffers.
 
 Compact generations also derive aggregate-only categorical covers from
 eligible single-column exact indexes. Low-cardinality one-page covers are
@@ -435,6 +438,14 @@ builder; execution does not retain or interpret SQL strings. Exact-index
 definitions are frozen when the file is created. The complete contract and
 measured limits are in [Mutable Store operations](docs/store.md).
 
+[ADR 0007](docs/adr/0007-compact-document-query-wire.md) locks the next query
+boundary without pretending it is already implemented: one compact
+`find`/`where`/`join`/`select`/`group`/`order`/`limit` document compiles once
+to a binary prepared plan, while the pure-Go builder emits the same typed
+operators directly. Nested objects are nested matches, point commands bypass
+the relation engine, and ordered nested/compound/multikey indexes are the
+explicit prerequisite for range, order-plus-limit, and indexed joins.
+
 An update parses only its replacement. Unchanged source and structural-tape
 storage stays immutable and is shared into the next bounded chunk; deletes copy
 only dense row metadata and remove the last-row chunk directly. There are no
@@ -498,8 +509,9 @@ candidate chunks.
 `query.FileExecutionWorkspace` retain hot probe and overflow scratch explicitly.
 
 The complete API, ownership rules, expiration semantics, tuning table,
-complexity bounds, zero-allocation recipes, operational counters, and DuckDB
-comparison boundary are in [Mutable Store operations](docs/store.md).
+complexity bounds, zero-allocation recipes, operational counters, limits, and
+reproducible Store measurements are in
+[Mutable Store operations](docs/store.md).
 
 ## Performance
 
@@ -529,16 +541,16 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Indexed Snapshot compound point query | 2.82 ns/input doc, 0 allocations |
 | Durable exact-index probe / candidate-only routing | 19.35-19.40 us / 2.31-2.42 us, 0 allocations |
 | Durable nested compound query, 1/64 selectivity | 113.0-114.2 us vs 664.8-665.3 us full scan; 170 KB vs 2.09 MB transient |
-| Compact durable bytes, 10K rows | 3.16 MiB (0.81x key+JSON), versus 3.26 MiB pinned DuckDB |
-| Recovered exact filter, 10K rows | 14.50 us, 2 posting pages, 0 JSON rows/rechecks, 7.35x faster than pinned one-thread DuckDB |
-| Recovered scalar-object `@>`, 10K rows | 13.08 us, 2 posting pages, 0 JSON rows/rechecks, 230.75x faster than pinned one-thread DuckDB |
-| Clean-stripe durable SUM, 5M rows / 1.25M finite values | 1.948 ms, 0 JSON rows, 4.13x faster than the retained pinned one-thread DuckDB capacity result |
-| Compact durable bytes, 5M-row capacity smoke | 1.555 GiB (0.813x key+JSON), 31.85% larger than the 1.18 GiB DuckDB checkpoint; the stripe costs 2.39 MiB |
-| Recovered exact filter, 5M-row capacity smoke | 4.376 ms, 540 posting pages, 0 JSON rows/rechecks, 5.60x faster in a cross-OS mechanism smoke, not a machine race |
-| Recovered scalar-object `@>`, 5M-row capacity smoke | 4.486 ms, 540 posting pages, 0 JSON rows/rechecks, 313.9x faster in the same cross-OS capacity smoke |
+| Compact durable bytes, 10K rows | 3.16 MiB (0.81x key+JSON) with one exact index and one numeric cover |
+| Recovered exact filter, 10K rows | 14.50 us, 2 posting pages, 0 JSON rows/rechecks |
+| Recovered scalar-object `@>`, 10K rows | 13.08 us, 2 posting pages, 0 JSON rows/rechecks |
+| Clean-stripe durable SUM, 5M rows / 1.25M finite values | 1.948 ms, 0 JSON rows |
+| Compact durable bytes, 5M-row capacity smoke | 1.555 GiB (0.813x key+JSON); the stripe costs 2.39 MiB |
+| Recovered exact filter, 5M-row capacity smoke | 4.376 ms, 540 posting pages, 0 JSON rows/rechecks |
+| Recovered scalar-object `@>`, 5M-row capacity smoke | 4.486 ms, 540 posting pages, 0 JSON rows/rechecks |
 | Clean exact-index grouping into a reused result, 100K rows / 32 groups | 4.586-4.620 us, 0 B/op, 0 allocs/op, and 0 posting or JSON pages |
-| Real-derived grouping, 128 MiB | CITM 542 ns / Twitter 792 ns, 821.19x / 347.22x faster than retained pinned one-thread DuckDB; one added 4 KiB catalog page per file |
-| Real-derived Twitter, 128 MiB | point 14.76x, filter 2.72x, SUM 2.97x, scalar-object `@>` 91.25x versus pinned one-thread DuckDB; FileStore file 1.48x larger |
+| Real-derived grouping, 128 MiB | CITM 542 ns / Twitter 792 ns, 0 posting or JSON pages; one added 4 KiB catalog page per file |
+| Real-derived Twitter covered SUM, 128 MiB | 51.125 us, 0 JSON rows |
 | Dense Store fused 3-predicate bitmap / ordered 4,096-row decode | 410-416 ns / 4.03-4.08 us, 0 allocations |
 | Change an existing TTL | 45 ns, 0 allocations |
 | Dense bitmap Boolean pass on M4 Max | 75-80 GB/s, 0 allocations; NEON did not beat scalar and is not dispatched |
@@ -552,24 +564,12 @@ kernel-plus-ordered-row decode improved from 8.44-8.51 us to 7.67-7.77 us at
 zero allocations. Hosted results are directional; the benchmark artifacts
 retain raw samples for both x64 and arm64.
 
-One caveat belongs next to that table: a one-shot, single-path lookup on a
-document seen once favors non-validating scanners — gjson scans only for the
-queried path and sonic validates only along it, while `BuildIndex` validates
-the entire input — so the break-even sits at roughly four lookups per
-document, beyond which the index is ahead and stays ahead.
-[`benchmarks/lookup_competitors_bench_test.go`](benchmarks/lookup_competitors_bench_test.go)
-reproduces the comparison and records each competitor's validation semantics.
-
 Performance changes must preserve correctness, ownership, retained memory,
 `B/op`, and `allocs/op`. Native CI exercises matched portable and SIMD behavior
 on amd64 and ARM64.
 
-[`benchmarks/results/latest.json`](benchmarks/results/latest.json) is the latest
-published machine-specific snapshot, not current-main evidence or a universal
-ranking. The [benchmark contract and reproduction commands](benchmarks/README.md)
-define the methodology, gates, comparison boundaries, and pinned toolchains.
-
-![Absolute portable/SIMD and Go-library benchmark times](benchmarks/charts/go-times.svg)
+The [benchmark contract and reproduction commands](benchmarks/README.md) define
+the standalone product workloads, regression gates, and pinned toolchains.
 
 ## Choose an API
 
