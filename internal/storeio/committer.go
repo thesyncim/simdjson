@@ -161,15 +161,23 @@ func (b *Batch) SetRoot(offset int64, length int) error {
 }
 
 // SetSuperblock encodes a checksummed double-root record into the reusable root
-// buffer and selects its alternate fixed page. Publish must receive the same
-// generation, preventing a durable-generation counter from naming different
-// on-disk state. No allocation is performed.
+// buffer and selects its alternate fixed page. The complete page is cleared
+// and committed: besides removing stale tail bytes, page-sized root writes
+// retain the offset/length alignment required by direct I/O. Recovery decodes
+// only the fixed record prefix. Publish must receive the same generation,
+// preventing a durable-generation counter from naming different on-disk
+// state. No allocation is performed.
 func (b *Batch) SetSuperblock(root Superblock) error {
 	if b == nil || b.state.Load() != batchOwned {
 		return ErrBatchState
 	}
 	buffer := b.committer.buffers[b.root.Buffer]
-	encoded, err := EncodeSuperblock(buffer, root)
+	if uint64(root.PageSize) > uint64(len(buffer)) {
+		return ErrInvalidWrite
+	}
+	page := buffer[:root.PageSize]
+	clear(page)
+	_, err := EncodeSuperblock(page, root)
 	if err != nil {
 		return err
 	}
@@ -178,7 +186,7 @@ func (b *Batch) SetSuperblock(root Superblock) error {
 		return err
 	}
 	b.root.Offset = offset
-	b.root.Length = uint32(len(encoded))
+	b.root.Length = root.PageSize
 	b.rootGeneration = root.Generation
 	return nil
 }

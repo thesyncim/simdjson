@@ -363,12 +363,19 @@ fallback.
 Cache misses can independently select `FileStoreReadBuffered`,
 `FileStoreReadDirectTry`, or `FileStoreReadDirectRequire`. Direct modes reopen
 the same Linux inode through `/proc/self/fd` with `O_DIRECT`; they do not mutate
-the flags or lifetime of the caller-owned write descriptor. The anonymous
-arena and every admitted offset/length are at least 4 KiB aligned. Try falls
-back only for an unsupported platform/filesystem and `Stats.DirectReads`
-reports what actually happened; Require fails construction instead. Direct
-reads avoid a second kernel page-cache copy, but whether that wins depends on
-device, filesystem, queue depth, and locality.
+the flags or lifetime of the caller-owned descriptor. Durable writes
+independently select `FileStoreWriteBuffered`, `FileStoreWriteDirectTry`, or
+`FileStoreWriteDirectRequire`. The direct writer is a second owned descriptor
+used by either the positional or pure-Go `io_uring` commit device. It preserves
+data-page/barrier/root/barrier ordering while keeping sustained writes from
+populating the kernel page cache. The anonymous arenas and every page
+offset/length are at least 4 KiB aligned. The 128-byte checksummed superblock
+record is cleared and written as one complete configured page, satisfying
+direct-I/O alignment without changing its decoded format. Try falls back only
+for an unsupported platform/filesystem; `Stats.DirectReads` and
+`Stats.DirectWrites` report what actually happened, and Require fails
+construction instead. Direct I/O is a residency control; whether it wins
+latency depends on device, filesystem, queue depth, grouping, and locality.
 
 `FileSnapshot` is an explicit generation lease and must be closed. Point reads
 copy into caller storage because an evictable frame cannot safely back an
@@ -451,6 +458,15 @@ transient batch/index state, not retained corpus state. Cold random reads pay
 device latency; throughput depends on locality, index selectivity, page size,
 queue depth, storage, and the resident budget.
 
+`BenchmarkRunFileSnapshotIndexSelectivityCrossover` compares indexed and
+unindexed duplicate fields over the same 2,048 rows. On buffered M4 and direct
+Linux/ARM64 runs, the durable exact index remained faster through roughly
+94% selectivity, was effectively tied near 97%, and lost at 100%. That rejects
+an arbitrary low cutoff such as 10% or 25%. The current planner does not switch
+after probing because it learns exact posting cardinality only after paying the
+index lookup; blindly rescanning then can pay both paths. A future cutoff needs
+persisted cardinality estimates or a measured online cost model.
+
 ### Scale smoke: 10k to 5M records
 
 `TestStoreScaleSmoke` is an explicit, non-CI ladder:
@@ -512,22 +528,33 @@ does not establish acceptable performance. The explicit Linux storage-pressure
 gate now places 21,347,320 source key+JSON bytes behind a 200,704-byte cache
 (106.4x); the physical high-water is 120,057,856 bytes. It reopens twice and
 checks a complete ordered scan, distant reads, update, delete, and a changed TTL
-under eviction with `O_DIRECT` active. In a 256 MiB Docker/Linux container it
-completed in 9.06 seconds; the 21,347,320-byte scan took 287.5 ms (70.8 MiB/s)
-and the Go heap sample was 3.50 MiB. Run it with:
+under eviction with direct reads and writes active. In a 256 MiB
+Docker/Linux container it completed in 11.63 seconds; the 21,347,320-byte scan
+took 260.9 ms (78.0 MiB/s), the Go heap sample was 3.50 MiB, current RSS was
+17.0 MiB, and peak RSS was 18.1 MiB. The run recorded 2,393 minor and 15 major
+faults. Run it with:
 
 ```text
 SIMDJSON_FILESTORE_100X=1 \
   go test . -run '^TestFileStoreHundredXResidentSmoke$' -v -count=1
 ```
 
-This proves bounded-cache correctness for source data above the configured
-resident page budget; it is not total-process-RAM accounting or an equal-latency
-claim. Directory and posting pages compete with documents for the same cache,
-cold random access pays storage latency, and copy-on-write generations,
+This proves bounded-cache correctness and measures total process residency for
+source data above the configured resident page budget. It is not an
+equal-latency claim or a substitute for a physical-RAM crossover test on the
+target device. Directory and posting pages compete with documents for the same
+cache, cold random access pays storage latency, and copy-on-write generations,
 allocator rounding, overflow pages, index cardinality, and free-space headroom
-add disk amplification. A 1 TiB deployment still needs workload-specific RSS,
-page-fault, amplification, latency-percentile, and fragmentation measurements.
+add disk amplification. A 1 TiB deployment still needs workload-specific
+working-set sweeps, amplification, latency-percentile, and fragmentation
+measurements.
+
+On the same Linux/ARM64 Docker host, 1 KiB asynchronous replacement updates
+with a final durability fence measured 0.34-0.37 ms through the direct
+positional writer versus a noisy 0.19-0.31 ms through buffered writes. Both
+grouped up to roughly 32 generations. Direct writes are intentionally optional:
+their value is preventing write traffic from displacing the read working set,
+not making small commits universally faster.
 
 The same Linux/ARM64 container, 2,048 inline documents and a 200,704-byte cache
 measured serial direct scans at 61.3-68.4 MiB/s and bounded read-ahead at

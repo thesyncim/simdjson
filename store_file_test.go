@@ -53,6 +53,11 @@ func TestFileStoreDirtyBudgetUsesExtentSizes(t *testing.T) {
 		t.Fatal("invalid direct-read mode accepted")
 	}
 	options = testFileStoreOptions()
+	options.WriteMode = FileStoreWriteMode(255)
+	if _, err := options.normalized(); err == nil {
+		t.Fatal("invalid direct-write mode accepted")
+	}
+	options = testFileStoreOptions()
 	options.ReadConcurrency = -1
 	if _, err := options.normalized(); err == nil {
 		t.Fatal("invalid read concurrency accepted")
@@ -72,6 +77,7 @@ func TestFileStoreDirectReadModeAndCallerDescriptorLifetime(t *testing.T) {
 	defer file.Close()
 	options := testFileStoreOptions()
 	options.ReadMode = FileStoreReadDirectTry
+	options.WriteMode = FileStoreWriteDirectTry
 	store, err := CreateFileStore(file, options)
 	if err != nil {
 		t.Fatal(err)
@@ -97,8 +103,8 @@ func TestFileStoreDirectReadModeAndCallerDescriptorLifetime(t *testing.T) {
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// FileStore owns only an independently reopened direct-read descriptor.
-	// Closing it must never close or alter the caller-owned descriptor.
+	// FileStore owns only independently reopened direct descriptors. Closing
+	// them must never close or alter the caller-owned descriptor.
 	var magic [8]byte
 	if _, err := file.ReadAt(magic[:], 0); err != nil {
 		t.Fatalf("caller descriptor after FileStore.Close: %v", err)

@@ -233,6 +233,7 @@ if err != nil {
 store, err := simdjson.CreateFileStore(file, simdjson.FileStoreOptions{
 	ResidentBytes: 256 << 20,
 	ReadMode:      simdjson.FileStoreReadDirectTry,
+	WriteMode:     simdjson.FileStoreWriteDirectTry,
 	Synchronous:   true,
 	Indexes: []simdjson.StoreIndexDefinition{
 		{Name: "tenant", Paths: []string{"/tenant"}},
@@ -259,21 +260,24 @@ every page paying the maximum extent size. The resident lookup directory and
 one-cache-line frame records are pointer-free, while independent hot pages use
 independent locks. Read workers, prefetch and commit queues, active snapshots,
 and retired extents all have explicit capacities reported by `Stats`.
-`FileStoreReadDirectTry` opens an independent Linux `O_DIRECT` read descriptor
-when supported and reports the actual choice through `Stats.DirectReads`; it
-never changes or closes the caller's write descriptor. Async writes become
-reader-visible when queued; `DurableGeneration` and `Flush` expose the
-durability boundary. `Synchronous` waits on each mutation. Snapshot leases
-fence physical reuse, while the previous durable generation remains
-recoverable if the newest data or root write is torn.
+Direct read and write modes reopen independent Linux `O_DIRECT` descriptors
+when supported and report the actual choices through `Stats.DirectReads` and
+`Stats.DirectWrites`; neither changes or closes the caller's descriptor.
+Direct writes keep sustained ingestion from filling the kernel page cache and
+work with both portable positional I/O and the pure-Go `io_uring` backend.
+Async writes become reader-visible when queued; `DurableGeneration` and
+`Flush` expose the durability boundary. `Synchronous` waits on each mutation.
+Snapshot leases fence physical reuse, while the previous durable generation
+remains recoverable if the newest data or root write is torn.
 
 The explicit `SIMDJSON_FILESTORE_100X=1` Linux gate stores 21,347,320 source
 key+JSON bytes behind a 200,704-byte page cache (106.4x), reopens twice, and
 checks a complete ordered read-ahead scan, distant reads, update, delete, and
-mutable TTL with direct reads active. The scan window is bounded by cache
-bytes, queue depth, and read concurrency. The weekly Linux gate runs it with a
-128 MiB Go memory limit. That is a bounded-residency correctness result, not a
-claim that cold storage has resident-memory latency.
+mutable TTL with direct reads and writes active. The scan window is bounded by
+cache bytes, queue depth, and read concurrency. A 256 MiB Linux container with
+a 128 MiB Go limit sampled 17.0 MiB RSS, 18.1 MiB peak RSS, and 3.50 MiB Go
+heap while scanning at 78.0 MiB/s. That is a bounded-residency correctness
+result, not a claim that cold storage has resident-memory latency.
 
 `query.Query.RunFileSnapshot` late-binds the frozen exact-index catalog.
 Equality and supported containment predicates read candidate chunks and

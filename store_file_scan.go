@@ -65,7 +65,7 @@ func (s *FileSnapshot) RangeRawReadAheadBuffer(scratch []byte, fn func(key, valu
 	// Buffered files already receive kernel readahead, and feeding resident
 	// hits through the user-space queue costs more than a direct scan. Explicit
 	// read-ahead is for O_DIRECT, where each miss otherwise blocks the walker.
-	if !s.store.direct || s.store.options.ReadConcurrency == 1 {
+	if !s.store.directRead || s.store.options.ReadConcurrency == 1 {
 		return s.RangeRawBuffer(scratch, fn)
 	}
 	state := s.state

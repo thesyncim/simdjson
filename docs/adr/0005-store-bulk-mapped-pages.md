@@ -5,9 +5,10 @@ Transient heap construction and mapped checkpoints remain on `Store`;
 incremental durability uses explicit page I/O, bounded CLOCK residency,
 copy-on-write key/chunk/index/TTL/free trees, overflow extents, alternating
 superblocks, snapshot generation leases, and persistent reclamation. Parallel
-file scans and external query spill are implemented. Online file-index DDL,
-distributed execution, and a 100x-RAM performance claim remain out of scope or
-unproven. Extends ADR 0004 without changing heap `Store` borrowing.
+file scans, direct writes, and external query spill are implemented. Online
+file-index DDL, distributed execution, and equal-latency performance at 100x
+physical RAM remain out of scope or unproven. Extends ADR 0004 without changing
+heap `Store` borrowing.
 
 ## Decision
 
@@ -278,15 +279,19 @@ probing, and explicit completion/overflow checks. It writes all data pages,
 passes a data barrier, writes only the newest grouped root, and passes the final
 barrier before advancing `DurableGeneration`. Unsupported kernels and sandbox
 policies fall back to the portable device. SQ polling remains an opt-in
-benchmark decision. Reads independently offer buffered, try-direct, and
-require-direct modes. The Linux direct modes reopen the same inode through
-`/proc/self/fd` with `O_DIRECT`, leaving the caller-owned write descriptor and
-committer flags unchanged. The cache arena and all page offsets and lengths are
-at least 4 KiB aligned. `Stats.DirectReads` makes fallback observable. These
+benchmark decision. Reads and writes independently offer buffered, try-direct,
+and require-direct modes. Each Linux direct lane reopens the same inode through
+`/proc/self/fd` with `O_DIRECT`, leaving the caller-owned descriptor and flags
+unchanged. The direct writer feeds either commit device and prevents sustained
+ingestion from populating the kernel page cache. Cache and staging arenas plus
+all page offsets and lengths are at least 4 KiB aligned.
+`Stats.DirectReads` and `Stats.DirectWrites` make fallback observable. These
 choices cannot change commit semantics.
 
 The internal root layer now writes a deterministic 128-byte record into one of
-two page-isolated slots selected by generation parity. CRC32C plus stored
+two page-isolated slots selected by generation parity. Commits clear and write
+the complete root page so direct I/O is aligned and no stale tail survives;
+recovery still decodes the fixed 128-byte prefix. CRC32C plus stored
 complements covers torn checksums and generation fields; a 128-bit Store id
 rejects roots copied from another file; page-aligned extents and the exclusive
 file high-water mark are checked before use. Recovery reads both slots, rejects
@@ -455,13 +460,15 @@ against heap `Store`, retained-snapshot and reopen continuation tests, exact
 index update/delete/reopen tests, bounded fan-in spill differentials, async
 flush tests, allocation checks, long-lived-snapshot reclamation/file-growth
 tests, page corruption tests, crash images that tear data and root writes,
-direct-read descriptor tests, and an explicit greater-than-cache gate. The
+direct read/write descriptor tests, concurrent direct reader/writer pressure,
+and an explicit greater-than-cache gate. The
 latter stores 21,347,320 source key+JSON bytes behind 200,704 resident page
 bytes (106.4x), reopens twice, performs an ordered full scan, probes distant
 keys, and preserves update, delete, and changed TTL. Its 256 MiB Docker/Linux
-run used `O_DIRECT`, reached a 120,057,856-byte physical high-water, and
-completed in 9.06 seconds. The 21,347,320-byte scan took 287.5 ms at
-70.8 MiB/s, with a 3.50 MiB sampled Go heap. It runs with:
+run used direct reads and writes, reached a 120,057,856-byte physical
+high-water, and completed in 11.63 seconds. The 21,347,320-byte scan took
+260.9 ms at 78.0 MiB/s, with 3.50 MiB sampled Go heap, 17.0 MiB current RSS,
+18.1 MiB peak RSS, 2,393 minor faults, and 15 major faults. It runs with:
 
 ```text
 SIMDJSON_FILESTORE_100X=1 \
@@ -478,16 +485,20 @@ Linux/ARM64 container, a 2,048-document pressure benchmark improved from
 
 The full race suite and portable Linux/Windows compile checks are release gates.
 
-Still required before advertising equal-latency or physical-RAM performance at
-that multiplier:
+Still required before advertising equal-latency performance at 100x physical
+RAM:
 
-- resident-set, page-fault, read/write amplification, and fragmentation
-  measurements on working sets below, near, and above physical RAM;
-- cold NVMe and constrained-cache workloads, not only a warm M4 Max cache;
+- working-set, read/write amplification, and fragmentation sweeps below, near,
+  and above physical RAM; the gate now records RSS and faults at one
+  constrained-cache point;
+- cold NVMe workloads, not only container-backed direct I/O;
 - longer crash/power-loss campaigns on real filesystems in addition to
   deterministic image tearing; and
-- persistent range/ordered indexes, safe `NOT` complements, and a measured
-  selectivity/cardinality cost model beyond exact equality and containment.
+- persistent range/ordered indexes, safe `NOT` complements, and persisted
+  cardinality estimates for a pre-probe cost model. The current crossover
+  fixture rejects an arbitrary 10-25% cutoff: exact equality remained useful
+  until approximately 94-97% selectivity on the measured buffered/direct
+  hosts.
 
 `OpenStore` remains the caller-owned mapped heap-Store checkpoint.
 `OpenFileStore` is the incremental durable and bounded-residency surface. The

@@ -34,7 +34,7 @@ func openPageCacheFile(file *os.File, mode DirectMode) (*os.File, bool, error) {
 		return file, false, nil
 	}
 	path := fmt.Sprintf("/proc/self/fd/%d", file.Fd())
-	direct, err := openDirectReadFile(path, file.Name()+" (direct reads)")
+	direct, err := openDirectFile(path, unix.O_RDONLY, file.Name()+" (direct reads)")
 	if err == nil {
 		return direct, true, nil
 	}
@@ -47,8 +47,30 @@ func openPageCacheFile(file *os.File, mode DirectMode) (*os.File, bool, error) {
 	return file, false, nil
 }
 
+func openPageCommitFile(file *os.File, mode DirectMode) (*os.File, bool, error) {
+	if mode == DirectOff {
+		return file, false, nil
+	}
+	path := fmt.Sprintf("/proc/self/fd/%d", file.Fd())
+	direct, err := openDirectFile(path, unix.O_RDWR, file.Name()+" (direct writes)")
+	if err == nil {
+		return direct, true, nil
+	}
+	if mode == DirectRequire && directDescriptorUnsupported(err) {
+		return nil, false, fmt.Errorf("%w: %w", ErrDirectIOUnsupported, err)
+	}
+	if !directDescriptorUnsupported(err) {
+		return nil, false, fmt.Errorf("open direct Store page commit descriptor: %w", err)
+	}
+	return file, false, nil
+}
+
 func openDirectReadFile(path, name string) (*os.File, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECT, 0)
+	return openDirectFile(path, unix.O_RDONLY, name)
+}
+
+func openDirectFile(path string, access int, name string) (*os.File, error) {
+	fd, err := unix.Open(path, access|unix.O_CLOEXEC|unix.O_DIRECT, 0)
 	if err != nil {
 		return nil, err
 	}

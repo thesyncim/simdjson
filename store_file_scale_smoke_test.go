@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -32,6 +34,7 @@ func TestFileStoreHundredXResidentSmoke(t *testing.T) {
 	}
 	options.ResidentBytes = int64(normalized.maxTransactionBytes)
 
+	usageBefore := fileStoreScaleProcessUsage()
 	started := time.Now()
 	store, err := CreateFileStore(file, options)
 	if err != nil {
@@ -165,11 +168,66 @@ func TestFileStoreHundredXResidentSmoke(t *testing.T) {
 	}
 	var memory runtime.MemStats
 	runtime.ReadMemStats(&memory)
-	t.Logf("records=%d source=%d source_ratio=%.1fx file=%d cache=%d file_ratio=%.1fx elapsed=%s scan=%s scan_mib_s=%.1f heap_alloc=%d reads=%d evictions=%d direct=%v",
+	usageAfter := fileStoreScaleProcessUsage()
+	t.Logf("records=%d source=%d source_ratio=%.1fx file=%d cache=%d file_ratio=%.1fx elapsed=%s scan=%s scan_mib_s=%.1f heap_alloc=%d rss=%d rss_peak=%d minor_faults=%d major_faults=%d reads=%d evictions=%d direct_reads=%v direct_writes=%v",
 		records, sourceBytes, float64(sourceBytes)/float64(stats.CapacityBytes), stats.FileEnd, stats.CapacityBytes,
 		float64(stats.FileEnd)/float64(stats.CapacityBytes),
 		time.Since(started), scanElapsed, float64(sourceBytes)/(1<<20)/scanElapsed.Seconds(),
-		memory.HeapAlloc, stats.PageReads, stats.Evictions, stats.DirectReads)
+		memory.HeapAlloc, usageAfter.rss, usageAfter.rssPeak,
+		fileStoreScaleDelta(usageAfter.minorFaults, usageBefore.minorFaults),
+		fileStoreScaleDelta(usageAfter.majorFaults, usageBefore.majorFaults),
+		stats.PageReads, stats.Evictions, stats.DirectReads, stats.DirectWrites)
+}
+
+type fileStoreProcessUsage struct {
+	rss         uint64
+	rssPeak     uint64
+	minorFaults uint64
+	majorFaults uint64
+}
+
+func fileStoreScaleDelta(after, before uint64) uint64 {
+	if after < before {
+		return 0
+	}
+	return after - before
+}
+
+func fileStoreScaleProcessUsage() fileStoreProcessUsage {
+	if runtime.GOOS != "linux" {
+		return fileStoreProcessUsage{}
+	}
+	var usage fileStoreProcessUsage
+	if status, err := os.ReadFile("/proc/self/status"); err == nil {
+		for _, line := range strings.Split(string(status), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			value, parseErr := strconv.ParseUint(fields[1], 10, 64)
+			if parseErr != nil {
+				continue
+			}
+			switch fields[0] {
+			case "VmRSS:":
+				usage.rss = value << 10
+			case "VmHWM:":
+				usage.rssPeak = value << 10
+			}
+		}
+	}
+	if stat, err := os.ReadFile("/proc/self/stat"); err == nil {
+		// A process name may contain spaces and parentheses. Fields after the
+		// final ')' begin with field 3 (state); minflt and majflt are 10 and 12.
+		if end := strings.LastIndexByte(string(stat), ')'); end >= 0 {
+			fields := strings.Fields(string(stat)[end+1:])
+			if len(fields) > 9 {
+				usage.minorFaults, _ = strconv.ParseUint(fields[7], 10, 64)
+				usage.majorFaults, _ = strconv.ParseUint(fields[9], 10, 64)
+			}
+		}
+	}
+	return usage
 }
 
 func fileStoreScaleOptions() FileStoreOptions {
@@ -179,7 +237,8 @@ func fileStoreScaleOptions() FileStoreOptions {
 		MaxDocumentBytes: 3072, MaxKeyBytes: 32, InlineValueBytes: 3072,
 		ReadConcurrency: 4, PrefetchQueue: 64, BufferCount: 64,
 		QueueSlots: 16, GroupLimit: 8, Backend: FileStoreBackendPortable,
-		ReadMode: FileStoreReadDirectTry, MaxSnapshotLeases: 16,
+		ReadMode: FileStoreReadDirectTry, WriteMode: FileStoreWriteDirectTry,
+		MaxSnapshotLeases: 16,
 		MaxRetiredExtents: 1 << 15,
 	}
 }

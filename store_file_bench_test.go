@@ -10,6 +10,70 @@ import (
 var fileStoreBytesSink []byte
 var fileStoreMasksSink []StoreMask
 
+func BenchmarkFileStoreUpdateDurability(b *testing.B) {
+	cases := []struct {
+		name string
+		mode FileStoreWriteMode
+	}{
+		{name: "buffered", mode: FileStoreWriteBuffered},
+		{name: "direct", mode: FileStoreWriteDirectTry},
+	}
+	for _, test := range cases {
+		b.Run(test.name, func(b *testing.B) {
+			file, err := os.CreateTemp(b.TempDir(), "file-store-update-benchmark-*")
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer file.Close()
+			options := testFileStoreOptions()
+			options.Synchronous = false
+			options.Store.ChunkDocuments = 64
+			options.WriteMode = test.mode
+			options.ResidentBytes = 32 << 20
+			options.BufferCount = 512
+			options.QueueSlots = 64
+			options.GroupLimit = 32
+			options.MaxRetiredExtents = 1 << 16
+			store, err := CreateFileStore(file, options)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer store.Close()
+			if test.mode != FileStoreWriteBuffered && !store.Stats().DirectWrites {
+				b.Skip("benchmark filesystem rejected O_DIRECT writes")
+			}
+			keys := make([]string, 1024)
+			value := []byte(`{"version":1,"payload":"` + strings.Repeat("x", 1024) + `"}`)
+			for i := range keys {
+				keys[i] = fmt.Sprintf("key-%05d", i)
+				if _, err := store.Put(keys[i], value); err != nil {
+					b.Fatal(err)
+				}
+			}
+			if err := store.Flush(); err != nil {
+				b.Fatal(err)
+			}
+			b.SetBytes(int64(len(value)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := store.Put(keys[i&1023], value); err != nil {
+					b.Fatal(err)
+				}
+			}
+			if err := store.Flush(); err != nil {
+				b.Fatal(err)
+			}
+			b.StopTimer()
+			stats := store.Stats()
+			if stats.DirectWrites {
+				b.ReportMetric(1, "direct")
+			}
+			b.ReportMetric(float64(stats.LargestCommitGroup), "max-group")
+		})
+	}
+}
+
 func BenchmarkFileSnapshotAppendRaw(b *testing.B) {
 	file, err := os.CreateTemp(b.TempDir(), "file-store-benchmark-*")
 	if err != nil {

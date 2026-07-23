@@ -43,7 +43,7 @@ const (
 )
 
 // FileStoreReadMode selects how cache misses reach the file. Direct modes are
-// Linux-only and leave the caller's write descriptor untouched.
+// Linux-only and leave the caller's descriptor untouched.
 type FileStoreReadMode uint8
 
 const (
@@ -55,9 +55,23 @@ const (
 	FileStoreReadDirectRequire
 )
 
-// FileStoreOptions fixes every resident and in-flight memory bound. The zero
-// value selects 4 KiB metadata pages, 64 KiB document/overflow extents, a
-// 64 MiB read cache, and 4 MiB maximum documents.
+// FileStoreWriteMode selects how durable page commits reach the file. Direct
+// modes are Linux-only and use an independently owned descriptor, so the
+// caller's descriptor flags and file offset remain untouched.
+type FileStoreWriteMode uint8
+
+const (
+	FileStoreWriteBuffered FileStoreWriteMode = iota
+	// FileStoreWriteDirectTry uses O_DIRECT when the platform and filesystem
+	// accept it, otherwise Stats reports the observable buffered fallback.
+	FileStoreWriteDirectTry
+	// FileStoreWriteDirectRequire fails construction rather than falling back.
+	FileStoreWriteDirectRequire
+)
+
+// FileStoreOptions fixes every Store-owned resident and in-flight memory
+// bound. The zero value selects 4 KiB metadata pages, 64 KiB
+// document/overflow extents, a 64 MiB read cache, and 4 MiB maximum documents.
 type FileStoreOptions struct {
 	Store StoreOptions
 	// Indexes are frozen exact scalar definitions maintained from the first
@@ -78,7 +92,11 @@ type FileStoreOptions struct {
 	Backend          FileStoreBackend
 	// ReadMode controls cache-miss reads independently from durable writes.
 	// DirectTry has observable fallback; DirectRequire fails when unavailable.
-	ReadMode          FileStoreReadMode
+	ReadMode FileStoreReadMode
+	// WriteMode controls durable data and root writes independently from cache
+	// misses. Direct modes keep sustained ingestion out of the kernel page
+	// cache while retaining the same ordered durability barriers.
+	WriteMode         FileStoreWriteMode
 	Synchronous       bool
 	MaxSnapshotLeases int
 	MaxRetiredExtents int
@@ -129,6 +147,7 @@ func (o FileStoreOptions) normalized() (normalizedFileStoreOptions, error) {
 		o.MaxRetiredExtents = 1 << 16
 	}
 	if o.Backend > FileStoreBackendIOUring || o.ReadMode > FileStoreReadDirectRequire ||
+		o.WriteMode > FileStoreWriteDirectRequire ||
 		o.PageSize < 4096 || o.PageSize&(o.PageSize-1) != 0 ||
 		o.MaxPageSize < o.PageSize || o.MaxPageSize&(o.MaxPageSize-1) != 0 || o.MaxPageSize%o.PageSize != 0 ||
 		o.MaxKeyBytes < 1 || o.InlineValueBytes < 1 || o.MaxDocumentBytes < 1 ||
@@ -250,12 +269,14 @@ type FileStore struct {
 	closeDone    bool
 	state        atomic.Pointer[fileStoreState]
 
-	committer *storeio.Committer
-	cache     *storeio.PageCache
-	readFile  *os.File
-	direct    bool
-	leases    *storeio.GenerationLeases
-	reclaimer *storeio.ExtentReclaimer
+	committer   *storeio.Committer
+	cache       *storeio.PageCache
+	readFile    *os.File
+	writeFile   *os.File
+	directRead  bool
+	directWrite bool
+	leases      *storeio.GenerationLeases
+	reclaimer   *storeio.ExtentReclaimer
 
 	parseScratch      []IndexEntry
 	oldParseScratch   []IndexEntry
@@ -298,6 +319,9 @@ type FileStoreStats struct {
 	// DirectReads reports actual O_DIRECT cache-miss reads, not merely a
 	// requested try-direct policy.
 	DirectReads bool
+	// DirectWrites reports actual O_DIRECT durable writes. It is independent
+	// from DirectReads and the selected portable or io_uring commit backend.
+	DirectWrites bool
 
 	SnapshotCapacity         uint64
 	ActiveSnapshots          uint64
@@ -413,7 +437,11 @@ func OpenFileStore(file *os.File, options FileStoreOptions) (*FileStore, error) 
 }
 
 func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, storeID [16]byte) (*FileStore, error) {
-	committer, err := storeio.NewCommitter(file, storeio.DeviceOptions{
+	writeFile, directWrite, err := storeio.OpenPageCommitFile(file, storeio.DirectMode(options.WriteMode))
+	if err != nil {
+		return nil, err
+	}
+	committer, err := storeio.NewCommitter(writeFile, storeio.DeviceOptions{
 		Backend: storeio.Backend(options.Backend), BufferCount: options.BufferCount,
 		BufferSize: max(options.MaxPageSize, os.Getpagesize()), QueueDepth: options.BufferCount,
 	}, storeio.CommitterOptions{
@@ -421,11 +449,17 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 		GroupLimit: options.GroupLimit,
 	})
 	if err != nil {
+		if writeFile != file {
+			_ = writeFile.Close()
+		}
 		return nil, err
 	}
-	readFile, direct, err := storeio.OpenPageCacheFile(file, storeio.DirectMode(options.ReadMode))
+	readFile, directRead, err := storeio.OpenPageCacheFile(file, storeio.DirectMode(options.ReadMode))
 	if err != nil {
 		_ = committer.Close()
+		if writeFile != file {
+			_ = writeFile.Close()
+		}
 		return nil, err
 	}
 	cache, err := storeio.NewPageCache(readFile, storeio.PageCacheOptions{
@@ -438,6 +472,9 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 			_ = readFile.Close()
 		}
 		_ = committer.Close()
+		if writeFile != file {
+			_ = writeFile.Close()
+		}
 		return nil, err
 	}
 	leases, err := storeio.NewGenerationLeases(storeio.GenerationLeaseOptions{MaxLeases: options.MaxSnapshotLeases})
@@ -447,6 +484,9 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 			_ = readFile.Close()
 		}
 		_ = committer.Close()
+		if writeFile != file {
+			_ = writeFile.Close()
+		}
 		return nil, err
 	}
 	reclaimer, err := storeio.NewExtentReclaimer(leases, storeio.ExtentReclaimerOptions{MaxRetiredExtents: options.MaxRetiredExtents})
@@ -457,15 +497,23 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 			_ = readFile.Close()
 		}
 		_ = committer.Close()
+		if writeFile != file {
+			_ = writeFile.Close()
+		}
 		return nil, err
 	}
 	var ownedRead *os.File
 	if readFile != file {
 		ownedRead = readFile
 	}
+	var ownedWrite *os.File
+	if writeFile != file {
+		ownedWrite = writeFile
+	}
 	return &FileStore{
 		file: file, options: options, storeID: storeID, committer: committer, cache: cache,
-		readFile: ownedRead, direct: direct,
+		readFile: ownedRead, writeFile: ownedWrite,
+		directRead: directRead, directWrite: directWrite,
 		leases: leases, reclaimer: reclaimer,
 		retireScratch: make([]storeio.FreeExtent, 0, options.maxTransactionPages+32),
 		reusable:      make([]storeio.FreeExtent, 0, options.MaxRetiredExtents),
@@ -831,7 +879,8 @@ func (s *FileStore) Stats() FileStoreStats {
 		CommitQueueDepth: commit.QueuedGenerations, DeviceCommits: commit.DeviceCommits,
 		CommittedBatches: commit.CommittedBatches, LargestCommitGroup: commit.LargestGroup,
 		Backend:          FileStoreBackend(commit.Backend),
-		DirectReads:      s.direct,
+		DirectReads:      s.directRead,
+		DirectWrites:     s.directWrite,
 		SnapshotCapacity: leases.Capacity, ActiveSnapshots: leases.Active,
 		OldestSnapshotGeneration: leases.MinimumGeneration,
 		RetiredExtentCapacity:    retired.Capacity, PendingRetiredExtents: retired.Pending,
@@ -2290,23 +2339,31 @@ func (s *FileStore) Close() error {
 }
 
 func (s *FileStore) closeResources() error {
+	var result error
 	if s.committer != nil {
 		if err := s.committer.Close(); err != nil {
-			return err
+			result = errors.Join(result, err)
 		}
 		s.cache.MarkDurable(s.committer.DurableGeneration())
 	}
 	if s.cache != nil {
 		if err := s.cache.Close(); err != nil {
-			return err
+			result = errors.Join(result, err)
 		}
 	}
 	if s.readFile != nil {
 		readFile := s.readFile
 		s.readFile = nil
 		if err := readFile.Close(); err != nil {
-			return err
+			result = errors.Join(result, err)
 		}
 	}
-	return nil
+	if s.writeFile != nil {
+		writeFile := s.writeFile
+		s.writeFile = nil
+		if err := writeFile.Close(); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
 }
