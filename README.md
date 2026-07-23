@@ -275,15 +275,17 @@ bytes, queue depth, and read concurrency. The weekly Linux gate runs it with a
 128 MiB Go memory limit. That is a bounded-residency correctness result, not a
 claim that cold storage has resident-memory latency.
 
-`query.Query.RunFileSnapshot` scans physical chunk leaves in order, builds
-bounded batches in parallel, and externally merges ordered rows or grouped
-state through temporary spill files with a 32-run fan-in. `MemoryBytes` bounds
-working state, not the caller-owned final result or one document larger than
-the target. The Store is deliberately single-file and single-writer: there is
-no replication, distributed execution, cross-Store transaction, SQL parser,
-join engine, or server protocol. Exact-index definitions are frozen when the
-file is created. The complete contract and measured limits are in
-[Mutable Store operations](docs/store.md).
+`query.Query.RunFileSnapshot` late-binds the frozen exact-index catalog.
+Equality and supported containment predicates read candidate chunks and
+recheck complete predicates; unbounded plans scan chunk leaves in order.
+Execution builds bounded batches in parallel and externally merges ordered
+rows or grouped state through temporary spill files with a 32-run fan-in.
+`MemoryBytes` bounds working state, not the caller-owned final result or one
+document larger than the target. The Store is deliberately single-file and
+single-writer: there is no replication, distributed execution, cross-Store
+transaction, SQL parser, join engine, or server protocol. Exact-index
+definitions are frozen when the file is created. The complete contract and
+measured limits are in [Mutable Store operations](docs/store.md).
 
 An update parses only its replacement. Unchanged source and structural-tape
 storage stays immutable and is shared into the next bounded chunk; deletes copy

@@ -70,7 +70,7 @@ raw, ok := view.GetRaw("user:42")
 | `FileSnapshot.AppendRaw` | copy exact JSON into caller storage | key-tree lookup + touched document/overflow pages |
 | `FileSnapshot.AppendIndexMasks/Into` | probe a frozen exact index with mandatory document recheck | posting chunks + collision candidates; `Into` reuses caller workspace |
 | `FileSnapshot.AppendIndexCandidateMasksInto` | append a hash-bounded superset for an engine that will recheck | index/posting pages only; never a final answer |
-| `FileSnapshot.RangeRawBuffer` / `RangeMasksRawBuffer` | ordered full or sparse stable-slot scan | touched document/overflow pages; zero allocation after caller scratch warms |
+| `FileSnapshot.RangeRawBuffer` / `RangeRawReadAheadBuffer` / `RangeMasksRawBuffer` | ordered serial, bounded direct-read-ahead, or sparse stable-slot scan | touched document/overflow pages; zero allocation after caller scratch warms |
 | `FileStore.Flush` | wait until the visible generation is crash-safe | queued storage work and durability barriers |
 | `query.RunFileSnapshot` | late-bound persistent-index pushdown, parallel bounded batches, external ordered/group spill | O(candidate input + merge), or full input when unbounded; final result storage is caller-owned |
 
@@ -264,8 +264,9 @@ pages. `AppendRaw(dst, key)` and `AppendRawKey` provide lifetime-independent
 copy-out and allocate zero bytes when `dst` has enough capacity. Automatic
 unmapping and finalizer-based ownership remain deliberately absent.
 
-The image is a startup/off-heap boundary, not yet the completed 100x-RAM
-engine. On the 16,384-document local fixture, the mapped image is 5.40 MB. A
+The image is a startup/off-heap boundary, not a larger-than-memory engine;
+`FileStore` below is the explicit bounded-residency surface. On the
+16,384-document local fixture, the mapped image is 5.40 MB. A
 key-only open takes 1.04-1.05 ms and allocates 234,688-234,689 Go-heap bytes in
 273 allocations; its pointer-free metadata is 688,136 external key bytes plus
 524,288 external row bytes. Compared with the former per-key HAMT/per-row

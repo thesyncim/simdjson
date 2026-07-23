@@ -200,9 +200,12 @@ whose byte slices happen to come from mmap. A logical micro-page contains:
 A small durable root names logical pages by immutable physical references.
 Point lookup resolves a key to `(logical chunk, stable slot)`, validates the
 document page, and returns a scoped view. Explicit exact-index probes produce
-page masks without scanning rejected JSON; the general query executor currently
-uses a physical chunk scan. Sequential reads and key prefetch submit bounded,
-physically ordered work rather than relying on demand faults.
+page masks without scanning rejected JSON. The general query executor
+late-binds the frozen catalog, chooses the widest compound equality bound,
+combines bounded `AND` and fully bounded `OR` plans, and rechecks the complete
+predicate over every candidate. Unbounded plans retain the ordered physical
+chunk scan. Direct sequential scans and key prefetch submit bounded, physically
+ordered work rather than relying on demand faults.
 
 Chunk-directory levels use implemented 64-way packed CHAMP nodes with one
 occupancy word and densely ranked fixed-width physical references rather than
@@ -425,12 +428,13 @@ I/O rather than demand-paged writable mappings.
 
 Declared nested and compound indexes keep the same scalar fingerprint and
 mandatory exact-recheck semantics. `FileSnapshot.AppendIndexMasks` returns the
-same sparse `(chunk, mask)` interchange form as heap snapshots. The current
-file query path uses those semantics for explicit probes; general
-`RunFileSnapshot` currently performs a physical chunk scan and bounded parallel
-batching rather than extracting arbitrary predicate plans from the durable
-index catalog. Index-driven page pruning is a performance extension, not a
-correctness dependency.
+same sparse `(chunk, mask)` interchange form as heap snapshots.
+`RunFileSnapshot` late-binds that catalog for equality and supported
+containment predicates, prefers the widest compound bound, intersects `AND`,
+unions only a completely bounded `OR`, then performs mandatory full-predicate
+recheck while preserving source order. `NOT`, range predicates, and any
+partially unbounded `OR` retain the physical scan because complementing an
+approximate candidate universe would be unsafe.
 
 TTL is publication-based and persistent. A deadline is stored beside its key
 and in an ordered copy-on-write TTL tree. Changing or removing it updates both
@@ -482,8 +486,8 @@ that multiplier:
 - cold NVMe and constrained-cache workloads, not only a warm M4 Max cache;
 - longer crash/power-loss campaigns on real filesystems in addition to
   deterministic image tearing; and
-- index-driven pruning in the general file query planner where selectivity
-  justifies it.
+- persistent range/ordered indexes, safe `NOT` complements, and a measured
+  selectivity/cardinality cost model beyond exact equality and containment.
 
 `OpenStore` remains the caller-owned mapped heap-Store checkpoint.
 `OpenFileStore` is the incremental durable and bounded-residency surface. The
