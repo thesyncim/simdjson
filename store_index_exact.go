@@ -73,9 +73,10 @@ type StoreRow struct {
 	Slot  uint8
 }
 
-// StoreMask is one chunk's stable-slot candidate bitmap. Masks are ordered by
-// Chunk, contain only live exact matches, and may be combined directly with
-// bitwise Boolean operations before decoding rows.
+// StoreMask is one chunk's stable-slot candidate bitmap. Exact index result
+// producers return strictly ordered live bits. Range consumers also accept
+// dead candidate bits and ignore them, which lets complement plans remain
+// metadata-only until the selected document page is admitted.
 type StoreMask struct {
 	Chunk uint32
 	Bits  uint64

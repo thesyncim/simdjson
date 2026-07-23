@@ -185,6 +185,166 @@ func TestRunFileSnapshotPersistentFloat64CoveringAggregates(t *testing.T) {
 	}
 }
 
+func TestRunFileSnapshotIndexNativeScalarGroups(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "query-file-groups-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	store, err := simdjson.CreateFileStore(file, simdjson.FileStoreOptions{
+		Store: simdjson.StoreOptions{ChunkDocuments: 4},
+		Indexes: []simdjson.StoreIndexDefinition{{
+			Name: "kind", Paths: []string{"/kind"},
+		}},
+		Synchronous: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	documents := []string{
+		`{"kind":"a"}`,
+		`{"kind":"b"}`,
+		`{"kind":"\u0061"}`,
+		`{"missing":true}`,
+		`{"kind":null}`,
+		`{"kind":{"nested":true}}`,
+		`{"kind":1}`,
+		`{"kind":1.0}`,
+	}
+	set := &simdjson.DocSet{ShapeTapes: true}
+	for row, document := range documents {
+		raw := []byte(document)
+		if _, err := set.Append(raw); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Put(fmt.Sprintf("k%d", row), raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+
+	q := Select(Path("kind"), Count()).GroupBy("kind").OrderBy("kind", Asc)
+	want, err := q.Run(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace FileExecutionWorkspace
+	got, stats, err := q.RunFileSnapshot(snapshot, FileExecutionOptions{
+		Workers: 3, MemoryBytes: 64 << 10, Workspace: &workspace,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotKey, wantKey := resultKey(got), resultKey(want); gotKey != wantKey {
+		t.Fatalf("index-native groups mismatch:\n got: %s\nwant: %s", gotKey, wantKey)
+	}
+	if stats.RowsTotal != 8 || stats.RowsScanned != 2 ||
+		stats.IndexLookups != 1 || stats.IndexPostingPages == 0 ||
+		stats.IndexCertificateRows != 6 || stats.IndexRecheckRows != 2 ||
+		stats.IndexGroupedRows != 6 || stats.IndexGroups != 5 ||
+		stats.Batches != 0 || stats.BufferedBytes != 0 {
+		t.Fatalf("index-native group stats = %+v", stats)
+	}
+
+	// Result strings and raw projections are execution-owned, not aliases of
+	// the reusable index certificate arena.
+	beforeReuse := resultKey(got)
+	if _, _, err := q.RunFileSnapshot(snapshot, FileExecutionOptions{
+		Workers: 1, MemoryBytes: 64 << 10, Workspace: &workspace,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if afterReuse := resultKey(got); afterReuse != beforeReuse {
+		t.Fatalf("result changed after workspace reuse:\n got: %s\nwant: %s", afterReuse, beforeReuse)
+	}
+}
+
+func TestRunFileSnapshotIndexCatalogScalarGroups(t *testing.T) {
+	builder, err := simdjson.NewStoreBuilder(simdjson.StoreOptions{
+		ChunkDocuments: 4, ShapeTapes: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := &simdjson.DocSet{ShapeTapes: true}
+	documents := []string{
+		`{"profile":{"kind":"a"}}`,
+		`{"profile":{"kind":"\u0061"}}`,
+		`{"missing":true}`,
+		`{"profile":{"kind":null}}`,
+		`{"profile":{"kind":1}}`,
+		`{"profile":{"kind":1.0}}`,
+	}
+	for row, document := range documents {
+		raw := []byte(document)
+		if err := builder.Append(fmt.Sprintf("k%d", row), raw); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := set.Append(raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(t.TempDir(), "query-file-group-catalog-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	options := simdjson.FileStoreOptions{
+		Store: simdjson.StoreOptions{ChunkDocuments: 4, ShapeTapes: true},
+		Indexes: []simdjson.StoreIndexDefinition{{
+			Name: "kind", Paths: []string{"/profile/kind"},
+		}},
+		PageSize: 4096, MaxPageSize: 64 << 10, Synchronous: true,
+	}
+	if _, err := source.WriteFileStore(file, options); err != nil {
+		t.Fatal(err)
+	}
+	store, err := simdjson.OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+
+	q := Select(Path("profile.kind"), Count()).
+		GroupBy("profile.kind").
+		OrderBy("profile.kind", Asc)
+	want, err := q.Run(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workspace FileExecutionWorkspace
+	got, stats, err := q.RunFileSnapshot(snapshot, FileExecutionOptions{
+		Workers: 4, MemoryBytes: 64 << 10, Workspace: &workspace,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotKey, wantKey := resultKey(got), resultKey(want); gotKey != wantKey {
+		t.Fatalf("index catalog groups mismatch:\n got: %s\nwant: %s", gotKey, wantKey)
+	}
+	if stats.RowsTotal != 6 || stats.RowsScanned != 0 ||
+		stats.IndexLookups != 1 || stats.IndexPostingPages != 0 ||
+		stats.IndexCertificateRows != 6 || stats.IndexRecheckRows != 0 ||
+		stats.IndexGroupedRows != 6 || stats.IndexGroups != 3 ||
+		stats.Batches != 0 || stats.BufferedBytes != 0 {
+		t.Fatalf("index catalog group stats = %+v", stats)
+	}
+}
+
 func TestRunFileSnapshotPersistentCompoundIndexPushdown(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "query-file-index-*")
 	if err != nil {
@@ -526,6 +686,73 @@ func BenchmarkRunFileSnapshotParallelAggregate(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func BenchmarkRunFileSnapshotIndexNativeScalarGroups(b *testing.B) {
+	const documents = 100_000
+	builder, err := simdjson.NewStoreBuilder(simdjson.StoreOptions{
+		ChunkDocuments: 8, ShapeTapes: true,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	for row := range documents {
+		document := []byte(fmt.Sprintf(
+			`{"id":%d,"group":"g%02d","padding":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}`,
+			row, row&31,
+		))
+		if err := builder.Append(fmt.Sprintf("k%06d", row), document); err != nil {
+			b.Fatal(err)
+		}
+	}
+	source, err := builder.Build()
+	if err != nil {
+		b.Fatal(err)
+	}
+	file, err := os.CreateTemp(b.TempDir(), "query-file-index-groups-bench-*")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer file.Close()
+	options := simdjson.FileStoreOptions{
+		Store: simdjson.StoreOptions{ChunkDocuments: 8, ShapeTapes: true},
+		Indexes: []simdjson.StoreIndexDefinition{{
+			Name: "group", Paths: []string{"/group"},
+		}},
+		PageSize: 4096, MaxPageSize: 64 << 10, ResidentBytes: 16 << 20,
+		Synchronous: false,
+	}
+	if _, err := source.WriteFileStore(file, options); err != nil {
+		b.Fatal(err)
+	}
+	store, err := simdjson.OpenFileStore(file, options)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer store.Close()
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer snapshot.Close()
+	query := Select(Path("group"), Count()).GroupBy("group")
+	execution := FileExecutionOptions{
+		Workers: 1, MemoryBytes: 64 << 20, Workspace: &FileExecutionWorkspace{},
+	}
+	if _, stats, err := query.RunFileSnapshot(snapshot, execution); err != nil {
+		b.Fatal(err)
+	} else if stats.RowsScanned != 0 || stats.IndexGroupedRows != documents {
+		b.Fatalf("group benchmark stats = %+v", stats)
+	}
+	b.ReportMetric(documents, "rows/op")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		result, _, err := query.RunFileSnapshot(snapshot, execution)
+		if err != nil || result.RowCount != 32 {
+			b.Fatalf("group benchmark = rows %d err %v", result.RowCount, err)
+		}
 	}
 }
 

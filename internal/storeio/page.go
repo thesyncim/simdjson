@@ -41,6 +41,7 @@ const (
 	PageFloat64Group
 	PageFloat64Catalog
 	PageFloat64Stripe
+	PageIndexGroupCatalog
 )
 
 // PageHeader is the decoded identity of one immutable physical page. StoreID
@@ -177,7 +178,7 @@ func validatePageHeader(header PageHeader) error {
 }
 
 func validPageKind(kind PageKind) bool {
-	return kind >= PageStateRoot && kind <= PageFloat64Stripe
+	return kind >= PageStateRoot && kind <= PageIndexGroupCatalog
 }
 
 func validPageFlags(kind PageKind, flags uint8) bool {

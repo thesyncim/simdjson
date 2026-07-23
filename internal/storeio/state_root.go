@@ -17,17 +17,20 @@ const (
 	// reference.
 	PageRefSize = 32
 
-	stateRootVersionV2      = uint32(2)
-	stateRootVersionV3      = uint32(3)
-	stateRootVersion        = uint32(4)
-	stateRootFreeHintOffset = 60
-	stateRootChunkRefOffset = 64
-	stateRootKeyRefOffset   = stateRootChunkRefOffset + PageRefSize
-	stateRootIndexRefOffset = stateRootKeyRefOffset + PageRefSize
-	stateRootTTLRefOffset   = stateRootIndexRefOffset + PageRefSize
-	stateRootRefsEnd        = stateRootTTLRefOffset + PageRefSize
-	stateRootFloat64Offset  = stateRootRefsEnd
-	stateRootFloat64End     = stateRootFloat64Offset + PageRefSize
+	stateRootVersionV2        = uint32(2)
+	stateRootVersionV3        = uint32(3)
+	stateRootVersionV4        = uint32(4)
+	stateRootVersion          = uint32(5)
+	stateRootFreeHintOffset   = 60
+	stateRootChunkRefOffset   = 64
+	stateRootKeyRefOffset     = stateRootChunkRefOffset + PageRefSize
+	stateRootIndexRefOffset   = stateRootKeyRefOffset + PageRefSize
+	stateRootTTLRefOffset     = stateRootIndexRefOffset + PageRefSize
+	stateRootRefsEnd          = stateRootTTLRefOffset + PageRefSize
+	stateRootFloat64Offset    = stateRootRefsEnd
+	stateRootFloat64End       = stateRootFloat64Offset + PageRefSize
+	stateRootIndexGroupOffset = stateRootFloat64End
+	stateRootIndexGroupEnd    = stateRootIndexGroupOffset + PageRefSize
 )
 
 // State-root option bits are durable equivalents of Store construction
@@ -101,6 +104,9 @@ type StateRoot struct {
 	// compact generation. It is only a scan accelerator; document mutations
 	// clear it and use the authoritative chunk tree plus peeled document pages.
 	Float64ScanHead PageRef
+	// IndexGroupHead names a bounded aggregate-only categorical cover of an
+	// untouched compact generation. Exact postings remain authoritative.
+	IndexGroupHead PageRef
 }
 
 // EncodeStateRootPage writes and seals one complete common-format page into
@@ -139,6 +145,7 @@ func EncodeStateRootPage(dst []byte, root StateRoot, fileEnd uint64) ([]byte, er
 	encodePageRef(payload[stateRootIndexRefOffset:stateRootTTLRefOffset], root.IndexDirectory)
 	encodePageRef(payload[stateRootTTLRefOffset:stateRootRefsEnd], root.TTLDirectory)
 	encodePageRef(payload[stateRootFloat64Offset:stateRootFloat64End], root.Float64ScanHead)
+	encodePageRef(payload[stateRootIndexGroupOffset:stateRootIndexGroupEnd], root.IndexGroupHead)
 	page := dst[:int(root.PageSize)]
 	if _, err := sealInitializedPage(page); err != nil {
 		return nil, err
@@ -157,7 +164,8 @@ func DecodeStateRootPage(src []byte, fileEnd uint64) (StateRoot, error) {
 	version := binary.LittleEndian.Uint32(payload[0:4])
 	if header.Kind != PageStateRoot || header.LogicalID != StateRootLogicalID ||
 		len(payload) != StateRootPayloadSize ||
-		version != stateRootVersionV2 && version != stateRootVersionV3 && version != stateRootVersion ||
+		version != stateRootVersionV2 && version != stateRootVersionV3 &&
+			version != stateRootVersionV4 && version != stateRootVersion ||
 		!pageRefReservedZero(payload[stateRootChunkRefOffset:stateRootKeyRefOffset]) ||
 		!pageRefReservedZero(payload[stateRootKeyRefOffset:stateRootIndexRefOffset]) ||
 		!pageRefReservedZero(payload[stateRootIndexRefOffset:stateRootTTLRefOffset]) ||
@@ -172,13 +180,20 @@ func DecodeStateRootPage(src []byte, fileEnd uint64) (StateRoot, error) {
 	} else {
 		freeChunkHint = binary.LittleEndian.Uint32(payload[stateRootFreeHintOffset:stateRootChunkRefOffset])
 	}
-	var float64ScanHead PageRef
-	if version == stateRootVersion {
+	var float64ScanHead, indexGroupHead PageRef
+	if version == stateRootVersion || version == stateRootVersionV4 {
 		if !pageRefReservedZero(payload[stateRootFloat64Offset:stateRootFloat64End]) ||
-			!allZero(payload[stateRootFloat64End:]) {
+			version == stateRootVersionV4 && !allZero(payload[stateRootFloat64End:]) {
 			return StateRoot{}, fmt.Errorf("%w: float64 scan head or reserved bytes", ErrStateRootCorrupt)
 		}
 		float64ScanHead = decodePageRef(payload[stateRootFloat64Offset:stateRootFloat64End])
+		if version == stateRootVersion {
+			if !pageRefReservedZero(payload[stateRootIndexGroupOffset:stateRootIndexGroupEnd]) ||
+				!allZero(payload[stateRootIndexGroupEnd:]) {
+				return StateRoot{}, fmt.Errorf("%w: index group head or reserved bytes", ErrStateRootCorrupt)
+			}
+			indexGroupHead = decodePageRef(payload[stateRootIndexGroupOffset:stateRootIndexGroupEnd])
+		}
 	} else if !allZero(payload[stateRootRefsEnd:]) {
 		return StateRoot{}, fmt.Errorf("%w: legacy reserved bytes", ErrStateRootCorrupt)
 	}
@@ -202,6 +217,7 @@ func DecodeStateRootPage(src []byte, fileEnd uint64) (StateRoot, error) {
 		IndexDirectory:   decodePageRef(payload[stateRootIndexRefOffset:stateRootTTLRefOffset]),
 		TTLDirectory:     decodePageRef(payload[stateRootTTLRefOffset:stateRootRefsEnd]),
 		Float64ScanHead:  float64ScanHead,
+		IndexGroupHead:   indexGroupHead,
 	}
 	if err := validateStateRoot(root, fileEnd); err != nil {
 		return StateRoot{}, fmt.Errorf("%w: %v", ErrStateRootCorrupt, err)
@@ -307,6 +323,32 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 				(refs[i].ref.LogicalID == ref.LogicalID || refs[i].ref.Offset == ref.Offset) {
 				return fmt.Errorf("%w: duplicate float64 scan head", ErrInvalidWrite)
 			}
+		}
+	}
+	if root.IndexGroupHead != (PageRef{}) {
+		ref := root.IndexGroupHead
+		length := uint64(ref.Length)
+		if root.IndexCount == 0 || root.DocumentCount == 0 ||
+			ref.Kind != PageIndexGroupCatalog || ref.Flags != 0 || ref.Aux != 0 ||
+			!validPhysicalPageSize(ref.Length) || ref.Length < root.PageSize ||
+			ref.Length%root.PageSize != 0 ||
+			ref.Generation == 0 || ref.Generation > root.Generation ||
+			ref.LogicalID <= StateRootLogicalID || ref.LogicalID >= root.NextLogicalID ||
+			ref.Offset < uint64(superblockCopies)*pageSize || ref.Offset%pageSize != 0 ||
+			length > fileEnd || ref.Offset > maxSuperblockFileOffset ||
+			ref.Offset > fileEnd-length {
+			return fmt.Errorf("%w: invalid index group head", ErrInvalidWrite)
+		}
+		for i := range refs {
+			if refs[i].ref != (PageRef{}) &&
+				(refs[i].ref.LogicalID == ref.LogicalID || refs[i].ref.Offset == ref.Offset) {
+				return fmt.Errorf("%w: duplicate index group head", ErrInvalidWrite)
+			}
+		}
+		if root.Float64ScanHead != (PageRef{}) &&
+			(root.Float64ScanHead.LogicalID == ref.LogicalID ||
+				root.Float64ScanHead.Offset == ref.Offset) {
+			return fmt.Errorf("%w: duplicate aggregate head", ErrInvalidWrite)
 		}
 	}
 	return nil

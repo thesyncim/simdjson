@@ -178,6 +178,8 @@ differential tests, and corpus tests jointly enforce these invariants. See
 - `store_document_template_read.go` — `(*storeTemplateFieldHint).lookup`
 - `store_document_template_read.go` — `(*storeTemplatePointerHint).resolve`
 - `store_file.go` — `newFileStoreResources`
+- `store_float64_reduce_simd_amd64.go` — `reducePackedFloat64LE`
+- `store_float64_reduce_simd_arm64.go` — `reducePackedFloat64LE`
 - `store_index_packed.go` — `newStorePackedIndex`
 - `store_index_packed.go` — `package scope`
 - `store_mapped_docs.go` — `(*DocSet).narrowAt`

@@ -73,6 +73,83 @@ func AppendIndexTreeHash(cache *PageCache, root PageRef, indexID uint32, tupleHa
 	return appendIndexTreeRange(cache, root, low, high, bounds, dst, limit, 0)
 }
 
+// WalkIndexTreeIndex visits every leaf intersecting one index id in routing
+// order. The borrowed view is valid only during fn. A boundary leaf may also
+// contain adjacent index ids; callers must select entries by IndexID.
+//
+// Keeping the directory page leased across its complete callback lets
+// analytical consumers stream a large index without retaining one Go object
+// per posting. The traversal stack is bounded by indexTreeMaxLevel.
+func WalkIndexTreeIndex(
+	cache *PageCache,
+	root PageRef,
+	indexID uint32,
+	bounds IndexTreeBounds,
+	fn func(IndexDirectoryView) error,
+) error {
+	if root == (PageRef{}) || fn == nil {
+		return nil
+	}
+	if indexID >= bounds.IndexHighWater {
+		return fmt.Errorf("%w: index-tree walk id", ErrInvalidWrite)
+	}
+	low := IndexDirectoryKey{IndexID: indexID}
+	high := IndexDirectoryKey{
+		IndexID: indexID, TupleHash: ^uint64(0), Chunk: ^uint32(0),
+	}
+	return walkIndexTreeRange(cache, root, low, high, bounds, fn, 0)
+}
+
+func walkIndexTreeRange(
+	cache *PageCache,
+	ref PageRef,
+	low, high IndexDirectoryKey,
+	bounds IndexTreeBounds,
+	fn func(IndexDirectoryView) error,
+	depth uint8,
+) error {
+	if depth > indexTreeMaxLevel {
+		return ErrIndexTreeDepth
+	}
+	lease, err := cache.Acquire(ref)
+	if err != nil {
+		return err
+	}
+	view, err := OpenIndexDirectoryPage(
+		lease.Page(), bounds.FileEnd, bounds.NextLogicalID, bounds.IndexHighWater,
+	)
+	if err != nil {
+		lease.Release()
+		return err
+	}
+	if view.Header().Level == 0 {
+		err = fn(view)
+		lease.Release()
+		return err
+	}
+	var childStorage [64]IndexDirectoryChild
+	children := childStorage[:view.Len()]
+	for i := range children {
+		children[i], _ = view.ChildAt(i)
+	}
+	lease.Release()
+	for i, child := range children {
+		if i+1 < len(children) &&
+			compareIndexDirectoryKey(children[i+1].Lower, low) <= 0 {
+			continue
+		}
+		if compareIndexDirectoryKey(child.Lower, high) > 0 {
+			break
+		}
+		if err := walkIndexTreeRange(
+			cache, child.Ref, low, high, bounds, fn, depth+1,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func appendIndexTreeRange(cache *PageCache, ref PageRef, low, high IndexDirectoryKey, bounds IndexTreeBounds, dst []IndexDirectoryEntry, limit int, depth uint8) ([]IndexDirectoryEntry, error) {
 	if depth > indexTreeMaxLevel {
 		return dst, ErrIndexTreeDepth

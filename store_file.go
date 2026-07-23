@@ -561,7 +561,10 @@ func newFileStoreResources(file *os.File, options normalizedFileStoreOptions, st
 		}
 		return nil, err
 	}
-	pageValidator := newFileStorePageValidator(uint32(options.PageSize))
+	pageValidator := newFileStorePageValidator(
+		uint32(options.PageSize), uint32(len(options.indexes)),
+		uint32(options.Store.ChunkDocuments),
+	)
 	cache, err := storeio.NewPageCache(readFile, storeio.PageCacheOptions{
 		PageSize: options.PageSize, MaxPageSize: options.MaxPageSize,
 		ResidentBytes: options.ResidentBytes, StoreID: storeID,
@@ -732,11 +735,15 @@ type FileSnapshot struct {
 // drops retained storage when a rare broad probe should not pin its high-water
 // capacity.
 type FileIndexWorkspace struct {
-	directory []storeio.IndexDirectoryEntry
-	postings  []fileIndexProbePosting
-	document  []byte
-	tape      []IndexEntry
-	lastProbe FileIndexProbeStats
+	directory         []storeio.IndexDirectoryEntry
+	postings          []fileIndexProbePosting
+	document          []byte
+	tape              []IndexEntry
+	groupArena        []byte
+	groupState        []fileIndexScalarGroupState
+	indexCoverage     []uint64
+	certifiedCoverage []uint64
+	lastProbe         FileIndexProbeStats
 }
 
 // FileIndexProbeStats reports the physical work of the most recent exact or
@@ -773,6 +780,10 @@ func (w *FileIndexWorkspace) Release() {
 	w.postings = nil
 	w.document = nil
 	w.tape = nil
+	w.groupArena = nil
+	w.groupState = nil
+	w.indexCoverage = nil
+	w.certifiedCoverage = nil
 	w.lastProbe = FileIndexProbeStats{}
 }
 
@@ -1302,7 +1313,7 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 	nextState, statePage, err := s.stageFileState(
 		tx, state, generation, prospectiveHighWater, documentCount, state.root.TTLCount,
 		liveChunks, chunkMutation.Root, keyRoot, indexRoot, state.ttlRoot,
-		storeio.PageRef{}, freeRoot, freeChecksum,
+		storeio.PageRef{}, storeio.PageRef{}, freeRoot, freeChecksum,
 	)
 	if err != nil {
 		return false, err
@@ -1555,7 +1566,7 @@ func (s *FileStore) setDeadlineLocked(state *fileStoreState, key []byte, locatio
 	nextState, statePage, err := s.stageFileState(
 		tx, state, generation, state.root.ChunkHighWater, state.root.DocumentCount, ttlCount,
 		state.root.LiveChunks, state.chunkRoot, keyMutation.Root, state.indexRoot, ttlRoot,
-		state.root.Float64ScanHead, freeRoot, freeChecksum,
+		state.root.Float64ScanHead, state.root.IndexGroupHead, freeRoot, freeChecksum,
 	)
 	if err != nil {
 		return false, err
@@ -1812,7 +1823,7 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 		tx, state, generation, state.root.ChunkHighWater,
 		state.root.DocumentCount-1, ttlCount, liveChunks,
 		chunkRoot, keyMutation.Root, indexRoot, ttlRoot,
-		storeio.PageRef{}, freeRoot, freeChecksum,
+		storeio.PageRef{}, storeio.PageRef{}, freeRoot, freeChecksum,
 	)
 	if err != nil {
 		return false, err
@@ -2261,7 +2272,8 @@ func (s *FileStore) stageFileState(
 	chunkHighWater uint32,
 	documentCount, ttlCount uint64,
 	liveChunks uint32,
-	chunkRoot, keyRoot, indexRoot, ttlRoot, float64ScanHead, freeRoot storeio.PageRef,
+	chunkRoot, keyRoot, indexRoot, ttlRoot, float64ScanHead, indexGroupHead,
+	freeRoot storeio.PageRef,
 	freeChecksum uint32,
 ) (*fileStoreState, storeio.TransactionPage, error) {
 	statePage, err := tx.Allocate(storeio.PageStateRoot, uint32(s.options.PageSize), storeio.StateRootLogicalID)
@@ -2277,6 +2289,7 @@ func (s *FileStore) stageFileState(
 		IndexCount:     uint32(len(s.options.indexes)), IndexCatalogHash: s.options.indexCatalogHash,
 		ChunkDirectory: chunkRoot, KeyDirectory: keyRoot, IndexDirectory: indexRoot, TTLDirectory: ttlRoot,
 		Float64ScanHead: float64ScanHead,
+		IndexGroupHead:  indexGroupHead,
 	}
 	if _, err := storeio.EncodeStateRootPage(statePage.Bytes(), root, tx.FileEnd()); err != nil {
 		return nil, storeio.TransactionPage{}, err
@@ -2308,7 +2321,7 @@ func (s *FileStore) reserveFileRetirements(
 	oldView *fileDocumentChunk,
 	key storeio.KeyTreeMutation,
 	chunk storeio.ChunkTreeMutation,
-	retireFloat64Scan bool,
+	retireCleanAggregates bool,
 ) error {
 	appendRef := func(ref storeio.PageRef) error {
 		if ref == (storeio.PageRef{}) {
@@ -2325,8 +2338,13 @@ func (s *FileStore) reserveFileRetirements(
 	if err := appendRef(old.stateRef); err != nil {
 		return err
 	}
-	if retireFloat64Scan && old.root.Float64ScanHead != (storeio.PageRef{}) {
+	if retireCleanAggregates && old.root.Float64ScanHead != (storeio.PageRef{}) {
 		if err := s.appendFloat64ScanRetirements(old); err != nil {
+			return err
+		}
+	}
+	if retireCleanAggregates {
+		if err := appendRef(old.root.IndexGroupHead); err != nil {
 			return err
 		}
 	}

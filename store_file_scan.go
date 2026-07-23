@@ -156,6 +156,88 @@ func (s *FileSnapshot) RangeMasksRawBuffer(masks []StoreMask, scratch []byte, fn
 	return scratch, nil
 }
 
+// RangeMasksRawRowsBuffer is the location-aware form of
+// [FileSnapshot.RangeMasksRawBuffer]. The callback receives the stable row
+// address selected from this snapshot. It is useful when a covering index
+// decides most rows and a query must preserve first-row ordering while
+// rechecking only the residual candidates.
+//
+// Masks must be strictly increasing by Chunk. Zero and dead bits are ignored.
+// key and value borrow one cache lease for the callback; overflow storage is
+// returned for reuse.
+func (s *FileSnapshot) RangeMasksRawRowsBuffer(
+	masks []StoreMask,
+	scratch []byte,
+	fn func(row StoreRow, key, value []byte) error,
+) ([]byte, error) {
+	if s == nil || s.store == nil || s.state == nil {
+		return scratch, ErrFileStoreClosed
+	}
+	if fn == nil {
+		return scratch, nil
+	}
+	state := s.state
+	bounds := storeio.ChunkTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+	}
+	var previous uint32
+	for i, mask := range masks {
+		if i != 0 && mask.Chunk <= previous {
+			return scratch, ErrStoreMaskOrder
+		}
+		previous = mask.Chunk
+		if mask.Bits == 0 {
+			continue
+		}
+		ref, ok, err := storeio.LookupChunkTree(
+			s.store.cache, state.chunkRoot, mask.Chunk, bounds,
+		)
+		if err != nil {
+			return scratch, err
+		}
+		if !ok {
+			return scratch, ErrStoreMaskChunk
+		}
+		if err := s.rangeFileDocumentRows(
+			state, mask.Chunk, ref, mask.Bits, &scratch, fn,
+		); err != nil {
+			return scratch, err
+		}
+	}
+	return scratch, nil
+}
+
+func (s *FileSnapshot) rangeFileDocumentRows(
+	state *fileStoreState,
+	chunk uint32,
+	ref storeio.PageRef,
+	mask uint64,
+	overflow *[]byte,
+	fn func(row StoreRow, key, value []byte) error,
+) error {
+	lease, err := s.store.cache.Acquire(ref)
+	if err != nil {
+		return err
+	}
+	defer lease.Release()
+	view, err := admittedFileDocumentChunk(lease.Page(), ref, chunk)
+	if err != nil {
+		return err
+	}
+	selected := view.live() & mask
+	return s.rangeFileDocumentView(
+		state, view, mask, overflow,
+		func(key, value []byte) error {
+			if selected == 0 {
+				return storeio.ErrDocumentPageCorrupt
+			}
+			slot := uint8(bits.TrailingZeros64(selected))
+			selected &= selected - 1
+			return fn(StoreRow{Chunk: chunk, Slot: slot}, key, value)
+		},
+	)
+}
+
 func (s *FileSnapshot) fileScanReadAheadWindow() (int, uint64) {
 	options := s.store.options
 	parallelLimit := options.ReadConcurrency * 4

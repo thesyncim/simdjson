@@ -158,7 +158,7 @@ minimum repetition. The report uses DuckDB's `latency`, not shell wall time.
 | point | `Snapshot.Get` plus compiled pointer | copied JSON plus structural index and compiled pointer | key ART lookup plus `json_extract_string` |
 | filter | exact bitmap candidates plus scalar recheck | collision-free exact certificate + bitmap; document recheck fallback | `count(*) where filter_value = ?` |
 | sum | compiled numeric column reduction | clean dense stripe, mutation-overlay typed cover, or JSON fallback | `sum(metric)` |
-| group | compiled grouped count | bounded page scan and grouped count | SQL `group by filter_value` |
+| group | compiled grouped count | clean O(groups) exact-index catalog, certified posting groups plus residual JSON after mutation, or bounded full scan | SQL `group by filter_value` |
 | contain | structural JSON containment | scalar-leaf object lowering + exact certificate; structural fallback | `json_contains(doc, ?::JSON)` |
 
 The filter is deliberately low cardinality in clustered synthetic data. DuckDB

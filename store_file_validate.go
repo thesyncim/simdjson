@@ -18,11 +18,16 @@ type fileStorePageValidator struct {
 	nextLogicalID  atomic.Uint64
 	chunkHighWater atomic.Uint32
 	pageSize       uint32
+	indexHighWater uint32
+	chunkDocuments uint32
 	groupScratch   sync.Pool
 }
 
-func newFileStorePageValidator(pageSize uint32) *fileStorePageValidator {
-	v := &fileStorePageValidator{pageSize: pageSize}
+func newFileStorePageValidator(pageSize, indexHighWater, chunkDocuments uint32) *fileStorePageValidator {
+	v := &fileStorePageValidator{
+		pageSize: pageSize, indexHighWater: indexHighWater,
+		chunkDocuments: chunkDocuments,
+	}
 	v.groupScratch.New = func() any {
 		scratch := make([]byte, 0, pageSize)
 		return &scratch
@@ -110,6 +115,24 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 			page, v.chunkHighWater.Load(), v.nextLogicalID.Load(),
 		)
 		return err
+	case storeio.PageIndexGroupCatalog:
+		catalog, err := storeio.OpenAdmittedIndexGroupCatalog(
+			page, v.indexHighWater, v.chunkHighWater.Load(), v.chunkDocuments,
+		)
+		if err != nil {
+			return err
+		}
+		iterator := catalog.Iterator()
+		for {
+			entry, ok := iterator.Next()
+			if !ok {
+				break
+			}
+			if !fileIndexCertificateValid(entry.Value, 1) {
+				return storeio.ErrIndexGroupCatalogCorrupt
+			}
+		}
+		return nil
 	}
 	return nil
 }

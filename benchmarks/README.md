@@ -102,7 +102,9 @@ truth, and renders Store heap/external blocks, DuckDB warm/peak buffers, and
 durable file bytes without mixing their accounting domains. The frozen 10K
 clustered smoke is
 [`results/duckdb-synth-s4.md`](results/duckdb-synth-s4.md); the methodology also
-provides identical 100K and 5M commands.
+provides identical 100K and 5M commands. The retained 128 MiB real-derived
+report includes clean exact-index categorical grouping; its O(groups) cover is
+measured separately from the older pre-catalog 5M capacity row.
 
 Ordinary tests validate generation, parsing, accounting, and the Store side.
 The container smoke is explicit:

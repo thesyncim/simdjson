@@ -84,6 +84,31 @@ func TestStateRootFloat64ScanHeadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStateRootIndexGroupHeadRoundTrip(t *testing.T) {
+	want, _ := testStateRoot(11)
+	want.IndexGroupHead = testStatePageRef(
+		PageIndexGroupCatalog, 7, 6, want.Generation,
+	)
+	fileEnd := 8 * uint64(testSuperblockPageSize)
+	page := make([]byte, testSuperblockPageSize)
+	encoded, err := EncodeStateRootPage(page, want, fileEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeStateRootPage(encoded, fileEnd)
+	if err != nil || got != want {
+		t.Fatalf("index group state root = (%+v,%v), want (%+v,nil)", got, err, want)
+	}
+
+	invalid := want
+	invalid.IndexCount = 0
+	invalid.IndexCatalogHash = 0
+	invalid.IndexDirectory = PageRef{}
+	if _, err := EncodeStateRootPage(page, invalid, fileEnd); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("group head without index = %v, want %v", err, ErrInvalidWrite)
+	}
+}
+
 func TestStateRootValidation(t *testing.T) {
 	valid, fileEnd := testStateRoot(11)
 	for _, test := range []struct {
@@ -147,6 +172,27 @@ func TestStateRootDecodesVersionTwoWithoutFreeHint(t *testing.T) {
 	}
 }
 
+func TestStateRootDecodesVersionFourWithoutIndexGroups(t *testing.T) {
+	want, _ := testStateRoot(11)
+	want.Options |= StateOptionFloat64Columns
+	want.Float64ScanHead = testStatePageRef(
+		PageFloat64Catalog, 7, 6, want.Generation,
+	)
+	fileEnd := 8 * uint64(testSuperblockPageSize)
+	page := make([]byte, testSuperblockPageSize)
+	if _, err := EncodeStateRootPage(page, want, fileEnd); err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint32(
+		page[PageHeaderSize:PageHeaderSize+4], stateRootVersionV4,
+	)
+	resealTestPage(page)
+	got, err := DecodeStateRootPage(page, fileEnd)
+	if err != nil || got != want {
+		t.Fatalf("DecodeStateRootPage(v4) = (%+v,%v), want (%+v,nil)", got, err, want)
+	}
+}
+
 func TestStateRootRejectsResealedSemanticCorruption(t *testing.T) {
 	root, fileEnd := testStateRoot(3)
 	page := make([]byte, testSuperblockPageSize)
@@ -155,6 +201,7 @@ func TestStateRootRejectsResealedSemanticCorruption(t *testing.T) {
 	}
 	for _, offset := range []int{
 		PageHeaderSize + 192,
+		PageHeaderSize + 224,
 		PageHeaderSize + 64 + 30,
 	} {
 		corrupt := append([]byte(nil), page...)

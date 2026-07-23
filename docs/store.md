@@ -71,6 +71,7 @@ raw, ok := view.GetRaw("user:42")
 | `FileSnapshot.AppendRaw` | copy exact JSON into caller storage | key-tree lookup + touched document/overflow pages |
 | `FileSnapshot.AppendIndexMasks/Into` | probe a frozen exact index with collision-safe certification or document recheck | posting chunks + uncertified/colliding candidates; `Into` reuses caller workspace |
 | `FileSnapshot.AppendIndexCandidateMasksInto` | append a hash-bounded superset for an engine that will recheck | index/posting pages only; never a final answer |
+| `FileSnapshot.AppendIndexScalarGroupsInto` | group one frozen scalar index from a compact categorical cover or certified postings | O(distinct groups) on a clean covered generation; otherwise posting streams plus residual JSON rows; warmed caller buffers allocate zero |
 | `FileSnapshot.ReduceFloat64Path` / `ReduceFloat64PathsInto` | reduce frozen numeric covers without parsing JSON | one compact stripe walk, or an overlay-aware typed-extent walk after mutation; fused paths and warmed caller buffers allocate zero |
 | `FileSnapshot.RangeRawBuffer` / `RangeRawReadAheadBuffer` / `RangeMasksRawBuffer` | ordered serial, bounded direct-read-ahead, or sparse stable-slot scan | touched document/overflow pages; zero allocation after caller scratch warms |
 | `FileStore.Flush` | wait until the visible generation is crash-safe | queued storage work and durability barriers |
@@ -472,6 +473,26 @@ zero bits cannot invent rows; a non-zero unknown chunk fails closed instead of
 silently applying a stale or cross-snapshot mask. `PrefetchKeys` deduplicates
 and physically orders document extents before submitting bounded read-ahead.
 
+Snapshot age has no time-based background cost. One open `FileSnapshot` uses
+one preallocated lease slot and a small handle; it does not copy the database
+or pin every page in the cache. Pages touched by its reads remain ordinarily
+evictable and can be reread because the generation lease prevents their
+physical extents from being reused.
+
+Writers do not wait for an old reader, but copy-on-write extents retired at or
+after that reader's generation cannot become reusable. Space pressure is
+therefore proportional to mutation churn and copied extent sizes, not elapsed
+minutes. `Stats.ActiveSnapshots`, `OldestSnapshotGeneration`,
+`PendingRetiredExtents`, `PendingRetiredBytes`, and `FileEnd` make the pressure
+observable. If the fixed `MaxRetiredExtents` budget is exhausted, the next
+mutation returns `ErrRetiredExtentCapacity` before publication. Closing the
+snapshot lowers the reader floor; a subsequent writer can move safe retired
+extents into the reusable free tree. File high-water does not shrink
+automatically, but later writes consume that reusable space. `FileStore.Close`
+also returns an active-lease error until every snapshot is closed. Applications
+with sustained writes should bound snapshot age as well as
+`MaxSnapshotLeases`.
+
 Exact index definitions are frozen in `FileStoreOptions.Indexes`; their catalog
 hash is part of the durable root. Each mutation updates the affected
 `(index, tuple hash, chunk)` posting page in the same transaction. Posting
@@ -490,6 +511,31 @@ skips the document pass and returns a superset for engines that immediately
 recheck; using it as a final answer is incorrect. TTL stores the deadline beside
 the key and in an ordered persistent tree; replacement preserves the deadline
 and ordinary reads never consult the clock.
+
+Clean bulk generations may also carry one bounded categorical group catalog.
+It is an aggregate-only derivative of existing single-column exact indexes,
+not another per-row index: each covered index stores one exact scalar
+representative, count, and earliest stable-slot token per distinct group.
+Missing paths merge with explicit JSON `null`, matching query semantics.
+Equivalent number spellings and escaped strings merge by value, not source
+spelling. RFC 6901 paths may be nested; eligibility is attached to the exact
+index id rather than restricted to top-level fields.
+
+The catalog occupies one power-of-two extent between `PageSize` and
+`MaxPageSize` and has a 64-bit covered-index bitmap. A container-valued row,
+uncertified/colliding posting, compound index, or summary that would exceed the
+configured extent makes only that index ineligible. Its query then streams the
+authoritative exact posting tree and reads JSON solely for missing, container,
+legacy, oversized-certificate, or collision rows.
+`AppendIndexScalarGroupsInto` exposes both lanes with caller-owned result,
+residual-mask, and workspace buffers. The compact cover retains O(groups)
+records and no per-row pointers; its warmed Store-layer scan allocates zero.
+
+The group catalog is published in the same checksummed state root as the
+posting tree. TTL-only publications preserve it. The first document update or
+delete atomically clears and retires the page before publishing the changed
+generation, so stale counts are never consulted; later grouping uses postings
+and residual rows until another compact rebuild.
 
 Numeric covering definitions are separately frozen in
 `FileStoreOptions.Float64Columns` as exact RFC 6901 paths. The catalog supports
@@ -556,6 +602,12 @@ survivor. This single document pass supplies exact recheck while preserving
 source order, LIMIT ties, and grouped first-row ordering. A fully indexed
 `COUNT(*)` instead asks the exact probe for final masks: certificates decide
 non-colliding streams and only ambiguous streams reopen documents.
+An unfiltered one-column scalar `GROUP BY` with `COUNT(*)` uses the matching
+single-column exact index. A clean categorical cover answers in O(groups)
+without posting or document pages; after mutation, certified posting groups
+are accumulated directly and only residual rows use the compiled JSON pointer.
+Both lanes retain first-row group ordering and exact null, number, and decoded
+string equality.
 
 Selected raw pages enter bounded arenas, build batch-local indexes in parallel,
 and merge in source order. Projection ordering and group state spill as sorted
@@ -563,10 +615,10 @@ temporary runs after the configured memory frontier; multi-pass merge opens at
 most 32 runs. Temporary files are removed on success and error.
 `FileExecutionStats` exposes `RowsTotal`, `RowsScanned`, `IndexBounded`,
 `IndexLookups`, `IndexPostingPages`, `IndexCertificateRows`,
-`IndexRecheckRows`, `CandidateRows`, `CandidateChunks`, and
-`CoveringColumns`, so plan selection is observable rather than inferred from
-latency. Consecutive directory entries that select one packed posting page
-share one lease and decode. Exact `COUNT(*)` over a fully indexed
+`IndexRecheckRows`, `CandidateRows`, `CandidateChunks`, `IndexGroupedRows`,
+`IndexGroups`, and `CoveringColumns`, so plan selection is observable rather
+than inferred from latency. Consecutive directory entries that select one
+packed posting page share one lease and decode. Exact `COUNT(*)` over a fully indexed
 equality or object-containment predicate popcounts final masks directly.
 Containment compilation can flatten a nested object made entirely of scalar
 leaves into exact path equalities, including a matching compound index.
@@ -576,8 +628,8 @@ single-row aggregate made only of `COUNT(*)` and configured
 `SUM`/`AVG`/`MIN`/`MAX` paths bypasses workers, JSON admission, parsing, and
 transient value/validity columns. Multiple numeric paths share one typed-extent
 walk.
-`COUNT(path)`, filtered aggregates, grouping, and partially covered plans retain
-the general executor. A reusable
+`COUNT(path)`, filtered aggregates, multi-column or non-count grouping, and
+partially covered plans retain the general executor. A reusable
 `FileExecutionWorkspace` retains index-planner and overflow scratch; worker
 batches and returned result cells remain execution-owned. The memory target
 excludes the returned `Result` and cannot make one oversized document smaller.
@@ -600,7 +652,9 @@ Apple M4 Max, stable Go, 1,024 hot documents:
 | 10K-row recovered exact filter | 14.50 us, 2 posting pages, 0 JSON rows/rechecks | 7.35x faster than pinned one-thread DuckDB |
 | 10K-row recovered scalar-object `@>` | 13.08 us, 2 posting pages, 0 JSON rows/rechecks | 230.75x faster than pinned one-thread DuckDB |
 | 5M-row recovered SUM through one clean typed stripe | 1.948 ms, 0 JSON rows | 4.13x faster than retained pinned DuckDB capacity result |
-| 128 MiB real-derived Twitter covered SUM | 45.083 us, 0 JSON rows | 3.37x faster than pinned one-thread DuckDB |
+| 128 MiB real-derived Twitter covered SUM | 51.125 us, 0 JSON rows | 2.97x faster than pinned one-thread DuckDB |
+| 100K-row / 32-group clean exact-index catalog | 8.88-9.09 us, 0 posting or JSON pages | Store-layer catalog scan is warmed zero-allocation; owned 32-group query result is 6,256 B / 69 allocations |
+| 128 MiB real-derived CITM / Twitter grouping | 542 ns / 792 ns, 0 posting or JSON pages | 821.19x / 347.22x faster than retained pinned one-thread DuckDB; one 4 KiB catalog page per file |
 
 The 1/64 nested compound fixture is reproducible with
 `BenchmarkRunFileSnapshotPersistentIndexPushdown`; its three samples were
@@ -1000,10 +1054,12 @@ DuckDB run. That frozen report's 143.5 us covered SUM predates the contiguous
 clean-generation scan stripe and remains historical rather than a current
 claim. The refreshed 5M capacity lane measures 1.948 ms versus DuckDB's
 8.051 ms, while a separately reproduced 128 MiB real-derived Twitter lane
-measures 45.083 us versus 151.833 us. Grouping remains much slower because it
-still decodes JSON, and individually double-fenced update/delete remain slower
-on the measured durability stacks. The report gives each ratio instead of
-averaging unlike operations into one score.
+measures 51.125 us versus 151.833 us. The same real-derived rerun measures the
+clean categorical grouping cover at 542 ns for CITM and 792 ns for Twitter,
+versus 445.083 us and 275.000 us in the retained DuckDB run. Individually
+double-fenced update/delete remain slower on the measured durability stacks.
+The report gives each ratio instead of averaging unlike operations into one
+score.
 
 ### Five-million-row capacity smoke
 
@@ -1027,7 +1083,7 @@ it is not presented as a publication-quality same-machine race.
 | Exact filter, 38,800 matches | 4.376 ms | 24.486 ms | FileStore 5.60x faster |
 | Scalar-object `@>`, 38,800 matches | 4.486 ms | 1.408 s | FileStore 313.9x faster |
 | Covered `SUM`, 1.25M finite values / 5M rows | 1.948 ms | 8.051 ms | FileStore 4.13x faster |
-| `GROUP BY`, 5M inputs | 4.126 s | 35.825 ms | FileStore 115.2x slower |
+| `GROUP BY`, 5M inputs | 4.126 s, retained pre-catalog run | 35.825 ms | historical gap; not presented as current catalog latency |
 | Durable update / operation | 9.176 ms | 1.444 ms | FileStore 6.35x slower |
 | Durable delete / operation | 8.624 ms | 589.2 us | FileStore 14.6x slower |
 
@@ -1043,8 +1099,11 @@ scattered sidecar/tree reads per warmed reduction with a contiguous 2.4 MiB
 dense integer projection. This closes the numeric aggregate gap without
 weakening mutation correctness: the first document write retires the clean
 projection and uses authoritative sidecars plus peeled pages. TTL-only
-publications retain the stripe. Grouping still decodes JSON and is the
-remaining full-column analytical gap.
+publications retain the stripe. The later categorical catalog similarly
+condenses eligible exact indexes to O(groups) count/first/value records; the
+old 5M grouping row above predates it, while the retained 100K/32-group and
+real-derived reruns provide current evidence without extrapolating a new 5M
+number.
 
 The measured FileStore engine-plus-largest-query envelope is 504.97 MiB
 (16.21 MiB + 488.76 MiB), but it is still neither process RSS nor directly

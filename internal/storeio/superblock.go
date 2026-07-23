@@ -275,7 +275,8 @@ func recoverRoots(file *os.File, pageSize uint32, pageScratch []byte, decodeStat
 
 func stateRootReferencesOffset(root StateRoot, offset uint64) bool {
 	return root.ChunkDirectory.Offset == offset || root.KeyDirectory.Offset == offset ||
-		root.IndexDirectory.Offset == offset || root.TTLDirectory.Offset == offset
+		root.IndexDirectory.Offset == offset || root.TTLDirectory.Offset == offset ||
+		root.Float64ScanHead.Offset == offset || root.IndexGroupHead.Offset == offset
 }
 
 func readStateRootRefs(file *os.File, root StateRoot, scratch []byte) (bool, error) {

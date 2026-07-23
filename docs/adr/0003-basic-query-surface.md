@@ -60,6 +60,14 @@ FileStore's persistent exact probe can instead return final masks when a
 collision-free scalar or compound certificate proves the complete stream;
 legacy, missing, oversized, and collision-marked certificates retain the same
 document-recheck fallback.
+For an unfiltered one-column scalar `GROUP BY` with `COUNT(*)`, a compact bulk
+generation may store one bounded aggregate-only catalog derived from the same
+exact certificates. It retains value/count/first-row state per group, not per
+row. After the first document mutation the root drops that cover atomically;
+the executor then groups certified postings and rechecks only residual rows.
+Nested RFC 6901 index paths are eligible. Containers, compound indexes,
+uncertified collisions, and high-cardinality summaries that do not fit the
+configured extent remain on the fallback without changing semantics.
 
 Projection, aggregation, and grouping consume typed columns directly.
 Shape-taped rows are read at their native narrow or wide width and are not

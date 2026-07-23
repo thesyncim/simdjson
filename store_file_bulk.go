@@ -257,6 +257,12 @@ type fileStoreBulkBuild struct {
 	float64Stripes       []fileStoreBulkFloat64StripePlan
 	float64ScanRefs      []storeio.PageRef
 	float64ScanDocuments int
+	indexGroupEntries    []storeio.IndexGroupCatalogEntry
+	indexGroupRef        storeio.PageRef
+	indexGroupCovered    uint64
+	indexGroupBlocked    uint64
+	indexGroupMissing    [64]uint64
+	indexGroupFirst      [64]uint64
 	chunks               []storeChunkDirectoryPlan
 	keys                 []fileStoreBulkKeyPlan
 	keyOrder             []int
@@ -532,6 +538,9 @@ func (b *fileStoreBulkBuild) plan() error {
 	if err := b.planPostings(); err != nil {
 		return err
 	}
+	if err := b.planIndexGroups(); err != nil {
+		return err
+	}
 	if err := b.planIndexTree(); err != nil {
 		return err
 	}
@@ -559,6 +568,7 @@ func (b *fileStoreBulkBuild) plan() error {
 		IndexMaxDepth: uint32(max(b.options.Store.IndexOptions.MaxDepth, 0)),
 		FreeChunkHint: freeChunkHint, ChunkDirectory: b.chunkRoot, KeyDirectory: b.keyRoot,
 		IndexDirectory: b.indexRoot, TTLDirectory: b.ttlRoot, Float64ScanHead: b.float64Head,
+		IndexGroupHead: b.indexGroupRef,
 	}
 	if len(b.options.float64Columns) != 0 {
 		b.root.Options |= storeio.StateOptionFloat64Columns
@@ -1214,6 +1224,17 @@ func (b *fileStoreBulkBuild) planPostings() error {
 				return err
 			}
 			if !ok {
+				if exact.n == 1 {
+					if len(values[0].Bytes()) == 0 {
+						if b.indexGroupMissing[indexID] == 0 {
+							b.indexGroupFirst[indexID] =
+								uint64(location.Chunk)<<6 | uint64(location.Slot)
+						}
+						b.indexGroupMissing[indexID]++
+					} else {
+						b.indexGroupBlocked |= uint64(1) << uint(indexID)
+					}
+				}
 				continue
 			}
 			mask := fileStoreBulkPostingMask{
@@ -1311,6 +1332,155 @@ func (b *fileStoreBulkBuild) planPostings() error {
 		})
 		first = last
 	}
+	return nil
+}
+
+// planIndexGroups condenses low-cardinality, single-column exact indexes into
+// one bounded aggregate-only page. It reuses posting certificates and never
+// adds per-row storage. Columns with containers, uncertified collisions, or a
+// summary that would exceed MaxPageSize simply retain the streaming exact-
+// index execution path.
+func (b *fileStoreBulkBuild) planIndexGroups() error {
+	if len(b.rows) == 0 || len(b.options.indexes) == 0 {
+		return nil
+	}
+	b.indexCertificates = slices.Grow(b.indexCertificates, 4*len(b.options.indexes))
+	required := storeio.PageHeaderSize + storeio.PageTrailerSize +
+		storeio.IndexGroupCatalogPayloadHeaderSize
+	maskAt := 0
+	for indexID, exact := range b.options.indexes {
+		for maskAt < len(b.masks) && b.masks[maskAt].key.IndexID < uint32(indexID) {
+			maskAt++
+		}
+		firstMask := maskAt
+		for maskAt < len(b.masks) && b.masks[maskAt].key.IndexID == uint32(indexID) {
+			maskAt++
+		}
+		if exact == nil || exact.n != 1 ||
+			b.indexGroupBlocked&(uint64(1)<<uint(indexID)) != 0 {
+			continue
+		}
+
+		entryStart := len(b.indexGroupEntries)
+		eligible := true
+		indexedRows := uint64(0)
+		var (
+			haveHash  bool
+			hash      uint64
+			hashStart int
+		)
+		for position := firstMask; position < maskAt; position++ {
+			mask := b.masks[position]
+			if mask.collision || mask.certLength == 0 {
+				eligible = false
+				break
+			}
+			certificate := b.indexCertificates[mask.certStart : mask.certStart+uint32(mask.certLength) : mask.certStart+uint32(mask.certLength)]
+			if !fileIndexCertificateValid(certificate, 1) {
+				return storeio.ErrInvalidWrite
+			}
+			if !haveHash || hash != mask.key.TupleHash {
+				haveHash = true
+				hash = mask.key.TupleHash
+				hashStart = len(b.indexGroupEntries)
+			}
+			group := -1
+			for candidate := hashStart; candidate < len(b.indexGroupEntries); candidate++ {
+				if fileIndexCertificatesEqual(
+					b.indexGroupEntries[candidate].Value, certificate, 1,
+				) {
+					group = candidate
+					break
+				}
+			}
+			rows := uint64(bits.OnesCount64(mask.bits))
+			if rows == 0 || indexedRows > ^uint64(0)-rows {
+				return storeio.ErrInvalidWrite
+			}
+			first := uint64(mask.key.Chunk)<<6 |
+				uint64(bits.TrailingZeros64(mask.bits))
+			if group < 0 {
+				b.indexGroupEntries = append(
+					b.indexGroupEntries,
+					storeio.IndexGroupCatalogEntry{
+						IndexID: uint32(indexID), Value: certificate,
+						Count: rows, First: first,
+					},
+				)
+			} else {
+				entry := &b.indexGroupEntries[group]
+				if entry.Count > ^uint64(0)-rows {
+					return storeio.ErrInvalidWrite
+				}
+				entry.Count += rows
+				entry.First = min(entry.First, first)
+			}
+			indexedRows += rows
+		}
+		missing := b.indexGroupMissing[indexID]
+		if !eligible || indexedRows > uint64(len(b.rows)) ||
+			missing != uint64(len(b.rows))-indexedRows {
+			b.indexGroupEntries = b.indexGroupEntries[:entryStart]
+			continue
+		}
+		if missing != 0 {
+			group := -1
+			for candidate := entryStart; candidate < len(b.indexGroupEntries); candidate++ {
+				if fileIndexCertificatesEqual(
+					b.indexGroupEntries[candidate].Value, []byte("null"), 1,
+				) {
+					group = candidate
+					break
+				}
+			}
+			if group < 0 {
+				start := len(b.indexCertificates)
+				b.indexCertificates = append(b.indexCertificates, "null"...)
+				b.indexGroupEntries = append(
+					b.indexGroupEntries,
+					storeio.IndexGroupCatalogEntry{
+						IndexID: uint32(indexID),
+						Value:   b.indexCertificates[start : start+4 : start+4],
+						Count:   missing, First: b.indexGroupFirst[indexID],
+					},
+				)
+			} else {
+				entry := &b.indexGroupEntries[group]
+				entry.Count += missing
+				entry.First = min(entry.First, b.indexGroupFirst[indexID])
+			}
+		}
+
+		candidateBytes := 0
+		for _, entry := range b.indexGroupEntries[entryStart:] {
+			size, err := storeio.IndexGroupCatalogEntryEncodedSize(entry)
+			if err != nil || candidateBytes > b.options.MaxPageSize-size {
+				eligible = false
+				break
+			}
+			candidateBytes += size
+		}
+		if !eligible || required > b.options.MaxPageSize-candidateBytes {
+			b.indexGroupEntries = b.indexGroupEntries[:entryStart]
+			continue
+		}
+		required += candidateBytes
+		b.indexGroupCovered |= uint64(1) << uint(indexID)
+	}
+	if b.indexGroupCovered == 0 {
+		return nil
+	}
+	size, ok := fileStoreBulkExtent(
+		required, b.options.PageSize, b.options.MaxPageSize,
+	)
+	if !ok {
+		return storeio.ErrInvalidWrite
+	}
+	ref, err := b.allocator.allocate(storeio.PageIndexGroupCatalog, size)
+	if err != nil {
+		return err
+	}
+	b.indexGroupRef = ref
 	return nil
 }
 
@@ -1537,6 +1707,9 @@ func (b *fileStoreBulkBuild) write(file *os.File) error {
 	if err := b.writeFloat64CatalogPages(file, scratch); err != nil {
 		return err
 	}
+	if err := b.writeIndexGroupCatalogPage(file, scratch); err != nil {
+		return err
+	}
 	for _, plan := range b.chunks {
 		page, err := storeio.EncodeChunkDirectoryPage(scratch[:b.options.PageSize], storeio.ChunkDirectoryHeader{
 			StoreID: b.storeID, Generation: b.allocator.generation, LogicalID: plan.ref.LogicalID,
@@ -1590,6 +1763,26 @@ func (b *fileStoreBulkBuild) write(file *os.File) error {
 		return err
 	}
 	return file.Sync()
+}
+
+func (b *fileStoreBulkBuild) writeIndexGroupCatalogPage(file *os.File, scratch []byte) error {
+	if b.indexGroupRef == (storeio.PageRef{}) {
+		return nil
+	}
+	page, err := storeio.EncodeIndexGroupCatalogPage(
+		scratch[:b.indexGroupRef.Length],
+		storeio.IndexGroupCatalogHeader{
+			StoreID: b.storeID, Generation: b.allocator.generation,
+			LogicalID: b.indexGroupRef.LogicalID, PageSize: b.indexGroupRef.Length,
+			CoveredIndexes: b.indexGroupCovered, DocumentCount: uint64(len(b.rows)),
+		},
+		b.indexGroupEntries, uint32(len(b.options.indexes)),
+		uint32(len(b.documents)), uint32(b.options.Store.ChunkDocuments),
+	)
+	if err != nil {
+		return err
+	}
+	return writeStorePageAt(file, page, b.indexGroupRef.Offset)
 }
 
 func (b *fileStoreBulkBuild) writeOverflowPages(file *os.File, scratch []byte) error {

@@ -38,12 +38,15 @@ type FileExecutionOptions struct {
 // zero value is ready to use. It does not own worker batches or returned
 // Result cells, whose cardinality depends on each execution.
 type FileExecutionWorkspace struct {
-	planner    Workspace
-	index      simdjson.FileIndexWorkspace
-	overflow   []byte
-	reductions []simdjson.Float64Aggregate
-	coverPaths []string
-	accs       []aggAcc
+	planner       Workspace
+	index         simdjson.FileIndexWorkspace
+	overflow      []byte
+	reductions    []simdjson.Float64Aggregate
+	coverPaths    []string
+	accs          []aggAcc
+	indexGroups   []simdjson.FileIndexScalarGroup
+	indexResidual []simdjson.StoreMask
+	fileGroups    []fileGroup
 }
 
 // Release drops storage retained by durable index planning.
@@ -57,13 +60,17 @@ func (w *FileExecutionWorkspace) Release() {
 	w.reductions = nil
 	w.coverPaths = nil
 	w.accs = nil
+	w.indexGroups = nil
+	w.indexResidual = nil
+	w.fileGroups = nil
 }
 
 // FileExecutionStats describes the physical work performed by
 // [Query.RunFileSnapshot]. RowsTotal is the snapshot cardinality while
 // RowsScanned is the number of JSON documents admitted to execution after
 // persistent-index pushdown. IndexCertificateRows were decided from a
-// collision-free posting representative without opening JSON;
+// collision-free posting representative or compact categorical cover without
+// opening JSON;
 // IndexRecheckRows required exact document comparison. An ordinary
 // IndexBounded execution still evaluates the complete predicate. BufferedBytes
 // is the largest measured batch or in-memory merge frontier; it excludes the
@@ -87,6 +94,8 @@ type FileExecutionStats struct {
 	CandidateRows        uint64
 	CandidateChunks      int
 	CoveringColumns      int
+	IndexGroupedRows     uint64
+	IndexGroups          int
 }
 
 const (
@@ -185,6 +194,19 @@ func (q *Query) RunFileSnapshot(snapshot *simdjson.FileSnapshot, opts FileExecut
 	coveringColumns, handled, directErr := p.runDirectFileAggregate(&result, snapshot, fileWorkspace)
 	if handled {
 		stats.CoveringColumns = coveringColumns
+		return result, stats, directErr
+	}
+	groupStats, handled, directErr := p.runDirectFileIndexGroups(
+		&result, snapshot, fileWorkspace,
+	)
+	if handled {
+		stats.IndexLookups = groupStats.lookups
+		stats.IndexPostingPages = groupStats.postingPages
+		stats.IndexCertificateRows = groupStats.certificates
+		stats.IndexRecheckRows = groupStats.rechecks
+		stats.RowsScanned = groupStats.rechecks
+		stats.IndexGroupedRows = groupStats.certificates
+		stats.IndexGroups = groupStats.groups
 		return result, stats, directErr
 	}
 	candidateMasks, err := p.fileCandidateMasks(snapshot, &fileWorkspace.index, &fileWorkspace.planner)

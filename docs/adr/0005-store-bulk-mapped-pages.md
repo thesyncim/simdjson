@@ -292,6 +292,16 @@ publications retain it. Recovery validates physical and logical ordering,
 exact chunk coverage, per-column
 encoding, CRC32C, and root generation before selecting the shortcut.
 
+The same clean state root may name one bounded categorical group catalog
+derived from existing single-column exact indexes. Each covered index stores
+one scalar representative, count, and earliest stable-slot token per semantic
+group; it stores no per-row directory. Missing and explicit null share one
+group. Equivalent number spellings and escaped strings merge by value. A
+covered-index bitmap lets compound, container-valued, uncertified/colliding,
+or high-cardinality indexes decline independently when the complete summary
+does not fit one configured maximum extent. The first document mutation clears
+and retires this derivative; TTL-only publications retain it.
+
 Values beyond the configured inline extent use a checksummed overflow chain
 whose descriptor binds total length and owner slot. Directory cache size,
 prefetch depth, and overflow threshold are `FileStoreOptions`; none changes
@@ -393,7 +403,9 @@ padding before sealing caller-filled pages, and checksum the complete physical
 page. Readers perform one checksum pass, reject reserved fields, and expose
 neither padding nor the trailer. The fixed 256-byte state-root payload records
 Store options and counts plus independent chunk, key, exact-index, and TTL
-directory roots. Each reference carries a physical offset and immutable
+directory roots. Its reserved suffix now holds optional clean-generation
+numeric-stripe and categorical-group accelerator roots. Each reference carries
+a physical offset and immutable
 logical-id/generation pair, so unchanged roots can be shared without a Go
 pointer or a global lookup. Recovery validates those top-level directory pages
 and their identities before selecting a generation; a torn or mismatched newer
@@ -539,6 +551,13 @@ must count there. An untouched compact generation reads its contiguous dense
 scan stripes. After the first document mutation the same API walks
 authoritative detached sidecars plus peeled document pages, preserving
 correctness without pretending that a stale clean stripe includes overlays.
+An unfiltered one-column scalar `GROUP BY` with `COUNT(*)` similarly uses a
+matching exact index. Untouched compact generations read the O(groups)
+categorical catalog without posting or document pages. After mutation, exact
+posting certificates provide group representatives and counts while only
+missing, container, legacy, oversized-certificate, or collision rows read JSON.
+Nested RFC 6901 paths are eligible; compound and multi-column grouping stay on
+the general executor.
 
 TTL is publication-based and persistent. A deadline is stored beside its key
 and in an ordered copy-on-write TTL tree. Changing or removing it updates both

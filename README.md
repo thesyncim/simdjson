@@ -482,7 +482,9 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Compact durable bytes, 5M-row capacity smoke | 1.555 GiB (0.813x key+JSON), 31.85% larger than the 1.18 GiB DuckDB checkpoint; the stripe costs 2.39 MiB |
 | Recovered exact filter, 5M-row capacity smoke | 4.376 ms, 540 posting pages, 0 JSON rows/rechecks, 5.60x faster in a cross-OS mechanism smoke, not a machine race |
 | Recovered scalar-object `@>`, 5M-row capacity smoke | 4.486 ms, 540 posting pages, 0 JSON rows/rechecks, 313.9x faster in the same cross-OS capacity smoke |
-| Real-derived Twitter, 128 MiB | point 16.69x, filter 3.49x, SUM 3.37x, scalar-object `@>` 114.33x versus pinned one-thread DuckDB; FileStore file 1.48x larger |
+| Clean exact-index grouping, 100K rows / 32 groups | 8.88-9.09 us, 0 posting or JSON pages; about 1,470x faster than the former posting-stream lane |
+| Real-derived grouping, 128 MiB | CITM 542 ns / Twitter 792 ns, 821.19x / 347.22x faster than retained pinned one-thread DuckDB; one added 4 KiB catalog page per file |
+| Real-derived Twitter, 128 MiB | point 14.76x, filter 2.72x, SUM 2.97x, scalar-object `@>` 91.25x versus pinned one-thread DuckDB; FileStore file 1.48x larger |
 | Dense Store fused 3-predicate bitmap / ordered 4,096-row decode | 410-416 ns / 4.03-4.08 us, 0 allocations |
 | Change an existing TTL | 45 ns, 0 allocations |
 | Dense bitmap Boolean pass on M4 Max | 75-80 GB/s, 0 allocations; NEON did not beat scalar and is not dispatched |
