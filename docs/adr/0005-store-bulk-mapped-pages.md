@@ -184,8 +184,8 @@ virtual mapping, but it still validates every key and row, allocates external
 metadata proportional to both, and rebuilds distinct shapes and exact roots.
 It is not the bounded-residency surface.
 
-`Store.WritePageFile` and `OpenStorePageReader` implement the first explicit
-greater-than-memory tier for immutable generations. The writer emits packed
+`Store.WritePageFile`, `OpenStorePageReader`, and `OpenStorePageDB` implement
+the first explicit greater-than-memory tier. The checkpoint writer emits packed
 document extents first, a sparse 64-way chunk radix, a sorted keyed B+tree,
 then the state root and finally one alternating superblock. The reader keeps
 only the recovered value root plus a fixed frame arena and O(frame-count)
@@ -211,6 +211,14 @@ not process baseline, goroutine stacks, kernel memory, or the small
 O(frame-count) Go control table. It is a residency proof, not an equal-latency
 claim: cold direct reads pay storage latency.
 
+The mutable smoke opens that same 141x image, durably replaces one middle row,
+reads it through the unchanged 8,192-byte budget, closes, and recovers the new
+generation. The update appends exactly 16 KiB—one document, two packed-radix
+nodes, and one state page—and performs zero Go allocations after open. A
+multi-level key-tree delete appends 20 KiB including its leaf and branch path.
+These prove bounded COW work per touched path; they do not yet prove bounded
+long-running file size because retired extents are not reused.
+
 On Apple M4 Max, admitted ordinary point reads measured 150.7-153.9 ns and a
 prepared immutable location 49.3-49.8 ns, both at zero allocations. Under the
 141x pressure fixture, random point reads perform five 4 KiB reads and measured
@@ -230,8 +238,10 @@ The complete mutable design continues to separate four temperature classes:
 
 The page reader already exposes capacity, logical resident bytes, frame states,
 pins, hits, misses, coalescing, reads, bytes, evictions, failures, file bytes,
-and whether direct I/O is actually active. Dirty bytes, prefetch depth, and
-queue depth belong to the not-yet-attached mutable/asynchronous tier.
+and whether direct I/O is actually active. `StorePageDB` additionally exposes
+visible and durable generations, selected commit backend, queued generations,
+device commits, completed batches, and largest group. Dirty-byte accounting
+and prefetch depth remain future control-plane fields.
 
 `OpenStore` may continue to mmap a read-only checkpoint for simple restart and
 hot, read-mostly workloads. It is not the primary 100x transactional backend.
@@ -241,8 +251,9 @@ encoding to virtual-memory behavior. The automatic writer therefore uses
 explicit append I/O and durability barriers; read-only mmap is an optional
 access mode, never the correctness mechanism.
 
-The proposed mutable mode is page-oriented copy-on-write, not a heap Store
-whose byte slices happen to come from mmap. A logical micro-page contains:
+The implemented first mutable slice and the remaining design are page-oriented
+copy-on-write, not a heap Store whose byte slices happen to come from mmap. A
+logical micro-page contains:
 
 - a generation, checksum, format version, and exact byte bounds;
 - at most 64 stable slots and a dense live-row directory;
@@ -289,14 +300,16 @@ steady heap allocation. Readers never load that queue or a durability counter.
 The consumer groups adjacent generations and executes the copy-on-write commit
 below once per batch.
 
-Async mutation returns after reader publication; `DurableGeneration` reports
-the newest crash-safe root and `Flush`/`Close` waits until a requested
-generation reaches it. A synchronous option waits after each mutation. It
-cannot be zero-latency because ordered storage writes and a durability barrier
-are physical work. Queue saturation applies backpressure instead of silently
-dropping durability records or retaining unbounded historical states. Any
-background I/O error becomes sticky, stops durable-generation advancement, and
-is returned by fencing and subsequent persistence-aware mutations.
+`StorePageDB` currently uses the synchronous contract: an existing-key `Put` or
+`Delete` waits for the data barrier, alternate-root write, and final barrier
+before publishing its in-memory RCU root and returning. Consequently
+`DurableGeneration` equals the visible generation after success and `Flush` is
+normally a cheap fence. The committer remains asynchronous and group-capable
+internally, but returning before pages are readable would require a bounded
+pending-page overlay; merely publishing a root whose pages still exist only in
+writer buffers would break read-after-write. That overlay and an explicit async
+acknowledgement option remain the next throughput phase. Queue saturation
+already applies bounded backpressure, and a background I/O error is sticky.
 
 One transaction follows a failure-atomic sequence:
 
@@ -386,11 +399,26 @@ base/delta pair. At 5M fixture rows, two nested/compound packed index bases use
 20,798,476 bytes (4.16 B/doc) versus the prior 496 MB heap-node estimate. The
 durable state root does not publish these pages yet.
 
-This is deliberately still internal: Store does not yet attach changed
-micro-pages to commit batches or encode copied key/index/TTL paths in their
-common page payloads. Therefore ordinary `Put`, `Delete`, and TTL operations
-are not yet automatically durable. Read-only checkpoint mappings never contain
-dirty transactional state.
+`StorePageDB` now attaches changed document micro-pages and packed chunk paths
+to those commit batches. Replacements copy one document extent, at most six
+chunk-directory nodes, and the state page. Deletes also remove the ordinary
+routed key location by copying its leaf and branch path; empty document and
+chunk-directory nodes disappear from the new root. Physical replacements keep
+their stable logical ids and advance generation, so repeated updates do not
+consume logical address space. A two-slot pointer-free RCU value root lets
+readers copy a complete generation without blocking on the writer's storage
+work. Resident reads and durable updates measure zero Go allocations.
+
+Mutable open takes a non-blocking advisory exclusive writer lease before
+recovery or tail truncation. A second writer is rejected; read-only page
+readers may coexist. Unsupported locking platforms fail closed.
+
+This remains a deliberately bounded feature slice. Missing-key insertion,
+durable exact-index and TTL roots, collision-continuation rewriting, overflow
+documents, pending-page async visibility, and snapshot-safe free-extent reuse
+are not represented as complete. `OpenStorePageDB` rejects TTL/index roots and
+`Put` rejects a missing key rather than silently producing partial durability.
+Read-only checkpoint mappings never contain dirty transactional state.
 
 The old root stays valid until the final step. Recovery chooses the newest
 valid superblock and ignores unreferenced partial pages. This follows the
@@ -403,7 +431,8 @@ durability protocol.
 
 ## Delete and space reclamation
 
-Delete builds the affected page without the row and publishes a new page id.
+Delete builds the affected page without the row and publishes a new physical
+version under the same logical page id.
 Deleting the final row removes the logical page mapping. Readers see neither a
 tombstone nor a version walk, and current-page scan density is restored by the
 same operation.
@@ -515,7 +544,8 @@ The mapped Store is not complete until it passes:
 - working sets below, near, and above physical RAM; and
 - bounded reclamation under a deliberately long-lived snapshot.
 
-Until those gates pass, `OpenStore` remains a caller-owned off-heap payload
-boundary and `OpenStorePageReader` remains an immutable bounded-residency tier,
-not a durable mutable database. `Open` remains the lower-level `DocSet` image
+Until the remaining gates pass, `OpenStore` remains a caller-owned off-heap
+payload boundary, `OpenStorePageReader` remains the immutable bounded-residency
+tier, and `StorePageDB` remains the narrower durable update/delete slice rather
+than the complete database. `Open` remains the lower-level `DocSet` image
 mechanism used inside `OpenStore`.

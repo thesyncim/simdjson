@@ -239,6 +239,20 @@ func (v KeyDirectoryView) LocationAt(rank int) (KeyLocation, bool) {
 	}, true
 }
 
+// BranchAt returns one internal upper bound and child by packed rank. It is
+// used by copy-on-write path reconstruction; ordinary point reads should use
+// Child's binary search.
+func (v KeyDirectoryView) BranchAt(rank int) (KeyBranch, bool) {
+	if v.header.Level == 0 || rank < 0 || rank >= int(v.count) {
+		return KeyBranch{}, false
+	}
+	start := KeyDirectoryPayloadHeaderSize + rank*KeyBranchEntrySize
+	return KeyBranch{
+		MaxHash: binary.LittleEndian.Uint64(v.payload[start : start+8]),
+		Child:   decodePageRef(v.payload[start+8 : start+KeyBranchEntrySize]),
+	}, true
+}
+
 // Child returns the unique internal child whose upper bound covers hash.
 func (v KeyDirectoryView) Child(hash uint64) (PageRef, bool) {
 	if v.header.Level == 0 || hash < v.header.MinHash || hash > v.header.MaxHash {

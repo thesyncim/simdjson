@@ -223,12 +223,14 @@ post-open mutations do not update the image. The measured limit and automatic
 append-only 100x-RAM design are in
 [Mutable Store operations](docs/store.md).
 
-The separate page-file surface is now an end-to-end bounded-residency read
-tier. `Store.WritePageFile` writes an immutable generation to an empty file,
+The separate page-file surface is now an end-to-end bounded-residency tier.
+`Store.WritePageFile` writes the initial immutable generation to an empty file,
 publishing its double-superblock only after document, packed 64-way chunk,
 sorted key, and state-root pages are checksummed and synced.
-`OpenStorePageReader` recovers that root and admits pages through a fixed
-external frame arena instead of mapping or validating the corpus eagerly:
+`OpenStorePageReader` recovers that root for immutable workloads.
+`OpenStorePageDB` opens the same format for crash-safe existing-key updates and
+deletes without loading the corpus into Go objects. Both admit pages through a
+fixed external frame arena instead of mapping or validating the corpus eagerly:
 
 ```go
 file, err := os.OpenFile("store.next", os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
@@ -265,6 +267,42 @@ if !ok {
 	return os.ErrNotExist
 }
 ```
+
+The mutable surface persists automatically; there is no checkpoint call after
+a successful mutation:
+
+```go
+db, err := simdjson.OpenStorePageDB("store.next", simdjson.StorePageDBOptions{
+	Open: simdjson.StorePageOpenOptions{
+		ResidentBytes: 64 << 20,
+		DirectIO:      simdjson.StoreDirectTry,
+	},
+	CommitBackend: simdjson.StorePageCommitAuto,
+})
+if err != nil {
+	return err
+}
+defer db.Close()
+
+_, err = db.Put("session:42", replacement) // existing stable slot
+deleted, err := db.Delete("session:expired")
+dst, ok, err = db.AppendRawKey(buf[:0], db.CompileKey("session:42"))
+```
+
+`Put` and `Delete` copy only the affected document micro-page, its packed
+chunk-radix path, the affected key path for a delete, and the state root. They
+reuse stable logical page ids, append physical versions, pass the data barrier,
+publish the alternate checksummed root, and return only when that generation is
+durable. Readers copy a pointer-free RCU root and never wait on page construction;
+old-root readers may finish while the new root becomes visible. Resident reads
+and durable updates are zero-allocation with caller buffers and warm fixed
+staging.
+
+This is deliberately not the final transactional surface: inserting a missing
+key returns `ErrStorePageInsertUnsupported`; durable TTL/index roots, overflow
+values, asynchronous group acknowledgement, and snapshot-safe extent reuse are
+still gated. Until reclamation lands, repeated replacements grow the file by
+the copied paths even though read residency remains fixed.
 
 Admission verifies CRC32C, Store identity, page identity, and the complete
 kind-specific schema once; resident hits use epoch-protected views. CLOCK
@@ -402,6 +440,7 @@ define the methodology, gates, comparison boundaries, and pinned toolchains.
 | Borrowed selection or repeated document navigation | `RawValue`, `Index`/`Node`, or `Parse`/`Value` |
 | Keyed datasets, including bulk construction | `StoreBuilder`, `Store`, `Snapshot` |
 | Immutable datasets larger than a fixed frame budget | `Store.WritePageFile`, `OpenStorePageReader`, `StorePageReader` |
+| Bounded-residency durable existing-key updates and deletes | `OpenStorePageDB`, `StorePageDB` |
 | Low-level immutable arenas and column extraction | `DocSet`, `ShapeCache`, `KeyInterner` |
 | Typed projection, filtering, grouping, and aggregation; optional SQL front end | `query.Plan`, `query.PrepareSQL`, `query.Result`, `query.Workspace` |
 | Keyed updates, deletes, TTL, snapshots, exact indexes, and wildcard postings | `Store`, `Snapshot`, `StoreIndexDefinition`, `StoreStats` |
@@ -442,6 +481,15 @@ values, and new calls observe `ErrStorePageClosed`. `StorePageValue` and
 frames. Close each value, never retain callback bytes, and use `AppendRaw` when
 the result must outlive a lease. Prepared page keys retain only value metadata,
 not frame pointers, and are safe to copy and share.
+
+`StorePageDB` serializes writers and holds a non-blocking advisory file lease;
+a second mutable opener receives `ErrStorePageWriterLocked`, while immutable
+readers may coexist. It does not hold its writer mutex or an RCU
+epoch across read I/O. Each read copies one current root, so it observes one
+complete durable generation. `StorePageDBKey` caches the Store-bound key hash,
+not a generation-specific physical reference, and remains valid across updates
+and deletes. `Close` fences the committer before releasing its writer file and
+bounded page cache.
 
 ## Support and project records
 

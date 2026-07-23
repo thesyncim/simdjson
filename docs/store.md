@@ -407,6 +407,63 @@ failures, and whether direct I/O is actually active.
 I/O; `StoreDirectRequire` never silently changes semantics and reports
 `ErrStoreDirectIOUnsupported` when the request cannot be honored.
 
+Open the same file for automatic copy-on-write replacement and deletion:
+
+```go
+db, err := simdjson.OpenStorePageDB("accounts.pages", simdjson.StorePageDBOptions{
+	Open: simdjson.StorePageOpenOptions{
+		ResidentBytes:        64 << 20,
+		MaxDocumentPageBytes: 64 << 10,
+		DirectIO:             simdjson.StoreDirectTry,
+	},
+	CommitBackend: simdjson.StorePageCommitAuto,
+})
+if err != nil {
+	return err
+}
+defer db.Close()
+
+if _, err := db.Put("account:42", replacement); err != nil {
+	return err
+}
+deleted, err := db.Delete("account:41")
+dst, ok, err = db.AppendRawKey(dst[:0], db.CompileKey("account:42"))
+```
+
+`Put` currently replaces an existing stable slot; a missing key returns
+`ErrStorePageInsertUnsupported`. The writer validates JSON before reserving a
+batch, encodes into fixed reusable buffers, writes the replacement document
+extent, copies only the affected packed chunk-radix path, writes the new state
+page, passes a data-integrity barrier, writes the alternate 128-byte
+superblock, and passes the final barrier. `Delete` additionally copies the
+routed key B+tree leaf and branch path, removes empty document/radix nodes, and
+publishes no document tombstone. A key reached only through an adversarial
+cross-leaf 64-bit hash-collision continuation retains a harmless stale
+candidate until the collision-chain rewrite lands; exact document-key recheck
+still makes it unobservable as a row.
+
+Replacement pages retain their logical ids and receive new physical offsets
+and generation numbers. That is important: logical id space grows for new
+logical objects, not for every version, while recovery can still distinguish
+every immutable physical version. The state root remains the only visibility
+switch. A failed data write, barrier, state write, or root write leaves the old
+superblock valid; open truncates any unreachable crash tail back to the
+recovered `FileEnd` before accepting another mutation.
+
+Readers use a two-slot, pointer-free RCU root. They enter only long enough to
+copy the current value root, then traverse immutable pages without a database
+mutex. The single writer can spend storage latency constructing and syncing a
+new generation without blocking old-root reads. Root-slot reuse waits only for
+the bounded value-copy epoch, not for page I/O. `StorePageDBKey` caches the
+SipHash result but deliberately never caches a generation-specific document
+reference.
+
+Open also acquires a non-blocking advisory exclusive writer lease before
+recovery or crash-tail truncation. A second mutable opener receives
+`ErrStorePageWriterLocked`; immutable readers remain allowed. Platforms on
+which the package cannot enforce that invariant fail with
+`ErrStorePageWriterLockUnsupported` instead of risking two root publishers.
+
 The bounded smoke writes 1,155,072 bytes and opens it with 8,192 bytes of
 frames: a 141.0x file/cache ratio. This proves bounded correctness, not equal
 latency. Apple M4 Max measurements:
@@ -424,13 +481,31 @@ that VM storage stack, not NVMe. A cold read cannot match DRAM latency; the
 useful guarantee is that a hot set stays resident and a cold set cannot force
 unbounded Go heap or RSS growth.
 
-This page-file surface is read-only and currently rejects TTL or secondary-
-index state rather than silently dropping it. Online copy-on-write mutation,
-durable index/TTL roots, overflow values, asynchronous scan batches, and
-snapshot-aware extent reclamation remain the attached-database boundary. The
-internal root-last committer and pure-Go Linux ring writer already provide the
-bounded durability substrate, but ordinary `Put`, `Delete`, and TTL calls are
-not falsely described as updating this file yet.
+For the mutable slice, a 1,024-row resident compiled-key read measured
+287.9-290.1 ns on Apple M4 Max with zero allocations. A synchronous portable
+update, including both durability barriers, measured 8.83-9.16 ms on the host
+filesystem. In the Linux/arm64 Docker VM over its bind-mounted filesystem, the
+same portable update measured 741-804 us; the required io_uring path measured
+867-994 us and therefore did not win in that environment. Backend availability
+is not treated as evidence of speed. Both paths remained 0 B/op and
+0 allocs/op. A one-row update in the 141x fixture appended exactly 16 KiB: one
+4 KiB document page, two 4 KiB chunk-radix nodes, and one 4 KiB state page.
+A delete through a two-level key tree appended its document and chunk pages,
+one key leaf, one key branch, and the state page—20 KiB total. These are
+copy-on-write amplification measurements, not steady-state file-size claims;
+free-extent reuse is still required to bound long-running file growth.
+
+`StorePageDB` is the first online mutable page-file slice, not the completed
+transactional engine. It currently rejects TTL or secondary-index state rather
+than silently making it stale; missing-key insertion, durable index/TTL roots,
+overflow values, asynchronous group acknowledgement, batched scans, and
+snapshot-aware extent reclamation remain gated. Every successful mutation is
+synchronous-durable today. `DurableGeneration` therefore equals the visible
+generation after return, and `Flush` is normally a cheap fence. The internal
+pure-Go Linux ring committer is already bounded and can group adjacent batches,
+but exposing asynchronous acknowledgement before pending pages are safely
+readable would violate read-after-write semantics and is intentionally not
+done.
 
 Chunk placement now uses 64-way packed CHAMP nodes: one occupancy word plus
 densely ranked 32-byte physical references, with no empty child array or Go
@@ -544,17 +619,20 @@ words without decoding rejected documents.
 
 ### Capacity planning for 1 TiB
 
-There are different answers for the mutable heap Store and immutable page
-reader. The current 5M-row builder Store uses 0.15 live heap bytes and 1.65
+There are different answers for the complete mutable heap Store and the
+bounded page tier. The current 5M-row builder Store uses 0.15 live heap bytes and 1.65
 heap-plus-external bytes per source byte. A linear 1 TiB extrapolation of this
 exact indexed workload would therefore require about 1.65 TiB of resident
 addressable storage even though the Go GC scans only a small fraction. That is
 workload evidence, not a universal multiplier: external ownership solves GC
 cost, while a 1 TiB corpus on 64 GiB needs the bounded page-file representation.
 
-The immutable page reader sizes its frame arena from the hot working set rather
-than total JSON. The following estimates also describe what a future mutable
-attached mode must budget. They extrapolate the measured 65,536-key
+`StorePageReader` and `StorePageDB` size their frame arena from the hot working
+set rather than total JSON. The mutable surface additionally reserves 26
+writer buffers by default, each the larger of the maximum document extent and
+the host page size; that fixed staging budget does not scale with rows. The
+following estimates describe directory and index data that may remain cold.
+They extrapolate the measured 65,536-key
 fixed and packed-CHAMP prototypes; the per-index column extrapolates the
 measured 4.2 bytes/document 16-value exact index. They exclude key spelling,
 TTL entries, high-cardinality value directories, allocator rounding, and the
@@ -802,11 +880,12 @@ snapshots, or an event loop that leaves expired deadlines unpublished.
 `ErrStoreTooLarge` before wraparound. Detailed source, tape, depth, retention,
 and maintenance limits are in [`contracts/limits.md`](contracts/limits.md).
 
-The mutable `Store` remains an in-memory API. `StorePageReader` is a public
-immutable bounded-residency surface, not the automatic-durability path for
-later mutations. The DuckDB harness compares two embedded
-engines over identical key+JSON input, one execution lane, matching scalar
-materialization, and verified results. It reports Store live heap and external
+The heap `Store` remains the complete mutable API for inserts, TTL, and durable-
+format-independent indexes. `StorePageReader` is the immutable bounded-
+residency surface; `StorePageDB` automatically persists existing-key updates
+and deletes but is not yet feature-equivalent to `Store`. The DuckDB harness
+compares two embedded engines over identical key+JSON input, one execution
+lane, matching scalar materialization, and verified results. It reports Store live heap and external
 blocks, DuckDB's checkpointed file and WAL, and DuckDB's current warm and peak
 buffer-manager bytes separately. A resident/file ratio would mix parsed state
 with compressed durable storage and is therefore intentionally absent.

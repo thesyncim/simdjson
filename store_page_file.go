@@ -359,28 +359,8 @@ func OpenStorePageReader(path string, options StorePageOpenOptions) (*StorePageR
 	if closeErr != nil {
 		return nil, closeErr
 	}
-	direct := storeio.DirectMode(options.DirectIO)
-	pages, err := storeio.OpenPageFile(path, storeio.PageFileOptions{
-		Cache: storeio.PageCacheOptions{
-			StoreID: root.StoreID, ResidentBytes: options.ResidentBytes,
-			FrameSize: options.MaxDocumentPageBytes,
-			Validate: func(page []byte, ref storeio.PageRef) error {
-				var err error
-				switch ref.Kind {
-				case storeio.PageDocument:
-					_, err = storeio.OpenDocumentPage(page, root.ChunkHighWater, root.NextLogicalID)
-				case storeio.PageChunkDirectory:
-					_, err = storeio.OpenChunkDirectoryPage(page, super.FileEnd, root.NextLogicalID)
-				case storeio.PageKeyDirectory:
-					_, err = storeio.OpenKeyDirectoryPage(page, super.FileEnd, root.NextLogicalID,
-						root.ChunkHighWater, root.ChunkDocuments)
-				default:
-					return fmt.Errorf("%w: unsupported page kind %d", ErrStorePageUnsupported, ref.Kind)
-				}
-				return storePageReadError(err)
-			},
-		},
-		Direct: direct,
+	pages, err := openStorePageFile(path, options, root.StoreID, func() (storeio.StateRoot, uint64) {
+		return root, super.FileEnd
 	})
 	if err != nil {
 		return nil, err
@@ -388,6 +368,37 @@ func OpenStorePageReader(path string, options StorePageOpenOptions) (*StorePageR
 	reader := &StorePageReader{root: root, fileEnd: super.FileEnd}
 	reader.pages.Store(pages)
 	return reader, nil
+}
+
+// openStorePageFile centralizes page admission for immutable readers and the
+// mutable page database. bounds must return a self-consistent root and file
+// high-water mark. The mutable caller copies them through its value-only RCU
+// root; no epoch is held while the admitted page is checked or consumed.
+func openStorePageFile(path string, options StorePageOpenOptions, storeID [16]byte,
+	bounds func() (storeio.StateRoot, uint64)) (*storeio.PageFile, error) {
+	return storeio.OpenPageFile(path, storeio.PageFileOptions{
+		Cache: storeio.PageCacheOptions{
+			StoreID: storeID, ResidentBytes: options.ResidentBytes,
+			FrameSize: options.MaxDocumentPageBytes,
+			Validate: func(page []byte, ref storeio.PageRef) error {
+				root, fileEnd := bounds()
+				var err error
+				switch ref.Kind {
+				case storeio.PageDocument:
+					_, err = storeio.OpenDocumentPage(page, root.ChunkHighWater, root.NextLogicalID)
+				case storeio.PageChunkDirectory:
+					_, err = storeio.OpenChunkDirectoryPage(page, fileEnd, root.NextLogicalID)
+				case storeio.PageKeyDirectory:
+					_, err = storeio.OpenKeyDirectoryPage(page, fileEnd, root.NextLogicalID,
+						root.ChunkHighWater, root.ChunkDocuments)
+				default:
+					return fmt.Errorf("%w: unsupported page kind %d", ErrStorePageUnsupported, ref.Kind)
+				}
+				return storePageReadError(err)
+			},
+		},
+		Direct: storeio.DirectMode(options.DirectIO),
+	})
 }
 
 // StorePageKey caches the deterministic persistent hash for one reader.
@@ -505,7 +516,15 @@ func (r *StorePageReader) viewPreparedPageKey(pages *storeio.PageFile, key Store
 }
 
 func (r *StorePageReader) lookupPageKey(pages *storeio.PageFile, key StorePageKey, prepared *StorePageKey) (StorePageValue, bool, error) {
-	ref := r.root.KeyDirectory
+	return lookupStorePageKey(pages, r.root.KeyDirectory, r.root.ChunkDirectory, key, prepared)
+}
+
+// lookupStorePageKey is the shared immutable-graph point lookup. Supplying
+// both root references by value lets a mutable caller finish against one
+// generation while a writer publishes the next; no traversed page is mutable.
+func lookupStorePageKey(pages *storeio.PageFile, keyRoot, chunkRoot storeio.PageRef, key StorePageKey,
+	prepared *StorePageKey) (StorePageValue, bool, error) {
+	ref := keyRoot
 	expectedLevel := uint8(0)
 	haveExpectedLevel := false
 	for ref != (storeio.PageRef{}) {
@@ -537,7 +556,7 @@ func (r *StorePageReader) lookupPageKey(pages *storeio.PageFile, key StorePageKe
 		first, end, candidates := view.CandidateRange(key.hash)
 		for i := first; candidates && i < end; i++ {
 			location, _ := view.LocationAt(i)
-			docRef, ok, resolveErr := r.resolveDocumentPage(pages, location.Chunk)
+			docRef, ok, resolveErr := resolveStoreDocumentPage(pages, chunkRoot, location.Chunk)
 			if resolveErr != nil {
 				_ = lease.Close()
 				return StorePageValue{}, false, resolveErr
@@ -582,7 +601,11 @@ func (r *StorePageReader) lookupPageKey(pages *storeio.PageFile, key StorePageKe
 		if !follow {
 			return StorePageValue{}, false, nil
 		}
-		if next.Offset <= ref.Offset || next.LogicalID <= ref.LogicalID {
+		// A copy-on-write leaf keeps its stable logical id but moves to a
+		// later physical extent, so its unchanged forward link may point to
+		// an older, lower offset. Logical ids retain strict forward order and
+		// are therefore the cycle-prevention invariant across generations.
+		if next.LogicalID <= ref.LogicalID {
 			return StorePageValue{}, false, corruptStorePage("key-leaf continuation order", storeio.ErrKeyDirectoryCorrupt)
 		}
 		ref = next
@@ -591,7 +614,12 @@ func (r *StorePageReader) lookupPageKey(pages *storeio.PageFile, key StorePageKe
 }
 
 func (r *StorePageReader) resolveDocumentPage(pages *storeio.PageFile, chunkID uint32) (storeio.PageRef, bool, error) {
-	ref := r.root.ChunkDirectory
+	return resolveStoreDocumentPage(pages, r.root.ChunkDirectory, chunkID)
+}
+
+func resolveStoreDocumentPage(pages *storeio.PageFile, chunkRoot storeio.PageRef,
+	chunkID uint32) (storeio.PageRef, bool, error) {
+	ref := chunkRoot
 	expectedShift := uint8(0)
 	haveExpectedShift := false
 	depth := 0
