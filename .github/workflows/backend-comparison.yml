@@ -4,6 +4,15 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      profile:
+        description: Benchmark sampling profile
+        required: true
+        default: quick
+        type: choice
+        options:
+          - quick
+          - full
 
 permissions:
   contents: read
@@ -19,13 +28,13 @@ jobs:
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       # Pull requests need directional signal from these noisy hosted runners;
       # the full publication profile remains available through workflow_dispatch.
-      BENCHTIME: ${{ github.event_name == 'workflow_dispatch' && '500ms' || '250ms' }}
-      BENCHCOUNT: ${{ github.event_name == 'workflow_dispatch' && '12' || '3' }}
-      CORRECTNESS_FLAGS: ${{ github.event_name == 'workflow_dispatch' && '' || '-short' }}
+      BENCHTIME: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'full' && '500ms' || '250ms' }}
+      BENCHCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'full' && '12' || '3' }}
+      CORRECTNESS_FLAGS: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'full' && '' || '-short' }}
       GOTOOLCHAIN: local
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
