@@ -10,9 +10,10 @@ import (
 const fileScanReadAheadLimit = 64
 
 type fileScanPage struct {
-	ref   storeio.PageRef
-	mask  uint64
-	chunk uint32
+	ref    storeio.PageRef
+	mask   uint64
+	chunk  uint32
+	chunks uint32
 }
 
 // RangeRaw visits live rows in ascending chunk/slot order. key and value are
@@ -37,10 +38,10 @@ func (s *FileSnapshot) RangeRawBuffer(scratch []byte, fn func(key, value []byte)
 		return scratch, nil
 	}
 	state := s.state
-	err := storeio.WalkChunkTree(s.store.cache, state.chunkRoot, storeio.ChunkTreeBounds{
+	err := storeio.WalkChunkTreeRuns(s.store.cache, state.chunkRoot, storeio.ChunkTreeBounds{
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-	}, func(chunk uint32, ref storeio.PageRef) error {
-		return s.rangeFileDocumentPage(state, chunk, ref, ^uint64(0), &scratch, fn)
+	}, func(chunk, chunks uint32, ref storeio.PageRef) error {
+		return s.rangeFileDocumentRun(state, chunk, chunks, ref, ^uint64(0), &scratch, fn)
 	})
 	return scratch, err
 }
@@ -85,16 +86,18 @@ func (s *FileSnapshot) RangeRawReadAheadBuffer(scratch []byte, fn func(key, valu
 		bytes = 0
 		return err
 	}
-	err := storeio.WalkChunkTree(s.store.cache, state.chunkRoot, storeio.ChunkTreeBounds{
+	err := storeio.WalkChunkTreeRuns(s.store.cache, state.chunkRoot, storeio.ChunkTreeBounds{
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-	}, func(chunk uint32, ref storeio.PageRef) error {
+	}, func(chunk, chunks uint32, ref storeio.PageRef) error {
 		length := uint64(ref.Length)
 		if count != 0 && (count == pageLimit || bytes+length > byteLimit) {
 			if err := flush(); err != nil {
 				return err
 			}
 		}
-		pages[count] = fileScanPage{ref: ref, mask: ^uint64(0), chunk: chunk}
+		pages[count] = fileScanPage{
+			ref: ref, mask: ^uint64(0), chunk: chunk, chunks: chunks,
+		}
 		count++
 		bytes += length
 		return nil
@@ -196,7 +199,9 @@ func (s *FileSnapshot) rangeFileReadAheadBatch(
 	}
 	for i := range pages {
 		page := pages[i]
-		if err := s.rangeFileDocumentPage(state, page.chunk, page.ref, page.mask, overflow, fn); err != nil {
+		if err := s.rangeFileDocumentRun(
+			state, page.chunk, page.chunks, page.ref, page.mask, overflow, fn,
+		); err != nil {
 			return err
 		}
 	}
@@ -211,39 +216,77 @@ func (s *FileSnapshot) rangeFileDocumentPage(
 	overflow *[]byte,
 	fn func(key, value []byte) error,
 ) error {
+	return s.rangeFileDocumentRun(state, chunk, 1, ref, mask, overflow, fn)
+}
+
+func (s *FileSnapshot) rangeFileDocumentRun(
+	state *fileStoreState,
+	first, chunks uint32,
+	ref storeio.PageRef,
+	mask uint64,
+	overflow *[]byte,
+	fn func(key, value []byte) error,
+) error {
+	if chunks == 0 || ref.Kind == storeio.PageDocument && chunks != 1 {
+		return storeio.ErrChunkDirectoryCorrupt
+	}
 	lease, err := s.store.cache.Acquire(ref)
 	if err != nil {
 		return err
 	}
-	view := storeio.AdmittedDocumentPage(lease.Page())
-	if view.Header().ChunkID != chunk {
-		lease.Release()
+	defer lease.Release()
+	for ordinal := uint32(0); ordinal < chunks; ordinal++ {
+		view, viewErr := admittedFileDocumentChunk(lease.Page(), ref, first+ordinal)
+		if viewErr != nil {
+			return viewErr
+		}
+		if err := s.rangeFileDocumentView(state, view, mask, overflow, fn); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *FileSnapshot) rangeFileDocumentView(
+	state *fileStoreState,
+	view fileDocumentChunk,
+	mask uint64,
+	overflow *[]byte,
+	fn func(key, value []byte) error,
+) error {
+	chunk := view.chunk
+	if chunk >= state.root.ChunkHighWater {
 		return storeio.ErrDocumentPageCorrupt
 	}
-	for live := view.Header().Live & mask; live != 0; live &= live - 1 {
+	for live := view.live() & mask; live != 0; live &= live - 1 {
 		slot := uint8(bits.TrailingZeros64(live))
-		record, ok := view.Lookup(slot)
+		record, ok := view.lookup(slot)
 		if !ok {
-			lease.Release()
 			return storeio.ErrDocumentPageCorrupt
 		}
-		value := record.JSON
-		if record.Overflow != (storeio.PageRef{}) {
+		value := record.value.value.Inline
+		if record.value.grouped {
 			*overflow = (*overflow)[:0]
+			var decoded bool
+			*overflow, decoded = view.appendJSON(*overflow, record.value)
+			if !decoded {
+				return storeio.ErrDocumentGroupCorrupt
+			}
+			value = *overflow
+		} else if record.value.value.Overflow != (storeio.PageRef{}) {
+			*overflow = (*overflow)[:0]
+			var err error
 			*overflow, err = s.store.appendFileValue(*overflow, state, storeio.DocumentValue{
-				Overflow: record.Overflow, Length: record.JSONLength,
+				Overflow: record.value.value.Overflow, Length: record.value.value.Length,
 			}, storeio.KeyLocation{Chunk: chunk, Slot: slot})
 			if err != nil {
-				lease.Release()
 				return err
 			}
 			value = *overflow
 		}
-		if err := fn(record.Key, value); err != nil {
-			lease.Release()
+		if err := fn(record.key, value); err != nil {
 			return err
 		}
 	}
-	lease.Release()
 	return nil
 }

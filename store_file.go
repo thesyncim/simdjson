@@ -351,6 +351,7 @@ type FileStore struct {
 	indexValueScratch       []byte
 	indexNewCertificate     []byte
 	indexCertificateScratch []byte
+	documentValueScratch    []byte
 	retireScratch           []storeio.FreeExtent
 	reusable                []storeio.FreeExtent
 	reuseJournal            []storeio.ReuseEdit
@@ -849,23 +850,26 @@ func (s *FileSnapshot) AppendRaw(dst []byte, key string) ([]byte, bool, error) {
 	if err != nil {
 		return dst, false, err
 	}
-	view := storeio.AdmittedDocumentPage(lease.Page())
-	if view.Header().ChunkID != location.Chunk {
+	view, err := admittedFileDocumentChunk(lease.Page(), documentRef, location.Chunk)
+	if err != nil {
 		lease.Release()
-		return dst, false, storeio.ErrDocumentPageCorrupt
+		return dst, false, err
 	}
-	value, ok := view.LookupStringValue(location.Slot, key)
+	value, ok := view.lookupString(location.Slot, key)
 	if !ok {
 		lease.Release()
 		return dst, false, nil
 	}
-	if value.Overflow == (storeio.PageRef{}) {
-		dst = append(dst, value.Inline...)
+	if value.grouped || value.value.Overflow == (storeio.PageRef{}) {
+		dst, ok = view.appendJSON(dst, value)
 		lease.Release()
+		if !ok {
+			return dst, false, storeio.ErrDocumentGroupCorrupt
+		}
 		return dst, true, nil
 	}
 	lease.Release()
-	dst, err = s.appendOverflow(dst, value, location)
+	dst, err = s.appendOverflow(dst, value.value, location)
 	return dst, err == nil, err
 }
 
@@ -1192,7 +1196,7 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 	hasOldIndex := false
 	if created {
 		if oldView != nil {
-			if _, occupied := oldView.Lookup(location.Slot); occupied {
+			if _, occupied := oldView.lookup(location.Slot); occupied {
 				return false, storeio.ErrDocumentPageCorrupt
 			}
 		}
@@ -1200,15 +1204,19 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 		if oldView == nil {
 			return false, storeio.ErrDocumentPageCorrupt
 		}
-		oldValue, ok := oldView.LookupKeyValue(location.Slot, key)
+		oldValue, ok := oldView.lookupKey(location.Slot, key)
 		if !ok {
 			return false, storeio.ErrDocumentPageCorrupt
 		}
-		if err := s.appendOverflowRetirements(state, oldValue, location); err != nil {
-			return false, err
+		if !oldValue.grouped {
+			if err := s.appendOverflowRetirements(state, oldValue.value, location); err != nil {
+				return false, err
+			}
 		}
 		if len(s.options.indexes) != 0 {
-			raw, valueErr := s.appendFileValue(s.indexValueScratch[:0], state, oldValue, location)
+			raw, valueErr := s.appendFileDocumentValue(
+				s.indexValueScratch[:0], state, *oldView, oldValue, location,
+			)
 			if valueErr != nil {
 				return false, valueErr
 			}
@@ -1224,7 +1232,7 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 	if err != nil {
 		return false, err
 	}
-	rows, live, err := s.buildFileRows(oldView, location.Slot, newRecord, true)
+	rows, live, err := s.buildFileRows(state, oldView, location.Slot, newRecord, true)
 	if err != nil {
 		return false, err
 	}
@@ -1237,7 +1245,7 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 		return false, err
 	}
 	documentLogicalID := uint64(0)
-	if oldRef != (storeio.PageRef{}) {
+	if oldRef.Kind == storeio.PageDocument {
 		documentLogicalID = oldRef.LogicalID
 	}
 	documentPage, err := tx.Allocate(storeio.PageDocument, documentSize, documentLogicalID)
@@ -1298,7 +1306,7 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 	if err != nil {
 		return false, err
 	}
-	if err := s.reserveFileRetirements(state, oldRef, keyMutation, chunkMutation); err != nil {
+	if err := s.reserveFileRetirements(state, oldRef, oldView, keyMutation, chunkMutation); err != nil {
 		return false, err
 	}
 	retirementReserved = true
@@ -1548,7 +1556,7 @@ func (s *FileStore) setDeadlineLocked(state *fileStoreState, key []byte, locatio
 	if err != nil {
 		return false, err
 	}
-	if err := s.reserveFileRetirements(state, storeio.PageRef{}, keyMutation, storeio.ChunkTreeMutation{}); err != nil {
+	if err := s.reserveFileRetirements(state, storeio.PageRef{}, nil, keyMutation, storeio.ChunkTreeMutation{}); err != nil {
 		return false, err
 	}
 	retirementReserved = true
@@ -1642,13 +1650,13 @@ func (s *FileStore) ExpireDue(now time.Time, limit int) (expired int, err error)
 		if err != nil || view == nil {
 			return expired, err
 		}
-		record, found := view.Lookup(entry.Slot)
+		record, found := view.lookup(entry.Slot)
 		if !found {
 			lease.Release()
 			return expired, storeio.ErrTTLDirectoryCorrupt
 		}
 		location := storeio.KeyLocation{Chunk: entry.Chunk, Slot: entry.Slot, Deadline: entry.Deadline}
-		_, err = s.deleteLocked(state, record.Key, location)
+		_, err = s.deleteLocked(state, record.key, location)
 		lease.Release()
 		if err != nil {
 			return expired, err
@@ -1688,16 +1696,20 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 		return false, err
 	}
 	defer oldLease.Release()
-	oldValue, ok := oldView.LookupKeyValue(location.Slot, key)
+	oldValue, ok := oldView.lookupKey(location.Slot, key)
 	if !ok {
 		return false, storeio.ErrDocumentPageCorrupt
 	}
-	if err := s.appendOverflowRetirements(state, oldValue, location); err != nil {
-		return false, err
+	if !oldValue.grouped {
+		if err := s.appendOverflowRetirements(state, oldValue.value, location); err != nil {
+			return false, err
+		}
 	}
 	var oldIndex Index
 	if len(s.options.indexes) != 0 {
-		raw, valueErr := s.appendFileValue(s.indexValueScratch[:0], state, oldValue, location)
+		raw, valueErr := s.appendFileDocumentValue(
+			s.indexValueScratch[:0], state, *oldView, oldValue, location,
+		)
 		if valueErr != nil {
 			return false, valueErr
 		}
@@ -1707,7 +1719,7 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 			return false, err
 		}
 	}
-	rows, live, err := s.buildFileRows(oldView, location.Slot, storeio.DocumentRecord{}, false)
+	rows, live, err := s.buildFileRows(state, oldView, location.Slot, storeio.DocumentRecord{}, false)
 	if err != nil {
 		return false, err
 	}
@@ -1725,7 +1737,11 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 		if sizeErr != nil {
 			return false, sizeErr
 		}
-		documentPage, allocateErr := tx.Allocate(storeio.PageDocument, documentSize, oldRef.LogicalID)
+		documentLogicalID := uint64(0)
+		if oldRef.Kind == storeio.PageDocument {
+			documentLogicalID = oldRef.LogicalID
+		}
+		documentPage, allocateErr := tx.Allocate(storeio.PageDocument, documentSize, documentLogicalID)
 		if allocateErr != nil {
 			return false, allocateErr
 		}
@@ -1794,7 +1810,7 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 	if err != nil {
 		return false, err
 	}
-	if err := s.reserveFileRetirements(state, oldRef, keyMutation, chunkMutation); err != nil {
+	if err := s.reserveFileRetirements(state, oldRef, oldView, keyMutation, chunkMutation); err != nil {
 		return false, err
 	}
 	retirementReserved = true
@@ -2040,7 +2056,7 @@ func (s *FileStore) stageFileValue(tx *storeio.WriteTransaction, location storei
 	return record, nil
 }
 
-func (s *FileStore) loadFileChunk(state *fileStoreState, chunkID uint32) (storeio.PageRef, *storeio.DocumentPageView, *storeio.PageLease, error) {
+func (s *FileStore) loadFileChunk(state *fileStoreState, chunkID uint32) (storeio.PageRef, *fileDocumentChunk, *storeio.PageLease, error) {
 	if chunkID >= state.root.ChunkHighWater || state.chunkRoot == (storeio.PageRef{}) {
 		return storeio.PageRef{}, nil, nil, nil
 	}
@@ -2054,16 +2070,17 @@ func (s *FileStore) loadFileChunk(state *fileStoreState, chunkID uint32) (storei
 	if err != nil {
 		return storeio.PageRef{}, nil, nil, err
 	}
-	view := storeio.AdmittedDocumentPage(lease.Page())
-	if view.Header().ChunkID != chunkID {
+	view, err := admittedFileDocumentChunk(lease.Page(), ref, chunkID)
+	if err != nil {
 		lease.Release()
-		return storeio.PageRef{}, nil, nil, storeio.ErrDocumentPageCorrupt
+		return storeio.PageRef{}, nil, nil, err
 	}
 	return ref, &view, &lease, nil
 }
 
-func (s *FileStore) buildFileRows(old *storeio.DocumentPageView, target uint8, replacement storeio.DocumentRecord, keep bool) ([]storeio.DocumentRecord, uint64, error) {
+func (s *FileStore) buildFileRows(state *fileStoreState, old *fileDocumentChunk, target uint8, replacement storeio.DocumentRecord, keep bool) ([]storeio.DocumentRecord, uint64, error) {
 	var storage [storeMaxChunkDocuments]storeio.DocumentRecord
+	s.documentValueScratch = s.documentValueScratch[:0]
 	position := 0
 	var live uint64
 	for slot := uint8(0); slot < uint8(s.options.Store.ChunkDocuments); slot++ {
@@ -2078,23 +2095,42 @@ func (s *FileStore) buildFileRows(old *storeio.DocumentPageView, target uint8, r
 		if old == nil {
 			continue
 		}
-		record, ok := old.Lookup(slot)
+		record, ok := old.lookup(slot)
 		if !ok {
 			continue
 		}
-		storage[position] = record
+		json := record.value.value.Inline
+		if record.value.grouped {
+			var appendErr error
+			start := len(s.documentValueScratch)
+			s.documentValueScratch, appendErr = s.appendFileDocumentValue(
+				s.documentValueScratch, state, *old, record.value,
+				storeio.KeyLocation{Chunk: old.chunk, Slot: slot},
+			)
+			if appendErr != nil {
+				return nil, 0, appendErr
+			}
+			json = s.documentValueScratch[start:]
+		}
+		stored := storeio.DocumentRecord{
+			Key: record.key, JSON: json, Overflow: record.value.value.Overflow, Slot: slot,
+		}
+		if stored.Overflow != (storeio.PageRef{}) {
+			stored.JSONLength = record.value.value.Length
+		}
+		storage[position] = stored
 		position++
 		live |= uint64(1) << slot
 	}
 	if old != nil {
-		if _, existed := old.Lookup(target); !keep && !existed {
+		if _, existed := old.lookup(target); !keep && !existed {
 			return nil, 0, storeio.ErrDocumentPageCorrupt
 		}
 	}
 	return storage[:position], live, nil
 }
 
-func (s *FileStore) buildFileFloat64Columns(state *fileStoreState, old *storeio.DocumentPageView, target uint8, replacement *Index, keep bool) (storeio.DocumentFloat64Columns, error) {
+func (s *FileStore) buildFileFloat64Columns(state *fileStoreState, old *fileDocumentChunk, target uint8, replacement *Index, keep bool) (storeio.DocumentFloat64Columns, error) {
 	if state == nil || state.root.Options&storeio.StateOptionFloat64Columns == 0 {
 		return storeio.DocumentFloat64Columns{}, nil
 	}
@@ -2104,11 +2140,11 @@ func (s *FileStore) buildFileFloat64Columns(state *fileStoreState, old *storeio.
 	}
 	clear(s.float64Masks)
 	if old != nil {
-		if old.Float64ColumnCount() != len(s.options.float64Columns) {
+		if old.float64ColumnCount() != len(s.options.float64Columns) {
 			return storeio.DocumentFloat64Columns{}, storeio.ErrDocumentPageCorrupt
 		}
 		for column := range s.options.float64Columns {
-			view, ok := old.Float64Column(column)
+			view, ok := old.float64Column(column)
 			if !ok {
 				return storeio.DocumentFloat64Columns{}, storeio.ErrDocumentPageCorrupt
 			}
@@ -2210,7 +2246,13 @@ func (s *FileStore) stageFileState(tx *storeio.WriteTransaction, old *fileStoreS
 	}, statePage, nil
 }
 
-func (s *FileStore) reserveFileRetirements(old *fileStoreState, oldDocument storeio.PageRef, key storeio.KeyTreeMutation, chunk storeio.ChunkTreeMutation) error {
+func (s *FileStore) reserveFileRetirements(
+	old *fileStoreState,
+	oldDocument storeio.PageRef,
+	oldView *fileDocumentChunk,
+	key storeio.KeyTreeMutation,
+	chunk storeio.ChunkTreeMutation,
+) error {
 	appendRef := func(ref storeio.PageRef) error {
 		if ref == (storeio.PageRef{}) {
 			return nil
@@ -2226,7 +2268,29 @@ func (s *FileStore) reserveFileRetirements(old *fileStoreState, oldDocument stor
 	if err := appendRef(old.stateRef); err != nil {
 		return err
 	}
-	if err := appendRef(oldDocument); err != nil {
+	if oldDocument.Kind == storeio.PageDocumentGroup {
+		if oldView == nil {
+			return storeio.ErrDocumentGroupCorrupt
+		}
+		header, ok := oldView.groupHeader()
+		if !ok {
+			return storeio.ErrDocumentGroupCorrupt
+		}
+		shared, err := storeio.ChunkTreeHasOtherReference(
+			s.cache, old.chunkRoot, header.FirstChunk, header.ChunkCount,
+			oldView.chunk, oldDocument, storeio.ChunkTreeBounds{
+				FileEnd: old.super.FileEnd, NextLogicalID: old.root.NextLogicalID,
+			},
+		)
+		if err != nil {
+			return err
+		}
+		if !shared {
+			if err := appendRef(oldDocument); err != nil {
+				return err
+			}
+		}
+	} else if err := appendRef(oldDocument); err != nil {
 		return err
 	}
 	for i := 0; i < int(key.RetiredCount); i++ {
@@ -2708,18 +2772,18 @@ func (s *FileStore) restoreAppendChunk(state *fileStoreState) error {
 	if err != nil {
 		return err
 	}
-	view := storeio.AdmittedDocumentPage(lease.Page())
+	view, viewErr := admittedFileDocumentChunk(lease.Page(), ref, last)
 	lease.Release()
-	if view.Header().ChunkID != last {
-		return storeio.ErrDocumentPageCorrupt
+	if viewErr != nil {
+		return viewErr
 	}
 	limit := ^uint64(0)
 	if state.root.ChunkDocuments < 64 {
 		limit = uint64(1)<<state.root.ChunkDocuments - 1
 	}
-	if view.Header().Live != limit {
+	if view.live() != limit {
 		s.appendChunk = last
-		s.appendLive = view.Header().Live
+		s.appendLive = view.live()
 	}
 	return nil
 }

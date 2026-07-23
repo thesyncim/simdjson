@@ -38,6 +38,7 @@ const (
 	PageTTLDirectory
 	PageFreeDirectory
 	PageIndexPosting
+	PageDocumentGroup
 )
 
 // PageHeader is the decoded identity of one immutable physical page. StoreID
@@ -174,5 +175,5 @@ func validatePageHeader(header PageHeader) error {
 }
 
 func validPageKind(kind PageKind) bool {
-	return kind >= PageStateRoot && kind <= PageIndexPosting
+	return kind >= PageStateRoot && kind <= PageDocumentGroup
 }

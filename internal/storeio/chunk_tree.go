@@ -34,6 +34,51 @@ func WalkChunkTree(cache *PageCache, root PageRef, bounds ChunkTreeBounds, fn fu
 	return walkChunkTreePage(cache, root, bounds, 30, fn)
 }
 
+// WalkChunkTreeRuns coalesces consecutive chunk ids that name the same
+// physical extent. Ordinary mutable document pages produce one-chunk runs;
+// compact-generation groups produce bounded multi-chunk runs even when their
+// mappings cross a radix-leaf boundary. Readers can therefore acquire and
+// prefetch each physical extent once without materializing a chunk list.
+func WalkChunkTreeRuns(
+	cache *PageCache,
+	root PageRef,
+	bounds ChunkTreeBounds,
+	fn func(first, count uint32, ref PageRef) error,
+) error {
+	if fn == nil {
+		return fmt.Errorf("%w: chunk-tree run walk", ErrInvalidWrite)
+	}
+	var runRef PageRef
+	var first, previous, count uint32
+	flush := func() error {
+		if count == 0 {
+			return nil
+		}
+		err := fn(first, count, runRef)
+		count = 0
+		return err
+	}
+	err := WalkChunkTree(cache, root, bounds, func(chunk uint32, ref PageRef) error {
+		if count != 0 && ref == runRef && uint64(chunk) == uint64(previous)+1 {
+			if count == ^uint32(0) {
+				return ErrChunkDirectoryCorrupt
+			}
+			previous = chunk
+			count++
+			return nil
+		}
+		if err := flush(); err != nil {
+			return err
+		}
+		runRef, first, previous, count = ref, chunk, chunk, 1
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return flush()
+}
+
 func walkChunkTreePage(cache *PageCache, ref PageRef, bounds ChunkTreeBounds, expectedShift uint8, fn func(uint32, PageRef) error) error {
 	lease, err := cache.Acquire(ref)
 	if err != nil {
@@ -83,7 +128,8 @@ func (m *ChunkTreeMutation) retire(ref PageRef) error {
 	return nil
 }
 
-// LookupChunkTree resolves one logical chunk to its immutable document extent.
+// LookupChunkTree resolves one logical chunk to its immutable document or
+// multi-chunk group extent.
 func LookupChunkTree(cache *PageCache, root PageRef, chunkID uint32, bounds ChunkTreeBounds) (PageRef, bool, error) {
 	if root == (PageRef{}) {
 		return PageRef{}, false, nil
@@ -113,6 +159,86 @@ func LookupChunkTree(cache *PageCache, root PageRef, chunkID uint32, bounds Chun
 		}
 		if expectedShift == 0 {
 			return next, true, nil
+		}
+		ref = next
+	}
+}
+
+// ChunkTreeHasOtherReference reports whether any chunk in [first, first+count)
+// except exclude still names want. It opens each covered 64-lane leaf once,
+// rather than performing one full radix lookup per chunk. Compact document
+// groups cover at most 128 rows, so their last-reference retirement touches at
+// most three leaf paths regardless of database size.
+func ChunkTreeHasOtherReference(
+	cache *PageCache,
+	root PageRef,
+	first uint32,
+	count uint16,
+	exclude uint32,
+	want PageRef,
+	bounds ChunkTreeBounds,
+) (bool, error) {
+	end := uint64(first) + uint64(count)
+	if cache == nil || root == (PageRef{}) || count == 0 || end > uint64(^uint32(0))+1 {
+		return false, fmt.Errorf("%w: chunk-tree reference range", ErrInvalidWrite)
+	}
+	for leaf := uint64(first) &^ uint64(63); leaf < end; leaf += 64 {
+		found, err := chunkTreeLeafHasOtherReference(
+			cache, root, uint32(leaf), first, end, exclude, want, bounds,
+		)
+		if err != nil || found {
+			return found, err
+		}
+	}
+	return false, nil
+}
+
+func chunkTreeLeafHasOtherReference(
+	cache *PageCache,
+	root PageRef,
+	leaf uint32,
+	first uint32,
+	end uint64,
+	exclude uint32,
+	want PageRef,
+	bounds ChunkTreeBounds,
+) (bool, error) {
+	ref := root
+	for expectedShift := uint8(30); ; expectedShift -= chunkDirectoryRadixBits {
+		lease, err := cache.Acquire(ref)
+		if err != nil {
+			return false, err
+		}
+		view, err := OpenChunkDirectoryPage(lease.Page(), bounds.FileEnd, bounds.NextLogicalID)
+		if err != nil {
+			lease.Release()
+			return false, err
+		}
+		header := view.Header()
+		if header.Shift != expectedShift || header.Prefix != chunkDirectoryPrefix(leaf, expectedShift) {
+			lease.Release()
+			return false, ErrChunkDirectoryCorrupt
+		}
+		if expectedShift == 0 {
+			begin := max(uint64(first), uint64(leaf))
+			limit := min(end, uint64(leaf)+64)
+			for chunk := begin; chunk < limit; chunk++ {
+				if uint32(chunk) == exclude {
+					continue
+				}
+				candidate, ok := view.Lookup(uint32(chunk))
+				if ok && candidate == want {
+					lease.Release()
+					return true, nil
+				}
+			}
+			lease.Release()
+			return false, nil
+		}
+		next, ok := view.Lookup(leaf)
+		lease.Release()
+		if !ok {
+			return false, nil
 		}
 		ref = next
 	}

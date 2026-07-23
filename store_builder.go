@@ -35,7 +35,7 @@ var (
 type StoreBuilder struct {
 	options  StoreOptions
 	seed     maphash.Seed
-	keys     *storeKeyNode
+	keyTable storeBuilderKeyTable
 	chunks   storeChunkVector
 	current  *storeChunk
 	count    int
@@ -109,8 +109,11 @@ func (b *StoreBuilder) Append(key string, src []byte) error {
 		return ErrStorePersistTooLarge
 	}
 	hash := maphash.String(b.seed, key)
-	if _, exists := storeKeyLookup(b.keys, hash, key); exists {
+	if b.keyTable.contains(b, hash, key) {
 		return fmt.Errorf("%w %q", ErrStoreDuplicateKey, key)
+	}
+	if uint64(b.count) >= storeBuilderKeyOrdinalMask {
+		return ErrStoreTooLarge
 	}
 	if b.current == nil {
 		if b.chunks.count == ^uint32(0) {
@@ -126,6 +129,9 @@ func (b *StoreBuilder) Append(key string, src []byte) error {
 	if err != nil {
 		return err
 	}
+	// Grow before publishing the new key into the table. Rehashing sees only
+	// preceding rows, and every subsequent operation is bounded and infallible.
+	b.keyTable.reserve(b, b.count+1)
 	b.currentDocBytes += len(src)
 	keyStart := len(b.current.keyBytes)
 	b.current.keyBytes = append(b.current.keyBytes, key...)
@@ -136,9 +142,8 @@ func (b *StoreBuilder) Append(key string, src []byte) error {
 	b.current.ord[slot] = uint8(ord)
 	b.current.live |= uint64(1) << uint(slot)
 	b.current.count++
+	b.keyTable.insert(hash, uint64(b.count))
 	b.count++
-	loc := storeLocation{chunk: b.chunks.count, slot: uint8(slot)}
-	storeKeyInsertTransient(&b.keys, 0, &storeKeyLeaf{hash: hash, key: storedKey, loc: loc})
 
 	if int(b.current.count) == b.options.ChunkDocuments {
 		b.flush()
@@ -297,7 +302,7 @@ func (b *StoreBuilder) Build() (*Store, error) {
 		return nil, err
 	}
 	store.state.Store(state)
-	b.keys = nil
+	b.keyTable = storeBuilderKeyTable{}
 	b.chunks = storeChunkVector{}
 	b.current = nil
 	b.exact = nil
@@ -408,36 +413,101 @@ func (b *StoreBuilder) buildExactIndexes(store *Store, state *storeState) error 
 	return nil
 }
 
-// storeKeyInsertTransient is StoreBuilder's uniquely-owned HAMT insertion.
-// It has the same terminal-bucket shape as storeKeyInsert but mutates nodes in
-// place, avoiding O(depth) immutable copies before any snapshot can exist.
-func storeKeyInsertTransient(root **storeKeyNode, shift uint, add *storeKeyLeaf) {
-	if *root == nil {
-		*root = &storeKeyNode{}
-	}
-	slot := &(*root).slots[(add.hash>>shift)&31]
-	if slot.child != nil {
-		storeKeyInsertTransient(&slot.child, shift+storeTrieBits, add)
-		return
-	}
-	if slot.leaf == nil {
-		slot.leaf = add
-		return
-	}
-	if storeKeyLeafHasHash(slot.leaf, add.hash) ||
-		shift >= storeKeyBucketShift && storeKeyLeafCount(slot.leaf) < storeKeyLeafBucket {
-		add.next = slot.leaf
-		slot.leaf = add
-		return
-	}
+const (
+	// A Store can address fewer than 2^38 rows: 2^32 chunk ids times at most
+	// 64 rows. Forty ordinal bits therefore leave a 24-bit hash fingerprint in
+	// one pointer-free word without narrowing the public address space.
+	storeBuilderKeyOrdinalBits = 40
+	storeBuilderKeyOrdinalMask = uint64(1)<<storeBuilderKeyOrdinalBits - 1
+	storeBuilderKeyMinSlots    = 16
+)
 
-	leaves := slot.leaf
-	slot.leaf = nil
-	for leaves != nil {
-		next := leaves.next
-		leaves.next = nil
-		storeKeyInsertTransient(&slot.child, shift+storeTrieBits, leaves)
-		leaves = next
+// storeBuilderKeyTable is the unpublished builder's duplicate-key guard.
+//
+// Each occupied slot packs a 24-bit hash fingerprint and row ordinal+1 into
+// one uint64. The ordinal resolves the exact key from builder-owned chunk
+// bytes, so even a full hash collision is compared byte-for-byte. Unlike the
+// online persistent HAMT, this append-only table needs no node or leaf per key,
+// contains no pointers for the garbage collector to scan, and grows only
+// geometrically. Build discards it after publishing the compact mapped key
+// directory.
+type storeBuilderKeyTable struct {
+	slots []uint64
+}
+
+func (t *storeBuilderKeyTable) contains(b *StoreBuilder, hash uint64, key string) bool {
+	if len(t.slots) == 0 {
+		return false
 	}
-	storeKeyInsertTransient(&slot.child, shift+storeTrieBits, add)
+	fingerprint := hash >> storeBuilderKeyOrdinalBits
+	mask := uint64(len(t.slots) - 1)
+	for slot := hash & mask; ; slot = (slot + 1) & mask {
+		packed := t.slots[slot]
+		if packed == 0 {
+			return false
+		}
+		if packed>>storeBuilderKeyOrdinalBits != fingerprint {
+			continue
+		}
+		stored, ok := b.keyAt((packed & storeBuilderKeyOrdinalMask) - 1)
+		if ok && stored == key {
+			return true
+		}
+	}
+}
+
+func (t *storeBuilderKeyTable) reserve(b *StoreBuilder, entries int) {
+	capacity := len(t.slots)
+	if capacity != 0 && entries <= capacity-capacity/8 {
+		return
+	}
+	if capacity == 0 {
+		capacity = storeBuilderKeyMinSlots
+	}
+	for entries > capacity-capacity/8 {
+		capacity *= 2
+	}
+	previous := t.slots
+	t.slots = make([]uint64, capacity)
+	for _, packed := range previous {
+		if packed == 0 {
+			continue
+		}
+		row := (packed & storeBuilderKeyOrdinalMask) - 1
+		key, ok := b.keyAt(row)
+		if !ok {
+			panic("simdjson: StoreBuilder key table ordinal invariant")
+		}
+		t.insert(maphash.String(b.seed, key), row)
+	}
+}
+
+func (t *storeBuilderKeyTable) insert(hash, row uint64) {
+	packed := hash&^storeBuilderKeyOrdinalMask | (row + 1)
+	mask := uint64(len(t.slots) - 1)
+	for slot := hash & mask; ; slot = (slot + 1) & mask {
+		if t.slots[slot] == 0 {
+			t.slots[slot] = packed
+			return
+		}
+	}
+}
+
+func (b *StoreBuilder) keyAt(row uint64) (string, bool) {
+	chunkDocuments := uint64(b.options.ChunkDocuments)
+	chunkID := row / chunkDocuments
+	if chunkID > uint64(^uint32(0)) {
+		return "", false
+	}
+	var chunk *storeChunk
+	if uint32(chunkID) < b.chunks.count {
+		chunk = b.chunks.get(uint32(chunkID))
+	} else if uint32(chunkID) == b.chunks.count {
+		chunk = b.current
+	}
+	slot := int(row % chunkDocuments)
+	if chunk == nil || slot >= int(chunk.count) {
+		return "", false
+	}
+	return chunk.keys[slot], true
 }

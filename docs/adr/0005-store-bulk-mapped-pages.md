@@ -237,6 +237,46 @@ values selected by the mask. JSON bounds remain capacity-clipped before the
 cover section. Mutation and recovery therefore cannot observe a cover from a
 different document generation, and the retained format adds no Go pointer per
 row or key.
+
+Compact generation creation can instead select a `PageDocumentGroup` when its
+rounded physical extent is strictly smaller than the same consecutive chunks
+as independent pages. A group contains at most 128 rows while preserving the
+configured logical chunk and stable-slot boundaries. The chunk tree may
+therefore map several consecutive lanes to one immutable physical reference;
+ordinary online pages remain one reference per chunk.
+
+The group payload has five independently bounded layers:
+
+1. a fixed chunk directory with live masks and packed row ranges;
+2. one row directory containing cumulative key/body ends, decoded length,
+   template id, and stable slot;
+3. exact key bytes and per-row scalar token streams;
+4. page-local structural templates plus at most 128 profitable complete-scalar
+   dictionary values; and
+5. directly addressable finite float64 masks and values.
+
+Dictionary ids occupy tokens 0 through 127. Tokens 128 through 254 encode
+literal lengths 1 through 127 directly; token 255 carries the longer canonical
+uvarint length. This removes one length byte from the common literal without
+changing exact JSON spelling. Candidate strings are read-only views of the
+source during construction, so a reused workspace does not allocate per
+scalar. A caller-sized output buffer makes point reconstruction
+zero-allocation. Page admission validates every directory, token length,
+decoded length, finite column, common CRC32C, and reconstructed JSON before the
+extent becomes visible.
+
+The grouped page is an immutable base, not the online mutation unit. Updating
+or deleting one row reconstructs only its bounded logical chunk as an ordinary
+document page. Other chunk lanes continue to reference the group. A bounded
+radix-range check visits each covered 64-lane leaf once and retires the group
+exactly when its final mapping is peeled; generation leases still fence
+physical reuse. Sequential scans and numeric reductions coalesce equal
+references and acquire each group once, including groups crossing a radix-leaf
+boundary. Grouping is currently a bulk/compact-generation optimization:
+correctness, scan density, and space reclamation do not require regrouping
+after online churn, but recovering its best compression after widespread
+updates requires creating another compact generation.
+
 Values beyond the configured inline extent use a checksummed overflow chain
 whose descriptor binds total length and owner slot. Directory cache size,
 prefetch depth, and overflow threshold are `FileStoreOptions`; none changes
@@ -388,10 +428,11 @@ durability protocol.
 
 ## Delete and space reclamation
 
-Delete builds the affected page without the row and publishes a new page id.
-Deleting the final row removes the logical page mapping. Readers see neither a
-tombstone nor a version walk, and current-page scan density is restored by the
-same operation.
+Delete builds the affected logical chunk without the row and publishes a new
+page id. Deleting the final row removes the logical chunk mapping. A compact
+group remains shared by untouched chunks and is retired after its final mapping
+is removed or peeled. Readers see neither a tombstone nor a version walk, and
+current-chunk scan density is restored by the same operation.
 
 Old physical pages cannot be reused until no active snapshot can reach their
 generation. Reclamation is page-granular:

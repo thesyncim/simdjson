@@ -64,31 +64,40 @@ func (s *FileSnapshot) ReduceFloat64PathsInto(dst []Float64Aggregate, paths []st
 	}
 	clear(dst)
 	state := s.state
-	err := storeio.WalkChunkTree(s.store.cache, state.chunkRoot, storeio.ChunkTreeBounds{
+	err := storeio.WalkChunkTreeRuns(s.store.cache, state.chunkRoot, storeio.ChunkTreeBounds{
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-	}, func(_ uint32, ref storeio.PageRef) error {
+	}, func(first, chunks uint32, ref storeio.PageRef) error {
+		if chunks == 0 || ref.Kind == storeio.PageDocument && chunks != 1 {
+			return storeio.ErrChunkDirectoryCorrupt
+		}
 		lease, err := s.store.cache.Acquire(ref)
 		if err != nil {
 			return err
 		}
-		view := storeio.AdmittedDocumentPage(lease.Page())
-		if view.Float64ColumnCount() != len(s.store.options.float64Columns) {
-			lease.Release()
-			return fmt.Errorf("%w: float64 covering catalog", storeio.ErrDocumentPageCorrupt)
-		}
-		for i, ordinal := range ordinals[:len(paths)] {
-			covered, ok := view.Float64Column(int(ordinal))
-			if !ok {
+		for chunkOrdinal := uint32(0); chunkOrdinal < chunks; chunkOrdinal++ {
+			view, viewErr := admittedFileDocumentChunk(lease.Page(), ref, first+chunkOrdinal)
+			if viewErr != nil {
 				lease.Release()
-				return fmt.Errorf("%w: float64 covering ordinal", storeio.ErrDocumentPageCorrupt)
+				return viewErr
 			}
-			iterator := covered.Values()
-			for {
-				value, present := iterator.Next()
-				if !present {
-					break
+			if view.float64ColumnCount() != len(s.store.options.float64Columns) {
+				lease.Release()
+				return fmt.Errorf("%w: float64 covering catalog", storeio.ErrDocumentPageCorrupt)
+			}
+			for i, ordinal := range ordinals[:len(paths)] {
+				covered, ok := view.float64Column(int(ordinal))
+				if !ok {
+					lease.Release()
+					return fmt.Errorf("%w: float64 covering ordinal", storeio.ErrDocumentPageCorrupt)
 				}
-				dst[i].add(value)
+				iterator := covered.Values()
+				for {
+					value, present := iterator.Next()
+					if !present {
+						break
+					}
+					dst[i].add(value)
+				}
 			}
 		}
 		lease.Release()

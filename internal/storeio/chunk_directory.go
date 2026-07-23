@@ -22,8 +22,10 @@ var ErrChunkDirectoryCorrupt = errors.New("simdjson: corrupt Store chunk directo
 
 // ChunkDirectoryHeader describes one immutable packed-radix node. Shift is a
 // multiple of six; zero identifies a leaf whose entries point to document
-// pages. Higher levels point to other chunk-directory pages. Bitmap lane order
-// defines the packed reference order, so sparse nodes store no empty slots.
+// pages or immutable multi-chunk document groups. Several leaf lanes may name
+// one group extent. Higher levels point to unique chunk-directory pages.
+// Bitmap lane order defines the packed reference order, so sparse nodes store
+// no empty slots.
 type ChunkDirectoryHeader struct {
 	StoreID    [16]byte
 	Generation uint64
@@ -123,7 +125,7 @@ func OpenChunkDirectoryPage(src []byte, fileEnd, nextLogicalID uint64) (ChunkDir
 		if err := validateChunkDirectoryRef(header, ref, fileEnd, nextLogicalID); err != nil {
 			return ChunkDirectoryView{}, fmt.Errorf("%w: %v", ErrChunkDirectoryCorrupt, err)
 		}
-		if !seen.add(ref) {
+		if (header.Shift != 0 || ref.Kind != PageDocumentGroup) && !seen.add(ref) {
 			return ChunkDirectoryView{}, fmt.Errorf("%w: duplicate child reference", ErrChunkDirectoryCorrupt)
 		}
 	}
@@ -235,7 +237,7 @@ func validateChunkDirectoryRefs(header ChunkDirectoryHeader, refs []PageRef, fil
 		if err := validateChunkDirectoryRef(header, ref, fileEnd, nextLogicalID); err != nil {
 			return err
 		}
-		if !seen.add(ref) {
+		if (header.Shift != 0 || ref.Kind != PageDocumentGroup) && !seen.add(ref) {
 			return fmt.Errorf("%w: duplicate child reference", ErrInvalidWrite)
 		}
 	}
@@ -283,12 +285,13 @@ func validateChunkDirectoryRef(header ChunkDirectoryHeader, ref PageRef, fileEnd
 	wantKind := PageChunkDirectory
 	validLength := ref.Length == header.PageSize
 	if header.Shift == 0 {
-		wantKind = PageDocument
+		wantKind = ref.Kind
 		// Directory and metadata nodes use the Store's allocation quantum.
-		// A document leaf may occupy a larger power-of-two extent so an
-		// ordinary 64-row chunk stays contiguous without forcing every sparse
-		// directory page to the same size.
-		validLength = ref.Length >= header.PageSize && validPhysicalPageSize(ref.Length)
+		// Document and group leaves may occupy larger power-of-two extents so
+		// packed rows stay contiguous without forcing sparse metadata pages to
+		// the same size.
+		validLength = (ref.Kind == PageDocument || ref.Kind == PageDocumentGroup) &&
+			ref.Length >= header.PageSize && validPhysicalPageSize(ref.Length)
 	}
 	pageSize := uint64(header.PageSize)
 	length := uint64(ref.Length)

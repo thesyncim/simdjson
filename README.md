@@ -165,8 +165,11 @@ raw, ok = before.GetRawKey(sessionKey)
 ```
 
 For an initial keyed corpus, `StoreBuilder` validates and copies rows directly
-into their final micro-pages, constructs the key directory through uniquely
-owned transient nodes, and publishes only the completed Store:
+into their final micro-pages. Duplicate detection uses a geometric,
+pointer-free table that packs a hash fingerprint and row ordinal into one word;
+the exact key bytes are still compared on every candidate. `Build` discards
+that transient table, compacts the published key directory, and publishes only
+the completed Store:
 
 ```go
 builder, err := simdjson.NewStoreBuilder(simdjson.StoreOptions{ShapeTapes: true})
@@ -258,15 +261,20 @@ raw, ok, err := snapshot.AppendRaw(nil, "event:42")
 
 For bulk creation, finish an in-memory `Store` and call
 `Store.WriteFileStore(file, options)` instead of replaying `Put`. It repacks
-live rows into the requested micro-page geometry, builds nested and compound
+live rows into the requested stable-slot geometry, builds nested and compound
 exact indexes plus TTL directories bottom-up, and publishes one mutable
-generation with two durability fences. Packed posting pages are immutable
-bases; the first update to one stream redirects that stream to an isolated
-copy-on-write page, so unrelated streams sharing the base cannot be retired.
-Explicit `Float64Columns` are built in the same bulk pass. Their finite numeric
-values and stable-slot masks live inside each document micro-page, so an online
-insert, replacement, or delete publishes JSON, exact indexes, and covers in one
-copy-on-write generation.
+generation with two durability fences. When it saves physical bytes, up to 128
+rows from consecutive logical chunks share one immutable document-group
+extent. Static JSON structure is stored once per shape; repeated scalar
+spellings use a bounded page dictionary, short literals carry their length in
+the token, and keys plus numeric covers remain directly addressable. Point and
+scan output still reconstructs the exact original JSON spelling into caller
+capacity. Packed posting and document-group pages are immutable bases. The
+first update peels only the affected logical chunk into an ordinary
+copy-on-write page; the shared extent is retired after its final mapping is
+peeled. Explicit `Float64Columns` are built in the same bulk pass, and online
+insert, replacement, or delete still publishes JSON, exact indexes, and covers
+in one copy-on-write generation.
 
 `FileStore` opens from bounded root/page scratch instead of walking the corpus.
 Its CLOCK arena is divided into 4 KiB allocation quanta: a metadata page uses
@@ -458,11 +466,13 @@ Single core, Apple M4 Max, pinned Go development toolchain with
 | Indexed Snapshot compound point query | 2.82 ns/input doc, 0 allocations |
 | Durable exact-index probe / candidate-only routing | 19.35-19.40 us / 2.31-2.42 us, 0 allocations |
 | Durable nested compound query, 1/64 selectivity | 113.0-114.2 us vs 664.8-665.3 us full scan; 170 KB vs 2.09 MB transient |
-| Recovered exact filter, 10K rows | 12.25 us, 2 posting pages, 0 JSON rows/rechecks, 13.73x faster than pinned one-thread DuckDB |
-| Recovered scalar-object `@>`, 10K rows | 11.83 us, 2 posting pages, 0 JSON rows/rechecks, 254.59x faster than pinned one-thread DuckDB |
-| Recovered durable SUM, 10K rows / one typed cover | 116.9 us, 0 JSON rows, 1.31x faster than pinned one-thread DuckDB |
-| Recovered exact filter, 5M-row capacity smoke | 4.029 ms, 540 posting pages, 0 JSON rows/rechecks, 6.08x faster in a cross-OS one-repetition mechanism smoke, not a machine race |
-| Recovered scalar-object `@>`, 5M-row capacity smoke | 3.919 ms, 540 posting pages, 0 JSON rows/rechecks, 359.28x faster in the same cross-OS capacity smoke |
+| Compact durable bytes, 10K rows | 3.16 MiB (0.81x key+JSON), versus 3.26 MiB pinned DuckDB |
+| Recovered exact filter, 10K rows | 14.50 us, 2 posting pages, 0 JSON rows/rechecks, 7.35x faster than pinned one-thread DuckDB |
+| Recovered scalar-object `@>`, 10K rows | 13.08 us, 2 posting pages, 0 JSON rows/rechecks, 230.75x faster than pinned one-thread DuckDB |
+| Recovered durable SUM, 10K rows / one typed cover | 143.5 us, 0 JSON rows, 1.10x slower than pinned one-thread DuckDB |
+| Compact durable bytes, 5M-row capacity smoke | 1.55 GiB (0.81x key+JSON), 31.1% larger than the 1.18 GiB DuckDB checkpoint |
+| Recovered exact filter, 5M-row capacity smoke | 5.143 ms, 540 posting pages, 0 JSON rows/rechecks, 4.76x faster in a cross-OS one-repetition mechanism smoke, not a machine race |
+| Recovered scalar-object `@>`, 5M-row capacity smoke | 4.876 ms, 540 posting pages, 0 JSON rows/rechecks, 288.76x faster in the same cross-OS capacity smoke |
 | Dense Store fused 3-predicate bitmap / ordered 4,096-row decode | 410-416 ns / 4.03-4.08 us, 0 allocations |
 | Change an existing TTL | 45 ns, 0 allocations |
 | Dense bitmap Boolean pass on M4 Max | 75-80 GB/s, 0 allocations; NEON did not beat scalar and is not dispatched |

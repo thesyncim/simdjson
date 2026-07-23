@@ -83,22 +83,24 @@ func (s *FileSnapshot) AppendIndexMasksInto(dst []StoreMask, workspace *FileInde
 		if acquireErr != nil {
 			return dst, acquireErr
 		}
-		documentPage := storeio.AdmittedDocumentPage(documentLease.Page())
-		if documentPage.Header().ChunkID != posting.Chunk {
+		documentPage, viewErr := admittedFileDocumentChunk(
+			documentLease.Page(), documentRef, posting.Chunk,
+		)
+		if viewErr != nil {
 			documentLease.Release()
-			return dst, storeio.ErrDocumentPageCorrupt
+			return dst, viewErr
 		}
 		verified := uint64(0)
 		for bitsLeft := posting.Bits; bitsLeft != 0; bitsLeft &= bitsLeft - 1 {
 			slot := uint8(bits.TrailingZeros64(bitsLeft))
-			value, present := documentPage.LookupValue(slot)
+			record, present := documentPage.lookup(slot)
 			if !present {
 				documentLease.Release()
 				return dst, storeio.ErrPostingPageCorrupt
 			}
 			workspace.document = workspace.document[:0]
-			workspace.document, err = s.store.appendFileValue(
-				workspace.document, probe.state, value,
+			workspace.document, err = s.store.appendFileDocumentValue(
+				workspace.document, probe.state, documentPage, record.value,
 				storeio.KeyLocation{Chunk: posting.Chunk, Slot: slot},
 			)
 			if err != nil {
@@ -110,7 +112,7 @@ func (s *FileSnapshot) AppendIndexMasksInto(dst []StoreMask, workspace *FileInde
 				var raw RawValue
 				var found bool
 				var pointerErr error
-				if value.Overflow == (storeio.PageRef{}) {
+				if record.value.grouped || record.value.value.Overflow == (storeio.PageRef{}) {
 					raw, found, pointerErr = probe.exact.paths[0].getRawTrusted(workspace.document)
 				} else {
 					raw, found, pointerErr = probe.exact.paths[0].GetRaw(workspace.document)

@@ -956,7 +956,8 @@ func (c *PageCache) validateRef(ref PageRef) (pageCacheKey, error) {
 	length := uint64(ref.Length)
 	if length < pageSize || length > uint64(c.options.MaxPageSize) ||
 		!validPhysicalPageSize(ref.Length) || length%pageSize != 0 ||
-		ref.Length != uint32(c.options.PageSize) && ref.Kind != PageDocument && ref.Kind != PageOverflow ||
+		ref.Length != uint32(c.options.PageSize) &&
+			ref.Kind != PageDocument && ref.Kind != PageDocumentGroup && ref.Kind != PageOverflow ||
 		ref.Flags != 0 || !validPageKind(ref.Kind) ||
 		ref.LogicalID <= StateRootLogicalID || ref.Generation == 0 ||
 		ref.Offset < uint64(superblockCopies)*pageSize || ref.Offset%pageSize != 0 ||

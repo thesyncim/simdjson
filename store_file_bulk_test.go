@@ -1,6 +1,9 @@
 package simdjson
 
 import (
+	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/bits"
 	"os"
@@ -183,6 +186,227 @@ func TestWriteFileStoreBulkPreservesDocumentsIndexesTTLAndMutation(t *testing.T)
 	masks, err = reopened.AppendIndexMasks(masks[:0], "status", active)
 	if err != nil || countMasks(masks) != 7 {
 		t.Fatalf("reopened active masks = (%+v,%v), count %d", masks, err, countMasks(masks))
+	}
+}
+
+func TestWriteFileStoreBulkGroupsExactDocumentsAndPeelsMutations(t *testing.T) {
+	const documents = 1024
+	options := testFileStoreOptions()
+	options.Store = StoreOptions{ChunkDocuments: 8, ShapeTapes: true}
+	options.MaxPageSize = 64 << 10
+	options.ResidentBytes = 8 << 20
+	options.Float64Columns = []string{"/score"}
+	builder, err := NewStoreBuilder(options.Store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row := range documents {
+		document := fmt.Appendf(
+			nil,
+			`{"tenant":"t%d","status":"s%d","score":%d,"active":%t,"payload":"%s"}`,
+			row&3, row%11, row, row&1 == 0, strings.Repeat("x", 96+(row&7)),
+		)
+		if err := builder.Append(fmt.Sprintf("doc:%04d", row), document); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(t.TempDir(), "file-store-groups-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	size, err := source.WriteFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size <= 0 {
+		t.Fatalf("grouped file size = %d", size)
+	}
+	store, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := store.state.Load()
+	groupRef, ok, err := storeio.LookupChunkTree(store.cache, state.chunkRoot, 0, storeio.ChunkTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+	})
+	if err != nil || !ok || groupRef.Kind != storeio.PageDocumentGroup {
+		t.Fatalf("chunk zero ref = (%+v,%v,%v)", groupRef, ok, err)
+	}
+	if groupRef.Length >= uint32(16*options.PageSize) {
+		t.Fatalf("group extent = %d, did not beat sixteen independent pages", groupRef.Length)
+	}
+	sameGroup, ok, err := storeio.LookupChunkTree(store.cache, state.chunkRoot, 1, storeio.ChunkTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+	})
+	if err != nil || !ok || sameGroup != groupRef {
+		t.Fatalf("adjacent chunk did not share group: (%+v,%v,%v)", sameGroup, ok, err)
+	}
+	buffer := make([]byte, 0, 256)
+	buffer, ok, err = store.AppendRaw(buffer[:0], "doc:0003")
+	if err != nil || !ok || !bytes.Contains(buffer, []byte(`"score":3`)) {
+		t.Fatalf("group point = (%q,%v,%v)", buffer, ok, err)
+	}
+	pointSnapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		var found bool
+		buffer, found, err = pointSnapshot.AppendRaw(buffer[:0], "doc:0003")
+		if err != nil || !found {
+			panic("group point failed")
+		}
+	})
+	if err := pointSnapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if allocs != 0 {
+		t.Fatalf("group point allocations = %.2f, want zero with caller buffer", allocs)
+	}
+
+	replacement := []byte(`{"tenant":"new","status":"updated","score":3000,"active":true}`)
+	if created, err := store.Put("doc:0003", replacement); err != nil || created {
+		t.Fatalf("group update = (%v,%v)", created, err)
+	}
+	if deleted, err := store.Delete("doc:0004"); err != nil || !deleted {
+		t.Fatalf("group delete = (%v,%v)", deleted, err)
+	}
+	state = store.state.Load()
+	peeled, ok, err := storeio.LookupChunkTree(store.cache, state.chunkRoot, 0, storeio.ChunkTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+	})
+	if err != nil || !ok || peeled.Kind != storeio.PageDocument || peeled == groupRef {
+		t.Fatalf("mutated chunk was not peeled to a private page: (%+v,%v,%v)", peeled, ok, err)
+	}
+	untouched, ok, err := storeio.LookupChunkTree(store.cache, state.chunkRoot, 1, storeio.ChunkTreeBounds{
+		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
+	})
+	if err != nil || !ok || untouched != groupRef {
+		t.Fatalf("untouched chunk lost shared base: (%+v,%v,%v)", untouched, ok, err)
+	}
+	groupLease, err := store.cache.Acquire(groupRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groupHeader := storeio.AdmittedDocumentGroup(groupLease.Page()).Header()
+	groupLease.Release()
+	for ordinal := uint16(1); ordinal < groupHeader.ChunkCount; ordinal++ {
+		row := int(ordinal) * options.Store.ChunkDocuments
+		key := fmt.Sprintf("doc:%04d", row)
+		replacement := fmt.Appendf(nil, `{"peeled":%d,"score":%d}`, ordinal, row)
+		if created, putErr := store.Put(key, replacement); putErr != nil || created {
+			t.Fatalf("peel group chunk %d = (%v,%v)", ordinal, created, putErr)
+		}
+		retiredGroup := false
+		for _, extent := range store.retireScratch {
+			if extent.Offset == groupRef.Offset && extent.Length == uint64(groupRef.Length) {
+				retiredGroup = true
+				break
+			}
+		}
+		wantRetired := ordinal+1 == groupHeader.ChunkCount
+		if retiredGroup != wantRetired {
+			t.Fatalf("group retirement after chunk %d = %v, want %v", ordinal, retiredGroup, wantRetired)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got, ok, err := reopened.AppendRaw(buffer[:0], "doc:0003")
+	if err != nil || !ok || !bytes.Equal(got, replacement) {
+		t.Fatalf("reopened update = (%q,%v,%v)", got, ok, err)
+	}
+	if _, ok, err := reopened.AppendRaw(buffer[:0], "doc:0004"); err != nil || ok {
+		t.Fatalf("reopened delete = (%v,%v)", ok, err)
+	}
+	got, ok, err = reopened.AppendRaw(buffer[:0], "doc:0010")
+	if err != nil || !ok || !bytes.Contains(got, []byte(`"score":10`)) {
+		t.Fatalf("reopened untouched group = (%q,%v,%v)", got, ok, err)
+	}
+}
+
+func TestWriteFileStoreBulkGroupRejectsResealedInvalidJSON(t *testing.T) {
+	const documents = 128
+	options := testFileStoreOptions()
+	options.Store = StoreOptions{ChunkDocuments: 8, ShapeTapes: true}
+	options.MaxPageSize = 64 << 10
+	options.ResidentBytes = 8 << 20
+	builder, err := NewStoreBuilder(options.Store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row := range documents {
+		document := fmt.Appendf(
+			nil, `{"id":%d,"payload":"%s"}`, row, strings.Repeat("x", 96+(row&7)),
+		)
+		if err := builder.Append(fmt.Sprintf("doc:%04d", row), document); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(t.TempDir(), "file-store-group-corrupt-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := source.WriteFileStore(file, options); err != nil {
+		t.Fatal(err)
+	}
+
+	lastChunk := uint32(documents/options.Store.ChunkDocuments - 1)
+	ref := recoveredFileDocumentRef(t, file, options, lastChunk)
+	if ref.Kind != storeio.PageDocumentGroup {
+		t.Fatalf("last chunk ref = %+v, want document group", ref)
+	}
+	page := make([]byte, ref.Length)
+	if _, err := file.ReadAt(page, int64(ref.Offset)); err != nil {
+		t.Fatal(err)
+	}
+	payload := page[storeio.PageHeaderSize:]
+	templateCount := int(binary.LittleEndian.Uint16(payload[12:14]))
+	templateStart := storeio.PageHeaderSize + storeio.DocumentGroupPayloadHeaderSize
+	for offset := 16; offset < 32; offset += 4 {
+		templateStart += int(binary.LittleEndian.Uint32(payload[offset : offset+4]))
+	}
+	entry := templateStart + templateCount*4
+	values := int(binary.LittleEndian.Uint16(page[entry : entry+2]))
+	staticStart := entry + 8 + (values+1)*4
+	if staticStart >= len(page) {
+		t.Fatalf("first template static byte offset %d is outside the page", staticStart)
+	}
+	if page[staticStart] != '{' {
+		t.Fatalf("first template static byte at %d = %q", staticStart, page[staticStart])
+	}
+	page[staticStart] = 'x'
+	if _, err := storeio.SealPage(page); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(page, int64(ref.Offset)); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenFileStore(file, options)
+	if reopened != nil {
+		_ = reopened.Close()
+		t.Fatal("OpenFileStore returned a store for invalid grouped JSON")
+	}
+	if !errors.Is(err, storeio.ErrDocumentGroupCorrupt) {
+		t.Fatalf("OpenFileStore invalid grouped JSON = %v, want document-group corruption", err)
 	}
 }
 

@@ -119,7 +119,11 @@ func fileStoreBenchOptions(m Manifest, maxDocumentBytes int, synchronous bool) s
 	if m.SumField != "" {
 		worstDocumentPage += 8 + chunkDocuments*8
 	}
-	maxPageSize := 4096
+	// Compact generations may pack up to 128 rows across stable 8-row chunks.
+	// Keep the online mutation unit small while admitting the largest grouped
+	// extent used by the benchmark; otherwise a 4 KiB cap silently disables
+	// the durable representation being measured.
+	maxPageSize := 64 << 10
 	for maxPageSize < worstDocumentPage {
 		maxPageSize <<= 1
 	}

@@ -144,9 +144,15 @@ same update, delete, TTL, snapshot, and index behavior as any other Store.
 compound paths are extracted at `Build`; the returned index is `Ready` in the
 first reader-visible generation, with no scan fallback window.
 
-The builder fills final micro-pages and mutates only unpublished key/chunk
-radix nodes. `Build` freezes that graph and performs one publication instead of
-path-copying it once per row. On the 16,384-document benchmark fixture it
+The builder fills final micro-pages and mutates only unpublished chunk radix
+nodes. Its duplicate guard is not a per-key HAMT: one pointer-free `uint64`
+slot packs a 24-bit hash fingerprint with a 40-bit row ordinal+1. A fingerprint
+candidate resolves the original chunk key and compares all bytes, so
+collisions cannot create a false duplicate. The table grows geometrically,
+reserved insert/lookup is zero-allocation, and `Build` drops it before
+publishing the compact mapped key directory. `Build` then freezes the graph and
+performs one publication instead of path-copying it once per row. On the
+16,384-document benchmark fixture it
 measured 4.57-4.76 ms (206-214 MB/s) versus 35.8-37.1 ms (26.4-27.3 MB/s) for
 repeated `Put`: about 7.7x the throughput, with 8.9 MiB rather than 143 MiB of
 transient allocation bytes. Including a ready 16-value exact index measured
@@ -568,9 +574,9 @@ Apple M4 Max, stable Go, 1,024 hot documents:
 | identical unindexed predicate, 1,024/1,024 rows scanned | 664.8-665.3 us | 2.091 MB/op, 2,565 allocs/op |
 | legacy JSON file aggregate, one worker | 745 us, 148 MB/s | 2.42 MB/op, 4,478 allocs/op |
 | legacy JSON file aggregate, four workers | 414 us, 267 MB/s | 2.42 MB/op, 4,481 allocs/op |
-| 10K-row recovered exact filter | 12.25 us, 2 posting pages, 0 JSON rows/rechecks | 13.73x faster than pinned one-thread DuckDB |
-| 10K-row recovered scalar-object `@>` | 11.83 us, 2 posting pages, 0 JSON rows/rechecks | 254.59x faster than pinned one-thread DuckDB |
-| 10K-row recovered SUM through one frozen cover | 116.9 us, 0 JSON rows | 1.31x faster than pinned one-thread DuckDB |
+| 10K-row recovered exact filter | 14.50 us, 2 posting pages, 0 JSON rows/rechecks | 7.35x faster than pinned one-thread DuckDB |
+| 10K-row recovered scalar-object `@>` | 13.08 us, 2 posting pages, 0 JSON rows/rechecks | 230.75x faster than pinned one-thread DuckDB |
+| 10K-row recovered SUM through one frozen cover | 143.50 us, 0 JSON rows | 0.91x DuckDB throughput (1.10x slower) |
 
 The 1/64 nested compound fixture is reproducible with
 `BenchmarkRunFileSnapshotPersistentIndexPushdown`; its three samples were
@@ -941,30 +947,34 @@ eligible single-column ART indexes over one deterministic NDJSON corpus. Every
 lane is correctness-gated. The frozen 10,000-document M4 Max run measured
 4.85 MiB of heap-Store-accounted resident state (1.25x logical key+JSON), a
 3.26 MiB checkpointed DuckDB file (0.84x), and 4.00 MiB of warm
-DuckDB-managed buffers. The current durable path writes the same data, one
-exact index, and one numeric cover as a 5.59 MiB
-FileStore (1.44x payload), 71% larger than DuckDB's 3.26 MiB checkpoint. Its
-conservatively accounted warm state is about 5.84 MiB; DuckDB reports 4.00 MiB
-of engine-managed warm buffers. Those accounting domains are not process-RSS
-equivalents and are therefore not reduced to a percentage comparison. Compact
-creation takes 29.65 ms including StoreBuilder work and both FileStore
-durability fences. DuckDB reports 18.12 ms load plus 7.76 ms index construction
-but does not retain checkpoint latency,
-so the report does not manufacture a durable-load ratio.
+DuckDB-managed buffers. The current compact-generation path writes the same
+data, one exact index, and one numeric cover as a 3.16 MiB FileStore (0.81x
+payload), 3.3% smaller than DuckDB's 3.26 MiB checkpoint. Consecutive
+stable-slot chunks share immutable document groups only when the rounded
+physical extent is strictly smaller than their independent pages. Static JSON
+structure is stored once per shape, repeated scalar spellings use a bounded
+dictionary, and one-byte short-literal tokens avoid per-value length varints.
+Keys and numeric covers stay directly addressable; exact JSON is reconstructed
+into caller capacity. The conservatively accounted warm state is about
+10.90 MiB because the harness admits 64 KiB group extents and charges the
+complete 8 MiB commit arena; DuckDB reports 4.00 MiB of engine-managed warm
+buffers. Those accounting domains are not process-RSS equivalents and are
+therefore not reduced to a percentage comparison. Compact creation takes
+39.75 ms including StoreBuilder work and both FileStore durability fences.
+DuckDB reports 18.77 ms load plus 7.07 ms index construction but does not retain
+checkpoint latency, so the report does not manufacture a durable-load ratio.
 
-After the same 256 updates and deletes, FileStore's high-water is 7.78 MiB
-with 2.22 MiB already reusable; DuckDB's database is 5.76 MiB with a zero-byte
+After the same 256 updates and deletes, FileStore's high-water is 5.49 MiB
+with 2.30 MiB already reusable; DuckDB's database is 5.76 MiB with a zero-byte
 WAL. Both post-mutation file sizes stay visible in the frozen report.
 
-With the pinned SIMD build, recovered FileStore point lookup is 14.2x faster.
+With the pinned SIMD build, recovered FileStore point lookup is 21.75x faster.
 The exact filter and equivalent one-member object `@>` each acquire two packed
 posting pages, certify all 84 matches, and admit zero JSON rows; they measure
-12.25 us and 11.83 us, respectively 13.73x and 254.59x faster than the fresh
-DuckDB run. The predicate-free covered SUM measures 116.9 us versus DuckDB's
-153.1 us, a 1.31x lead. The numeric cover fit existing 4 KiB page slack in this
-corpus; posting certificates bring FileStore to 5.59 MiB. That is a measured
-fixture result, not a zero-space guarantee. Grouping remains about 19.2x
-slower, and individually double-fenced update/delete about 9.0x/15.4x slower.
+14.50 us and 13.08 us, respectively 7.35x and 230.75x faster than the fresh
+DuckDB run. The predicate-free covered SUM measures 143.5 us versus DuckDB's
+130.5 us, 1.10x slower. Grouping remains about 22.0x slower, and individually
+double-fenced update/delete about 9.94x/19.0x slower.
 The remaining analytical gap is categorical/group covering and column-only
 cold I/O, while the mutation gap is dominated by strict per-operation
 durability and copy-on-write metadata. The report gives each ratio instead of
@@ -982,32 +992,34 @@ capacity and mechanism evidence, not a publication-quality machine race.
 
 | Measure | recovered FileStore | DuckDB | Direct interpretation |
 | --- | ---: | ---: | --- |
-| Durable file | 2.72 GiB (1.42x payload) | 1.18 GiB (0.62x) | FileStore is 2.31x larger |
-| File after 256 updates and deletes | 2.73 GiB (5.10 MiB reusable) | 1.21 GiB, 0 B WAL | FileStore is 2.26x larger |
-| Engine-accounted warm state | 9.02 MiB, excluding caller query state below | 998.25 MiB warm buffers | different accounting domains; not process RSS |
+| Durable file | 1.55 GiB (0.81x payload) | 1.18 GiB (0.62x) | FileStore is 1.31x larger |
+| File after 256 updates and deletes | 1.55 GiB (4.96 MiB reusable) | 1.21 GiB, 0 B WAL | FileStore is 1.28x larger |
+| Engine-accounted warm state | 16.21 MiB, excluding caller query state below | 998.25 MiB warm buffers | different accounting domains; not process RSS |
 | Largest caller query buffer | 488.76 MiB | 1.94 GiB peak buffers | different ownership domains |
-| Recovery/open | 260.8 us | not isolated | FileStore reads bounded roots, not the corpus |
-| Keyed point read | 11.08 us | 129.83 us | FileStore 11.71x faster |
-| Exact filter, 38,800 matches | 4.029 ms | 24.486 ms | FileStore 6.08x faster |
-| Scalar-object `@>`, 38,800 matches | 3.919 ms | 1.408 s | FileStore 359.28x faster |
-| Covered `SUM`, 5M inputs | 1.880 s | 8.051 ms | FileStore 233.5x slower |
-| `GROUP BY`, 5M inputs | 2.894 s | 35.825 ms | FileStore 80.8x slower |
-| Durable update / operation | 9.177 ms | 1.444 ms | FileStore 6.35x slower |
-| Durable delete / operation | 8.930 ms | 589.2 us | FileStore 15.2x slower |
+| Recovery/open | 329.8 us | not isolated | FileStore reads bounded roots, not the corpus |
+| Keyed point read | 8.584 us | 129.83 us | FileStore 15.13x faster |
+| Exact filter, 38,800 matches | 5.143 ms | 24.486 ms | FileStore 4.76x faster |
+| Scalar-object `@>`, 38,800 matches | 4.876 ms | 1.408 s | FileStore 288.76x faster |
+| Covered `SUM`, 5M inputs | 2.102 s | 8.051 ms | FileStore 261.1x slower |
+| `GROUP BY`, 5M inputs | 3.789 s | 35.825 ms | FileStore 105.8x slower |
+| Durable update / operation | 9.025 ms | 1.444 ms | FileStore 6.25x slower |
+| Durable delete / operation | 8.746 ms | 589.2 us | FileStore 14.8x slower |
 
 The exact filter and containment probes opened 540 packed posting pages,
 certified every matching stable slot, and performed zero document rechecks.
-Posting-page coalescing reduced the same FileStore filter from 45.30 ms to
-4.03 ms and containment from 45.65 ms to 3.92 ms by sharing one immutable page
-lease and decode across consecutive streams. The remaining full-column gap is
-not hidden: numeric covers are update-safe but co-located with document pages,
-so a cold 5M-row reduction reads far more bytes than DuckDB's columnar scan.
-Grouping still decodes JSON. Closing those gaps requires separate immutable
-column/group extents with the same generation and checksum contract, not a
-misleading micro-optimization claim.
+Posting-page coalescing reduced the earlier FileStore filter and containment
+from about 45 ms to the low-millisecond range by sharing one immutable page
+lease and decode across consecutive streams. Grouped document extents cut this
+run's file by 43.3%, page reads by 91.3%, and read bytes by 48.7% relative to
+the preceding 4 KiB-page run. The remaining full-column gap is not hidden:
+numeric covers are update-safe but co-located with document pages, so a cold
+5M-row reduction reads far more bytes than DuckDB's columnar scan. Grouping
+still decodes JSON. Closing those gaps requires separate immutable column/group
+extents with the same generation and checksum contract, not a misleading
+micro-optimization claim.
 
-The measured FileStore engine-plus-largest-query envelope is 497.78 MiB
-(9.02 MiB + 488.76 MiB), but it is still neither process RSS nor directly
+The measured FileStore engine-plus-largest-query envelope is 504.97 MiB
+(16.21 MiB + 488.76 MiB), but it is still neither process RSS nor directly
 comparable with DuckDB's buffer-manager counters.
 
 These are mechanism measurements, not a claim that the systems are equivalent.

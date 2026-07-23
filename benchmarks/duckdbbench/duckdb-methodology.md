@@ -83,12 +83,17 @@ mutable Store returned to applications.
 
 FileStore starts from the same completed heap Store and writes one compact
 mutable generation with `Store.WriteFileStore`. The creator repacks source
-chunks into eight stable slots per document micro-page, writes exact JSON once,
-packs many exact-posting streams per physical page, builds key/chunk/index/TTL
-directories bottom-up, and then performs one data/tree fence plus one
-superblock fence. It creates no per-row durable generations, free-tree history,
-or persistent load commit arena. The timer includes NDJSON ingestion,
-StoreBuilder completion, all page construction, both fences, and file close.
+chunks into eight stable slots. When it saves rounded physical bytes, up to 128
+rows share an immutable document group: structural templates are stored once,
+repeated complete scalar spellings use a bounded dictionary, and short literal
+lengths are carried by their token. Keys and the configured numeric cover
+remain directly addressable; point and scan output reconstruct exact JSON.
+The creator packs many exact-posting streams per physical page, builds
+key/chunk/index/TTL directories bottom-up, and then performs one data/tree
+fence plus one superblock fence. It creates no per-row durable generations,
+free-tree history, or persistent load commit arena. The timer includes NDJSON
+ingestion, StoreBuilder completion, all page construction, both fences, and
+file close.
 
 Packed posting pages are immutable bases. An online mutation redirects only
 the affected stream to an isolated copy-on-write posting page and does not
@@ -96,10 +101,11 @@ retire shared base storage. This is a format invariant, not a benchmark-only
 shortcut.
 
 The measured file is reopened with synchronous mutations, an 8 MiB read-cache
-capacity, a workload-sized 512-entry reusable-extent arena, and the smallest
-power-of-two maximum document page that fits the corpus geometry. The latter
-also bounds commit staging: the harness does not charge every 4 KiB document
-page as though it required a 64 KiB buffer.
+capacity, a workload-sized 512-entry reusable-extent arena, and a maximum
+extent of at least 64 KiB so compact document groups are not silently disabled.
+Larger corpus documents raise that bound to the smallest fitting power of two.
+The same maximum bounds commit staging and is reported separately from
+admitted read-cache bytes.
 
 DuckDB bulk-loads this table:
 

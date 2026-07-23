@@ -301,6 +301,50 @@ func TestStoreBuilderCompactsNonPowerOfTwoKeyDirectory(t *testing.T) {
 	}
 }
 
+func TestStoreBuilderKeyTableCollisionAndAllocs(t *testing.T) {
+	builder, err := NewStoreBuilder(StoreOptions{ChunkDocuments: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"alpha", "beta", "gamma"} {
+		if err := builder.Append(key, []byte(`0`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A single artificial fingerprint and probe bucket exercises the exact-key
+	// comparison rather than relying on maphash collisions occurring by chance.
+	const collision = uint64(0x123456789abcdef0)
+	builder.keyTable = storeBuilderKeyTable{}
+	builder.keyTable.reserve(builder, 3)
+	for row := range uint64(3) {
+		builder.keyTable.insert(collision, row)
+	}
+	for _, key := range []string{"alpha", "beta", "gamma"} {
+		if !builder.keyTable.contains(builder, collision, key) {
+			t.Fatalf("collision chain missed %q", key)
+		}
+	}
+	if builder.keyTable.contains(builder, collision, "delta") {
+		t.Fatal("collision chain accepted a different key")
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		clear(builder.keyTable.slots)
+		for row := range uint64(3) {
+			builder.keyTable.insert(collision, row)
+		}
+		for _, key := range []string{"alpha", "beta", "gamma"} {
+			if !builder.keyTable.contains(builder, collision, key) {
+				panic("key table lookup invariant")
+			}
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("reserved key insert/lookup allocations = %.2f, want 0", allocs)
+	}
+}
+
 func TestStoreBuilderSharesImmutableShapesAcrossChunks(t *testing.T) {
 	builder, err := NewStoreBuilder(StoreOptions{ChunkDocuments: 2, ShapeTapes: true})
 	if err != nil {

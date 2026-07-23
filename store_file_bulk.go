@@ -178,6 +178,14 @@ type fileStoreBulkDocumentPlan struct {
 	chunk       uint32
 	live        uint64
 	ref         storeio.PageRef
+	required    int
+	overflow    bool
+	group       int // group plan index + 1; zero is an ordinary document page
+}
+
+type fileStoreBulkDocumentGroupPlan struct {
+	first, last int // logical document-plan range
+	ref         storeio.PageRef
 }
 
 type fileStoreBulkKeyPlan struct {
@@ -231,6 +239,7 @@ type fileStoreBulkBuild struct {
 
 	overflows         []fileStoreBulkOverflowPlan
 	documents         []fileStoreBulkDocumentPlan
+	documentGroups    []fileStoreBulkDocumentGroupPlan
 	chunks            []storeChunkDirectoryPlan
 	keys              []fileStoreBulkKeyPlan
 	keyOrder          []int
@@ -248,6 +257,13 @@ type fileStoreBulkBuild struct {
 	ttlRoot   storeio.PageRef
 	stateRef  storeio.PageRef
 	root      storeio.StateRoot
+
+	groupChunks  []storeio.DocumentGroupChunk
+	groupRecords []storeio.DocumentGroupRecord
+	groupSpans   []storeio.DocumentGroupSpan
+	groupMasks   []uint64
+	groupValues  []float64
+	groupCodec   storeio.DocumentGroupWorkspace
 }
 
 func (b *fileStoreBulkBuild) sourceRow(row int) (*storeChunk, string, []byte) {
@@ -272,6 +288,141 @@ func (b *fileStoreBulkBuild) sourceFloat64(row, column int) (float64, bool, erro
 		return 0, false, nil
 	}
 	return value, true, nil
+}
+
+func (b *fileStoreBulkBuild) prepareDocumentGroup(first, last int) ([]storeio.DocumentGroupChunk, error) {
+	chunkCount := last - first
+	rowCount := 0
+	for i := first; i < last; i++ {
+		rowCount += b.documents[i].last - b.documents[i].first
+	}
+	columnCount := len(b.options.float64Columns)
+	if cap(b.groupChunks) < chunkCount {
+		b.groupChunks = make([]storeio.DocumentGroupChunk, chunkCount)
+	} else {
+		b.groupChunks = b.groupChunks[:chunkCount]
+		clear(b.groupChunks)
+	}
+	if cap(b.groupRecords) < rowCount {
+		b.groupRecords = make([]storeio.DocumentGroupRecord, 0, rowCount)
+	} else {
+		b.groupRecords = b.groupRecords[:0]
+	}
+	b.groupSpans = b.groupSpans[:0]
+	maskCount := chunkCount * columnCount
+	if cap(b.groupMasks) < maskCount {
+		b.groupMasks = make([]uint64, maskCount)
+	} else {
+		b.groupMasks = b.groupMasks[:maskCount]
+		clear(b.groupMasks)
+	}
+	valueCount := maskCount * 64
+	if cap(b.groupValues) < valueCount {
+		b.groupValues = make([]float64, valueCount)
+	} else {
+		b.groupValues = b.groupValues[:valueCount]
+		clear(b.groupValues)
+	}
+
+	for chunkOrdinal := 0; chunkOrdinal < chunkCount; chunkOrdinal++ {
+		plan := &b.documents[first+chunkOrdinal]
+		if plan.overflow {
+			return nil, fmt.Errorf("%w: overflow row in document group", storeio.ErrInvalidWrite)
+		}
+		recordStart := len(b.groupRecords)
+		for row := plan.first; row < plan.last; row++ {
+			_, key, raw := b.sourceRow(row)
+			spanStart := len(b.groupSpans)
+			var err error
+			b.groupSpans, err = b.appendDocumentGroupSpans(b.groupSpans, row)
+			if err != nil {
+				return nil, err
+			}
+			b.groupRecords = append(b.groupRecords, storeio.DocumentGroupRecord{
+				Key: byteview.Bytes(key), JSON: raw,
+				Spans: b.groupSpans[spanStart:len(b.groupSpans)], Slot: uint8(row - plan.first),
+			})
+		}
+		maskBase := chunkOrdinal * columnCount
+		valueBase := maskBase * 64
+		for column := range b.options.float64Columns {
+			for row := plan.first; row < plan.last; row++ {
+				value, ok, err := b.sourceFloat64(row, column)
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					continue
+				}
+				slot := row - plan.first
+				b.groupMasks[maskBase+column] |= uint64(1) << uint(slot)
+				b.groupValues[valueBase+column*64+slot] = value
+			}
+		}
+		b.groupChunks[chunkOrdinal] = storeio.DocumentGroupChunk{
+			ChunkID: plan.chunk, Live: plan.live,
+			Rows: b.groupRecords[recordStart:len(b.groupRecords)],
+			Columns: storeio.DocumentFloat64Columns{
+				Masks:  b.groupMasks[maskBase : maskBase+columnCount],
+				Values: b.groupValues[valueBase : valueBase+columnCount*64],
+			},
+		}
+	}
+	return b.groupChunks, nil
+}
+
+// appendDocumentGroupSpans reads compact source metadata directly. It never
+// widens or caches a classic tape per document.
+func (b *fileStoreBulkBuild) appendDocumentGroupSpans(dst []storeio.DocumentGroupSpan, row int) ([]storeio.DocumentGroupSpan, error) {
+	entry := b.rows[row]
+	chunk := b.source.chunks.get(entry.sourceChunk)
+	ordinal := int(chunk.ord[entry.sourceSlot])
+	raw := chunk.docs.rawAt(ordinal)
+	start := len(dst)
+	if template, ok := chunk.docs.storeTemplateAt(ordinal); ok {
+		for i := range template.index.entries {
+			tape := &template.index.entries[i]
+			if tape.flags()&tapeFlagKey != 0 || tape.next != 1 {
+				continue
+			}
+			span := chunk.docs.storeTemplateSpan(ordinal, template, i)
+			dst = append(dst, storeio.DocumentGroupSpan{Start: span & 0xffff, End: span >> 16})
+		}
+	} else if ref := chunk.docs.shapeTapeRefAt(ordinal); ref.rec != nil {
+		if ref.narrow {
+			for field := range ref.rec.fields {
+				value := chunk.docs.narrowAt(ordinal, ref, field)
+				dst = append(dst, storeio.DocumentGroupSpan{Start: value.start(), End: value.end()})
+			}
+		} else {
+			index := chunk.docs.docAt(ordinal)
+			for i := range index.entries {
+				value := &index.entries[i]
+				dst = append(dst, storeio.DocumentGroupSpan{Start: value.start, End: value.end})
+			}
+		}
+	} else {
+		index := chunk.docs.docAt(ordinal)
+		if len(index.entries) == 0 {
+			return nil, fmt.Errorf("%w: missing document tape for group encoding", storeio.ErrInvalidWrite)
+		}
+		for i := range index.entries {
+			tape := &index.entries[i]
+			if tape.flags()&tapeFlagKey == 0 && tape.next == 1 {
+				dst = append(dst, storeio.DocumentGroupSpan{Start: tape.start, End: tape.end})
+			}
+		}
+	}
+	for i := start + 1; i < len(dst); i++ {
+		if dst[i-1].End > dst[i].Start || uint64(dst[i].End) > uint64(len(raw)) {
+			return nil, fmt.Errorf("%w: unordered document-group spans", storeio.ErrInvalidWrite)
+		}
+	}
+	if start < len(dst) && (dst[start].Start >= dst[start].End ||
+		uint64(dst[len(dst)-1].End) > uint64(len(raw))) {
+		return nil, fmt.Errorf("%w: invalid document-group span bounds", storeio.ErrInvalidWrite)
+	}
+	return dst, nil
 }
 
 func (b *fileStoreBulkBuild) documentFloat64Bytes(first, last int) (int, error) {
@@ -490,22 +641,87 @@ func (b *fileStoreBulkBuild) planDocuments() error {
 				b.overflows[i].next = b.overflows[i+1].ref
 			}
 		}
-		pageSize, ok := fileStoreBulkExtent(required, b.options.PageSize, b.options.MaxPageSize)
-		if !ok {
-			return ErrFileStoreDocumentTooLarge
-		}
-		ref, err := b.allocator.allocate(storeio.PageDocument, pageSize)
-		if err != nil {
-			return err
-		}
 		count := last - first
 		live := ^uint64(0)
 		if count < 64 {
 			live = uint64(1)<<uint(count) - 1
 		}
 		b.documents = append(b.documents, fileStoreBulkDocumentPlan{
-			first: first, last: last, chunk: chunkID, live: live, ref: ref,
+			first: first, last: last, chunk: chunkID, live: live,
+			required: required, overflow: overflowMask != 0,
 		})
+	}
+	return b.planDocumentGroups()
+}
+
+const fileStoreBulkDocumentGroupRows = 128
+
+// planDocumentGroups keeps the online stable-slot unit unchanged while
+// packing consecutive compact-generation chunks into larger immutable
+// extents. A later update redirects only its touched logical chunk to an
+// ordinary page; untouched lanes continue sharing the original group.
+func (b *fileStoreBulkBuild) planDocumentGroups() error {
+	for first := 0; first < len(b.documents); {
+		last, rows := first, 0
+		for last < len(b.documents) && !b.documents[last].overflow {
+			next := b.documents[last].last - b.documents[last].first
+			if rows+next > fileStoreBulkDocumentGroupRows {
+				break
+			}
+			rows += next
+			last++
+		}
+		grouped := false
+		if last-first >= 2 {
+			chunks, err := b.prepareDocumentGroup(first, last)
+			if err != nil {
+				return err
+			}
+			groupSize, ok := storeio.DocumentGroupSize(
+				chunks, uint32(b.options.PageSize), &b.groupCodec,
+			)
+			individualBytes := 0
+			for i := first; i < last; i++ {
+				size, fits := fileStoreBulkExtent(
+					b.documents[i].required, b.options.PageSize, b.options.MaxPageSize,
+				)
+				if !fits {
+					return ErrFileStoreDocumentTooLarge
+				}
+				individualBytes += int(size)
+			}
+			if ok && groupSize <= uint32(b.options.MaxPageSize) && int(groupSize) < individualBytes {
+				ref, allocateErr := b.allocator.allocate(storeio.PageDocumentGroup, groupSize)
+				if allocateErr != nil {
+					return allocateErr
+				}
+				group := len(b.documentGroups)
+				b.documentGroups = append(b.documentGroups, fileStoreBulkDocumentGroupPlan{
+					first: first, last: last, ref: ref,
+				})
+				for i := first; i < last; i++ {
+					b.documents[i].ref = ref
+					b.documents[i].group = group + 1
+				}
+				first = last
+				grouped = true
+			}
+		}
+		if grouped {
+			continue
+		}
+		size, ok := fileStoreBulkExtent(
+			b.documents[first].required, b.options.PageSize, b.options.MaxPageSize,
+		)
+		if !ok {
+			return ErrFileStoreDocumentTooLarge
+		}
+		ref, err := b.allocator.allocate(storeio.PageDocument, size)
+		if err != nil {
+			return err
+		}
+		b.documents[first].ref = ref
+		first++
 	}
 	return nil
 }
@@ -1027,7 +1243,36 @@ func (b *fileStoreBulkBuild) writeDocumentPages(file *os.File, scratch []byte) e
 	var storage [storeMaxChunkDocuments]storeio.DocumentRecord
 	masks := make([]uint64, len(b.options.float64Columns))
 	values := make([]float64, len(b.options.float64Columns)*64)
-	for _, plan := range b.documents {
+	for document := range b.documents {
+		plan := b.documents[document]
+		if plan.group != 0 {
+			group := b.documentGroups[plan.group-1]
+			if document != group.first {
+				continue
+			}
+			chunks, err := b.prepareDocumentGroup(group.first, group.last)
+			if err != nil {
+				return err
+			}
+			page, err := storeio.EncodeDocumentGroup(
+				scratch[:group.ref.Length],
+				storeio.DocumentGroupHeader{
+					StoreID: b.storeID, Generation: b.allocator.generation,
+					LogicalID: group.ref.LogicalID, PageSize: group.ref.Length,
+					FirstChunk: chunks[0].ChunkID, ChunkCount: uint16(len(chunks)),
+					RowCount:    uint16(groupRows(chunks)),
+					ColumnCount: uint16(len(b.options.float64Columns)),
+				},
+				chunks, b.allocator.nextLogical, &b.groupCodec,
+			)
+			if err != nil {
+				return err
+			}
+			if err := writeStorePageAt(file, page, group.ref.Offset); err != nil {
+				return err
+			}
+			continue
+		}
 		rows := storage[:plan.last-plan.first]
 		for i := range rows {
 			rowIndex := plan.first + i
@@ -1069,6 +1314,14 @@ func (b *fileStoreBulkBuild) writeDocumentPages(file *os.File, scratch []byte) e
 		clear(rows)
 	}
 	return nil
+}
+
+func groupRows(chunks []storeio.DocumentGroupChunk) int {
+	rows := 0
+	for _, chunk := range chunks {
+		rows += len(chunk.Rows)
+	}
+	return rows
 }
 
 func (b *fileStoreBulkBuild) writeKeyPages(file *os.File, scratch []byte) error {
