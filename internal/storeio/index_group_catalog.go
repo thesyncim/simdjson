@@ -54,7 +54,7 @@ type IndexGroupCatalogEntry struct {
 // IndexGroupCatalogEntryEncodedSize returns the packed encoded size of entry.
 func IndexGroupCatalogEntryEncodedSize(entry IndexGroupCatalogEntry) (int, error) {
 	if len(entry.Value) == 0 || entry.Count == 0 ||
-		len(entry.Value) > int(^uint32(0)) ||
+		uint64(len(entry.Value)) > uint64(^uint32(0)) ||
 		len(entry.Value) > int(^uint(0)>>1)-IndexGroupCatalogEntryHeaderSize-7 {
 		return 0, fmt.Errorf("%w: index group entry", ErrInvalidWrite)
 	}
@@ -182,7 +182,7 @@ func validateIndexGroupCatalogEntries(
 		indexHighWater == 0 || indexHighWater > 64 ||
 		chunkHighWater == 0 || chunkDocuments == 0 || chunkDocuments > 64 ||
 		header.CoveredIndexes&^(uint64(1)<<indexHighWater-1) != 0 ||
-		len(entries) == 0 || len(entries) > int(^uint32(0)) {
+		len(entries) == 0 || uint64(len(entries)) > uint64(^uint32(0)) {
 		return 0, fmt.Errorf("%w: index group catalog header", ErrInvalidWrite)
 	}
 	size := IndexGroupCatalogPayloadHeaderSize
@@ -233,7 +233,7 @@ func validateSegmentedIndexGroupCatalogEntries(
 	); err != nil {
 		return 0, err
 	}
-	if len(entries) == 0 || len(entries) > int(^uint32(0)) {
+	if len(entries) == 0 || uint64(len(entries)) > uint64(^uint32(0)) {
 		return 0, fmt.Errorf(
 			"%w: segmented index group entries", ErrInvalidWrite,
 		)

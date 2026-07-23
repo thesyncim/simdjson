@@ -1365,7 +1365,7 @@ func (b *fileStoreBulkBuild) planPostings() error {
 				b.indexCertificates, values[:exact.n], maxCertificate,
 			)
 			certificateLength := len(certificates) - certificateStart
-			if certified && certificateStart <= int(^uint32(0)) &&
+			if certified && uint64(certificateStart) <= uint64(^uint32(0)) &&
 				certificateLength <= int(^uint16(0)) {
 				b.indexCertificates = certificates
 				mask.certStart = uint32(certificateStart)

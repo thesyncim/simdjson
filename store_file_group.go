@@ -196,7 +196,8 @@ func (s *FileSnapshot) AppendIndexScalarGroupsInto(
 				first := uint64(posting.Chunk)<<6 |
 					uint64(bits.TrailingZeros64(posting.Bits))
 				if group < 0 {
-					if len(workspace.groupArena) > int(^uint32(0))-len(certificate) {
+					if uint64(len(workspace.groupArena))+uint64(len(certificate)) >
+						uint64(^uint32(0)) {
 						return ErrStoreTooLarge
 					}
 					start := len(workspace.groupArena)
@@ -318,7 +319,8 @@ func (s *FileSnapshot) appendIndexCatalogScalarGroups(
 				continue
 			}
 			if !fileIndexCertificateValid(entry.Value, 1) ||
-				len(workspace.groupArena) > int(^uint32(0))-len(entry.Value) ||
+				uint64(len(workspace.groupArena))+uint64(len(entry.Value)) >
+					uint64(^uint32(0)) ||
 				total > ^uint64(0)-entry.Count {
 				lease.Release()
 				return dst, true, storeio.ErrIndexGroupCatalogCorrupt
