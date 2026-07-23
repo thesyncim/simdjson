@@ -1,9 +1,11 @@
 # Store
 
 `Store` is an in-memory keyed JSON collection with updates, deletes, immutable
-snapshots, TTL, declared single/compound indexes, and wildcard postings. It is
-designed for applications that want predictable in-process reads without a
-reader lock, clock call, expiry branch, tombstone, or version check.
+snapshots, TTL, declared single/compound indexes, and wildcard postings.
+`FileStore` is the incremental, crash-safe, bounded-residency sibling for a
+caller-owned file. They share JSON validation, stable 64-slot chunks, exact
+scalar semantics, and the compiled query layer; they intentionally have
+different ownership and index-lifecycle surfaces.
 
 The zero value is ready to use. Options are frozen by the first `Put`,
 `CreateIndex`, or `AddIndex`.
@@ -52,6 +54,14 @@ raw, ok := view.GetRaw("user:42")
 | `AppendIndexBitmap` / `AppendLiveBitmap` | append one dense stable-slot word per logical page | O(page high-water + exact lookup work) |
 | `AppendStoreBitmapAnd/And3/Or/AndNot` | combine dense caller-owned workspaces | O(shortest or longest input words), zero allocation with capacity |
 | `query.RunSnapshotInto` | late-bound indexed query over a snapshot | candidate masks + selected-column work |
+| `CreateFileStore` / `OpenFileStore` | create or lazily recover a durable page graph | bounded root/page scratch; no corpus walk on open |
+| `FileStore.Put` / `Delete` | publish a copy-on-write durable generation | changed document plus copied metadata paths |
+| `FileStore.SetDeadline` / `Persist` / `ExpireDue` | mutate the persistent deadline tree | copied key/TTL paths; due work is caller-bounded by `limit` |
+| `FileStore.Snapshot` / `FileSnapshot.Close` | acquire/release a generation lease | O(1); the lease fences physical extent reuse |
+| `FileSnapshot.AppendRaw` | copy exact JSON into caller storage | key-tree lookup + touched document/overflow pages |
+| `FileSnapshot.AppendIndexMasks` | probe a frozen exact index with mandatory document recheck | posting chunks + collision candidates |
+| `FileStore.Flush` | wait until the visible generation is crash-safe | queued storage work and durability barriers |
+| `query.RunFileSnapshot` | parallel bounded batches with external ordered/group spill | O(input + merge); final result storage is caller-owned |
 
 A non-positive `ExpireDue`, `BackfillIndex`, or `ReclaimIndexes` limit means all
 currently eligible work. Event loops should normally use a positive limit.
@@ -304,121 +314,73 @@ writer-owned fixed storage; only the top-level reference list, Store manifest,
 and writer object allocate. The manifest must be buffered to checksum before a
 generic `io.Writer` receives it.
 
-Supporting a corpus around 100 times larger than RAM while keeping a bounded
-hot set needs the next four changes:
+## Attached `FileStore`
 
-1. address immutable chunks by logical page id and pointer-swizzle resident
-   frames, reducing a hot hit to one predictable state check and a direct
-   pointer;
-2. store packed key, exact-index, posting, and TTL nodes in the same page
-   space, keeping only measured hot upper paths resident;
-3. issue explicit asynchronous page reads and physically ordered prefetch under
-   a Store-owned byte budget, exposing reads, bytes, hits, queue depth, dirty
-   bytes, and evictions; and
-4. publish replacement pages and roots through append-only copy-on-write with
-   snapshot-aware extent reclamation and checksummed root selection.
+`FileStore` implements the explicit-I/O path that the mapped checkpoint does
+not: a bounded CLOCK page cache, bounded asynchronous read/prefetch queues,
+copy-on-write mutations, alternating durable roots, persistent free extents,
+and generation leases. `CreateFileStore` requires an empty caller-owned file;
+`OpenFileStore` reads only the two superblocks and referenced root pages. It
+does not enumerate keys, chunks, postings, TTL records, or free extents during
+open. The free tree is loaded lazily when a writer first needs it.
 
-Read-only mapping remains useful for the implemented checkpoint and a hot,
-read-mostly corpus. It is not the automatic 100x transactional scheduler:
-demand faults can block arbitrary goroutines and do not provide Store-level
-admission, eviction, prefetch, or error control. ADR 0005 records the primary
-research basis and the explicit-I/O, swizzled-buffer-manager decision.
+Every page carries Store identity, kind, logical id, generation, exact bounds,
+and CRC32C. Metadata uses 4 KiB pages. Document and overflow extents may use
+larger configured power-of-two pages. Key, chunk, exact-index, TTL, and free
+trees are path-copied; unchanged pages remain shared. The commit device writes
+data pages, executes a data-integrity barrier, writes the alternate
+superblock, and executes the final barrier. Recovery accepts the newest root
+only after its state and top-level page graph validate, otherwise it uses the
+previous root. Crash-image tests cover partially written data and root prefixes
+and require recovery to return one whole generation, never a mixture.
 
-The intended attached-file mode is automatic without taxing readers. The
-serialized Store writer is already single-threaded, so it can enqueue a
-generation into a preallocated single-producer ring without another lock or a
-heap allocation. A background writer appends changed pages and copied
-directory/index/TTL paths, group-commits their root, and advances a durable
-generation counter. `Flush`/`Close` fence a requested generation. A synchronous
-option waits on each mutation and necessarily pays storage latency. An async
-`Put` is reader-visible before it is crash-durable; hiding that distinction
-would be an incorrect safety contract.
+Mutation is single-writer. With `Synchronous`, `Put`, `Delete`, TTL changes, and
+expiry wait for durability. Without it they return after the bounded committer
+accepts the reader-visible generation; `DurableGeneration` can lag and `Flush`
+or `Close` fences it. Queue and buffer exhaustion applies backpressure. A
+background device error is sticky. The Linux backend can use pure-Go
+`io_uring`; the portable positional-I/O backend is used elsewhere and as the
+fallback.
 
-The internal I/O half of that contract is implemented. It has a lock-free SPSC
-generation ring, ABA-resistant lock-free buffer/descriptor recycling, bounded
-backpressure, sticky failures, natural group commit, and a zero-allocation
-`Begin`/fill/`Publish`/`Wait` test. Linux uses a scoped pure-Go `io_uring`
-backend with registered off-heap buffers and files; other systems, unsupported
-kernels, and blocked sandboxes use positional writes and data-integrity
-barriers. The root is submitted only after every data page succeeds. This is
-not yet a public Store persistence mode. The internal double-superblock codec
-now enforces generation-slot parity, Store identity, CRC32C/complement checks,
-page-aligned bounds, file high-water bounds, and referenced-state verification;
-recovery validates both state and free-tree roots and falls back when the
-newest root or either referenced page is torn. Mutation attachment, key/TTL
-payload schemas, large-value overflow, and extent reclamation are the remaining
-correctness boundary. The common page envelope binds a 64-byte
-pointer-free header and full-page CRC32C trailer to Store id, kind, stable
-logical id, and generation. Its fixed 256-byte state root separates chunk, key,
-exact-index, and TTL directory references, and recovery verifies each
-referenced top-level page before generation selection.
+`FileSnapshot` is an explicit generation lease and must be closed. Point reads
+copy into caller storage because an evictable frame cannot safely back an
+unowned `RawValue`. `AppendRaw` is zero-allocation on a resident inline hit
+when the destination has capacity. `RangeRaw` visits chunk/slot order with one
+document lease at a time and one reusable overflow buffer. `PrefetchKeys`
+deduplicates and physically orders document extents before submitting bounded
+read-ahead.
 
-Chunk placement now uses 64-way packed CHAMP nodes: one occupancy word plus
-densely ranked 32-byte physical references, with no empty child array or Go
-pointer per chunk. Document leaves use the same stable-slot word and only two
-cumulative `uint32` ends per live row. Slot identity is implicit in bitmap
-rank, so the worst-case row directory is 512 bytes rather than 64 slice/string
-headers. Keys and JSON occupy one canonical packed byte stream; an admitted
-page returns capacity-clipped borrowed views and verifies a complete candidate
-key before returning JSON. Directory nodes use the 4 KiB allocation quantum,
-while a document leaf may use a larger power-of-two extent authenticated by
-`PageRef.Length`. This keeps ordinary 64-row chunks contiguous without
-inflating every sparse metadata node.
+Exact index definitions are frozen in `FileStoreOptions.Indexes`; their catalog
+hash is part of the durable root. Each mutation updates the affected
+`(index, tuple hash, chunk)` posting page in the same transaction. A probe first
+finds candidate masks and then reopens every candidate document for mandatory
+exact scalar recheck, so hash collisions and alternate escaped spellings cannot
+produce a false result. TTL stores the deadline beside the key and in an ordered
+persistent tree; replacement preserves the deadline and ordinary reads never
+consult the clock.
 
-Exact indexes now use the posting-page codec as the live immutable base for
-`StoreBuilder` and `OpenStore`, not only as a projection. Each 4 KiB physical
-page packs many sorted value streams. Scattered singleton hits encode
-`(chunk delta, slot)` as a uvarint—normally two bytes—while multi-hit chunks
-retain a native `uint64` word for Boolean operations. A fixed 48-byte segment
-record carries stream bounds, row count, tuple hash, and an optional logical
-page/rank continuation; it contains no Go or physical pointer. Admission
-validates sorted unique stream ids, canonical dense/singleton encodings, exact
-packed offsets, row counts, continuations, and CRC before publication.
+`query.RunFileSnapshot` scans raw pages into bounded arenas, builds batch-local
+`DocSet` indexes in parallel, and merges batches in source order. Projection
+ordering and group state spill as sorted temporary runs after the configured
+memory frontier; multi-pass merge opens at most 32 runs. Temporary files are
+removed on success and error. The memory target excludes the returned `Result`
+and cannot make one oversized document smaller. Parallel floating aggregation
+has deterministic batch order but, like other parallel engines, may differ in
+the last rounding bits from a strictly row-at-a-time sum.
 
-Writes never rebuild that immutable corpus base. The first mutation of one
-64-row chunk copies that chunk's complete current postings into a persistent
-delta and marks the chunk shadowed; later writes path-copy only changed delta
-routes. Readers merge base and delta in chunk order and skip every stale base
-word for a shadowed chunk. Old snapshots retain their base/delta pair, so this
-reduces initial GC footprint without weakening update, delete, or snapshot
-semantics. The same pages are not yet connected to the durable state root.
+Apple M4 Max, stable Go, 1,024 hot documents:
 
-A ready recycle or busy-worker notification stays on the atomic fast path; a
-full budget or an idle worker necessarily parks or wakes. Checksums stay scoped
-to `internal/storeio` and use no handwritten assembly. Stable builds use Go's
-hardware-aware CRC32C. SIMD builds dispatch pure-Go PMULL only on Darwin ARM64,
-where it has a measured win, and use the standard path on Linux ARM64 and
-amd64. Native Ubuntu ARM64 measured the PMULL candidate at 192.3-192.4 ns per
-4 KiB versus 154.6-154.8 ns for the standard path; AMD EPYC 7763 measured the
-ordinary PCLMUL candidate at 323.0-323.2 ns versus 170.7-170.8 ns. Those losing
-kernels are not dispatched. The pure-Go amd64 PCLMUL and AVX-512 candidates
-remain directly correctness-tested and ISA-checked so a future CPU-specific
-tier can be admitted only after a native end-to-end win.
+| Benchmark | Result | Allocation |
+| --- | ---: | ---: |
+| `BenchmarkFileSnapshotAppendRaw` | 5.10 us/op | 0 B/op, 0 allocs/op |
+| `BenchmarkFileSnapshotRangeRaw` | 27.50 us/scan, 1.65 GB/s | 0 B/op, 0 allocs/op |
+| file aggregate, one worker | 745 us, 148 MB/s | 2.42 MB/op, 4,478 allocs/op |
+| file aggregate, four workers | 414 us, 267 MB/s | 2.42 MB/op, 4,481 allocs/op |
 
-On M4 Max, stable Go CRC32C measured 383.3-387.5 ns per 4 KiB page and
-5.924-6.296 us per 64 KiB page. The Darwin PMULL path measured 89.17-91.66 ns
-and 1.131-1.146 us respectively (about 4.2x and 5.5x faster), with zero
-allocations. The complete 4 KiB state-root page measured 170.0-171.6 ns to
-encode and 152.4-153.3 ns to verify/decode. A full 64-way chunk-directory node
-measured 935.2-948.9 ns to encode, 836.6-843.9 ns to verify/admit, and
-7.17-7.26 ns for an admitted hit. A 64-row document page measured
-747.8-753.5 ns to encode and 459.4-460.1 ns to verify/admit; JSON-only lookup
-measured 2.566-2.576 ns and complete string-key verification plus JSON return
-4.034-4.092 ns. A packed 1,900-singleton posting page measured 7.95-8.03 us to
-encode, 7.38-7.49 us to verify/admit, 24.11-24.32 ns for an admitted stream
-lookup, and 4.05-4.11 ns per decoded posting. Every result is zero-allocation.
-
-Packed CHAMP nodes are the cold chunk-directory format. The existing
-fixed-prefix directory remains preferable for the tiny heap hot overlay and
-compiled stable-slot reads: a measured heap prototype saved 59% directory
-bytes but made keyed lookup about 20% slower. The hybrid keeps cold footprint
-low without taxing every hot hit.
-
-A selective external query can beat a heap scan by combining resident 64-slot
-index masks and never reading rejected JSON pages. A random cold point read
-cannot be faster than DRAM; it pays storage latency. The 100x target is
-therefore accepted only when the measured hot working set fits the configured
-resident budget and the workload is indexed or locality-friendly.
+These are warm-cache local measurements, not cold-device latency. The query
+allocation is bounded transient batch/index state, not retained corpus state.
+Cold random reads pay device latency; throughput depends on locality, index
+selectivity, page size, queue depth, storage, and the resident budget.
 
 ### Scale smoke: 10k to 5M records
 
@@ -446,8 +408,8 @@ and 13,246,371 objects to 2,605,486,408 bytes and 1,252,619 objects: 65.2% of
 the original heap remains, 90.5% of the objects are gone, and point lookup is
 faster. Actual packed index storage
 is 20,798,476 bytes (4.16 B/doc), within 0.04% of the independent 20,791,296
-byte page projection. The still-unattached variable document extents project
-to 640,000,000 bytes (1.30x source); document plus posting extents are about
+byte page projection. The variable document extent model projects to
+640,000,000 bytes (1.30x source); document plus posting extents are about
 1.34x source before key/value directories, TTL/free-space metadata, roots,
 allocator slack, and retained generations.
 
@@ -455,10 +417,9 @@ The remaining 0.251 objects/doc is not accepted as the endpoint. A diagnostic
 reopen through the existing pointer-free checkpoint reached 0.016 objects/doc
 at 100k rows—more than 100x below the original 2.665—but its legacy tape image
 was 5.45x source and made point/index operations slower. That path is evidence
-that the GC target is feasible, not the selected format. Acceptance requires
-at most 0.027 objects/doc with the new packed extents and no hot-path
-regression; attaching compact document/tape frames is the remaining dominant
-work.
+that the GC target is feasible, not the selected heap format. `FileStore`
+instead keeps corpus metadata in evictable pages, so this heap object target is
+not its residency metric.
 
 Across the same 5M run, indexed update averaged 4.17 us, delete plus reinsert
 7.95 us, and changing an existing TTL 42 ns. The point-read rise from 19 ns to
@@ -469,35 +430,22 @@ without decoding rejected documents.
 
 ### Capacity planning for 1 TiB
 
-There are two different answers until the paged mode is complete. The current
-heap Store measured 62.4 MiB for 25.0 MiB of clustered source JSON with one
+Heap `Store` measured 62.4 MiB for 25.0 MiB of clustered source JSON with one
 low-cardinality exact index: 2.50 live heap bytes per source byte. A linear
-1 TiB extrapolation would therefore require about 2.50 TiB of live heap. That
-is workload evidence, not a universal multiplier, but it makes clear that the
-current implementation is not a 1 TiB-on-64-GiB database.
+1 TiB extrapolation would require about 2.50 TiB of live heap. That is workload
+evidence, not a universal multiplier, and is why heap `Store` is not presented
+as a 1 TiB-on-64-GiB database.
 
-The bounded paged target sizes RAM from the hot working set rather than total
-JSON. The following directory estimates extrapolate the measured 65,536-key
-fixed and packed-CHAMP prototypes; the per-index column extrapolates the
-measured 4.2 bytes/document 16-value exact index. They exclude key spelling,
-TTL entries, high-cardinality value directories, allocator rounding, and the
-resident JSON-page cache.
-
-| average JSON/document | documents in 1 TiB | hot fixed directory | packed cold directory | each measured enum index |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 KiB | 1.07 billion | 147 GiB | 60.3 GiB | 4.2 GiB |
-| 4 KiB | 268 million | 36.7 GiB | 15.1 GiB | 1.05 GiB |
-| 16 KiB | 67.1 million | 9.17 GiB | 3.77 GiB | 0.26 GiB |
-
-For the 4 KiB example, a literal 100x page-cache ratio contributes another
-10.24 GiB. About 32 GiB is therefore only a lower-bound configuration with a
-paged cold directory and a few compact indexes; 64 GiB is a practical starting
-point, and 128 GiB buys a materially larger hot set. One-kilobyte documents or
-many unique/high-cardinality and compound indexes can require 128–256 GiB even
-though JSON pages remain bounded. Disk must additionally hold page headers,
-index/value dictionaries, copy-on-write generations awaiting reclamation, and
-free-space headroom; no fixed disk multiplier is claimed until the durable page
-format and churn benchmark exist.
+`FileStore` decouples corpus size from Go heap: `ResidentBytes` fixes admitted
+page capacity, while queues, buffers, snapshot leases, and retirement records
+have separate finite options. This makes a 1 TiB file structurally possible; it
+does not establish acceptable performance. Directory and posting pages compete
+with documents for the same cache, cold random access pays storage latency, and
+copy-on-write generations, allocator rounding, overflow pages, index
+cardinality, and free-space headroom add disk amplification. Size the resident
+budget from a measured hot set and keep storage headroom. No 1 TiB or 100x-RAM
+operating point is claimed until the above-RAM scale benchmark records RSS,
+faults, read/write amplification, latency percentiles, and fragmentation.
 
 ## TTL
 
@@ -710,14 +658,25 @@ snapshots, or an event loop that leaves expired deadlines unpublished.
 
 ## Limits and comparison boundary
 
-`ChunkDocuments` is in `[1,64]`. Chunk ids are `uint32`; `Put` returns
-`ErrStoreTooLarge` before wraparound. Detailed source, tape, depth, retention,
-and maintenance limits are in [`contracts/limits.md`](contracts/limits.md).
+`ChunkDocuments` is in `[1,64]`. Chunk ids are `uint32`; mutation returns
+`ErrStoreTooLarge` before wraparound. `FileStore` additionally fixes maximum
+key/document bytes, page sizes, resident bytes, I/O and commit queue slots,
+snapshot leases, retired extents, and at most 64 frozen exact indexes. Detailed
+source, tape, depth, retention, and maintenance limits are in
+[`contracts/limits.md`](contracts/limits.md).
 
-The Store is in-memory. It has no WAL, crash recovery, replication, eviction,
-cluster protocol, or cross-process snapshot. The RedisJSON/RediSearch harness
-compares a keyed Store plus a matching declared exact index over identical
-corpora, while retaining DocSet-only rows as representation diagnostics. The
+Heap `Store` is in-memory; `FileStore` adds one-file crash recovery, explicit
+eviction, and durability. Neither is a distributed database. There is no
+replication, consensus, cluster protocol, server/client transport, access
+control, cross-Store transaction, join, secondary range index, online
+`FileStore` index DDL, or cross-process snapshot. A `FileStore` is single-node
+and single-writer, though snapshots and compiled queries may be read
+concurrently. Its copy-on-write protocol is the durability mechanism; it is not
+a user-visible WAL and does not provide log shipping or point-in-time restore.
+
+The RedisJSON/RediSearch harness compares a keyed heap Store plus a matching
+declared exact index over identical corpora, while retaining DocSet-only rows
+as representation diagnostics. The
 latest local 65,536-document clustered run measured 62.4 MiB live Store heap
 including its 0.5 MiB exact index, versus 62.0 MiB RedisJSON keyspace plus a
 17.5 MiB RediSearch index: 0.79x as many accounted bytes. Store load was 1.89x

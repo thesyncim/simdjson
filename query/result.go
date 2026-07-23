@@ -12,11 +12,13 @@ import (
 // projection yields one row per surviving document; a query with aggregates
 // and no GROUP BY yields exactly one row; a GROUP BY yields one row per group.
 //
-// Cells that project a document value borrow the DocSet's storage, exactly
-// like the RawValue they came from. RunInto may additionally place decoded
-// escaped text and computed aggregate JSON in its Workspace. Copy Cell.JSON
-// and, when needed, Cell.TextBytes before the DocSet, Result, or Workspace is
-// reused if a cell must outlive that borrowing boundary.
+// Cells produced by Run/RunInto borrow the DocSet's storage, exactly like the
+// RawValue they came from. RunInto may additionally place decoded escaped text
+// and computed aggregate JSON in its Workspace. Copy Cell.JSON and, when
+// needed, Cell.TextBytes before the DocSet, Result, or Workspace is reused if a
+// cell must outlive that borrowing boundary. RunFileSnapshot instead copies
+// selected values into Result-owned backing, so its cells survive snapshot
+// close and page eviction.
 type Result struct {
 	Columns  []ResultColumn
 	RowCount int

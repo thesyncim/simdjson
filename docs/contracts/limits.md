@@ -211,6 +211,39 @@ ordinary churn. `StoreBitmapWords` panics before returning a wrapped length if
 an otherwise valid address span cannot be represented by the platform's `int`
 slice length.
 
+### Attached FileStore
+
+`FileStoreOptions` makes retained and in-flight resources explicit.
+`ResidentBytes` bounds admitted page buffers; `BufferCount` and `QueueSlots`
+bound commit data/descriptors; `ReadConcurrency` and `PrefetchQueue` bound read
+work; `MaxSnapshotLeases` and `MaxRetiredExtents` bound lifetime/reclamation
+metadata. Exhaustion returns an error or applies queue backpressure rather than
+growing without limit. `Stats` reports current use and pressure.
+
+`PageSize` is a power of two at least 4 KiB. `MaxPageSize` is a power-of-two
+multiple of it. Keys and JSON are rejected above `MaxKeyBytes` and
+`MaxDocumentBytes`; values above `InlineValueBytes` use bounded overflow pages.
+Chunk ids remain `uint32`, physical offsets and file high-water are bounded by
+signed OS file offsets, and persistent logical ids are `uint64`. At most 64
+one-to-four-column exact indexes may be frozen into a file. Reopening with a
+different effective catalog or format options fails instead of interpreting
+old bytes under new semantics.
+
+Opening reads bounded root/page scratch and does not scale heap with corpus
+cardinality. This is not a promise that every operation fits one page: one
+maximum-sized document, a copy-out destination, transaction scratch, and the
+caller's final query result exist outside `ResidentBytes`. The file query
+executor separately bounds raw batches and merge state with `MemoryBytes`;
+one oversized row may exceed the target, and an unbounded projection or group
+result necessarily consumes output-proportional memory. Spill merge opens at
+most 32 runs at once and removes its temporary files on return.
+
+The caller owns the `*os.File` and spill directory. `FileStore.Close` does not
+close the file and fails while `FileSnapshot` leases remain. `RangeRaw` callback
+bytes expire when the callback returns; `AppendRaw` and file-query result cells
+own independent copies. The attached format is pre-v1 and version checked, but
+cross-release compatibility is not yet promised.
+
 ## Limits that applications must add
 
 The package does not provide a process-wide memory budget, total-stream byte or

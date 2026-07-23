@@ -1,21 +1,23 @@
-# ADR 0005: one Store surface, bulk construction, and mapped pages
+# ADR 0005: heap Store, mapped checkpoints, and attached FileStore
 
-Status: accepted in stages. Transient construction, the caller-owned
-Store-image boundary with pointer-free base metadata, dense stable-slot Boolean
-workspaces, the scoped pure-Go Linux ring substrate, the bounded internal page
-committer, checksummed double-superblock recovery, the common page envelope,
-the state-root schema, packed chunk directories, and compact document pages are
-implemented. Mutation attachment, key/index/TTL and large-value overflow page
-schemas, the swizzled read-page manager, and bounded residency remain proposed.
-Extends ADR 0004 without changing its borrowed-value lifetime contract.
+Status: accepted and implemented for a separate attached `FileStore` surface.
+Transient heap construction and mapped checkpoints remain on `Store`;
+incremental durability uses explicit page I/O, bounded CLOCK residency,
+copy-on-write key/chunk/index/TTL/free trees, overflow extents, alternating
+superblocks, snapshot generation leases, and persistent reclamation. Parallel
+file scans and external query spill are implemented. Online file-index DDL,
+distributed execution, and a 100x-RAM performance claim remain out of scope or
+unproven. Extends ADR 0004 without changing heap `Store` borrowing.
 
 ## Decision
 
-Make `Store` the primary collection surface for keyed, static, mutable, and
-eventually mapped data. Keep the existing immutable document-set machinery as
-an internal page-building engine until Store has capability and performance
-parity; do not maintain two independent parsers, tape formats, shape compilers,
-or query executors.
+Keep `Store` as the low-latency heap collection and mapped-checkpoint surface.
+Use a distinct `FileStore` for incremental durability and bounded residency,
+because its explicit leases, I/O errors, copy-out reads, and file ownership
+cannot be added honestly to the heap API without taxing or weakening it. Both
+reuse the existing validator, structural index, compiled pointers, exact scalar
+semantics, stable-slot masks, and query planner; do not maintain independent
+JSON parsers or query languages.
 
 The migration has three ordered stages:
 
@@ -143,36 +145,32 @@ stream every nested page without per-row or per-page heap objects.
 
 ## Greater-than-memory mode
 
-The current Store image can be larger than physical memory as a virtual
-mapping, but `OpenStore` still validates every key and row, allocates external
-metadata proportional to both, and rebuilds distinct shapes and exact roots
-from documents. It therefore cannot promise a bounded resident working set or
-a 100x-RAM corpus yet. The mapping is bounded by virtual address space, Go's
-`int` slice length, the image format, and existing per-document 32-bit
-coordinate limits.
+The mapped `OpenStore` checkpoint still validates every key and row and retains
+metadata proportional to the corpus. `FileStore` is the bounded-residency path:
+open validates only alternating roots and their referenced top-level pages;
+lower key, chunk, index, TTL, and free nodes enter the page cache lazily. Corpus
+size is therefore no longer a Go-heap or eager-open requirement. It remains
+bounded by the on-disk ids/offsets and configured maximum key/document sizes.
 
-The engineering target for mapped Store is a data image at least 100 times the
-configured resident budget, provided the workload's hot key/index/page working
-set fits that budget. The multiplier is not a latency guarantee: a cold random
-read must pay a storage fault. Selective indexed queries can nevertheless beat
-a heap engine that scans more data by proving non-candidate pages from compact
-resident summaries and never faulting their JSON bytes.
+This establishes a controllable working set, not a universal 100x-RAM latency
+claim. A cold random read pays device latency. A corpus 100 times the resident
+budget is useful only when the hot key/index/page set fits that budget or the
+workload has scan locality. End-to-end validation above physical RAM remains a
+release benchmark gate rather than an assertion in the API contract.
 
-Keep residency controllable by separating four temperature classes:
+Residency separates four temperature classes:
 
-1. a very small pinned superblock and upper key/index directory;
-2. bounded swizzled frames for directory, posting, and document pages;
+1. two fixed superblocks and the currently selected root metadata;
+2. bounded cache frames for directory, posting, and document pages;
 3. immutable background-storage pages admitted through explicit asynchronous
    reads and bounded prefetch; and
 4. append-only replacement pages plus reclaimable free extents.
 
-The Store page manager, rather than virtual mapping size, owns the resident byte
-budget and replacement policy. A resident logical-page reference is pointer-
-swizzled so its hot path is one predictable state check and a direct frame
-pointer, not a hash-table lookup. Cold references retain their physical page
-id and enter the I/O scheduler. The implementation must expose resident bytes,
-page reads, prefetch hits, dirty bytes, evictions, and queue depth. A 100x corpus
-is accepted only when steady hot-set RSS remains within the configured budget.
+The page manager, rather than virtual mapping size, owns a fixed resident-byte
+budget and CLOCK replacement. Cold references retain physical offset, length,
+logical id, and generation and enter bounded read workers. `FileStore.Stats`
+exposes resident/dirty bytes, reads, cache/prefetch hits, evictions, queue
+depths, durable generation, snapshots, retired extents, and reusable extents.
 
 `OpenStore` may continue to mmap a read-only checkpoint for simple restart and
 hot, read-mostly workloads. It is not the primary 100x transactional backend.
@@ -182,7 +180,7 @@ encoding to virtual-memory behavior. The automatic writer therefore uses
 explicit append I/O and durability barriers; read-only mmap is an optional
 access mode, never the correctness mechanism.
 
-The proposed mutable mode is page-oriented copy-on-write, not a heap Store
+The attached mutable mode is page-oriented copy-on-write, not a heap Store
 whose byte slices happen to come from mmap. A logical micro-page contains:
 
 - a generation, checksum, format version, and exact byte bounds;
@@ -191,23 +189,19 @@ whose byte slices happen to come from mmap. A logical micro-page contains:
 - page-local exact-index tuple masks; and
 - no pointers, capacities, or runtime-specific object layouts.
 
-A small durable root names logical pages by immutable physical page id. Point
-lookup resolves key to `(logical page, stable slot)`, validates the page header,
-and returns a scoped view. Query planning performs `AND`, `OR`, and `NOT` on
-page masks before touching source pages, so a selective query reads only
-candidate pages. Sequential scans submit physically ordered, bounded read
-batches rather than triggering one synchronous fault per page.
+A small durable root names logical pages by immutable physical references.
+Point lookup resolves a key to `(logical chunk, stable slot)`, validates the
+document page, and returns a scoped view. Explicit exact-index probes produce
+page masks without scanning rejected JSON; the general query executor currently
+uses a physical chunk scan. Sequential reads and key prefetch submit bounded,
+physically ordered work rather than relying on demand faults.
 
-Cold chunk-directory levels use implemented 64-way packed CHAMP nodes with one
+Chunk-directory levels use implemented 64-way packed CHAMP nodes with one
 occupancy word and densely ranked fixed-width physical references rather than
-Go pointers. Hot upper levels are swizzled into direct frame
-pointers and may use the existing fixed fan-out form when measurement justifies
-it. Posting streams are ordered by logical page, so
-Boolean operators merge compressed page ids and apply one native 64-bit mask
-per page; candidate page ids are then sorted by physical offset and prefetched
-in bounded windows. Projection-only queries may be answered from compact
-indexed scalar payloads without reading the source page, but every API that
-claims exact JSON spelling still visits and verifies the source.
+Go pointers. Admitted pages are found in the bounded cache; cold references
+enter its read workers. Posting keys are ordered by index, tuple hash, and
+logical chunk and carry one native 64-bit mask. Every exact probe that returns
+rows visits candidate documents to verify complete scalar values.
 
 The implemented document payload makes slot identity implicit in one 64-bit
 live word and stores only cumulative key and JSON ends: eight directory bytes
@@ -216,10 +210,10 @@ bitmap probe and popcount; complete key comparison remains mandatory on a
 fingerprint hit. Metadata nodes use a 4 KiB allocation quantum, while a
 document `PageRef` can name a larger power-of-two extent. This covers ordinary
 variable-size chunks without forcing every sparse node to the maximum size.
-Values beyond the maximum practical contiguous extent still require the
-separately checksummed overflow schema; it is not implemented yet. Directory
-cache size, prefetch depth, and overflow threshold are format or Store options
-with conservative defaults; none may change query semantics.
+Values beyond the configured inline extent use a checksummed overflow chain
+whose descriptor binds total length and owner slot. Directory cache size,
+prefetch depth, and overflow threshold are `FileStoreOptions`; none changes
+query semantics.
 
 ## Publication and crash consistency
 
@@ -317,21 +311,18 @@ directory therefore falls back to the older root. On M4 Max, the complete
 pure-Go SIMD state-root encoder measured 170.0-171.6 ns per 4 KiB page and the
 decoder 152.4-153.3 ns, both at zero allocations.
 
-The exact-index payload is implemented and attached as the immutable base of
-bulk-built and reopened Stores. One physical page packs multiple sorted
-stable-slot streams; singleton hits use delta/slot uvarints, dense chunks keep
-native 64-bit masks, and long streams continue by logical page/rank. A bounded
-heap delta wholly shadows each chunk touched after publication, so the first
-write does not rebuild the corpus and retained snapshots preserve their exact
-base/delta pair. At 5M fixture rows, two nested/compound packed index bases use
-20,798,476 bytes (4.16 B/doc) versus the prior 496 MB heap-node estimate. The
-durable state root does not publish these pages yet.
+Heap `Store` retains its packed multi-stream exact-index base plus dirty-chunk
+delta. `FileStore` uses a different durable representation: its frozen catalog
+hash is in the state root, a copy-on-write index tree maps
+`(index id, tuple hash, chunk)` to one stable-slot posting page, and each
+mutation updates affected postings in the same transaction as the document and
+key roots. Probes always reopen candidate documents for exact tuple recheck.
 
-This is deliberately still internal: Store does not yet attach changed
-micro-pages to commit batches or encode copied key/index/TTL paths in their
-common page payloads. Therefore ordinary `Put`, `Delete`, and TTL operations
-are not yet automatically durable. Read-only checkpoint mappings never contain
-dirty transactional state.
+Key, chunk, exact-index, TTL, free, document, and overflow pages are all
+attached to public `FileStore` mutation batches. `Put`, `Delete`, deadline
+changes, persistence, and expiry publish complete page graphs. Heap `Store`
+checkpoint mappings remain read-only export images and are intentionally not
+updated by those heap mutations.
 
 The old root stays valid until the final step. Recovery chooses the newest
 valid superblock and ignores unreferenced partial pages. This follows the
@@ -366,34 +357,26 @@ pages or reclamation work; hiding that cost would be incorrect.
 
 ## Lifetime-safe reads
 
-The existing `RawValue` and `Index` types are borrowed handles with no mapping
-owner. They cannot safely escape an automatically unmapped Store. The mapped
-surface must therefore use one of these explicit contracts:
+The implemented `FileSnapshot` pins one root generation, not every cache frame.
+It must be closed explicitly; `FileStore.Close` refuses to finish while a
+snapshot lease remains. `AppendRaw(dst, key)` acquires scoped page leases and
+copies into caller-owned capacity, so returned bytes survive eviction and
+snapshot close. `RangeRaw` borrows only for its callback and reuses one overflow
+buffer. The query executor copies selected values into its result.
 
-- a `ReadLease` pins a mapped generation; all borrowed values become invalid
-  only after the lease closes;
-- callback-scoped `ViewRaw` keeps a lease for the callback duration; or
-- `AppendRaw(dst, key)` copies into caller-owned capacity and returns no mapped
-  view.
-
-The copy-out form can be zero-allocation with a sufficient destination but is
-not zero-copy. An owner pointer added to every hot value handle is rejected
-until its size and latency are measured. Finalizers are a leak backstop, never
-the correctness mechanism for unmapping.
-
-The explicit page manager makes this contract load-bearing: an evictable frame
-cannot back an unowned `RawValue`. Attached-file mode must therefore pin frames
-through a `ReadLease`/snapshot lease or require caller-buffered copy-out. A hot
-resident lease may be very cheap, but it is measured separately from the
-existing heap Store's 5 ns compiled-key path.
+This is load-bearing: an evictable frame cannot safely back an unowned
+`RawValue`. The file surface therefore does not return one. A sufficient
+destination makes an inline resident `AppendRaw` allocation-free, but it is
+still a copy and is measured separately from heap `Store` reads.
 
 ## Research basis and rejected shortcuts
 
 [LeanStore](https://db.in.tum.de/~leis/papers/leanstore.pdf) demonstrates the
-relevant low-overhead buffer-manager technique: pointer swizzling reduces a
-resident page access to a predictable check while preserving explicit global
-replacement beyond RAM. Store adopts that direction for logical pages, but its
-stable 64-slot masks and immutable publication remain specific to JSON queries.
+relevant low-overhead buffer-manager direction: explicit replacement preserves
+control beyond RAM, and pointer swizzling can reduce resident access cost.
+`FileStore` adopts explicit replacement but currently uses a bounded cache
+lookup rather than claiming a swizzled fast path. Its stable 64-slot masks and
+immutable publication remain specific to JSON queries.
 
 The CIDR paper
 [Are You Sure You Want to Use MMAP in Your Database Management System?](https://db.cs.cmu.edu/papers/2022/cidr2022-p13-crotty.pdf)
@@ -420,42 +403,46 @@ I/O rather than demand-paged writable mappings.
 ## Query and TTL consequences
 
 Declared nested and compound indexes keep the same scalar fingerprint and
-mandatory exact-recheck semantics. Current postings already expose sparse
-page-level masks plus caller-owned dense words with one bit per stable slot.
-Two- and fused three-input Boolean kernels use runtime-gated 256-bit AVX2 on
-amd64 when it wins; sub-eight-word buffers and selective sparse streams stay
-scalar. The external physical
-posting becomes a hierarchy of the same page masks. That executor must expose
-page-fault and bytes-touched metrics in addition to nanoseconds and result
-counts.
+mandatory exact-recheck semantics. `FileSnapshot.AppendIndexMasks` returns the
+same sparse `(chunk, mask)` interchange form as heap snapshots. The current
+file query path uses those semantics for explicit probes; general
+`RunFileSnapshot` currently performs a physical chunk scan and bounded parallel
+batching rather than extracting arbitrary predicate plans from the durable
+index catalog. Index-driven page pruning is a performance extension, not a
+correctness dependency.
 
-TTL remains publication-based. Deadlines can live in a compact writer-side
-heap for the active write process or in a persistent deadline index, but an
-ordinary snapshot read still performs no clock access or expiry branch. Expiry
-publishes the same page-level deletes as an explicit mutation.
+TTL is publication-based and persistent. A deadline is stored beside its key
+and in an ordered copy-on-write TTL tree. Changing or removing it updates both
+paths in one generation. `ExpireDue` reads the earliest record and publishes
+ordinary deletes up to the caller's limit. Far-future pages stay cold; ordinary
+reads perform no clock access or expiry branch.
 
-At 100x-RAM scale, one heap node per expiring key cannot be assumed resident.
-Use persistent deadline pages partitioned by coarse time bucket, with only the
-near-term bucket frontier and its mutable four-ary heap cached in memory.
-Changing TTL removes and inserts one keyed deadline record in the same
-copy-on-write transaction as metadata publication; it never adds a stale
-generation. Far-future buckets stay mapped and cold. Reads still pay zero TTL
-instructions, while expiry cost is proportional to due records and touched
-document pages rather than total expiring keys.
+Ordered projections and grouped query state can exceed the memory target, so
+`RunFileSnapshot` emits sorted temporary runs and merges with a maximum fan-in
+of 32. Batch parsing/indexing is parallel; publication order is restored before
+partial reductions merge. Final output remains caller-owned and therefore is
+not counted against the transient working-memory target.
 
-## Acceptance gates
+## Validation and remaining gates
 
-The mapped Store is not complete until it passes:
+The implementation now has deterministic randomized mutation/TTL parity
+against heap `Store`, retained-snapshot and reopen continuation tests, exact
+index update/delete/reopen tests, bounded fan-in spill differentials, async
+flush tests, allocation checks, long-lived-snapshot reclamation/file-growth
+tests, page corruption tests, and crash images that tear data and root writes.
+The full race suite and portable Linux/Windows compile checks are release gates.
 
-- differential results against the heap Store for nested/compound indexed
-  queries, updates, deletes, TTL changes, and retained snapshots;
-- crash injection at every persist boundary and corrupt-page fail-closed tests;
-- mapping-lifetime tests under forced GC, race, and `checkptr`;
-- resident-set, Go-heap, page-fault, read-amplification, write-amplification,
-  and file-fragmentation measurements;
-- working sets below, near, and above physical RAM; and
-- bounded reclamation under a deliberately long-lived snapshot.
+Still required before advertising a numeric 100x-RAM operating point:
 
-Until those gates pass, `OpenStore` is a caller-owned off-heap payload boundary,
-not a bounded-residency or durable mapped database. `Open` remains the
-lower-level `DocSet` image mechanism used inside it.
+- resident-set, page-fault, read/write amplification, and fragmentation
+  measurements on working sets below, near, and above physical RAM;
+- cold NVMe and constrained-cache workloads, not only a warm M4 Max cache;
+- longer crash/power-loss campaigns on real filesystems in addition to
+  deterministic image tearing; and
+- index-driven pruning in the general file query planner where selectivity
+  justifies it.
+
+`OpenStore` remains the caller-owned mapped heap-Store checkpoint.
+`OpenFileStore` is the incremental durable and bounded-residency surface. The
+latter is usable without claiming that every workload performs well at an
+arbitrary disk-to-RAM multiplier.

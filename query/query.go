@@ -1,8 +1,9 @@
 // Package query is a basic, single-table query surface over a
-// [simdjson.DocSet]: the product layer that turns the store's indexing,
-// projection, containment, and grouping primitives into a small SQL-shaped
-// engine. The table is one DocSet, each document is a row, and columns are
-// JSON paths. It answers SELECT of path projections and aggregates
+// [simdjson.DocSet], heap [simdjson.Snapshot], or durable
+// [simdjson.FileSnapshot]: the product layer that turns indexing, projection,
+// containment, and grouping primitives into a small SQL-shaped engine. Each
+// document is one row and columns are JSON paths. It answers SELECT of path
+// projections and aggregates
 // (COUNT, SUM, AVG, MIN, MAX); WHERE with comparisons, containment (@>),
 // existence, and null tests combined by And/Or/Not; GROUP BY; ORDER BY; and
 // LIMIT. Joins, subqueries, mutation, and full SQL are out of scope.
@@ -34,6 +35,11 @@
 // ordering, and limiting. A compiled query is immutable and safe to run
 // concurrently; Run owns its transient scan state, while concurrent RunInto
 // calls use one independent Result and Workspace pair per goroutine.
+// [Query.RunFileSnapshot] instead scans bounded raw batches, indexes and
+// evaluates them in parallel, restores source order before partial reductions,
+// and externally merges ordered projections or groups when their transient
+// frontier reaches the configured memory target. The caller owns the final
+// result, whose size is necessarily outside that working-memory target.
 //
 // # Value semantics
 //

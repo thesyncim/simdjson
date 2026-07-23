@@ -34,10 +34,13 @@ conversion.
 
 `internal/storeio` owns the attached-Store durability boundary: bounded commit
 queues and devices, double-superblock recovery, common page framing, packed
-directory/document payloads, and their checksum kernels. Persistent formats
-use byte offsets, fixed-width values, and stable logical ids rather than Go
-pointers or runtime layouts. Store-specific SIMD stays in this internal
-package; the public `simd` package does not acquire database I/O policy.
+key/chunk/index/TTL/free/document/overflow payloads, copy-on-write tree
+mutations, generation leases, extent reclamation, the bounded CLOCK page cache,
+and checksum kernels. Persistent formats use byte offsets, fixed-width values,
+and stable logical ids rather than Go pointers or runtime layouts. The public
+`FileStore` composes those mechanisms without exposing physical references.
+Store-specific SIMD stays in this internal package; the public `simd` package
+does not acquire database I/O policy.
 
 The pre-v1 `simd` package retains decimal classification, eight-digit parsing,
 fixed-width decimal formatting, JSON float and time formatting, plus effective
@@ -72,6 +75,10 @@ bounds and lifetime are already established by typed state.
 | Encoder and writer output | Returned bytes belong to the caller. | Source graphs must not overlap output capacity being appended to. |
 | `Store` snapshot values | Borrow immutable chunks reachable from the snapshot state. | Keep the snapshot or a derived handle alive; later writes never invalidate it. |
 | `OpenStore` image-backed values | Borrow the caller's complete immutable image through the Store state graph. | Keep the image mapped until the Store, snapshots, and all borrowed handles are dead; use `AppendRaw` for owned copy-out. |
+| `FileSnapshot` | Pins one durable root generation and therefore all physical extents reachable from it. | Call `Close`; `FileStore.Close` fails while leases remain. |
+| `FileSnapshot.AppendRaw` | Copies from a scoped page lease into caller-owned capacity. | The returned bytes are independent of cache eviction and snapshot close. |
+| `FileSnapshot.RangeRaw` callback | Key/value views borrow the current page or reused overflow buffer. | Invalid when the callback returns; copy anything retained. |
+| `query.RunFileSnapshot` result | Owns copied projection/group bytes and formatted aggregates. | Independent of snapshot close; final result memory scales with result cardinality. |
 
 Borrowing avoids a copy; it never hides a pointer. Compiled plans contain no
 source or destination pointer and are immutable after construction. Mutable

@@ -208,21 +208,57 @@ dst, ok := reopened.AppendRaw(make([]byte, 0, 256), "session:42")
 The image bytes must remain immutable and live until the Store, retained
 snapshots, and borrowed values are dead. `AppendRaw`/`AppendRawKey` make an
 owned copy into caller capacity and allocate nothing after capacity is warm.
-Opening keeps the immutable key directory and 32-byte row descriptors in
-pointer-free anonymous memory on supported Unix systems. Page roots and chunk
-owners, the mutation overlay, shapes, optional accelerators, and exact-index
-roots remain Go objects. This is still not a completed bounded-residency
-database: `WriteTo` is a full checkpoint, not a per-write durability path, and
-post-open mutations do not update the image. The measured limit and automatic
-append-only 100x-RAM design are in
-[Mutable Store operations](docs/store.md).
+`WriteTo` remains a full checkpoint: later heap-Store mutations do not update
+that image.
 
-The separate attached-file substrate now has crash-safe double roots, a common
-checksummed page envelope, a pointer-free state root, packed 64-way chunk
-directories, and eight-byte-per-live-row document directories with
-variable-size extents. It remains internal until mutation batches and the
-key/index/TTL page schemas are connected end to end; these codecs do not make
-ordinary `Put` durable yet.
+For incremental durability and a bounded resident set, attach a `FileStore` to
+a caller-owned file. Its key, chunk, exact-index, TTL, free-space, document, and
+overflow structures are checksummed copy-on-write pages selected by alternating
+superblocks:
+
+```go
+file, err := os.OpenFile("events.sj", os.O_RDWR|os.O_CREATE, 0o600)
+if err != nil {
+	return err
+}
+store, err := simdjson.CreateFileStore(file, simdjson.FileStoreOptions{
+	ResidentBytes: 256 << 20,
+	Synchronous:   true,
+	Indexes: []simdjson.StoreIndexDefinition{
+		{Name: "tenant", Paths: []string{"/tenant"}},
+	},
+})
+if err != nil {
+	return err
+}
+defer store.Close() // the caller still closes file
+
+_, err = store.Put("event:42", []byte(`{"tenant":"acme","score":7}`))
+snapshot, err := store.Snapshot()
+if err != nil {
+	return err
+}
+defer snapshot.Close()
+raw, ok, err := snapshot.AppendRaw(nil, "event:42")
+```
+
+`FileStore` opens from bounded root/page scratch instead of walking the corpus.
+Its CLOCK cache, read workers, prefetch queue, commit queue, active snapshots,
+and retired extents all have explicit capacities reported by `Stats`. Async
+writes become reader-visible when queued; `DurableGeneration` and `Flush`
+expose the durability boundary. `Synchronous` waits on each mutation. Snapshot
+leases fence physical reuse, while the previous durable generation remains
+recoverable if the newest data or root write is torn.
+
+`query.Query.RunFileSnapshot` scans physical chunk leaves in order, builds
+bounded batches in parallel, and externally merges ordered rows or grouped
+state through temporary spill files with a 32-run fan-in. `MemoryBytes` bounds
+working state, not the caller-owned final result or one document larger than
+the target. The Store is deliberately single-file and single-writer: there is
+no replication, distributed execution, cross-Store transaction, SQL parser,
+join engine, or server protocol. Exact-index definitions are frozen when the
+file is created. The complete contract and measured limits are in
+[Mutable Store operations](docs/store.md).
 
 An update parses only its replacement. Unchanged source and structural-tape
 storage stays immutable and is shared into the next bounded chunk; deletes copy
@@ -345,8 +381,10 @@ define the methodology, gates, comparison boundaries, and pinned toolchains.
 | Compact, indented, or canonical output | `Compact`, `Indent`, `Canonicalize` |
 | Borrowed selection or repeated document navigation | `RawValue`, `Index`/`Node`, or `Parse`/`Value` |
 | Keyed datasets, including bulk construction | `StoreBuilder`, `Store`, `Snapshot` |
+| Incrementally durable, bounded-residency keyed datasets | `CreateFileStore`, `OpenFileStore`, `FileStore`, `FileSnapshot` |
 | Low-level immutable arenas and column extraction | `DocSet`, `ShapeCache`, `KeyInterner` |
 | SQL-shaped projection, filtering, grouping, and aggregation | `query.Query.RunInto`, `query.Result`, `query.Workspace` |
+| Parallel bounded-batch queries over a durable file snapshot | `query.Query.RunFileSnapshot`, `query.FileExecutionOptions` |
 | Keyed updates, deletes, TTL, snapshots, exact indexes, and wildcard postings | `Store`, `Snapshot`, `StoreIndexDefinition`, `StoreStats` |
 
 The advanced document APIs are moving into `document` during the pre-v1
