@@ -90,6 +90,21 @@ func (v *fileStorePageValidator) validate(page []byte, ref storeio.PageRef) erro
 				}
 			}
 		}
+	case storeio.PageFloat64Group:
+		_, err := storeio.OpenAdmittedFloat64Group(
+			page, v.chunkHighWater.Load(), v.nextLogicalID.Load(),
+		)
+		return err
+	case storeio.PageFloat64Catalog:
+		_, err := storeio.OpenAdmittedFloat64Catalog(
+			page, v.fileEnd.Load(), v.nextLogicalID.Load(), v.pageSize,
+		)
+		return err
+	case storeio.PageFloat64Stripe:
+		_, err := storeio.OpenAdmittedFloat64Stripe(
+			page, v.chunkHighWater.Load(), v.nextLogicalID.Load(),
+		)
+		return err
 	}
 	return nil
 }

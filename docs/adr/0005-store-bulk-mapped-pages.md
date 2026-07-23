@@ -234,9 +234,11 @@ variable-size chunks without forcing every sparse node to the maximum size.
 Format v2 may append a frozen set of typed float64 covers to that same
 micro-page: one stable-slot mask per RFC 6901 path followed by only the finite
 values selected by the mask. JSON bounds remain capacity-clipped before the
-cover section. Mutation and recovery therefore cannot observe a cover from a
-different document generation, and the retained format adds no Go pointer per
-row or key.
+cover section. Compact groups route to detached typed extents instead: one
+extent may cover multiple document groups in a bounded allocation micro-region.
+Each column independently selects exact unsigned 8-, 16-, or 32-bit values
+when every value fits, and otherwise stores IEEE float64. Neither representation
+adds a Go pointer per row or key.
 
 Compact generation creation can instead select a `PageDocumentGroup` when its
 rounded physical extent is strictly smaller than the same consecutive chunks
@@ -253,7 +255,8 @@ The group payload has five independently bounded layers:
 3. exact key bytes and per-row scalar token streams;
 4. page-local structural templates plus at most 128 profitable complete-scalar
    dictionary values; and
-5. directly addressable finite float64 masks and values.
+5. a bounded reference to the shared typed sidecar; finite masks and values
+   remain directly addressable there.
 
 Dictionary ids occupy tokens 0 through 127. Tokens 128 through 254 encode
 literal lengths 1 through 127 directly; token 255 carries the longer canonical
@@ -271,11 +274,23 @@ document page. Other chunk lanes continue to reference the group. A bounded
 radix-range check visits each covered 64-lane leaf once and retires the group
 exactly when its final mapping is peeled; generation leases still fence
 physical reuse. Sequential scans and numeric reductions coalesce equal
-references and acquire each group once, including groups crossing a radix-leaf
-boundary. Grouping is currently a bulk/compact-generation optimization:
+references and acquire each group or shared sidecar once, including runs
+crossing a radix-leaf boundary. A sidecar is retired only when its final
+deriving chunk is peeled. Grouping is currently a bulk/compact-generation optimization:
 correctness, scan density, and space reclamation do not require regrouping
 after online churn, but recovering its best compression after widespread
 updates requires creating another compact generation.
+
+The clean state root may additionally name a checksummed catalog of contiguous
+aggregate-only stripes. A stripe stores dense adaptive typed values but no
+stable-slot masks or JSON, and covers ordinary, overflow-backed, and grouped
+chunks alike. Predicate-free numeric aggregates can therefore avoid both the
+chunk tree and document extents. The first document mutation clears this root
+field, coalesces the now-unreachable stripe/catalog run into bounded retirement
+metadata, and uses the authoritative sidecar/document overlay path. TTL-only
+publications retain it. Recovery validates physical and logical ordering,
+exact chunk coverage, per-column
+encoding, CRC32C, and root generation before selecting the shortcut.
 
 Values beyond the configured inline extent use a checksummed overflow chain
 whose descriptor binds total length and owner slot. Directory cache size,
@@ -517,12 +532,13 @@ approximate candidate universe would be unsafe.
 
 The planner also recognizes an unfiltered scalar aggregate containing only
 `COUNT(*)` and numeric aggregates whose paths are all frozen covers. It
-preflights the complete list and fuses distinct columns into one page walk,
-without admitting JSON rows or launching workers. Numeric masks deliberately
-cannot answer `COUNT(path)`, because present non-numeric values must count
-there. Co-locating covers is the update-safe first tier; cold analytical scans
-still read document extents, so separate packed column extents remain a future
-larger-than-RAM optimization rather than a claimed property here.
+preflights the complete list and fuses distinct columns into one typed-extent
+walk, without admitting JSON rows or launching workers. Numeric masks
+deliberately cannot answer `COUNT(path)`, because present non-numeric values
+must count there. An untouched compact generation reads its contiguous dense
+scan stripes. After the first document mutation the same API walks
+authoritative detached sidecars plus peeled document pages, preserving
+correctness without pretending that a stale clean stripe includes overlays.
 
 TTL is publication-based and persistent. A deadline is stored beside its key
 and in an ordered copy-on-write TTL tree. Changing or removing it updates both

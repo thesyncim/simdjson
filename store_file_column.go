@@ -64,50 +64,179 @@ func (s *FileSnapshot) ReduceFloat64PathsInto(dst []Float64Aggregate, paths []st
 	}
 	clear(dst)
 	state := s.state
-	err := storeio.WalkChunkTreeRuns(s.store.cache, state.chunkRoot, storeio.ChunkTreeBounds{
+	if state.root.Float64ScanHead != (storeio.PageRef{}) {
+		if err := s.reduceFloat64ScanChain(dst, ordinals[:len(paths)]); err != nil {
+			clear(dst)
+			return true, err
+		}
+		return true, nil
+	}
+	err := storeio.WalkChunkTreeFloat64Runs(s.store.cache, state.chunkRoot, storeio.ChunkTreeBounds{
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
-	}, func(first, chunks uint32, ref storeio.PageRef) error {
-		if chunks == 0 || ref.Kind == storeio.PageDocument && chunks != 1 {
-			return storeio.ErrChunkDirectoryCorrupt
-		}
-		lease, err := s.store.cache.Acquire(ref)
-		if err != nil {
-			return err
-		}
-		for chunkOrdinal := uint32(0); chunkOrdinal < chunks; chunkOrdinal++ {
-			view, viewErr := admittedFileDocumentChunk(lease.Page(), ref, first+chunkOrdinal)
-			if viewErr != nil {
-				lease.Release()
-				return viewErr
-			}
-			if view.float64ColumnCount() != len(s.store.options.float64Columns) {
-				lease.Release()
-				return fmt.Errorf("%w: float64 covering catalog", storeio.ErrDocumentPageCorrupt)
-			}
-			for i, ordinal := range ordinals[:len(paths)] {
-				covered, ok := view.float64Column(int(ordinal))
-				if !ok {
-					lease.Release()
-					return fmt.Errorf("%w: float64 covering ordinal", storeio.ErrDocumentPageCorrupt)
-				}
-				iterator := covered.Values()
-				for {
-					value, present := iterator.Next()
-					if !present {
-						break
-					}
-					dst[i].add(value)
-				}
-			}
-		}
-		lease.Release()
-		return nil
+	}, uint32(s.store.options.PageSize), func(
+		first, chunks uint32, ref storeio.PageRef, detached bool,
+	) error {
+		return s.reduceFloat64MappedRun(
+			dst, ordinals[:len(paths)], first, chunks, ref, detached,
+		)
 	})
 	if err != nil {
 		clear(dst)
 		return true, err
 	}
 	return true, nil
+}
+
+// reduceFloat64ScanChain is the untouched compact-generation fast path. The
+// state-root catalog and contiguous value-only stripes omit the stable-slot
+// tree walk; the first document write clears the head, making the general
+// overlay-aware path above authoritative for mixed base and peeled chunks.
+func (s *FileSnapshot) reduceFloat64ScanChain(dst []Float64Aggregate, ordinals []uint16) error {
+	state := s.state
+	catalogRef := state.root.Float64ScanHead
+	nextChunk := uint32(0)
+	var previousScanRef storeio.PageRef
+	for catalogRef != (storeio.PageRef{}) {
+		lease, err := s.store.cache.Acquire(catalogRef)
+		if err != nil {
+			return err
+		}
+		catalog := storeio.AdmittedFloat64Catalog(lease.Page())
+		header := catalog.Header()
+		var refs [64]storeio.PageRef
+		for first := 0; first < catalog.Len(); first += len(refs) {
+			count := min(len(refs), catalog.Len()-first)
+			for i := 0; i < count; i++ {
+				var ok bool
+				refs[i], ok = catalog.RefAt(first + i)
+				if !ok {
+					lease.Release()
+					return storeio.ErrFloat64CatalogCorrupt
+				}
+			}
+			if _, err := s.store.cache.Prefetch(refs[:count]); err != nil {
+				lease.Release()
+				return err
+			}
+			for i := 0; i < count; i++ {
+				if previousScanRef != (storeio.PageRef{}) &&
+					(refs[i].Offset <= previousScanRef.Offset ||
+						refs[i].LogicalID <= previousScanRef.LogicalID) {
+					lease.Release()
+					return fmt.Errorf(
+						"%w: float64 catalog global order",
+						storeio.ErrFloat64CatalogCorrupt,
+					)
+				}
+				groupLease, acquireErr := s.store.cache.Acquire(refs[i])
+				if acquireErr != nil {
+					lease.Release()
+					return acquireErr
+				}
+				stripe := storeio.AdmittedFloat64Stripe(groupLease.Page())
+				stripeHeader := stripe.Header()
+				if stripeHeader.FirstChunk != nextChunk ||
+					stripeHeader.ColumnCount != uint16(len(s.store.options.float64Columns)) {
+					groupLease.Release()
+					lease.Release()
+					return fmt.Errorf("%w: float64 stripe coverage", storeio.ErrFloat64StripeCorrupt)
+				}
+				for column, ordinal := range ordinals {
+					values, encoding, found := stripe.ColumnValues(int(ordinal))
+					if !found || !dst[column].addPackedFloat64Width(values, encoding.ByteWidth()) {
+						groupLease.Release()
+						lease.Release()
+						return fmt.Errorf("%w: float64 stripe column", storeio.ErrFloat64StripeCorrupt)
+					}
+				}
+				coveredChunks := stripeHeader.ChunkCount
+				if uint64(nextChunk)+uint64(coveredChunks) > uint64(^uint32(0)) {
+					groupLease.Release()
+					lease.Release()
+					return fmt.Errorf("%w: float64 scan chunk overflow", storeio.ErrFloat64GroupCorrupt)
+				}
+				nextChunk += coveredChunks
+				previousScanRef = refs[i]
+				groupLease.Release()
+			}
+		}
+		next := header.Next
+		if next != (storeio.PageRef{}) &&
+			(next.Offset <= catalogRef.Offset || next.LogicalID <= catalogRef.LogicalID) {
+			lease.Release()
+			return fmt.Errorf("%w: float64 catalog link order", storeio.ErrFloat64CatalogCorrupt)
+		}
+		lease.Release()
+		catalogRef = next
+	}
+	if nextChunk != state.root.ChunkHighWater {
+		return fmt.Errorf("%w: incomplete float64 stripe coverage", storeio.ErrFloat64StripeCorrupt)
+	}
+	return nil
+}
+
+func (s *FileSnapshot) reduceFloat64MappedRun(
+	dst []Float64Aggregate,
+	ordinals []uint16,
+	first, chunks uint32,
+	ref storeio.PageRef,
+	detached bool,
+) error {
+	if chunks == 0 || ref.Kind == storeio.PageDocument && chunks != 1 {
+		return storeio.ErrChunkDirectoryCorrupt
+	}
+	lease, err := s.store.cache.Acquire(ref)
+	if err != nil {
+		return err
+	}
+	if detached {
+		group := storeio.AdmittedFloat64Group(lease.Page())
+		header := group.Header()
+		runEnd := uint64(first) + uint64(chunks)
+		groupEnd := uint64(header.FirstChunk) + uint64(header.ChunkCount)
+		if header.ColumnCount != uint16(len(s.store.options.float64Columns)) ||
+			first < header.FirstChunk || runEnd > groupEnd {
+			lease.Release()
+			return fmt.Errorf("%w: detached float64 covering catalog", storeio.ErrFloat64GroupCorrupt)
+		}
+		for i, ordinal := range ordinals {
+			values, encoding, found := group.Float64ColumnRangeValues(int(ordinal), first, chunks)
+			if !found || !dst[i].addPackedFloat64Width(values, encoding.ByteWidth()) {
+				lease.Release()
+				return fmt.Errorf("%w: detached float64 packed column", storeio.ErrFloat64GroupCorrupt)
+			}
+		}
+		lease.Release()
+		return nil
+	}
+	for chunkOrdinal := uint32(0); chunkOrdinal < chunks; chunkOrdinal++ {
+		view, viewErr := admittedFileDocumentChunk(lease.Page(), ref, first+chunkOrdinal)
+		if viewErr != nil {
+			lease.Release()
+			return viewErr
+		}
+		if view.float64ColumnCount() != len(s.store.options.float64Columns) {
+			lease.Release()
+			return fmt.Errorf("%w: float64 covering catalog", storeio.ErrDocumentPageCorrupt)
+		}
+		for i, ordinal := range ordinals {
+			covered, ok := view.float64Column(int(ordinal))
+			if !ok {
+				lease.Release()
+				return fmt.Errorf("%w: float64 covering ordinal", storeio.ErrDocumentPageCorrupt)
+			}
+			iterator := covered.Values()
+			for {
+				value, present := iterator.Next()
+				if !present {
+					break
+				}
+				dst[i].add(value)
+			}
+		}
+	}
+	lease.Release()
+	return nil
 }
 
 func (s *FileSnapshot) float64ColumnOrdinal(path string) int {

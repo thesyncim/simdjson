@@ -289,7 +289,7 @@ func validateFreeDirectoryHeader(header FreeDirectoryHeader, count, recordSize i
 func validateFreeDirectoryChild(header FreeDirectoryHeader, ref PageRef, fileEnd, nextLogicalID uint64) error {
 	pageSize := uint64(header.PageSize)
 	if fileEnd < uint64(superblockCopies)*pageSize || fileEnd > maxSuperblockFileOffset || fileEnd%pageSize != 0 ||
-		ref.Kind != PageFreeDirectory || ref.Flags != 0 || ref.Length != header.PageSize ||
+		ref.Kind != PageFreeDirectory || ref.Flags != 0 || ref.Aux != 0 || ref.Length != header.PageSize ||
 		ref.Generation == 0 || ref.Generation > header.Generation ||
 		ref.LogicalID <= StateRootLogicalID || ref.LogicalID >= nextLogicalID || ref.LogicalID == header.LogicalID ||
 		ref.Offset < uint64(superblockCopies)*pageSize || ref.Offset%pageSize != 0 ||

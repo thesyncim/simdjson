@@ -67,6 +67,43 @@ func TestPageCacheBoundedAdmissionEvictionAndIdentity(t *testing.T) {
 	}
 }
 
+func TestPageCacheReadyHitIncludesRoutingMetadata(t *testing.T) {
+	file, storeID, refs := newPageCacheFixture(t, 1)
+	cache, err := NewPageCache(file, PageCacheOptions{
+		PageSize: pageCacheTestPageSize, ResidentBytes: pageCacheTestPageSize,
+		StoreID: storeID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+	lease, err := cache.Acquire(refs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Release()
+	key, err := cache.validateRef(refs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := key
+	mask := uint64(len(cache.table) - 1)
+	for aux := uint16(1); aux != 0; aux++ {
+		wrong.aux = aux
+		if cacheKeyHash(wrong)&mask == cacheKeyHash(key)&mask {
+			break
+		}
+	}
+	if wrong.aux == 0 {
+		t.Fatal("could not construct colliding routing key")
+	}
+	var wrongLease PageLease
+	if cache.tryPinReady(cacheKeyHash(wrong), wrong, &wrongLease) {
+		wrongLease.Release()
+		t.Fatal("ready hit ignored PageRef routing metadata")
+	}
+}
+
 func TestPageCachePrefetchOrderingAndHit(t *testing.T) {
 	file, storeID, refs := newPageCacheFixture(t, 3)
 	cache, err := NewPageCache(file, PageCacheOptions{

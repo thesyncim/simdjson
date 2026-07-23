@@ -71,7 +71,7 @@ raw, ok := view.GetRaw("user:42")
 | `FileSnapshot.AppendRaw` | copy exact JSON into caller storage | key-tree lookup + touched document/overflow pages |
 | `FileSnapshot.AppendIndexMasks/Into` | probe a frozen exact index with collision-safe certification or document recheck | posting chunks + uncertified/colliding candidates; `Into` reuses caller workspace |
 | `FileSnapshot.AppendIndexCandidateMasksInto` | append a hash-bounded superset for an engine that will recheck | index/posting pages only; never a final answer |
-| `FileSnapshot.ReduceFloat64Path` / `ReduceFloat64PathsInto` | reduce frozen numeric covers without parsing JSON | one ordered document-page walk; fused paths and warmed caller buffers allocate zero |
+| `FileSnapshot.ReduceFloat64Path` / `ReduceFloat64PathsInto` | reduce frozen numeric covers without parsing JSON | one compact stripe walk, or an overlay-aware typed-extent walk after mutation; fused paths and warmed caller buffers allocate zero |
 | `FileSnapshot.RangeRawBuffer` / `RangeRawReadAheadBuffer` / `RangeMasksRawBuffer` | ordered serial, bounded direct-read-ahead, or sparse stable-slot scan | touched document/overflow pages; zero allocation after caller scratch warms |
 | `FileStore.Flush` | wait until the visible generation is crash-safe | queued storage work and durability barriers |
 | `query.RunFileSnapshot` | late-bound persistent-index pushdown, parallel bounded batches, external ordered/group spill | O(candidate input + merge), or full input when unbounded; final result storage is caller-owned |
@@ -494,15 +494,38 @@ and ordinary reads never consult the clock.
 Numeric covering definitions are separately frozen in
 `FileStoreOptions.Float64Columns` as exact RFC 6901 paths. The catalog supports
 at most 256 paths and participates in the same durable catalog hash, so reopen
-fails closed when the order or spelling changes. Document-page format v2
-appends, for each configured path, one stable-slot validity mask and only its
-finite `float64` values. Version-one pages remain readable for stores without
-covers. Missing, null, non-numeric, NaN, and infinity have no set bit.
-`Store.WriteFileStore`, online `Put`, and `Delete` maintain the typed section in
-the same page generation as the JSON; a torn or stale cover can never be
-selected independently. Encoding rejects masks outside live rows and
-non-finite values, while open verifies exact section length, live-mask
-containment, finite bits, checksum, and the frozen column count.
+fails closed when the order or spelling changes. Ordinary document pages keep
+one stable-slot validity mask per path followed by only its finite values.
+Missing, null, non-numeric, NaN, and infinity have no set bit.
+
+A compact generation separates mutation authority from aggregate locality:
+
+1. a detached typed group covers consecutive stable-slot chunks, retains their
+   masks, and can be shared by document groups across a bounded micro-region;
+2. integer-only runs use exact unsigned 8-, 16-, or 32-bit lanes, while
+   negative, fractional, or wider values use IEEE float64; and
+3. an aggregate-only scan stripe copies the dense covered values—without masks
+   or JSON—into physically consecutive extents named by a small catalog in the
+   state root.
+
+The stripe covers every clean bulk-built chunk, including ordinary and
+overflow-backed document pages; it does not depend on document-group
+continuity. A predicate-free aggregate therefore reads the catalog and dense
+value extents directly instead of walking the chunk tree or admitting document
+pages. The authoritative sidecars remain update-safe. The first online
+document mutation atomically clears the clean scan head, retires adjacent
+stripe and catalog pages as one coalesced range, and falls back to the chunk
+tree. A touched chunk is peeled to an ordinary document page while untouched
+chunks continue to share their detached sidecar. The sidecar is retired only
+after its final chunk mapping disappears. Rebuilding a compact generation
+restores the clean scan stripe after widespread churn.
+
+Every typed page is checksummed independently. Admission rejects masks outside
+live rows, invalid adaptive encodings, non-finite general values, non-monotonic
+catalog references, incomplete chunk coverage, and a frozen column-count
+mismatch. The scan root is published in the same state-root generation as its
+document graph, so recovery can select neither a stale stripe nor half of a
+catalog.
 The page cache performs common framing/CRC32C and complete document-schema
 validation once, before publishing a loaded frame. Hot point reads, scans,
 index rechecks, and covering reductions then use an admitted borrowed view
@@ -511,16 +534,15 @@ still checks that the document's encoded `ChunkID` matches the selecting
 chunk-tree edge, closing the cross-tree substitution case even when a forged
 page carries a valid checksum and an otherwise in-range chunk id.
 
-`ReduceFloat64PathsInto` preflights every requested path before reading a
-document page and fuses all configured paths into one ordered page walk.
+`ReduceFloat64PathsInto` preflights every requested path before reading an
+extent and fuses all configured paths into one ordered walk.
 Returning `false` therefore means no partial scan occurred and a query engine
 can choose one coherent fallback. A warmed scan with caller-owned aggregate and
-path slices allocates zero bytes. The on-page covers are pointer-free and add
-at most `8 + 8*ChunkDocuments` bytes per path and document page; the writer's
-fixed pointer-free scratch is reported by `Stats.Float64ScratchBytes`.
-Co-location makes update/delete publication simple and keeps point locality,
-but a cold cover scan still admits the containing document pages. It is not a
-claim of column-only device I/O for data far beyond RAM.
+path slices allocates zero bytes. Portable and Go-native SIMD reducers use the
+same fixed four-lane accumulation order, so dispatch and adaptive integer
+widths cannot change result bits. The writer's fixed pointer-free mutation
+scratch is reported by `Stats.Float64ScratchBytes`; compact-build count and
+encoding arrays are transient and pointer-free.
 
 `query.RunFileSnapshot` late-binds the frozen catalog before starting workers.
 It chooses the widest matching compound equality index, avoids redundant
@@ -552,7 +574,8 @@ Duplicate needle members retain last-wins semantics. Arrays and empty objects
 are not flattened because their structure is part of the answer. An unfiltered
 single-row aggregate made only of `COUNT(*)` and configured
 `SUM`/`AVG`/`MIN`/`MAX` paths bypasses workers, JSON admission, parsing, and
-transient value/validity columns. Multiple numeric paths share one page walk.
+transient value/validity columns. Multiple numeric paths share one typed-extent
+walk.
 `COUNT(path)`, filtered aggregates, grouping, and partially covered plans retain
 the general executor. A reusable
 `FileExecutionWorkspace` retains index-planner and overflow scratch; worker
@@ -576,7 +599,8 @@ Apple M4 Max, stable Go, 1,024 hot documents:
 | legacy JSON file aggregate, four workers | 414 us, 267 MB/s | 2.42 MB/op, 4,481 allocs/op |
 | 10K-row recovered exact filter | 14.50 us, 2 posting pages, 0 JSON rows/rechecks | 7.35x faster than pinned one-thread DuckDB |
 | 10K-row recovered scalar-object `@>` | 13.08 us, 2 posting pages, 0 JSON rows/rechecks | 230.75x faster than pinned one-thread DuckDB |
-| 10K-row recovered SUM through one frozen cover | 143.50 us, 0 JSON rows | 0.91x DuckDB throughput (1.10x slower) |
+| 5M-row recovered SUM through one clean typed stripe | 1.948 ms, 0 JSON rows | 4.13x faster than retained pinned DuckDB capacity result |
+| 128 MiB real-derived Twitter covered SUM | 45.083 us, 0 JSON rows | 3.37x faster than pinned one-thread DuckDB |
 
 The 1/64 nested compound fixture is reproducible with
 `BenchmarkRunFileSnapshotPersistentIndexPushdown`; its three samples were
@@ -972,12 +996,13 @@ With the pinned SIMD build, recovered FileStore point lookup is 21.75x faster.
 The exact filter and equivalent one-member object `@>` each acquire two packed
 posting pages, certify all 84 matches, and admit zero JSON rows; they measure
 14.50 us and 13.08 us, respectively 7.35x and 230.75x faster than the fresh
-DuckDB run. The predicate-free covered SUM measures 143.5 us versus DuckDB's
-130.5 us, 1.10x slower. Grouping remains about 22.0x slower, and individually
-double-fenced update/delete about 9.94x/19.0x slower.
-The remaining analytical gap is categorical/group covering and column-only
-cold I/O, while the mutation gap is dominated by strict per-operation
-durability and copy-on-write metadata. The report gives each ratio instead of
+DuckDB run. That frozen report's 143.5 us covered SUM predates the contiguous
+clean-generation scan stripe and remains historical rather than a current
+claim. The refreshed 5M capacity lane measures 1.948 ms versus DuckDB's
+8.051 ms, while a separately reproduced 128 MiB real-derived Twitter lane
+measures 45.083 us versus 151.833 us. Grouping remains much slower because it
+still decodes JSON, and individually double-fenced update/delete remain slower
+on the measured durability stacks. The report gives each ratio instead of
 averaging unlike operations into one score.
 
 ### Five-million-row capacity smoke
@@ -986,24 +1011,25 @@ A separate one-repetition capacity smoke used the same deterministic
 four-shape corpus at 5,000,000 rows: 53,888,890 key bytes plus 2,000,153,357
 JSON bytes (1.91 GiB), digest
 `19f8307d4d296e8a6ac7f32fa87df2a395b4ef882fb120d15ec40e3856dd2416`.
-The Store side ran on an Apple M4 Max and the pinned DuckDB 1.5.4 image ran
-single-threaded in Linux/arm64 Docker. Cross-OS, one-repetition numbers are
-capacity and mechanism evidence, not a publication-quality machine race.
+The refreshed FileStore side used the minimum of three repetitions on an Apple
+M4 Max; the retained pinned DuckDB 1.5.4 capacity artifact ran single-threaded
+in Linux/arm64 Docker. This cross-OS evidence explains mechanisms and capacity;
+it is not presented as a publication-quality same-machine race.
 
 | Measure | recovered FileStore | DuckDB | Direct interpretation |
 | --- | ---: | ---: | --- |
-| Durable file | 1.55 GiB (0.81x payload) | 1.18 GiB (0.62x) | FileStore is 1.31x larger |
-| File after 256 updates and deletes | 1.55 GiB (4.96 MiB reusable) | 1.21 GiB, 0 B WAL | FileStore is 1.28x larger |
-| Engine-accounted warm state | 16.21 MiB, excluding caller query state below | 998.25 MiB warm buffers | different accounting domains; not process RSS |
+| Durable file | 1.555 GiB (0.813x payload) | 1.18 GiB (0.62x) | FileStore is 1.318x larger |
+| File after 256 updates and deletes | 1.559 GiB (5.99 MiB reusable) | 1.21 GiB, 0 B WAL | high-water includes reusable extents |
+| Engine-accounted warm state | about 16.2 MiB, excluding caller query state below | 998.25 MiB warm buffers | different accounting domains; not process RSS |
 | Largest caller query buffer | 488.76 MiB | 1.94 GiB peak buffers | different ownership domains |
-| Recovery/open | 329.8 us | not isolated | FileStore reads bounded roots, not the corpus |
-| Keyed point read | 8.584 us | 129.83 us | FileStore 15.13x faster |
-| Exact filter, 38,800 matches | 5.143 ms | 24.486 ms | FileStore 4.76x faster |
-| Scalar-object `@>`, 38,800 matches | 4.876 ms | 1.408 s | FileStore 288.76x faster |
-| Covered `SUM`, 5M inputs | 2.102 s | 8.051 ms | FileStore 261.1x slower |
-| `GROUP BY`, 5M inputs | 3.789 s | 35.825 ms | FileStore 105.8x slower |
-| Durable update / operation | 9.025 ms | 1.444 ms | FileStore 6.25x slower |
-| Durable delete / operation | 8.746 ms | 589.2 us | FileStore 14.8x slower |
+| Recovery/open | 1.276 ms | not isolated | FileStore reads bounded roots, not the corpus |
+| Keyed point read | 9.625 us | 129.83 us | FileStore 13.49x faster |
+| Exact filter, 38,800 matches | 4.376 ms | 24.486 ms | FileStore 5.60x faster |
+| Scalar-object `@>`, 38,800 matches | 4.486 ms | 1.408 s | FileStore 313.9x faster |
+| Covered `SUM`, 1.25M finite values / 5M rows | 1.948 ms | 8.051 ms | FileStore 4.13x faster |
+| `GROUP BY`, 5M inputs | 4.126 s | 35.825 ms | FileStore 115.2x slower |
+| Durable update / operation | 9.176 ms | 1.444 ms | FileStore 6.35x slower |
+| Durable delete / operation | 8.624 ms | 589.2 us | FileStore 14.6x slower |
 
 The exact filter and containment probes opened 540 packed posting pages,
 certified every matching stable slot, and performed zero document rechecks.
@@ -1011,12 +1037,14 @@ Posting-page coalescing reduced the earlier FileStore filter and containment
 from about 45 ms to the low-millisecond range by sharing one immutable page
 lease and decode across consecutive streams. Grouped document extents cut this
 run's file by 43.3%, page reads by 91.3%, and read bytes by 48.7% relative to
-the preceding 4 KiB-page run. The remaining full-column gap is not hidden:
-numeric covers are update-safe but co-located with document pages, so a cold
-5M-row reduction reads far more bytes than DuckDB's columnar scan. Grouping
-still decodes JSON. Closing those gaps requires separate immutable column/group
-extents with the same generation and checksum contract, not a misleading
-micro-optimization claim.
+the preceding 4 KiB-page run. The clean-generation typed scan stripe adds
+2,510,848 bytes—0.12% of logical payload—to the file and replaces 10,346
+scattered sidecar/tree reads per warmed reduction with a contiguous 2.4 MiB
+dense integer projection. This closes the numeric aggregate gap without
+weakening mutation correctness: the first document write retires the clean
+projection and uses authoritative sidecars plus peeled pages. TTL-only
+publications retain the stripe. Grouping still decodes JSON and is the
+remaining full-column analytical gap.
 
 The measured FileStore engine-plus-largest-query envelope is 504.97 MiB
 (16.21 MiB + 488.76 MiB), but it is still neither process RSS nor directly
@@ -1029,4 +1057,5 @@ checkpoint, vectorized-execution, and snapshot-isolation envelope. Heap Store
 memory, FileStore file/cache/staging bytes, DuckDB files, and DuckDB buffer
 memory remain explicitly labelled accounting domains. See the
 [frozen run](../benchmarks/results/duckdb-synth-s4.md) and
+the [128 MiB real-derived run](../benchmarks/results/duckdb-real-128m.md), plus
 [`benchmarks/duckdbbench/duckdb-methodology.md`](../benchmarks/duckdbbench/duckdb-methodology.md).

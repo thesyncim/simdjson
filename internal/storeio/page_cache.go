@@ -135,6 +135,8 @@ type pageCacheKey struct {
 	generation uint64
 	length     uint32
 	kind       PageKind
+	flags      uint8
+	aux        uint16
 }
 
 const (
@@ -832,7 +834,8 @@ func (c *PageCache) tryPinReady(hash uint64, key pageCacheKey, lease *PageLease)
 		if c.closing.Load() || frame.state != pageCacheReady ||
 			frame.key.offset != key.offset || frame.key.generation != key.generation ||
 			frame.key.logicalID != key.logicalID || frame.key.length != key.length ||
-			frame.key.kind != key.kind || frame.pins == ^uint32(0) {
+			frame.key.kind != key.kind || frame.key.flags != key.flags ||
+			frame.key.aux != key.aux || frame.pins == ^uint32(0) {
 			frame.lock.Unlock()
 			continue
 		}
@@ -945,7 +948,8 @@ func cacheKeyHash(key pageCacheKey) uint64 {
 	// Physical extents are at least 4 KiB aligned. Generation must participate:
 	// a large cache can retain a clean old page after its offset is safely reused,
 	// and offset-only hashing would turn that history into one long probe chain.
-	x := key.offset>>12 ^ key.generation*0x9e3779b97f4a7c15
+	x := key.offset>>12 ^ key.generation*0x9e3779b97f4a7c15 ^
+		uint64(key.kind)<<48 ^ uint64(key.flags)<<56 ^ uint64(key.aux)<<32
 	x ^= x >> 30
 	x *= 0xbf58476d1ce4e5b9
 	return x ^ x>>27
@@ -954,11 +958,19 @@ func cacheKeyHash(key pageCacheKey) uint64 {
 func (c *PageCache) validateRef(ref PageRef) (pageCacheKey, error) {
 	pageSize := uint64(c.options.PageSize)
 	length := uint64(ref.Length)
+	validRouting := ref.Aux == 0
+	if ref.Kind == PageDocumentGroup &&
+		uint16(ref.Flags)&DocumentGroupFlagFloat64Sidecar != 0 {
+		_, detached, err := DocumentGroupFloat64Sidecar(ref, uint32(c.options.PageSize))
+		validRouting = err == nil && detached
+	}
 	if length < pageSize || length > uint64(c.options.MaxPageSize) ||
 		!validPhysicalPageSize(ref.Length) || length%pageSize != 0 ||
 		ref.Length != uint32(c.options.PageSize) &&
-			ref.Kind != PageDocument && ref.Kind != PageDocumentGroup && ref.Kind != PageOverflow ||
-		ref.Flags != 0 || !validPageKind(ref.Kind) ||
+			ref.Kind != PageDocument && ref.Kind != PageDocumentGroup &&
+			ref.Kind != PageFloat64Group && ref.Kind != PageFloat64Catalog &&
+			ref.Kind != PageFloat64Stripe && ref.Kind != PageOverflow ||
+		!validPageFlags(ref.Kind, ref.Flags) || !validRouting || !validPageKind(ref.Kind) ||
 		ref.LogicalID <= StateRootLogicalID || ref.Generation == 0 ||
 		ref.Offset < uint64(superblockCopies)*pageSize || ref.Offset%pageSize != 0 ||
 		ref.Offset > uint64(^uint64(0)>>1)-length {
@@ -966,7 +978,7 @@ func (c *PageCache) validateRef(ref PageRef) (pageCacheKey, error) {
 	}
 	return pageCacheKey{
 		offset: ref.Offset, logicalID: ref.LogicalID, generation: ref.Generation,
-		length: ref.Length, kind: ref.Kind,
+		length: ref.Length, kind: ref.Kind, flags: ref.Flags, aux: ref.Aux,
 	}, nil
 }
 

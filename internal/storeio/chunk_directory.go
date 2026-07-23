@@ -118,9 +118,6 @@ func OpenChunkDirectoryPage(src []byte, fileEnd, nextLogicalID uint64) (ChunkDir
 	for i := 0; i < count; i++ {
 		start := ChunkDirectoryPayloadHeaderSize + i*PageRefSize
 		encoded := payload[start : start+PageRefSize]
-		if !pageRefReservedZero(encoded) {
-			return ChunkDirectoryView{}, fmt.Errorf("%w: reference reserved bytes", ErrChunkDirectoryCorrupt)
-		}
 		ref := decodePageRef(encoded)
 		if err := validateChunkDirectoryRef(header, ref, fileEnd, nextLogicalID); err != nil {
 			return ChunkDirectoryView{}, fmt.Errorf("%w: %v", ErrChunkDirectoryCorrupt, err)
@@ -295,7 +292,21 @@ func validateChunkDirectoryRef(header ChunkDirectoryHeader, ref PageRef, fileEnd
 	}
 	pageSize := uint64(header.PageSize)
 	length := uint64(ref.Length)
-	if ref.Kind != wantKind || ref.Flags != 0 || !validLength ||
+	validFlags := ref.Flags == 0 && ref.Aux == 0
+	if header.Shift == 0 && ref.Kind == PageDocumentGroup {
+		flags := uint16(ref.Flags)
+		validFlags = flags&^documentGroupKnownFlags == 0 &&
+			(flags&DocumentGroupFlagFloat64Sidecar != 0 || flags == 0)
+		if validFlags && flags == 0 {
+			validFlags = ref.Aux == 0
+		}
+		if validFlags && flags != 0 {
+			sidecar, found, err := DocumentGroupFloat64Sidecar(ref, header.PageSize)
+			validFlags = err == nil && found && sidecar.LogicalID < nextLogicalID &&
+				uint64(sidecar.Length) <= fileEnd && sidecar.Offset <= fileEnd-uint64(sidecar.Length)
+		}
+	}
+	if ref.Kind != wantKind || !validFlags || !validLength ||
 		ref.Generation == 0 || ref.Generation > header.Generation ||
 		ref.LogicalID <= StateRootLogicalID || ref.LogicalID >= nextLogicalID ||
 		ref.Offset < uint64(superblockCopies)*pageSize || ref.Offset%pageSize != 0 ||

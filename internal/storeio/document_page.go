@@ -359,8 +359,9 @@ func (v DocumentPageView) Float64ColumnCount() int { return int(v.float64Count) 
 
 // DocumentFloat64ColumnView is one borrowed stable-slot numeric column.
 type DocumentFloat64ColumnView struct {
-	mask   uint64
-	values []byte
+	mask     uint64
+	values   []byte
+	encoding Float64GroupEncoding
 }
 
 // Mask returns the stable slots with a finite numeric value.
@@ -376,20 +377,21 @@ func (v DocumentFloat64ColumnView) Lookup(slot uint8) (float64, bool) {
 		return 0, false
 	}
 	rank := bits.OnesCount64(v.mask & (bit - 1))
-	offset := rank * 8
-	return math.Float64frombits(binary.LittleEndian.Uint64(v.values[offset : offset+8])), true
+	width := v.encoding.ByteWidth()
+	return decodeFloat64GroupValue(v.values, rank*width, v.encoding), true
 }
 
 // DocumentFloat64Iterator walks covered values in stable-slot order.
 type DocumentFloat64Iterator struct {
-	slots  uint64
-	values []byte
-	offset int
+	slots    uint64
+	values   []byte
+	offset   int
+	encoding Float64GroupEncoding
 }
 
 // Iterator returns an allocation-free stable-slot iterator.
 func (v DocumentFloat64ColumnView) Iterator() DocumentFloat64Iterator {
-	return DocumentFloat64Iterator{slots: v.mask, values: v.values}
+	return DocumentFloat64Iterator{slots: v.mask, values: v.values, encoding: v.encoding}
 }
 
 // Next returns the next stable slot and value.
@@ -398,9 +400,9 @@ func (i *DocumentFloat64Iterator) Next() (uint8, float64, bool) {
 		return 0, 0, false
 	}
 	slot := uint8(bits.TrailingZeros64(i.slots))
-	value := math.Float64frombits(binary.LittleEndian.Uint64(i.values[i.offset : i.offset+8]))
+	value := decodeFloat64GroupValue(i.values, i.offset, i.encoding)
 	i.slots &= i.slots - 1
-	i.offset += 8
+	i.offset += i.encoding.ByteWidth()
 	return slot, value, true
 }
 
@@ -409,13 +411,14 @@ func (i *DocumentFloat64Iterator) Next() (uint8, float64, bool) {
 // one trailing-zero count and one mask update per value while retaining the
 // exact stable-slot order used by Iterator.
 type DocumentFloat64ValueIterator struct {
-	values []byte
-	offset int
+	values   []byte
+	offset   int
+	encoding Float64GroupEncoding
 }
 
 // Values returns an allocation-free dense value iterator.
 func (v DocumentFloat64ColumnView) Values() DocumentFloat64ValueIterator {
-	return DocumentFloat64ValueIterator{values: v.values}
+	return DocumentFloat64ValueIterator{values: v.values, encoding: v.encoding}
 }
 
 // Next returns the next covered value in stable-slot order.
@@ -423,8 +426,8 @@ func (i *DocumentFloat64ValueIterator) Next() (float64, bool) {
 	if i == nil || i.offset == len(i.values) {
 		return 0, false
 	}
-	value := math.Float64frombits(binary.LittleEndian.Uint64(i.values[i.offset : i.offset+8]))
-	i.offset += 8
+	value := decodeFloat64GroupValue(i.values, i.offset, i.encoding)
+	i.offset += i.encoding.ByteWidth()
 	return value, true
 }
 

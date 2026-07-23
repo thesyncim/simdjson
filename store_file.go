@@ -1301,12 +1301,15 @@ func (s *FileStore) putLocked(state *fileStoreState, key, src []byte, newIndex I
 	}
 	nextState, statePage, err := s.stageFileState(
 		tx, state, generation, prospectiveHighWater, documentCount, state.root.TTLCount,
-		liveChunks, chunkMutation.Root, keyRoot, indexRoot, state.ttlRoot, freeRoot, freeChecksum,
+		liveChunks, chunkMutation.Root, keyRoot, indexRoot, state.ttlRoot,
+		storeio.PageRef{}, freeRoot, freeChecksum,
 	)
 	if err != nil {
 		return false, err
 	}
-	if err := s.reserveFileRetirements(state, oldRef, oldView, keyMutation, chunkMutation); err != nil {
+	if err := s.reserveFileRetirements(
+		state, oldRef, oldView, keyMutation, chunkMutation, true,
+	); err != nil {
 		return false, err
 	}
 	retirementReserved = true
@@ -1551,12 +1554,15 @@ func (s *FileStore) setDeadlineLocked(state *fileStoreState, key []byte, locatio
 	}
 	nextState, statePage, err := s.stageFileState(
 		tx, state, generation, state.root.ChunkHighWater, state.root.DocumentCount, ttlCount,
-		state.root.LiveChunks, state.chunkRoot, keyMutation.Root, state.indexRoot, ttlRoot, freeRoot, freeChecksum,
+		state.root.LiveChunks, state.chunkRoot, keyMutation.Root, state.indexRoot, ttlRoot,
+		state.root.Float64ScanHead, freeRoot, freeChecksum,
 	)
 	if err != nil {
 		return false, err
 	}
-	if err := s.reserveFileRetirements(state, storeio.PageRef{}, nil, keyMutation, storeio.ChunkTreeMutation{}); err != nil {
+	if err := s.reserveFileRetirements(
+		state, storeio.PageRef{}, nil, keyMutation, storeio.ChunkTreeMutation{}, false,
+	); err != nil {
 		return false, err
 	}
 	retirementReserved = true
@@ -1805,12 +1811,15 @@ func (s *FileStore) deleteLocked(state *fileStoreState, key []byte, location sto
 	nextState, statePage, err := s.stageFileState(
 		tx, state, generation, state.root.ChunkHighWater,
 		state.root.DocumentCount-1, ttlCount, liveChunks,
-		chunkRoot, keyMutation.Root, indexRoot, ttlRoot, freeRoot, freeChecksum,
+		chunkRoot, keyMutation.Root, indexRoot, ttlRoot,
+		storeio.PageRef{}, freeRoot, freeChecksum,
 	)
 	if err != nil {
 		return false, err
 	}
-	if err := s.reserveFileRetirements(state, oldRef, oldView, keyMutation, chunkMutation); err != nil {
+	if err := s.reserveFileRetirements(
+		state, oldRef, oldView, keyMutation, chunkMutation, true,
+	); err != nil {
 		return false, err
 	}
 	retirementReserved = true
@@ -2056,7 +2065,23 @@ func (s *FileStore) stageFileValue(tx *storeio.WriteTransaction, location storei
 	return record, nil
 }
 
-func (s *FileStore) loadFileChunk(state *fileStoreState, chunkID uint32) (storeio.PageRef, *fileDocumentChunk, *storeio.PageLease, error) {
+type fileDocumentLeases struct {
+	document storeio.PageLease
+	columns  storeio.PageLease
+	detached bool
+}
+
+func (l *fileDocumentLeases) Release() {
+	if l == nil {
+		return
+	}
+	if l.detached {
+		l.columns.Release()
+	}
+	l.document.Release()
+}
+
+func (s *FileStore) loadFileChunk(state *fileStoreState, chunkID uint32) (storeio.PageRef, *fileDocumentChunk, *fileDocumentLeases, error) {
 	if chunkID >= state.root.ChunkHighWater || state.chunkRoot == (storeio.PageRef{}) {
 		return storeio.PageRef{}, nil, nil, nil
 	}
@@ -2075,7 +2100,28 @@ func (s *FileStore) loadFileChunk(state *fileStoreState, chunkID uint32) (storei
 		lease.Release()
 		return storeio.PageRef{}, nil, nil, err
 	}
-	return ref, &view, &lease, nil
+	leases := fileDocumentLeases{document: lease}
+	columnsRef, detached, err := storeio.DocumentGroupFloat64Sidecar(
+		ref, uint32(s.options.PageSize),
+	)
+	if err != nil {
+		leases.Release()
+		return storeio.PageRef{}, nil, nil, err
+	}
+	if detached {
+		columns, acquireErr := s.cache.Acquire(columnsRef)
+		if acquireErr != nil {
+			leases.Release()
+			return storeio.PageRef{}, nil, nil, acquireErr
+		}
+		leases.columns = columns
+		leases.detached = true
+		if attachErr := view.attachFloat64Group(columns.Page()); attachErr != nil {
+			leases.Release()
+			return storeio.PageRef{}, nil, nil, attachErr
+		}
+	}
+	return ref, &view, &leases, nil
 }
 
 func (s *FileStore) buildFileRows(state *fileStoreState, old *fileDocumentChunk, target uint8, replacement storeio.DocumentRecord, keep bool) ([]storeio.DocumentRecord, uint64, error) {
@@ -2208,7 +2254,16 @@ func (s *FileStore) fileDocumentPageSize(rows []storeio.DocumentRecord, columns 
 	return uint32(size), nil
 }
 
-func (s *FileStore) stageFileState(tx *storeio.WriteTransaction, old *fileStoreState, generation uint64, chunkHighWater uint32, documentCount, ttlCount uint64, liveChunks uint32, chunkRoot, keyRoot, indexRoot, ttlRoot, freeRoot storeio.PageRef, freeChecksum uint32) (*fileStoreState, storeio.TransactionPage, error) {
+func (s *FileStore) stageFileState(
+	tx *storeio.WriteTransaction,
+	old *fileStoreState,
+	generation uint64,
+	chunkHighWater uint32,
+	documentCount, ttlCount uint64,
+	liveChunks uint32,
+	chunkRoot, keyRoot, indexRoot, ttlRoot, float64ScanHead, freeRoot storeio.PageRef,
+	freeChecksum uint32,
+) (*fileStoreState, storeio.TransactionPage, error) {
 	statePage, err := tx.Allocate(storeio.PageStateRoot, uint32(s.options.PageSize), storeio.StateRootLogicalID)
 	if err != nil {
 		return nil, storeio.TransactionPage{}, err
@@ -2221,6 +2276,7 @@ func (s *FileStore) stageFileState(tx *storeio.WriteTransaction, old *fileStoreS
 		ChunkDocuments: uint32(s.options.Store.ChunkDocuments),
 		IndexCount:     uint32(len(s.options.indexes)), IndexCatalogHash: s.options.indexCatalogHash,
 		ChunkDirectory: chunkRoot, KeyDirectory: keyRoot, IndexDirectory: indexRoot, TTLDirectory: ttlRoot,
+		Float64ScanHead: float64ScanHead,
 	}
 	if _, err := storeio.EncodeStateRootPage(statePage.Bytes(), root, tx.FileEnd()); err != nil {
 		return nil, storeio.TransactionPage{}, err
@@ -2252,6 +2308,7 @@ func (s *FileStore) reserveFileRetirements(
 	oldView *fileDocumentChunk,
 	key storeio.KeyTreeMutation,
 	chunk storeio.ChunkTreeMutation,
+	retireFloat64Scan bool,
 ) error {
 	appendRef := func(ref storeio.PageRef) error {
 		if ref == (storeio.PageRef{}) {
@@ -2267,6 +2324,11 @@ func (s *FileStore) reserveFileRetirements(
 	}
 	if err := appendRef(old.stateRef); err != nil {
 		return err
+	}
+	if retireFloat64Scan && old.root.Float64ScanHead != (storeio.PageRef{}) {
+		if err := s.appendFloat64ScanRetirements(old); err != nil {
+			return err
+		}
 	}
 	if oldDocument.Kind == storeio.PageDocumentGroup {
 		if oldView == nil {
@@ -2289,6 +2351,32 @@ func (s *FileStore) reserveFileRetirements(
 			if err := appendRef(oldDocument); err != nil {
 				return err
 			}
+			columns, detached, deriveErr := storeio.DocumentGroupFloat64Sidecar(
+				oldDocument, uint32(s.options.PageSize),
+			)
+			if deriveErr != nil {
+				return deriveErr
+			}
+			if detached {
+				columnsHeader, ok := oldView.detachedFloat64Header()
+				if !ok || columnsHeader.LogicalID != columns.LogicalID {
+					return storeio.ErrFloat64GroupCorrupt
+				}
+				sharedColumns, referenceErr := storeio.ChunkTreeHasOtherFloat64Sidecar(
+					s.cache, old.chunkRoot, columnsHeader.FirstChunk, columnsHeader.ChunkCount,
+					oldView.chunk, columns, uint32(s.options.PageSize), storeio.ChunkTreeBounds{
+						FileEnd: old.super.FileEnd, NextLogicalID: old.root.NextLogicalID,
+					},
+				)
+				if referenceErr != nil {
+					return referenceErr
+				}
+				if !sharedColumns {
+					if err := appendRef(columns); err != nil {
+						return err
+					}
+				}
+			}
 		}
 	} else if err := appendRef(oldDocument); err != nil {
 		return err
@@ -2304,6 +2392,86 @@ func (s *FileStore) reserveFileRetirements(
 		}
 	}
 	return s.reclaimer.RetireBatch(s.retireScratch)
+}
+
+// appendFloat64ScanRetirements releases the aggregate-only projection whose
+// root is cleared by the first document mutation after a bulk build. Stripe
+// and catalog pages are allocated as one physical run. Adjacent refs are
+// folded into one retirement record so reclamation metadata remains O(1) for
+// a large store. TTL-only publications retain the projection.
+//
+// Authoritative detached PageFloat64Group sidecars are not catalog entries
+// and remain reachable from document refs.
+func (s *FileStore) appendFloat64ScanRetirements(old *fileStoreState) error {
+	appendRef := func(ref storeio.PageRef) error {
+		if ref == (storeio.PageRef{}) {
+			return nil
+		}
+		length := uint64(ref.Length)
+		if len(s.retireScratch) != 0 {
+			last := &s.retireScratch[len(s.retireScratch)-1]
+			if last.RetiredGeneration == old.root.Generation &&
+				last.Offset <= ^uint64(0)-last.Length &&
+				last.Offset+last.Length == ref.Offset &&
+				last.Length <= ^uint64(0)-length {
+				last.Length += length
+				return nil
+			}
+		}
+		if len(s.retireScratch) == cap(s.retireScratch) {
+			return storeio.ErrRetiredExtentCapacity
+		}
+		s.retireScratch = append(s.retireScratch, storeio.FreeExtent{
+			Offset: ref.Offset, Length: length, RetiredGeneration: old.root.Generation,
+		})
+		return nil
+	}
+	// First append every stripe in physical catalog order. Catalog pages were
+	// allocated after the final stripe, so a second pass can extend the same
+	// retirement range without retaining a ref-sized Go object per page.
+	var previousScanRef storeio.PageRef
+	for pass := 0; pass < 2; pass++ {
+		ref := old.root.Float64ScanHead
+		for ref != (storeio.PageRef{}) {
+			lease, err := s.cache.Acquire(ref)
+			if err != nil {
+				return err
+			}
+			catalog := storeio.AdmittedFloat64Catalog(lease.Page())
+			if pass == 0 {
+				for entry := 0; entry < catalog.Len(); entry++ {
+					scanRef, ok := catalog.RefAt(entry)
+					if !ok {
+						lease.Release()
+						return storeio.ErrFloat64CatalogCorrupt
+					}
+					if previousScanRef != (storeio.PageRef{}) &&
+						(scanRef.Offset <= previousScanRef.Offset ||
+							scanRef.LogicalID <= previousScanRef.LogicalID) {
+						lease.Release()
+						return storeio.ErrFloat64CatalogCorrupt
+					}
+					previousScanRef = scanRef
+					if err := appendRef(scanRef); err != nil {
+						lease.Release()
+						return err
+					}
+				}
+			} else if err := appendRef(ref); err != nil {
+				lease.Release()
+				return err
+			}
+			next := catalog.Header().Next
+			if next != (storeio.PageRef{}) &&
+				(next.Offset <= ref.Offset || next.LogicalID <= ref.LogicalID) {
+				lease.Release()
+				return storeio.ErrFloat64CatalogCorrupt
+			}
+			lease.Release()
+			ref = next
+		}
+	}
+	return nil
 }
 
 func (s *FileStore) appendTTLRetirements(old *fileStoreState, mutation storeio.TTLTreeMutation) error {

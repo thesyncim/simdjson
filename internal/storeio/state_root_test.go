@@ -62,6 +62,28 @@ func TestStateRootPageRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStateRootFloat64ScanHeadRoundTrip(t *testing.T) {
+	want, _ := testStateRoot(11)
+	want.Options |= StateOptionFloat64Columns
+	want.Float64ScanHead = testStatePageRef(PageFloat64Catalog, 7, 6, want.Generation)
+	fileEnd := 8 * uint64(testSuperblockPageSize)
+	page := make([]byte, testSuperblockPageSize)
+	encoded, err := EncodeStateRootPage(page, want, fileEnd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeStateRootPage(encoded, fileEnd)
+	if err != nil || got != want {
+		t.Fatalf("float64 state root = (%+v,%v), want (%+v,nil)", got, err, want)
+	}
+
+	invalid := want
+	invalid.Options &^= StateOptionFloat64Columns
+	if _, err := EncodeStateRootPage(page, invalid, fileEnd); !errors.Is(err, ErrInvalidWrite) {
+		t.Fatalf("scan head without columns = %v, want %v", err, ErrInvalidWrite)
+	}
+}
+
 func TestStateRootValidation(t *testing.T) {
 	valid, fileEnd := testStateRoot(11)
 	for _, test := range []struct {

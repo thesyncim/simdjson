@@ -79,6 +79,65 @@ func WalkChunkTreeRuns(
 	return flush()
 }
 
+// WalkChunkTreeFloat64Runs extends ordinary physical run coalescing across
+// adjacent document groups that derive the same detached typed extent. When
+// detached is true ref names PageFloat64Group; otherwise it retains the
+// ordinary document or document-group reference. This lets covering scans
+// admit one shared typed page once without changing the general chunk tree.
+func WalkChunkTreeFloat64Runs(
+	cache *PageCache,
+	root PageRef,
+	bounds ChunkTreeBounds,
+	allocationQuantum uint32,
+	fn func(first, count uint32, ref PageRef, detached bool) error,
+) error {
+	if fn == nil || !validPhysicalPageSize(allocationQuantum) {
+		return fmt.Errorf("%w: float64 chunk-tree run walk", ErrInvalidWrite)
+	}
+	var runRef PageRef
+	var first, previous, count uint32
+	runDetached := false
+	flush := func() error {
+		if count == 0 {
+			return nil
+		}
+		err := fn(first, count, runRef, runDetached)
+		count = 0
+		return err
+	}
+	err := WalkChunkTreeRuns(cache, root, bounds, func(nextFirst, nextCount uint32, document PageRef) error {
+		ref := document
+		detached := false
+		columns, found, deriveErr := DocumentGroupFloat64Sidecar(document, allocationQuantum)
+		if deriveErr != nil {
+			return deriveErr
+		}
+		if found {
+			ref, detached = columns, true
+		}
+		if count != 0 && detached == runDetached && ref == runRef &&
+			uint64(nextFirst) == uint64(previous)+1 {
+			if uint64(count)+uint64(nextCount) > uint64(^uint32(0)) {
+				return ErrChunkDirectoryCorrupt
+			}
+			count += nextCount
+			previous = nextFirst + nextCount - 1
+			return nil
+		}
+		if err := flush(); err != nil {
+			return err
+		}
+		runRef, runDetached = ref, detached
+		first, count = nextFirst, nextCount
+		previous = nextFirst + nextCount - 1
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return flush()
+}
+
 func walkChunkTreePage(cache *PageCache, ref PageRef, bounds ChunkTreeBounds, expectedShift uint8, fn func(uint32, PageRef) error) error {
 	lease, err := cache.Acquire(ref)
 	if err != nil {
@@ -178,13 +237,51 @@ func ChunkTreeHasOtherReference(
 	want PageRef,
 	bounds ChunkTreeBounds,
 ) (bool, error) {
+	return chunkTreeHasOtherReference(
+		cache, root, first, count, exclude, want, 0, bounds,
+	)
+}
+
+// ChunkTreeHasOtherFloat64Sidecar reports whether another document-group
+// mapping in a typed extent's coverage derives want. Shared typed sidecars are
+// retired only after both the touched document group and every other deriving
+// group have disappeared from the old generation.
+func ChunkTreeHasOtherFloat64Sidecar(
+	cache *PageCache,
+	root PageRef,
+	first uint32,
+	count uint16,
+	exclude uint32,
+	want PageRef,
+	allocationQuantum uint32,
+	bounds ChunkTreeBounds,
+) (bool, error) {
+	if want.Kind != PageFloat64Group || want.Flags != 0 || want.Aux != 0 ||
+		!validPhysicalPageSize(allocationQuantum) {
+		return false, fmt.Errorf("%w: float64 sidecar reference", ErrInvalidWrite)
+	}
+	return chunkTreeHasOtherReference(
+		cache, root, first, count, exclude, want, allocationQuantum, bounds,
+	)
+}
+
+func chunkTreeHasOtherReference(
+	cache *PageCache,
+	root PageRef,
+	first uint32,
+	count uint16,
+	exclude uint32,
+	want PageRef,
+	float64Quantum uint32,
+	bounds ChunkTreeBounds,
+) (bool, error) {
 	end := uint64(first) + uint64(count)
 	if cache == nil || root == (PageRef{}) || count == 0 || end > uint64(^uint32(0))+1 {
 		return false, fmt.Errorf("%w: chunk-tree reference range", ErrInvalidWrite)
 	}
 	for leaf := uint64(first) &^ uint64(63); leaf < end; leaf += 64 {
 		found, err := chunkTreeLeafHasOtherReference(
-			cache, root, uint32(leaf), first, end, exclude, want, bounds,
+			cache, root, uint32(leaf), first, end, exclude, want, float64Quantum, bounds,
 		)
 		if err != nil || found {
 			return found, err
@@ -201,6 +298,7 @@ func chunkTreeLeafHasOtherReference(
 	end uint64,
 	exclude uint32,
 	want PageRef,
+	float64Quantum uint32,
 	bounds ChunkTreeBounds,
 ) (bool, error) {
 	ref := root
@@ -227,9 +325,28 @@ func chunkTreeLeafHasOtherReference(
 					continue
 				}
 				candidate, ok := view.Lookup(uint32(chunk))
-				if ok && candidate == want {
-					lease.Release()
-					return true, nil
+				if !ok {
+					continue
+				}
+				if float64Quantum == 0 {
+					if candidate == want {
+						lease.Release()
+						return true, nil
+					}
+					continue
+				}
+				if candidate.Kind == PageDocumentGroup {
+					sidecar, detached, deriveErr := DocumentGroupFloat64Sidecar(
+						candidate, float64Quantum,
+					)
+					if deriveErr != nil {
+						lease.Release()
+						return false, deriveErr
+					}
+					if detached && sidecar == want {
+						lease.Release()
+						return true, nil
+					}
 				}
 			}
 			lease.Release()
@@ -415,7 +532,7 @@ func encodeChunkTreeNode(tx *WriteTransaction, logicalID uint64, prefix uint32, 
 func validChunkTreeDocumentRef(tx *WriteTransaction, ref PageRef) bool {
 	quantum := uint64(tx.options.PageSize)
 	length := uint64(ref.Length)
-	return ref.Kind == PageDocument && ref.Flags == 0 && validPhysicalPageSize(ref.Length) &&
+	return ref.Kind == PageDocument && ref.Flags == 0 && ref.Aux == 0 && validPhysicalPageSize(ref.Length) &&
 		ref.Length >= tx.options.PageSize && ref.Length%tx.options.PageSize == 0 &&
 		ref.Generation != 0 && ref.Generation <= tx.options.Generation &&
 		ref.LogicalID > StateRootLogicalID && ref.LogicalID < tx.NextLogicalID() &&

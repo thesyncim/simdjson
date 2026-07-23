@@ -421,7 +421,7 @@ func validateEncodedPageKeyBranch(payload []byte, count int, header PageKeyDirec
 
 func validatePageKeyChildRef(header PageKeyDirectoryHeader, ref PageRef, fileEnd, nextLogicalID uint64) error {
 	pageSize := uint64(header.PageSize)
-	if ref.Kind != PageKeyDirectory || ref.Flags != 0 || ref.Length != header.PageSize ||
+	if ref.Kind != PageKeyDirectory || ref.Flags != 0 || ref.Aux != 0 || ref.Length != header.PageSize ||
 		ref.Generation == 0 || ref.Generation > header.Generation ||
 		ref.LogicalID <= StateRootLogicalID || ref.LogicalID >= nextLogicalID ||
 		ref.LogicalID == header.LogicalID ||

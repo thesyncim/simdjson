@@ -12,10 +12,12 @@ import (
 // Keeping the branch here prevents grouped-storage details from leaking into
 // the query, index, TTL, or public Store APIs.
 type fileDocumentChunk struct {
-	page    storeio.DocumentPageView
-	group   storeio.DocumentGroupChunkView
-	chunk   uint32
-	grouped bool
+	page            storeio.DocumentPageView
+	group           storeio.DocumentGroupChunkView
+	detachedColumns storeio.Float64GroupChunkView
+	chunk           uint32
+	grouped         bool
+	detached        bool
 }
 
 type fileDocumentValue struct {
@@ -61,6 +63,13 @@ func (v fileDocumentChunk) groupHeader() (storeio.DocumentGroupHeader, bool) {
 		return storeio.DocumentGroupHeader{}, false
 	}
 	return v.group.GroupHeader(), true
+}
+
+func (v fileDocumentChunk) detachedFloat64Header() (storeio.Float64GroupHeader, bool) {
+	if !v.detached {
+		return storeio.Float64GroupHeader{}, false
+	}
+	return v.detachedColumns.GroupHeader(), true
 }
 
 func (v fileDocumentChunk) lookup(slot uint8) (fileDocumentRecord, bool) {
@@ -122,6 +131,9 @@ func (v fileDocumentChunk) appendJSON(dst []byte, value fileDocumentValue) ([]by
 }
 
 func (v fileDocumentChunk) float64ColumnCount() int {
+	if v.detached {
+		return v.detachedColumns.Float64ColumnCount()
+	}
 	if v.grouped {
 		return v.group.Float64ColumnCount()
 	}
@@ -129,10 +141,40 @@ func (v fileDocumentChunk) float64ColumnCount() int {
 }
 
 func (v fileDocumentChunk) float64Column(column int) (storeio.DocumentFloat64ColumnView, bool) {
+	if v.detached {
+		return v.detachedColumns.Float64Column(column)
+	}
 	if v.grouped {
 		return v.group.Float64Column(column)
 	}
 	return v.page.Float64Column(column)
+}
+
+func (v *fileDocumentChunk) attachFloat64Group(page []byte) error {
+	if v == nil || !v.grouped {
+		return storeio.ErrDocumentGroupCorrupt
+	}
+	documentHeader := v.group.GroupHeader()
+	if documentHeader.Flags&storeio.DocumentGroupFlagFloat64Sidecar == 0 {
+		return storeio.ErrDocumentGroupCorrupt
+	}
+	group := storeio.AdmittedFloat64Group(page)
+	header := group.Header()
+	documentEnd := uint64(documentHeader.FirstChunk) + uint64(documentHeader.ChunkCount)
+	columnsEnd := uint64(header.FirstChunk) + uint64(header.ChunkCount)
+	if header.StoreID != documentHeader.StoreID ||
+		header.Generation != documentHeader.Generation ||
+		documentHeader.FirstChunk < header.FirstChunk ||
+		documentEnd > columnsEnd {
+		return storeio.ErrFloat64GroupCorrupt
+	}
+	chunk, ok := group.Chunk(v.chunk)
+	if !ok || chunk.Live() != v.group.Live() {
+		return storeio.ErrFloat64GroupCorrupt
+	}
+	v.detachedColumns = chunk
+	v.detached = true
+	return nil
 }
 
 func (s *FileStore) appendFileDocumentValue(

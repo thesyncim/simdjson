@@ -15,9 +15,8 @@ const (
 	// aligned and lets checksum code consume one contiguous prefix.
 	PageTrailerSize = 8
 
-	pageMagic      = "SJPAGE01"
-	pageVersion    = uint16(1)
-	pageKnownFlags = uint8(0)
+	pageMagic   = "SJPAGE01"
+	pageVersion = uint16(1)
 )
 
 // ErrPageCorrupt reports a malformed, truncated, or checksum-invalid common
@@ -39,6 +38,9 @@ const (
 	PageFreeDirectory
 	PageIndexPosting
 	PageDocumentGroup
+	PageFloat64Group
+	PageFloat64Catalog
+	PageFloat64Stripe
 )
 
 // PageHeader is the decoded identity of one immutable physical page. StoreID
@@ -164,7 +166,7 @@ func validatePageHeader(header PageHeader) error {
 	if header.StoreID == ([16]byte{}) || header.Generation == 0 || header.LogicalID == 0 {
 		return fmt.Errorf("%w: zero page identity", ErrInvalidWrite)
 	}
-	if !validPageKind(header.Kind) || header.Flags&^pageKnownFlags != 0 {
+	if !validPageKind(header.Kind) || !validPageFlags(header.Kind, header.Flags) {
 		return fmt.Errorf("%w: page kind or flags", ErrInvalidWrite)
 	}
 	if !validPhysicalPageSize(header.PageSize) ||
@@ -175,5 +177,14 @@ func validatePageHeader(header PageHeader) error {
 }
 
 func validPageKind(kind PageKind) bool {
-	return kind >= PageStateRoot && kind <= PageDocumentGroup
+	return kind >= PageStateRoot && kind <= PageFloat64Stripe
+}
+
+func validPageFlags(kind PageKind, flags uint8) bool {
+	if kind == PageDocumentGroup {
+		encoded := uint16(flags)
+		return encoded&^documentGroupKnownFlags == 0 &&
+			(encoded&DocumentGroupFlagFloat64Sidecar != 0 || encoded == 0)
+	}
+	return flags == 0
 }

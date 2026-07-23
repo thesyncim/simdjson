@@ -18,8 +18,9 @@ const (
 	DocumentGroupChunkSize         = 16
 	DocumentGroupRecordSize        = 16
 
-	documentGroupVersion       = uint32(1)
-	documentGroupKnownFlags    = uint16(0)
+	documentGroupVersion    = uint32(1)
+	documentGroupKnownFlags = DocumentGroupFlagFloat64Sidecar |
+		documentGroupFloat64OrderMask | documentGroupFloat64LogicalHighMask
 	documentGroupShortLiteral  = byte(0x80)
 	documentGroupLongLiteral   = byte(0xff)
 	documentGroupMaxDictionary = int(documentGroupShortLiteral)
@@ -132,9 +133,10 @@ func DocumentGroupSize(chunks []DocumentGroupChunk, allocationQuantum uint32, wo
 // EncodeDocumentGroup writes consecutive stable-slot chunks into one exact,
 // independently checksummed extent. Repeated structural bytes are stored once
 // per page template; repeated complete leaf spellings use a bounded dictionary.
-// Literal leaves remain byte-for-byte exact. Keys and typed columns stay
-// directly addressable, so point-key verification and numeric reductions do
-// not decompress unrelated JSON.
+// Literal leaves remain byte-for-byte exact. Keys and any co-located typed
+// columns stay directly addressable. A compact bulk generation may instead
+// set DocumentGroupFlagFloat64Sidecar and store columns in the adjacent
+// column-major extent derived from the group PageRef.
 func EncodeDocumentGroup(dst []byte, header DocumentGroupHeader, chunks []DocumentGroupChunk, nextLogicalID uint64, workspace *DocumentGroupWorkspace) ([]byte, error) {
 	layout, err := planDocumentGroup(chunks, workspace)
 	if err != nil {
@@ -149,6 +151,7 @@ func EncodeDocumentGroup(dst []byte, header DocumentGroupHeader, chunks []Docume
 	payload, err := InitPage(dst, PageHeader{
 		StoreID: header.StoreID, Generation: header.Generation, LogicalID: header.LogicalID,
 		PageSize: header.PageSize, PayloadLength: uint32(layout.payloadBytes), Kind: PageDocumentGroup,
+		Flags: uint8(header.Flags),
 	})
 	if err != nil {
 		return nil, err
@@ -438,6 +441,7 @@ func validateDocumentGroupHeader(header DocumentGroupHeader, layout documentGrou
 	if header.StoreID == ([16]byte{}) || header.Generation == 0 ||
 		header.LogicalID <= StateRootLogicalID || header.LogicalID >= nextLogicalID ||
 		!validPhysicalPageSize(header.PageSize) || header.Flags&^documentGroupKnownFlags != 0 ||
+		header.Flags&DocumentGroupFlagFloat64Sidecar != 0 && layout.columns != 0 ||
 		header.FirstChunk != chunks[0].ChunkID ||
 		int(header.ChunkCount) != layout.chunks || int(header.RowCount) != layout.rows ||
 		int(header.ColumnCount) != layout.columns ||
@@ -620,6 +624,9 @@ func openDocumentGroupPayload(pageHeader PageHeader, payload []byte, chunkHighWa
 	flags := binary.LittleEndian.Uint16(payload[46:48])
 	if chunkCount < 2 || rowCount == 0 || templateCount == 0 ||
 		dictionaryCount > documentGroupMaxDictionary || flags&^documentGroupKnownFlags != 0 ||
+		uint16(pageHeader.Flags) != flags ||
+		flags&DocumentGroupFlagFloat64Sidecar != 0 &&
+			binary.LittleEndian.Uint16(payload[44:46]) != 0 ||
 		pageHeader.LogicalID <= StateRootLogicalID || pageHeader.LogicalID >= nextLogicalID ||
 		uint64(firstChunk)+uint64(chunkCount) > uint64(chunkHighWater) {
 		return DocumentGroupView{}, fmt.Errorf("%w: identity or counts", ErrDocumentGroupCorrupt)

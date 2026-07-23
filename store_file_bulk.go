@@ -184,7 +184,20 @@ type fileStoreBulkDocumentPlan struct {
 }
 
 type fileStoreBulkDocumentGroupPlan struct {
-	first, last int // logical document-plan range
+	first, last             int // logical document-plan range
+	columnFirst, columnLast int // non-empty only on the shared sidecar owner
+	ref                     storeio.PageRef
+	columns                 storeio.PageRef
+}
+
+type fileStoreBulkFloat64CatalogPlan struct {
+	first, last int
+	ref, next   storeio.PageRef
+}
+
+type fileStoreBulkFloat64StripePlan struct {
+	first, last int
+	rows        uint32
 	ref         storeio.PageRef
 }
 
@@ -237,26 +250,31 @@ type fileStoreBulkBuild struct {
 	allocator fileStoreBulkAllocator
 	fileEnd   uint64
 
-	overflows         []fileStoreBulkOverflowPlan
-	documents         []fileStoreBulkDocumentPlan
-	documentGroups    []fileStoreBulkDocumentGroupPlan
-	chunks            []storeChunkDirectoryPlan
-	keys              []fileStoreBulkKeyPlan
-	keyOrder          []int
-	postings          []fileStoreBulkPostingPlan
-	masks             []fileStoreBulkPostingMask
-	indexes           []fileStoreBulkIndexPlan
-	indexRows         []storeio.IndexDirectoryEntry
-	indexCertificates []byte
-	ttls              []fileStoreBulkTTLPlan
-	ttlRows           []storeio.TTLKey
+	overflows            []fileStoreBulkOverflowPlan
+	documents            []fileStoreBulkDocumentPlan
+	documentGroups       []fileStoreBulkDocumentGroupPlan
+	float64Catalogs      []fileStoreBulkFloat64CatalogPlan
+	float64Stripes       []fileStoreBulkFloat64StripePlan
+	float64ScanRefs      []storeio.PageRef
+	float64ScanDocuments int
+	chunks               []storeChunkDirectoryPlan
+	keys                 []fileStoreBulkKeyPlan
+	keyOrder             []int
+	postings             []fileStoreBulkPostingPlan
+	masks                []fileStoreBulkPostingMask
+	indexes              []fileStoreBulkIndexPlan
+	indexRows            []storeio.IndexDirectoryEntry
+	indexCertificates    []byte
+	ttls                 []fileStoreBulkTTLPlan
+	ttlRows              []storeio.TTLKey
 
-	chunkRoot storeio.PageRef
-	keyRoot   storeio.PageRef
-	indexRoot storeio.PageRef
-	ttlRoot   storeio.PageRef
-	stateRef  storeio.PageRef
-	root      storeio.StateRoot
+	chunkRoot   storeio.PageRef
+	keyRoot     storeio.PageRef
+	indexRoot   storeio.PageRef
+	ttlRoot     storeio.PageRef
+	float64Head storeio.PageRef
+	stateRef    storeio.PageRef
+	root        storeio.StateRoot
 
 	groupChunks  []storeio.DocumentGroupChunk
 	groupRecords []storeio.DocumentGroupRecord
@@ -264,6 +282,11 @@ type fileStoreBulkBuild struct {
 	groupMasks   []uint64
 	groupValues  []float64
 	groupCodec   storeio.DocumentGroupWorkspace
+
+	float64Counts        []uint8
+	float64Encodings     []uint8
+	float64StripeValues  []byte
+	float64StripeColumns []storeio.Float64StripeColumn
 }
 
 func (b *fileStoreBulkBuild) sourceRow(row int) (*storeChunk, string, []byte) {
@@ -291,10 +314,24 @@ func (b *fileStoreBulkBuild) sourceFloat64(row, column int) (float64, bool, erro
 }
 
 func (b *fileStoreBulkBuild) prepareDocumentGroup(first, last int) ([]storeio.DocumentGroupChunk, error) {
+	return b.prepareGroupedChunks(first, last, true)
+}
+
+func (b *fileStoreBulkBuild) prepareFloat64Group(first, last int) ([]storeio.DocumentGroupChunk, error) {
+	return b.prepareGroupedChunks(first, last, false)
+}
+
+// prepareGroupedChunks materializes one bounded encoder view into reusable
+// builder storage. Detached typed extents skip keys, JSON, and structural
+// spans entirely; document groups retain them. Both paths share column
+// extraction and the stable-slot invariants.
+func (b *fileStoreBulkBuild) prepareGroupedChunks(first, last int, documents bool) ([]storeio.DocumentGroupChunk, error) {
 	chunkCount := last - first
 	rowCount := 0
-	for i := first; i < last; i++ {
-		rowCount += b.documents[i].last - b.documents[i].first
+	if documents {
+		for i := first; i < last; i++ {
+			rowCount += b.documents[i].last - b.documents[i].first
+		}
 	}
 	columnCount := len(b.options.float64Columns)
 	if cap(b.groupChunks) < chunkCount {
@@ -330,18 +367,20 @@ func (b *fileStoreBulkBuild) prepareDocumentGroup(first, last int) ([]storeio.Do
 			return nil, fmt.Errorf("%w: overflow row in document group", storeio.ErrInvalidWrite)
 		}
 		recordStart := len(b.groupRecords)
-		for row := plan.first; row < plan.last; row++ {
-			_, key, raw := b.sourceRow(row)
-			spanStart := len(b.groupSpans)
-			var err error
-			b.groupSpans, err = b.appendDocumentGroupSpans(b.groupSpans, row)
-			if err != nil {
-				return nil, err
+		if documents {
+			for row := plan.first; row < plan.last; row++ {
+				_, key, raw := b.sourceRow(row)
+				spanStart := len(b.groupSpans)
+				var err error
+				b.groupSpans, err = b.appendDocumentGroupSpans(b.groupSpans, row)
+				if err != nil {
+					return nil, err
+				}
+				b.groupRecords = append(b.groupRecords, storeio.DocumentGroupRecord{
+					Key: byteview.Bytes(key), JSON: raw,
+					Spans: b.groupSpans[spanStart:len(b.groupSpans)], Slot: uint8(row - plan.first),
+				})
 			}
-			b.groupRecords = append(b.groupRecords, storeio.DocumentGroupRecord{
-				Key: byteview.Bytes(key), JSON: raw,
-				Spans: b.groupSpans[spanStart:len(b.groupSpans)], Slot: uint8(row - plan.first),
-			})
 		}
 		maskBase := chunkOrdinal * columnCount
 		valueBase := maskBase * 64
@@ -427,18 +466,40 @@ func (b *fileStoreBulkBuild) appendDocumentGroupSpans(dst []storeio.DocumentGrou
 
 func (b *fileStoreBulkBuild) documentFloat64Bytes(first, last int) (int, error) {
 	bytes := len(b.options.float64Columns) * 8
+	var counts [fileStoreMaxFloat64Columns]uint8
+	var encodings [fileStoreMaxFloat64Columns]uint8
 	for column := range b.options.float64Columns {
 		for row := first; row < last; row++ {
-			_, ok, err := b.sourceFloat64(row, column)
+			value, ok, err := b.sourceFloat64(row, column)
 			if err != nil {
 				return 0, err
 			}
 			if ok {
 				bytes += 8
+				counts[column]++
+				encodings[column] = max(encodings[column], fileStoreFloat64Encoding(value))
 			}
 		}
 	}
+	columns := len(b.options.float64Columns)
+	b.float64Counts = append(b.float64Counts, counts[:columns]...)
+	b.float64Encodings = append(b.float64Encodings, encodings[:columns]...)
 	return bytes, nil
+}
+
+// fileStoreFloat64Encoding orders exact representations from narrowest to
+// widest. Three is the general IEEE float64 fallback.
+func fileStoreFloat64Encoding(value float64) uint8 {
+	switch {
+	case math.Signbit(value) || value > math.MaxUint32 || value != math.Trunc(value):
+		return 3
+	case value <= math.MaxUint8:
+		return 0
+	case value <= math.MaxUint16:
+		return 1
+	default:
+		return 2
+	}
 }
 
 func (b *fileStoreBulkBuild) targetLocation(row int) storeio.KeyLocation {
@@ -451,6 +512,9 @@ func (b *fileStoreBulkBuild) targetLocation(row int) storeio.KeyLocation {
 
 func (b *fileStoreBulkBuild) plan() error {
 	if err := b.planDocuments(); err != nil {
+		return err
+	}
+	if err := b.planFloat64Catalogs(); err != nil {
 		return err
 	}
 	items := make([]storeChunkDirectoryItem, len(b.documents))
@@ -494,7 +558,7 @@ func (b *fileStoreBulkBuild) plan() error {
 		IndexCount: uint32(len(b.options.indexes)), IndexCatalogHash: b.options.indexCatalogHash,
 		IndexMaxDepth: uint32(max(b.options.Store.IndexOptions.MaxDepth, 0)),
 		FreeChunkHint: freeChunkHint, ChunkDirectory: b.chunkRoot, KeyDirectory: b.keyRoot,
-		IndexDirectory: b.indexRoot, TTLDirectory: b.ttlRoot,
+		IndexDirectory: b.indexRoot, TTLDirectory: b.ttlRoot, Float64ScanHead: b.float64Head,
 	}
 	if len(b.options.float64Columns) != 0 {
 		b.root.Options |= storeio.StateOptionFloat64Columns
@@ -654,13 +718,81 @@ func (b *fileStoreBulkBuild) planDocuments() error {
 	return b.planDocumentGroups()
 }
 
-const fileStoreBulkDocumentGroupRows = 128
+const (
+	fileStoreBulkDocumentGroupRows   = 128
+	fileStoreBulkFloat64RegionGroups = 120
+)
+
+type fileStoreBulkFloat64Segment struct {
+	firstGroup, lastGroup       int
+	firstDocument, lastDocument int
+	columnSize                  uint32
+}
 
 // planDocumentGroups keeps the online stable-slot unit unchanged while
 // packing consecutive compact-generation chunks into larger immutable
 // extents. A later update redirects only its touched logical chunk to an
 // ordinary page; untouched lanes continue sharing the original group.
 func (b *fileStoreBulkBuild) planDocumentGroups() error {
+	var segments [fileStoreBulkFloat64RegionGroups]fileStoreBulkFloat64Segment
+	segmentCount := 0
+	regionGroups := 0
+	flushColumns := func() error {
+		if segmentCount == 0 {
+			return nil
+		}
+		for segmentIndex := 0; segmentIndex < segmentCount; segmentIndex++ {
+			segment := segments[segmentIndex]
+			columns, err := b.allocator.allocate(storeio.PageFloat64Group, segment.columnSize)
+			if err != nil {
+				return err
+			}
+			for groupIndex := segment.firstGroup; groupIndex < segment.lastGroup; groupIndex++ {
+				group := &b.documentGroups[groupIndex]
+				group.ref, err = storeio.AttachDocumentGroupFloat64Sidecar(
+					group.ref, columns, uint32(b.options.PageSize),
+				)
+				if err != nil {
+					return err
+				}
+				group.columns = columns
+				for document := group.first; document < group.last; document++ {
+					b.documents[document].ref = group.ref
+				}
+			}
+			owner := &b.documentGroups[segment.firstGroup]
+			owner.columnFirst = segment.firstDocument
+			owner.columnLast = segment.lastDocument
+		}
+		clear(segments[:segmentCount])
+		segmentCount = 0
+		regionGroups = 0
+		return nil
+	}
+	regionFits := func(groupSize, columnSize uint32, newSegment bool) bool {
+		endGroups := b.allocator.offset + uint64(groupSize)
+		sidecarOffset := endGroups
+		maxForward := storeio.DocumentGroupFloat64MaxForwardBytes(uint32(b.options.PageSize))
+		for segmentIndex := 0; segmentIndex < segmentCount; segmentIndex++ {
+			segment := segments[segmentIndex]
+			size := segment.columnSize
+			if !newSegment && segmentIndex == segmentCount-1 {
+				size = columnSize
+			}
+			firstOffset := b.documentGroups[segment.firstGroup].ref.Offset
+			if sidecarOffset < firstOffset || sidecarOffset-firstOffset > maxForward {
+				return false
+			}
+			sidecarOffset += uint64(size)
+		}
+		if newSegment &&
+			(sidecarOffset < b.allocator.offset ||
+				sidecarOffset-b.allocator.offset > maxForward) {
+			return false
+		}
+		return true
+	}
+
 	for first := 0; first < len(b.documents); {
 		last, rows := first, 0
 		for last < len(b.documents) && !b.documents[last].overflow {
@@ -677,6 +809,13 @@ func (b *fileStoreBulkBuild) planDocumentGroups() error {
 			if err != nil {
 				return err
 			}
+			columnSize := uint32(0)
+			if len(b.options.float64Columns) != 0 {
+				if size, ok := b.float64GroupExtent(first, last); ok {
+					columnSize = size
+					clearDocumentGroupColumns(chunks)
+				}
+			}
 			groupSize, ok := storeio.DocumentGroupSize(
 				chunks, uint32(b.options.PageSize), &b.groupCodec,
 			)
@@ -690,12 +829,60 @@ func (b *fileStoreBulkBuild) planDocumentGroups() error {
 				}
 				individualBytes += int(size)
 			}
-			if ok && groupSize <= uint32(b.options.MaxPageSize) && int(groupSize) < individualBytes {
+			canGroup := ok && groupSize <= uint32(b.options.MaxPageSize) &&
+				int(groupSize)+int(columnSize) < individualBytes
+			newSegment := false
+			segmentColumnSize := columnSize
+			if canGroup && columnSize != 0 {
+				newSegment = segmentCount == 0
+				if !newSegment {
+					current := segments[segmentCount-1]
+					combinedSize, combined := b.float64GroupExtent(
+						current.firstDocument, last,
+					)
+					if combined {
+						segmentColumnSize = combinedSize
+					} else {
+						newSegment = true
+					}
+				}
+				if regionGroups == fileStoreBulkFloat64RegionGroups ||
+					!regionFits(groupSize, segmentColumnSize, newSegment) {
+					if err := flushColumns(); err != nil {
+						return err
+					}
+					newSegment = true
+					segmentColumnSize = columnSize
+				}
+				canGroup = regionFits(groupSize, segmentColumnSize, newSegment)
+			}
+			if canGroup {
+				if columnSize == 0 {
+					if err := flushColumns(); err != nil {
+						return err
+					}
+				}
 				ref, allocateErr := b.allocator.allocate(storeio.PageDocumentGroup, groupSize)
 				if allocateErr != nil {
 					return allocateErr
 				}
 				group := len(b.documentGroups)
+				if columnSize != 0 {
+					if newSegment {
+						if segmentCount == len(segments) {
+							return fmt.Errorf("%w: float64 region segments", storeio.ErrInvalidWrite)
+						}
+						segments[segmentCount] = fileStoreBulkFloat64Segment{
+							firstGroup: group, firstDocument: first, columnSize: segmentColumnSize,
+						}
+						segmentCount++
+					}
+					current := &segments[segmentCount-1]
+					current.lastGroup = group + 1
+					current.lastDocument = last
+					current.columnSize = segmentColumnSize
+					regionGroups++
+				}
 				b.documentGroups = append(b.documentGroups, fileStoreBulkDocumentGroupPlan{
 					first: first, last: last, ref: ref,
 				})
@@ -710,6 +897,9 @@ func (b *fileStoreBulkBuild) planDocumentGroups() error {
 		if grouped {
 			continue
 		}
+		if err := flushColumns(); err != nil {
+			return err
+		}
 		size, ok := fileStoreBulkExtent(
 			b.documents[first].required, b.options.PageSize, b.options.MaxPageSize,
 		)
@@ -723,7 +913,184 @@ func (b *fileStoreBulkBuild) planDocumentGroups() error {
 		b.documents[first].ref = ref
 		first++
 	}
+	if err := flushColumns(); err != nil {
+		return err
+	}
+	b.prepareFloat64ScanPlan()
 	return nil
+}
+
+// prepareFloat64ScanPlan records the immutable source range used by the
+// aggregate-only stripe. The stripe is independent of document grouping and
+// covers ordinary pages, shared sidecars, and overflow-backed documents.
+func (b *fileStoreBulkBuild) prepareFloat64ScanPlan() {
+	b.float64Head = storeio.PageRef{}
+	b.float64ScanRefs = b.float64ScanRefs[:0]
+	b.float64ScanDocuments = 0
+	if len(b.options.float64Columns) != 0 {
+		b.float64ScanDocuments = len(b.documents)
+	}
+}
+
+func (b *fileStoreBulkBuild) planFloat64Catalogs() error {
+	if b.float64ScanDocuments == 0 {
+		return nil
+	}
+	b.float64ScanRefs = b.float64ScanRefs[:0]
+	if err := b.planFloat64Stripes(); err != nil {
+		return err
+	}
+	maxEntries := (b.options.MaxPageSize - storeio.PageHeaderSize - storeio.PageTrailerSize -
+		storeio.Float64CatalogPayloadHeaderSize) / storeio.PageRefSize
+	if maxEntries < 1 {
+		return storeio.ErrInvalidWrite
+	}
+	for first := 0; first < len(b.float64ScanRefs); first += maxEntries {
+		last := min(first+maxEntries, len(b.float64ScanRefs))
+		required := storeio.PageHeaderSize + storeio.PageTrailerSize +
+			storeio.Float64CatalogPayloadHeaderSize + (last-first)*storeio.PageRefSize
+		size, ok := fileStoreBulkExtent(required, b.options.PageSize, b.options.MaxPageSize)
+		if !ok {
+			return storeio.ErrInvalidWrite
+		}
+		ref, err := b.allocator.allocate(storeio.PageFloat64Catalog, size)
+		if err != nil {
+			return err
+		}
+		if len(b.float64Catalogs) != 0 {
+			b.float64Catalogs[len(b.float64Catalogs)-1].next = ref
+		} else {
+			b.float64Head = ref
+		}
+		b.float64Catalogs = append(b.float64Catalogs, fileStoreBulkFloat64CatalogPlan{
+			first: first, last: last, ref: ref,
+		})
+	}
+	return nil
+}
+
+func (b *fileStoreBulkBuild) planFloat64Stripes() error {
+	columns := len(b.options.float64Columns)
+	if columns == 0 || b.float64ScanDocuments == 0 {
+		return nil
+	}
+	var counts [fileStoreMaxFloat64Columns]uint64
+	var encodings [fileStoreMaxFloat64Columns]uint8
+	first := 0
+	rows := uint64(0)
+	for document := 0; document < b.float64ScanDocuments; {
+		required := uint64(
+			storeio.PageHeaderSize + storeio.PageTrailerSize +
+				storeio.Float64StripePayloadHeaderSize + columns*storeio.Float64StripeColumnSize,
+		)
+		for column := 0; column < columns; column++ {
+			offset := document*columns + column
+			nextCount := counts[column] + uint64(b.float64Counts[offset])
+			nextEncoding := max(encodings[column], b.float64Encodings[offset])
+			width := [...]uint64{1, 2, 4, 8}[nextEncoding]
+			required += nextCount * width
+		}
+		nextRows := rows + uint64(bits.OnesCount64(b.documents[document].live))
+		tooLarge := required > uint64(b.options.MaxPageSize) ||
+			uint64(document-first)+1 > math.MaxUint32 ||
+			nextRows > math.MaxUint32
+		if tooLarge && document > first {
+			if err := b.allocateFloat64Stripe(
+				first, document, uint32(rows), counts[:columns], encodings[:columns],
+			); err != nil {
+				return err
+			}
+			clear(counts[:columns])
+			clear(encodings[:columns])
+			first = document
+			rows = 0
+			continue
+		}
+		if tooLarge {
+			return storeio.ErrInvalidWrite
+		}
+		for column := 0; column < columns; column++ {
+			offset := document*columns + column
+			counts[column] += uint64(b.float64Counts[offset])
+			encodings[column] = max(encodings[column], b.float64Encodings[offset])
+		}
+		rows = nextRows
+		document++
+	}
+	return b.allocateFloat64Stripe(
+		first, b.float64ScanDocuments, uint32(rows), counts[:columns], encodings[:columns],
+	)
+}
+
+func (b *fileStoreBulkBuild) allocateFloat64Stripe(
+	first, last int,
+	rows uint32,
+	counts []uint64,
+	encodings []uint8,
+) error {
+	if first < 0 || last <= first || last > b.float64ScanDocuments || rows == 0 ||
+		uint64(last-first) > math.MaxUint32 {
+		return storeio.ErrInvalidWrite
+	}
+	required := uint64(
+		storeio.PageHeaderSize + storeio.PageTrailerSize +
+			storeio.Float64StripePayloadHeaderSize +
+			len(counts)*storeio.Float64StripeColumnSize,
+	)
+	for column, count := range counts {
+		required += count * [...]uint64{1, 2, 4, 8}[encodings[column]]
+	}
+	if required > uint64(b.options.MaxPageSize) {
+		return storeio.ErrInvalidWrite
+	}
+	size, ok := fileStoreBulkExtent(int(required), b.options.PageSize, b.options.MaxPageSize)
+	if !ok {
+		return storeio.ErrInvalidWrite
+	}
+	ref, err := b.allocator.allocate(storeio.PageFloat64Stripe, size)
+	if err != nil {
+		return err
+	}
+	b.float64Stripes = append(b.float64Stripes, fileStoreBulkFloat64StripePlan{
+		first: first, last: last, rows: rows, ref: ref,
+	})
+	b.float64ScanRefs = append(b.float64ScanRefs, ref)
+	return nil
+}
+
+// float64GroupExtent computes the exact adaptive shared-sidecar extent from
+// compact count/encoding metadata gathered for ordinary document pages. It
+// avoids a second JSON extraction pass and never under-allocates after a
+// segment widens from an integer lane to general float64.
+func (b *fileStoreBulkBuild) float64GroupExtent(first, last int) (uint32, bool) {
+	if first < 0 || last > len(b.documents) || last-first < 2 ||
+		len(b.options.float64Columns) == 0 {
+		return 0, false
+	}
+	required := storeio.PageHeaderSize + storeio.PageTrailerSize +
+		storeio.Float64GroupPayloadHeaderSize +
+		(last-first)*storeio.Float64GroupChunkSize +
+		len(b.options.float64Columns)*4 +
+		(last-first)*len(b.options.float64Columns)*8
+	columns := len(b.options.float64Columns)
+	for column := 0; column < columns; column++ {
+		encoding := uint8(0)
+		count := 0
+		for document := first; document < last; document++ {
+			offset := document*columns + column
+			encoding = max(encoding, b.float64Encodings[offset])
+			count += int(b.float64Counts[offset])
+		}
+		width := [...]int{1, 2, 4, 8}[encoding]
+		required += count * width
+	}
+	return fileStoreBulkExtent(required, b.options.PageSize, b.options.MaxPageSize)
+}
+
+func clearDocumentGroupColumns(chunks []storeio.DocumentGroupChunk) {
+	for i := range chunks {
+		chunks[i].Columns = storeio.DocumentFloat64Columns{}
+	}
 }
 
 func fileStoreBulkExtent(required, minimum, maximum int) (uint32, bool) {
@@ -1164,6 +1531,12 @@ func (b *fileStoreBulkBuild) write(file *os.File) error {
 	if err := b.writeDocumentPages(file, scratch); err != nil {
 		return err
 	}
+	if err := b.writeFloat64StripePages(file, scratch); err != nil {
+		return err
+	}
+	if err := b.writeFloat64CatalogPages(file, scratch); err != nil {
+		return err
+	}
 	for _, plan := range b.chunks {
 		page, err := storeio.EncodeChunkDirectoryPage(scratch[:b.options.PageSize], storeio.ChunkDirectoryHeader{
 			StoreID: b.storeID, Generation: b.allocator.generation, LogicalID: plan.ref.LogicalID,
@@ -1250,9 +1623,39 @@ func (b *fileStoreBulkBuild) writeDocumentPages(file *os.File, scratch []byte) e
 			if document != group.first {
 				continue
 			}
+			if group.columnLast > group.columnFirst {
+				columnChunks, prepareErr := b.prepareFloat64Group(
+					group.columnFirst, group.columnLast,
+				)
+				if prepareErr != nil {
+					return prepareErr
+				}
+				page, encodeErr := storeio.EncodeFloat64Group(
+					scratch[:group.columns.Length],
+					storeio.Float64GroupHeader{
+						StoreID: b.storeID, Generation: b.allocator.generation,
+						LogicalID: group.columns.LogicalID, PageSize: group.columns.Length,
+						FirstChunk: columnChunks[0].ChunkID, ChunkCount: uint16(len(columnChunks)),
+						RowCount:    uint16(groupRows(columnChunks)),
+						ColumnCount: uint16(len(b.options.float64Columns)),
+					},
+					columnChunks, b.allocator.nextLogical,
+				)
+				if encodeErr != nil {
+					return encodeErr
+				}
+				if writeErr := writeStorePageAt(file, page, group.columns.Offset); writeErr != nil {
+					return writeErr
+				}
+			}
 			chunks, err := b.prepareDocumentGroup(group.first, group.last)
 			if err != nil {
 				return err
+			}
+			columnCount := len(b.options.float64Columns)
+			if group.columns != (storeio.PageRef{}) {
+				clearDocumentGroupColumns(chunks)
+				columnCount = 0
 			}
 			page, err := storeio.EncodeDocumentGroup(
 				scratch[:group.ref.Length],
@@ -1261,7 +1664,7 @@ func (b *fileStoreBulkBuild) writeDocumentPages(file *os.File, scratch []byte) e
 					LogicalID: group.ref.LogicalID, PageSize: group.ref.Length,
 					FirstChunk: chunks[0].ChunkID, ChunkCount: uint16(len(chunks)),
 					RowCount:    uint16(groupRows(chunks)),
-					ColumnCount: uint16(len(b.options.float64Columns)),
+					ColumnCount: uint16(columnCount), Flags: uint16(group.ref.Flags),
 				},
 				chunks, b.allocator.nextLogical, &b.groupCodec,
 			)
@@ -1316,10 +1719,117 @@ func (b *fileStoreBulkBuild) writeDocumentPages(file *os.File, scratch []byte) e
 	return nil
 }
 
+func (b *fileStoreBulkBuild) writeFloat64CatalogPages(file *os.File, scratch []byte) error {
+	for _, plan := range b.float64Catalogs {
+		page, err := storeio.EncodeFloat64Catalog(
+			scratch[:plan.ref.Length],
+			storeio.Float64CatalogHeader{
+				StoreID: b.storeID, Generation: b.allocator.generation,
+				LogicalID: plan.ref.LogicalID, PageSize: plan.ref.Length, Next: plan.next,
+			},
+			b.float64ScanRefs[plan.first:plan.last],
+			b.fileEnd, b.allocator.nextLogical, b.allocator.pageSize,
+		)
+		if err != nil {
+			return err
+		}
+		if err := writeStorePageAt(file, page, plan.ref.Offset); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *fileStoreBulkBuild) writeFloat64StripePages(file *os.File, scratch []byte) error {
+	columns := len(b.options.float64Columns)
+	var starts [fileStoreMaxFloat64Columns]int
+	var ends [fileStoreMaxFloat64Columns]int
+	if cap(b.float64StripeColumns) < columns {
+		b.float64StripeColumns = make([]storeio.Float64StripeColumn, columns)
+	} else {
+		b.float64StripeColumns = b.float64StripeColumns[:columns]
+	}
+	for _, plan := range b.float64Stripes {
+		b.float64StripeValues = b.float64StripeValues[:0]
+		if cap(b.float64StripeValues) < int(plan.ref.Length) {
+			b.float64StripeValues = make([]byte, 0, plan.ref.Length)
+		}
+		for column := 0; column < columns; column++ {
+			encodingRank := uint8(0)
+			for document := plan.first; document < plan.last; document++ {
+				encodingRank = max(
+					encodingRank, b.float64Encodings[document*columns+column],
+				)
+			}
+			encoding := [...]storeio.Float64GroupEncoding{
+				storeio.Float64GroupUint8,
+				storeio.Float64GroupUint16,
+				storeio.Float64GroupUint32,
+				storeio.Float64GroupFloat64LE,
+			}[encodingRank]
+			starts[column] = len(b.float64StripeValues)
+			for document := plan.first; document < plan.last; document++ {
+				chunk := b.documents[document]
+				for row := chunk.first; row < chunk.last; row++ {
+					value, ok, err := b.sourceFloat64(row, column)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						continue
+					}
+					switch encoding {
+					case storeio.Float64GroupUint8:
+						b.float64StripeValues = append(b.float64StripeValues, byte(value))
+					case storeio.Float64GroupUint16:
+						offset := len(b.float64StripeValues)
+						b.float64StripeValues = append(b.float64StripeValues, 0, 0)
+						binary.LittleEndian.PutUint16(b.float64StripeValues[offset:], uint16(value))
+					case storeio.Float64GroupUint32:
+						offset := len(b.float64StripeValues)
+						b.float64StripeValues = append(b.float64StripeValues, 0, 0, 0, 0)
+						binary.LittleEndian.PutUint32(b.float64StripeValues[offset:], uint32(value))
+					default:
+						offset := len(b.float64StripeValues)
+						b.float64StripeValues = append(b.float64StripeValues, 0, 0, 0, 0, 0, 0, 0, 0)
+						binary.LittleEndian.PutUint64(b.float64StripeValues[offset:], math.Float64bits(value))
+					}
+				}
+			}
+			ends[column] = len(b.float64StripeValues)
+			b.float64StripeColumns[column] = storeio.Float64StripeColumn{
+				Encoding: encoding,
+			}
+		}
+		for column := 0; column < columns; column++ {
+			b.float64StripeColumns[column].Values =
+				b.float64StripeValues[starts[column]:ends[column]:ends[column]]
+		}
+		page, err := storeio.EncodeFloat64Stripe(
+			scratch[:plan.ref.Length],
+			storeio.Float64StripeHeader{
+				StoreID: b.storeID, Generation: b.allocator.generation,
+				LogicalID: plan.ref.LogicalID, PageSize: plan.ref.Length,
+				FirstChunk: b.documents[plan.first].chunk,
+				ChunkCount: uint32(plan.last - plan.first), RowCount: plan.rows,
+				ColumnCount: uint16(columns),
+			},
+			b.float64StripeColumns, b.allocator.nextLogical,
+		)
+		if err != nil {
+			return err
+		}
+		if err := writeStorePageAt(file, page, plan.ref.Offset); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func groupRows(chunks []storeio.DocumentGroupChunk) int {
 	rows := 0
 	for _, chunk := range chunks {
-		rows += len(chunk.Rows)
+		rows += bits.OnesCount64(chunk.Live)
 	}
 	return rows
 }

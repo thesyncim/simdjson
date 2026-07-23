@@ -86,14 +86,23 @@ mutable generation with `Store.WriteFileStore`. The creator repacks source
 chunks into eight stable slots. When it saves rounded physical bytes, up to 128
 rows share an immutable document group: structural templates are stored once,
 repeated complete scalar spellings use a bounded dictionary, and short literal
-lengths are carried by their token. Keys and the configured numeric cover
-remain directly addressable; point and scan output reconstruct exact JSON.
-The creator packs many exact-posting streams per physical page, builds
-key/chunk/index/TTL directories bottom-up, and then performs one data/tree
-fence plus one superblock fence. It creates no per-row durable generations,
-free-tree history, or persistent load commit arena. The timer includes NDJSON
-ingestion, StoreBuilder completion, all page construction, both fences, and
-file close.
+lengths are carried by their token. Keys remain directly addressable.
+Configured numeric covers retain stable-slot masks in shared authoritative
+typed sidecars and adapt integer-only columns to exact 8-, 16-, or 32-bit
+unsigned lanes. A separate clean-generation projection stores only dense
+covered values in physically contiguous scan stripes. Its root catalog covers
+every bulk-built chunk, including ordinary and overflow-backed chunks, so an
+unfiltered aggregate needs neither the chunk tree nor JSON pages. The first
+document mutation atomically removes and retires that projection; TTL-only
+publications retain it, and the sidecar/document overlay remains authoritative.
+
+Point and scan output reconstruct exact JSON. The creator packs many
+exact-posting streams per physical page, builds key/chunk/index/TTL
+directories, typed stripes, and their catalog bottom-up, and then performs one
+data/tree fence plus one superblock fence. It creates no per-row durable
+generations, free-tree history, or persistent load commit arena. The timer
+includes NDJSON ingestion, StoreBuilder completion, all page construction,
+both fences, and file close.
 
 Packed posting pages are immutable bases. An online mutation redirects only
 the affected stream to an isolated copy-on-write posting page and does not
@@ -148,7 +157,7 @@ minimum repetition. The report uses DuckDB's `latency`, not shell wall time.
 |---|---|---|---|
 | point | `Snapshot.Get` plus compiled pointer | copied JSON plus structural index and compiled pointer | key ART lookup plus `json_extract_string` |
 | filter | exact bitmap candidates plus scalar recheck | collision-free exact certificate + bitmap; document recheck fallback | `count(*) where filter_value = ?` |
-| sum | compiled numeric column reduction | persistent typed cover when configured; JSON/page fallback otherwise | `sum(metric)` |
+| sum | compiled numeric column reduction | clean dense stripe, mutation-overlay typed cover, or JSON fallback | `sum(metric)` |
 | group | compiled grouped count | bounded page scan and grouped count | SQL `group by filter_value` |
 | contain | structural JSON containment | scalar-leaf object lowering + exact certificate; structural fallback | `json_contains(doc, ?::JSON)` |
 
@@ -295,6 +304,38 @@ working buffers, and retained artifacts can consume several gigabytes. Record
 machine model, available RAM, operating system, image digest, Go version, and a
 clean working tree alongside any published run. A killed or swapping run is a
 capacity result, not a latency result.
+
+## Real-derived corpus lane
+
+The repository-pinned Twitter and CITM sources exercise natural nesting,
+optional fields, string distributions, and document-size skew. Their natural
+record units are cycled in source order only to reach a declared byte target;
+the manifest retains the original pretty-source byte count, exact minified
+transport digest, row count, and every expected answer. Results must call this
+`real-derived` and disclose the target size—replication does not create more
+distinct source records.
+
+```bash
+root="results/real-128m"
+
+go run ./duckdbbench/cmd/duckdbbench gen \
+  -dir "$root/corpora" -docs 1 -docbytes 400 \
+  -realbytes $((128 << 20)) -only twitter_tweets
+go run ./duckdbbench/cmd/duckdbbench gen \
+  -dir "$root/corpora" -docs 1 -docbytes 400 \
+  -realbytes $((128 << 20)) -only citm_perf
+
+go run ./duckdbbench/cmd/duckdbbench ours \
+  -dir "$root/corpora" -out "$root/ours.json" -reps 3 \
+  -host "machine model and OS version"
+
+RESULTS="$root/duckdb" REPS=7 ./duckdbbench/run-duckdb.sh \
+  "$root/corpora/twitter_tweets" "$root/corpora/citm_perf"
+
+go run ./duckdbbench/cmd/duckdbbench report \
+  -ours "$root/ours.json" -duckdb "$root/duckdb" \
+  -out "$root/report.md"
+```
 
 Ordinary plumbing validation is fast:
 

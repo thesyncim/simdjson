@@ -237,6 +237,43 @@ func TestWriteFileStoreBulkGroupsExactDocumentsAndPeelsMutations(t *testing.T) {
 	if err != nil || !ok || groupRef.Kind != storeio.PageDocumentGroup {
 		t.Fatalf("chunk zero ref = (%+v,%v,%v)", groupRef, ok, err)
 	}
+	columnRef, detached, err := storeio.DocumentGroupFloat64Sidecar(
+		groupRef, uint32(options.PageSize),
+	)
+	if err != nil || !detached || columnRef.Kind != storeio.PageFloat64Group {
+		t.Fatalf("group float64 sidecar = (%+v,%v,%v)", columnRef, detached, err)
+	}
+	if state.root.Float64ScanHead.Kind != storeio.PageFloat64Catalog {
+		t.Fatalf("float64 scan head = %+v, want catalog", state.root.Float64ScanHead)
+	}
+	var scanProjectionRefs []storeio.PageRef
+	catalogColumn := storeio.PageRef{}
+	for catalogRef := state.root.Float64ScanHead; catalogRef != (storeio.PageRef{}); {
+		catalogLease, acquireErr := store.cache.Acquire(catalogRef)
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+		catalog := storeio.AdmittedFloat64Catalog(catalogLease.Page())
+		for entry := 0; entry < catalog.Len(); entry++ {
+			ref, found := catalog.RefAt(entry)
+			if !found {
+				catalogLease.Release()
+				t.Fatalf("float64 catalog entry %d missing", entry)
+			}
+			if catalogColumn == (storeio.PageRef{}) {
+				catalogColumn = ref
+			}
+			scanProjectionRefs = append(scanProjectionRefs, ref)
+		}
+		next := catalog.Header().Next
+		catalogLease.Release()
+		scanProjectionRefs = append(scanProjectionRefs, catalogRef)
+		catalogRef = next
+	}
+	found := catalogColumn != (storeio.PageRef{})
+	if !found || catalogColumn.Kind != storeio.PageFloat64Stripe {
+		t.Fatalf("float64 catalog first ref = (%+v,%v), want stripe", catalogColumn, found)
+	}
 	if groupRef.Length >= uint32(16*options.PageSize) {
 		t.Fatalf("group extent = %d, did not beat sixteen independent pages", groupRef.Length)
 	}
@@ -268,15 +305,72 @@ func TestWriteFileStoreBulkGroupsExactDocumentsAndPeelsMutations(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("group point allocations = %.2f, want zero with caller buffer", allocs)
 	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, covered, err := snapshot.ReduceFloat64Path("/score")
+	if closeErr := snapshot.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil || !covered || total.Count != documents ||
+		total.Sum != float64(documents*(documents-1)/2) {
+		t.Fatalf("detached score reduction = (%+v,%v,%v)", total, covered, err)
+	}
+
+	scanHead := state.root.Float64ScanHead
+	deadline := time.Unix(2_000_000_000, 0)
+	if updated, deadlineErr := store.SetDeadline("doc:0010", deadline); deadlineErr != nil || !updated {
+		t.Fatalf("set deadline over clean stripe = (%v,%v)", updated, deadlineErr)
+	}
+	if got := store.state.Load().root.Float64ScanHead; got != scanHead {
+		t.Fatalf("TTL update changed clean float64 scan head: got %+v, want %+v", got, scanHead)
+	}
+	if updated, deadlineErr := store.SetDeadline("doc:0010", deadline.Add(time.Hour)); deadlineErr != nil || !updated {
+		t.Fatalf("change deadline over clean stripe = (%v,%v)", updated, deadlineErr)
+	}
+	if got := store.state.Load().root.Float64ScanHead; got != scanHead {
+		t.Fatalf("TTL change changed clean float64 scan head: got %+v, want %+v", got, scanHead)
+	}
+	if updated, persistErr := store.Persist("doc:0010"); persistErr != nil || !updated {
+		t.Fatalf("persist deadline over clean stripe = (%v,%v)", updated, persistErr)
+	}
+	if got := store.state.Load().root.Float64ScanHead; got != scanHead {
+		t.Fatalf("TTL removal changed clean float64 scan head: got %+v, want %+v", got, scanHead)
+	}
 
 	replacement := []byte(`{"tenant":"new","status":"updated","score":3000,"active":true}`)
 	if created, err := store.Put("doc:0003", replacement); err != nil || created {
 		t.Fatalf("group update = (%v,%v)", created, err)
 	}
+	for _, ref := range scanProjectionRefs {
+		retired := false
+		for _, extent := range store.retireScratch {
+			if extent.Offset <= ref.Offset &&
+				uint64(ref.Length) <= extent.Length &&
+				ref.Offset-extent.Offset <= extent.Length-uint64(ref.Length) {
+				retired = true
+				break
+			}
+		}
+		if !retired {
+			t.Fatalf("first mutation did not retire float64 scan ref %+v", ref)
+		}
+	}
+	for _, extent := range store.retireScratch {
+		if extent.Offset <= columnRef.Offset &&
+			uint64(columnRef.Length) <= extent.Length &&
+			columnRef.Offset-extent.Offset <= extent.Length-uint64(columnRef.Length) {
+			t.Fatalf("first mutation retired authoritative float64 sidecar %+v", columnRef)
+		}
+	}
 	if deleted, err := store.Delete("doc:0004"); err != nil || !deleted {
 		t.Fatalf("group delete = (%v,%v)", deleted, err)
 	}
 	state = store.state.Load()
+	if state.root.Float64ScanHead != (storeio.PageRef{}) {
+		t.Fatalf("mutation retained stale float64 scan head %+v", state.root.Float64ScanHead)
+	}
 	peeled, ok, err := storeio.LookupChunkTree(store.cache, state.chunkRoot, 0, storeio.ChunkTreeBounds{
 		FileEnd: state.super.FileEnd, NextLogicalID: state.root.NextLogicalID,
 	})
@@ -289,12 +383,36 @@ func TestWriteFileStoreBulkGroupsExactDocumentsAndPeelsMutations(t *testing.T) {
 	if err != nil || !ok || untouched != groupRef {
 		t.Fatalf("untouched chunk lost shared base: (%+v,%v,%v)", untouched, ok, err)
 	}
+	snapshot, err = store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, covered, err = snapshot.ReduceFloat64Path("/score")
+	if closeErr := snapshot.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	wantSum := float64(documents*(documents-1)/2 - 3 - 4 + 3000)
+	if err != nil || !covered || total.Count != documents-1 || total.Sum != wantSum {
+		t.Fatalf("mixed detached/peeled reduction = (%+v,%v,%v), want sum %.0f", total, covered, err, wantSum)
+	}
 	groupLease, err := store.cache.Acquire(groupRef)
 	if err != nil {
 		t.Fatal(err)
 	}
 	groupHeader := storeio.AdmittedDocumentGroup(groupLease.Page()).Header()
 	groupLease.Release()
+	columnLease, err := store.cache.Acquire(columnRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	columnHeader := storeio.AdmittedFloat64Group(columnLease.Page()).Header()
+	columnLease.Release()
+	if columnHeader.ChunkCount <= groupHeader.ChunkCount {
+		t.Fatalf(
+			"typed extent covers %d chunks, want more than one %d-chunk document group",
+			columnHeader.ChunkCount, groupHeader.ChunkCount,
+		)
+	}
 	for ordinal := uint16(1); ordinal < groupHeader.ChunkCount; ordinal++ {
 		row := int(ordinal) * options.Store.ChunkDocuments
 		key := fmt.Sprintf("doc:%04d", row)
@@ -303,15 +421,42 @@ func TestWriteFileStoreBulkGroupsExactDocumentsAndPeelsMutations(t *testing.T) {
 			t.Fatalf("peel group chunk %d = (%v,%v)", ordinal, created, putErr)
 		}
 		retiredGroup := false
+		retiredColumns := false
 		for _, extent := range store.retireScratch {
 			if extent.Offset == groupRef.Offset && extent.Length == uint64(groupRef.Length) {
 				retiredGroup = true
-				break
+			}
+			if extent.Offset == columnRef.Offset && extent.Length == uint64(columnRef.Length) {
+				retiredColumns = true
 			}
 		}
-		wantRetired := ordinal+1 == groupHeader.ChunkCount
-		if retiredGroup != wantRetired {
-			t.Fatalf("group retirement after chunk %d = %v, want %v", ordinal, retiredGroup, wantRetired)
+		wantGroupRetired := ordinal+1 == groupHeader.ChunkCount
+		if retiredGroup != wantGroupRetired || retiredColumns {
+			t.Fatalf(
+				"group retirement after chunk %d = (documents %v, columns %v), want (%v,false)",
+				ordinal, retiredGroup, retiredColumns, wantGroupRetired,
+			)
+		}
+	}
+	for chunk := uint32(groupHeader.ChunkCount); chunk < uint32(columnHeader.ChunkCount); chunk++ {
+		row := int(chunk) * options.Store.ChunkDocuments
+		key := fmt.Sprintf("doc:%04d", row)
+		value := fmt.Appendf(nil, `{"peeled":%d,"score":%d}`, chunk, row)
+		if created, putErr := store.Put(key, value); putErr != nil || created {
+			t.Fatalf("peel typed extent chunk %d = (%v,%v)", chunk, created, putErr)
+		}
+		retiredColumns := false
+		for _, extent := range store.retireScratch {
+			if extent.Offset == columnRef.Offset && extent.Length == uint64(columnRef.Length) {
+				retiredColumns = true
+			}
+		}
+		wantRetired := chunk+1 == uint32(columnHeader.ChunkCount)
+		if retiredColumns != wantRetired {
+			t.Fatalf(
+				"typed extent retirement after chunk %d = %v, want %v",
+				chunk, retiredColumns, wantRetired,
+			)
 		}
 	}
 	if err := store.Close(); err != nil {
@@ -332,6 +477,100 @@ func TestWriteFileStoreBulkGroupsExactDocumentsAndPeelsMutations(t *testing.T) {
 	got, ok, err = reopened.AppendRaw(buffer[:0], "doc:0010")
 	if err != nil || !ok || !bytes.Contains(got, []byte(`"score":10`)) {
 		t.Fatalf("reopened untouched group = (%q,%v,%v)", got, ok, err)
+	}
+}
+
+func TestWriteFileStoreBulkCatalogedFloat64ScanExact(t *testing.T) {
+	const documents = 20000
+	options := testFileStoreOptions()
+	options.Store = StoreOptions{ChunkDocuments: 8, ShapeTapes: true}
+	options.MaxPageSize = 64 << 10
+	options.ResidentBytes = 8 << 20
+	options.Float64Columns = []string{"/score"}
+	builder, err := NewStoreBuilder(options.Store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row := range documents {
+		document := fmt.Appendf(nil, `{"score":%d,"payload":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}`, row)
+		if err := builder.Append(fmt.Sprintf("doc:%04d", row), document); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(t.TempDir(), "file-store-linked-columns-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := source.WriteFileStore(file, options); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	state := store.state.Load()
+	catalogRef := state.root.Float64ScanHead
+	coveredChunks := uint32(0)
+	extents := 0
+	for catalogRef != (storeio.PageRef{}) {
+		lease, acquireErr := store.cache.Acquire(catalogRef)
+		if acquireErr != nil {
+			t.Fatal(acquireErr)
+		}
+		catalog := storeio.AdmittedFloat64Catalog(lease.Page())
+		next := catalog.Header().Next
+		for entry := 0; entry < catalog.Len(); entry++ {
+			ref, ok := catalog.RefAt(entry)
+			if !ok {
+				t.Fatalf("catalog entry %d missing", entry)
+			}
+			groupLease, acquireErr := store.cache.Acquire(ref)
+			if acquireErr != nil {
+				t.Fatal(acquireErr)
+			}
+			header := storeio.AdmittedFloat64Stripe(groupLease.Page()).Header()
+			groupLease.Release()
+			if header.FirstChunk != coveredChunks {
+				t.Fatalf("linked extent %d starts at %d, want %d", extents, header.FirstChunk, coveredChunks)
+			}
+			coveredChunks += uint32(header.ChunkCount)
+			extents++
+		}
+		lease.Release()
+		catalogRef = next
+	}
+	if extents < 1 || coveredChunks != state.root.ChunkHighWater {
+		t.Fatalf(
+			"catalog typed coverage = (%d extents, %d chunks), high water %d",
+			extents, coveredChunks, state.root.ChunkHighWater,
+		)
+	}
+	snapshot, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, covered, err := snapshot.ReduceFloat64Path("/score")
+	allocs := testing.AllocsPerRun(100, func() {
+		total, covered, err = snapshot.ReduceFloat64Path("/score")
+		if err != nil || !covered {
+			panic("linked score reduction")
+		}
+	})
+	if closeErr := snapshot.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil || !covered || total.Count != documents ||
+		total.Sum != float64(documents*(documents-1)/2) {
+		t.Fatalf("linked score reduction = (%+v,%v,%v)", total, covered, err)
+	}
+	if allocs != 0 {
+		t.Fatalf("linked score warm allocations = %.2f, want zero", allocs)
 	}
 }
 
@@ -407,6 +646,86 @@ func TestWriteFileStoreBulkGroupRejectsResealedInvalidJSON(t *testing.T) {
 	}
 	if !errors.Is(err, storeio.ErrDocumentGroupCorrupt) {
 		t.Fatalf("OpenFileStore invalid grouped JSON = %v, want document-group corruption", err)
+	}
+}
+
+func TestWriteFileStoreBulkGroupRejectsResealedDetachedColumnCorruption(t *testing.T) {
+	const documents = 128
+	options := testFileStoreOptions()
+	options.Store = StoreOptions{ChunkDocuments: 8, ShapeTapes: true}
+	options.MaxPageSize = 64 << 10
+	options.ResidentBytes = 8 << 20
+	options.Float64Columns = []string{"/score"}
+	builder, err := NewStoreBuilder(options.Store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row := range documents {
+		document := fmt.Appendf(
+			nil, `{"score":%d,"payload":"%s"}`, row, strings.Repeat("x", 96+(row&7)),
+		)
+		if err := builder.Append(fmt.Sprintf("doc:%04d", row), document); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source, err := builder.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.CreateTemp(t.TempDir(), "file-store-group-columns-corrupt-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := source.WriteFileStore(file, options); err != nil {
+		t.Fatal(err)
+	}
+
+	group := recoveredFileDocumentRef(t, file, options, 0)
+	columns, detached, err := storeio.DocumentGroupFloat64Sidecar(
+		group, uint32(options.PageSize),
+	)
+	if err != nil || !detached {
+		t.Fatalf("detached columns = (%+v,%v,%v)", columns, detached, err)
+	}
+	page := make([]byte, columns.Length)
+	if _, err := file.ReadAt(page, int64(columns.Offset)); err != nil {
+		t.Fatal(err)
+	}
+	payload := page[storeio.PageHeaderSize:]
+	chunkBytes := int(binary.LittleEndian.Uint32(payload[16:20]))
+	directoryBytes := int(binary.LittleEndian.Uint32(payload[20:24]))
+	firstMask := storeio.PageHeaderSize + storeio.Float64GroupPayloadHeaderSize +
+		chunkBytes + directoryBytes
+	page[firstMask+1] |= 0x01
+	if _, err := storeio.SealPage(page); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(page, int64(columns.Offset)); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenFileStore(file, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	snapshot, err := reopened.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snapshot.Close()
+	aggregate, covered, err := snapshot.ReduceFloat64Path("/score")
+	if err != nil || !covered || aggregate.Count != documents {
+		t.Fatalf("independent clean stripe = (%+v, covered %v, %v)", aggregate, covered, err)
+	}
+	if _, err := reopened.Put("doc:0000", []byte(`{"score":9}`)); !errors.Is(
+		err, storeio.ErrFloat64GroupCorrupt,
+	) {
+		t.Fatalf("mutation over corrupt authoritative sidecar = %v", err)
 	}
 }
 

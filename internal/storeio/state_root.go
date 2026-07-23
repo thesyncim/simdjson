@@ -18,13 +18,16 @@ const (
 	PageRefSize = 32
 
 	stateRootVersionV2      = uint32(2)
-	stateRootVersion        = uint32(3)
+	stateRootVersionV3      = uint32(3)
+	stateRootVersion        = uint32(4)
 	stateRootFreeHintOffset = 60
 	stateRootChunkRefOffset = 64
 	stateRootKeyRefOffset   = stateRootChunkRefOffset + PageRefSize
 	stateRootIndexRefOffset = stateRootKeyRefOffset + PageRefSize
 	stateRootTTLRefOffset   = stateRootIndexRefOffset + PageRefSize
 	stateRootRefsEnd        = stateRootTTLRefOffset + PageRefSize
+	stateRootFloat64Offset  = stateRootRefsEnd
+	stateRootFloat64End     = stateRootFloat64Offset + PageRefSize
 )
 
 // State-root option bits are durable equivalents of Store construction
@@ -60,6 +63,11 @@ type PageRef struct {
 	Length     uint32
 	Kind       PageKind
 	Flags      uint8
+	// Aux is routing metadata for schemas that explicitly define it. It is
+	// zero for every ordinary reference. Document-group leaves use it only
+	// with DocumentGroupFlagFloat64Sidecar to encode bounded physical and
+	// logical deltas to a shared typed extent.
+	Aux uint16
 }
 
 // StateRoot is the compact, pointer-free graph root named by a Superblock.
@@ -89,6 +97,10 @@ type StateRoot struct {
 	KeyDirectory   PageRef
 	IndexDirectory PageRef
 	TTLDirectory   PageRef
+	// Float64ScanHead names the ordered value-stripe catalog of an untouched
+	// compact generation. It is only a scan accelerator; document mutations
+	// clear it and use the authoritative chunk tree plus peeled document pages.
+	Float64ScanHead PageRef
 }
 
 // EncodeStateRootPage writes and seals one complete common-format page into
@@ -126,6 +138,7 @@ func EncodeStateRootPage(dst []byte, root StateRoot, fileEnd uint64) ([]byte, er
 	encodePageRef(payload[stateRootKeyRefOffset:stateRootIndexRefOffset], root.KeyDirectory)
 	encodePageRef(payload[stateRootIndexRefOffset:stateRootTTLRefOffset], root.IndexDirectory)
 	encodePageRef(payload[stateRootTTLRefOffset:stateRootRefsEnd], root.TTLDirectory)
+	encodePageRef(payload[stateRootFloat64Offset:stateRootFloat64End], root.Float64ScanHead)
 	page := dst[:int(root.PageSize)]
 	if _, err := sealInitializedPage(page); err != nil {
 		return nil, err
@@ -144,12 +157,11 @@ func DecodeStateRootPage(src []byte, fileEnd uint64) (StateRoot, error) {
 	version := binary.LittleEndian.Uint32(payload[0:4])
 	if header.Kind != PageStateRoot || header.LogicalID != StateRootLogicalID ||
 		len(payload) != StateRootPayloadSize ||
-		version != stateRootVersionV2 && version != stateRootVersion ||
+		version != stateRootVersionV2 && version != stateRootVersionV3 && version != stateRootVersion ||
 		!pageRefReservedZero(payload[stateRootChunkRefOffset:stateRootKeyRefOffset]) ||
 		!pageRefReservedZero(payload[stateRootKeyRefOffset:stateRootIndexRefOffset]) ||
 		!pageRefReservedZero(payload[stateRootIndexRefOffset:stateRootTTLRefOffset]) ||
-		!pageRefReservedZero(payload[stateRootTTLRefOffset:stateRootRefsEnd]) ||
-		!allZero(payload[stateRootRefsEnd:]) {
+		!pageRefReservedZero(payload[stateRootTTLRefOffset:stateRootRefsEnd]) {
 		return StateRoot{}, fmt.Errorf("%w: header, version, or reserved bytes", ErrStateRootCorrupt)
 	}
 	freeChunkHint := uint32(0)
@@ -159,6 +171,16 @@ func DecodeStateRootPage(src []byte, fileEnd uint64) (StateRoot, error) {
 		}
 	} else {
 		freeChunkHint = binary.LittleEndian.Uint32(payload[stateRootFreeHintOffset:stateRootChunkRefOffset])
+	}
+	var float64ScanHead PageRef
+	if version == stateRootVersion {
+		if !pageRefReservedZero(payload[stateRootFloat64Offset:stateRootFloat64End]) ||
+			!allZero(payload[stateRootFloat64End:]) {
+			return StateRoot{}, fmt.Errorf("%w: float64 scan head or reserved bytes", ErrStateRootCorrupt)
+		}
+		float64ScanHead = decodePageRef(payload[stateRootFloat64Offset:stateRootFloat64End])
+	} else if !allZero(payload[stateRootRefsEnd:]) {
+		return StateRoot{}, fmt.Errorf("%w: legacy reserved bytes", ErrStateRootCorrupt)
 	}
 	root := StateRoot{
 		StoreID:          header.StoreID,
@@ -179,6 +201,7 @@ func DecodeStateRootPage(src []byte, fileEnd uint64) (StateRoot, error) {
 		KeyDirectory:     decodePageRef(payload[stateRootKeyRefOffset:stateRootIndexRefOffset]),
 		IndexDirectory:   decodePageRef(payload[stateRootIndexRefOffset:stateRootTTLRefOffset]),
 		TTLDirectory:     decodePageRef(payload[stateRootTTLRefOffset:stateRootRefsEnd]),
+		Float64ScanHead:  float64ScanHead,
 	}
 	if err := validateStateRoot(root, fileEnd); err != nil {
 		return StateRoot{}, fmt.Errorf("%w: %v", ErrStateRootCorrupt, err)
@@ -193,6 +216,7 @@ func encodePageRef(dst []byte, ref PageRef) {
 	binary.LittleEndian.PutUint32(dst[24:28], ref.Length)
 	dst[28] = byte(ref.Kind)
 	dst[29] = ref.Flags
+	binary.LittleEndian.PutUint16(dst[30:32], ref.Aux)
 }
 
 func decodePageRef(src []byte) PageRef {
@@ -203,11 +227,12 @@ func decodePageRef(src []byte) PageRef {
 		Length:     binary.LittleEndian.Uint32(src[24:28]),
 		Kind:       PageKind(src[28]),
 		Flags:      src[29],
+		Aux:        binary.LittleEndian.Uint16(src[30:32]),
 	}
 }
 
 func pageRefReservedZero(src []byte) bool {
-	return allZero(src[30:PageRefSize])
+	return binary.LittleEndian.Uint16(src[30:PageRefSize]) == 0
 }
 
 func validateStateRoot(root StateRoot, fileEnd uint64) error {
@@ -263,6 +288,27 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 			}
 		}
 	}
+	if root.Float64ScanHead != (PageRef{}) {
+		ref := root.Float64ScanHead
+		length := uint64(ref.Length)
+		if root.Options&StateOptionFloat64Columns == 0 ||
+			ref.Kind != PageFloat64Catalog || ref.Flags != 0 || ref.Aux != 0 ||
+			!validPhysicalPageSize(ref.Length) || ref.Length < root.PageSize ||
+			ref.Length%root.PageSize != 0 ||
+			ref.Generation == 0 || ref.Generation > root.Generation ||
+			ref.LogicalID <= StateRootLogicalID || ref.LogicalID >= root.NextLogicalID ||
+			ref.Offset < uint64(superblockCopies)*pageSize || ref.Offset%pageSize != 0 ||
+			length > fileEnd || ref.Offset > maxSuperblockFileOffset ||
+			ref.Offset > fileEnd-length {
+			return fmt.Errorf("%w: invalid float64 scan head", ErrInvalidWrite)
+		}
+		for i := range refs {
+			if refs[i].ref != (PageRef{}) &&
+				(refs[i].ref.LogicalID == ref.LogicalID || refs[i].ref.Offset == ref.Offset) {
+				return fmt.Errorf("%w: duplicate float64 scan head", ErrInvalidWrite)
+			}
+		}
+	}
 	return nil
 }
 
@@ -274,7 +320,7 @@ func validateStatePageRef(ref PageRef, kind PageKind, required bool, root StateR
 		return nil
 	}
 	pageSize := uint64(root.PageSize)
-	if ref.Kind != kind || ref.Flags != 0 || ref.Length != root.PageSize ||
+	if ref.Kind != kind || ref.Flags != 0 || ref.Aux != 0 || ref.Length != root.PageSize ||
 		ref.Generation == 0 || ref.Generation > root.Generation ||
 		ref.LogicalID <= StateRootLogicalID || ref.LogicalID >= root.NextLogicalID ||
 		ref.Offset < uint64(superblockCopies)*pageSize || ref.Offset%pageSize != 0 ||
