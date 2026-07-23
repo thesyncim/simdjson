@@ -168,6 +168,7 @@ store_bitmap_test.go
 store_index_exact_test.go
 store_index_packed_test.go
 store_persist_test.go
+store_page_db_test.go
 store_page_file_test.go
 internal/storeio/ring_linux_test.go
 value_accessors_contract_test.go
