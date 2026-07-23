@@ -32,6 +32,7 @@ func testStateRoot(generation uint64) (StateRoot, uint64) {
 		IndexCount:       2,
 		IndexMaxDepth:    1024,
 		IndexCatalogHash: 0x123456789abcdef0,
+		FreeChunkHint:    2,
 		ChunkDirectory:   testStatePageRef(PageChunkDirectory, 3, 2, generation),
 		KeyDirectory:     testStatePageRef(PageKeyDirectory, 4, 3, generation),
 		IndexDirectory:   testStatePageRef(PageIndexDirectory, 5, 4, generation),
@@ -73,6 +74,7 @@ func TestStateRootValidation(t *testing.T) {
 		{"document minimum", func(root *StateRoot, _ *uint64) { root.DocumentCount = 2 }},
 		{"document maximum", func(root *StateRoot, _ *uint64) { root.DocumentCount = 193 }},
 		{"ttl count", func(root *StateRoot, _ *uint64) { root.TTLCount = root.DocumentCount + 1 }},
+		{"free chunk hint", func(root *StateRoot, _ *uint64) { root.FreeChunkHint = root.ChunkHighWater + 1 }},
 		{"next logical id", func(root *StateRoot, _ *uint64) { root.NextLogicalID = 5 }},
 		{"missing chunk root", func(root *StateRoot, _ *uint64) { root.ChunkDirectory = PageRef{} }},
 		{"wrong key kind", func(root *StateRoot, _ *uint64) { root.KeyDirectory.Kind = PageTTLDirectory }},
@@ -107,6 +109,22 @@ func TestStateRootValidation(t *testing.T) {
 	}
 }
 
+func TestStateRootDecodesVersionTwoWithoutFreeHint(t *testing.T) {
+	want, fileEnd := testStateRoot(11)
+	page := make([]byte, testSuperblockPageSize)
+	if _, err := EncodeStateRootPage(page, want, fileEnd); err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint32(page[PageHeaderSize:PageHeaderSize+4], stateRootVersionV2)
+	binary.LittleEndian.PutUint32(page[PageHeaderSize+stateRootFreeHintOffset:PageHeaderSize+stateRootChunkRefOffset], 0)
+	resealTestPage(page)
+	want.FreeChunkHint = 0
+	got, err := DecodeStateRootPage(page, fileEnd)
+	if err != nil || got != want {
+		t.Fatalf("DecodeStateRootPage(v2) = (%+v,%v), want (%+v,nil)", got, err, want)
+	}
+}
+
 func TestStateRootRejectsResealedSemanticCorruption(t *testing.T) {
 	root, fileEnd := testStateRoot(3)
 	page := make([]byte, testSuperblockPageSize)
@@ -114,7 +132,6 @@ func TestStateRootRejectsResealedSemanticCorruption(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, offset := range []int{
-		PageHeaderSize + 60,
 		PageHeaderSize + 192,
 		PageHeaderSize + 64 + 30,
 	} {

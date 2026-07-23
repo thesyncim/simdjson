@@ -70,6 +70,10 @@ func TestStorePageFileRoundTripEvictionAndCompiledKey(t *testing.T) {
 	if reader.Len() != uint64(len(want)) || reader.Generation() != store.Generation() {
 		t.Fatalf("reader Len/Generation = %d/%d", reader.Len(), reader.Generation())
 	}
+	if reader.root.FreeChunkHint != reader.root.ChunkHighWater {
+		t.Fatalf("dense free-chunk hint = %d, want high-water %d",
+			reader.root.FreeChunkHint, reader.root.ChunkHighWater)
+	}
 	for i := range len(want) {
 		key := fmt.Sprintf("account:%08d", i)
 		dst := make([]byte, 3, 256)

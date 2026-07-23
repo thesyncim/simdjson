@@ -76,17 +76,19 @@ func TestKeyBranchPageRoundTrip(t *testing.T) {
 	for _, test := range []struct {
 		hash uint64
 		want PageRef
+		rank int
 		ok   bool
 	}{
-		{7, entries[0].Child, true},
-		{100, entries[0].Child, true},
-		{101, entries[1].Child, true},
-		{900, entries[2].Child, true},
-		{901, PageRef{}, false},
+		{7, entries[0].Child, 0, true},
+		{100, entries[0].Child, 0, true},
+		{101, entries[1].Child, 1, true},
+		{900, entries[2].Child, 2, true},
+		{901, PageRef{}, 0, false},
 	} {
-		got, ok := view.Child(test.hash)
-		if ok != test.ok || got != test.want {
-			t.Fatalf("Child(%d) = (%+v,%v), want (%+v,%v)", test.hash, got, ok, test.want, test.ok)
+		got, rank, ok := view.ChildIndex(test.hash)
+		if ok != test.ok || got != test.want || rank != test.rank {
+			t.Fatalf("ChildIndex(%d) = (%+v,%d,%v), want (%+v,%d,%v)",
+				test.hash, got, rank, ok, test.want, test.rank, test.ok)
 		}
 	}
 }

@@ -17,6 +17,7 @@ const (
 	storePageQuantum            = uint32(4096)
 	storePageDefaultMaxDocument = uint32(64 << 10)
 	storePageDefaultResident    = int64(64 << 20)
+	storePageKeyMaxDepth        = 16
 )
 
 var (
@@ -172,10 +173,17 @@ func (s *Store) WritePageFile(file *os.File, options StorePageWriteOptions) (int
 	docPlans := make([]storeDocumentPagePlan, 0, state.chunkCount)
 	keyEntries := make([]storeio.PageKeyLocation, 0, state.count)
 	chunkItems := make([]storeChunkDirectoryItem, 0, state.chunkCount)
+	freeChunkHint := state.chunks.count
 	for chunkID := uint32(0); chunkID < state.chunks.count; chunkID++ {
 		chunk := state.chunks.get(chunkID)
 		if chunk == nil {
+			if freeChunkHint == state.chunks.count {
+				freeChunkHint = chunkID
+			}
 			continue
+		}
+		if int(chunk.count) < state.options.ChunkDocuments && freeChunkHint == state.chunks.count {
+			freeChunkHint = chunkID
 		}
 		required := uint64(storeio.PageHeaderSize + storeio.PageTrailerSize +
 			storeio.DocumentPagePayloadHeaderSize + int(chunk.count)*storeio.DocumentPageRecordSize)
@@ -293,6 +301,7 @@ func (s *Store) WritePageFile(file *os.File, options StorePageWriteOptions) (int
 		NextLogicalID: nextLogicalID, ChunkHighWater: state.chunks.count,
 		LiveChunks: state.chunkCount, ChunkDocuments: uint32(state.options.ChunkDocuments),
 		IndexMaxDepth:  uint32(max(state.options.IndexOptions.MaxDepth, 0)),
+		FreeChunkHint:  freeChunkHint,
 		ChunkDirectory: chunkRoot, KeyDirectory: keyRoot,
 	}
 	statePage, err := storeio.EncodeStateRootPage(scratch[:storePageQuantum], root, fileEnd)
@@ -519,6 +528,16 @@ func (r *StorePageReader) lookupPageKey(pages *storeio.PageFile, key StorePageKe
 	return lookupStorePageKey(pages, r.root.KeyDirectory, r.root.ChunkDirectory, key, prepared)
 }
 
+// storePageKeyPathEntry retains only the value identity and selected rank of
+// one immutable key branch. It is stack-resident lookup state, not a durable
+// or heap-side page table. A collision continuation can therefore derive the
+// next leaf from the current root even after copy-on-write moved that leaf.
+type storePageKeyPathEntry struct {
+	ref   storeio.PageRef
+	rank  uint16
+	level uint8
+}
+
 // lookupStorePageKey is the shared immutable-graph point lookup. Supplying
 // both root references by value lets a mutable caller finish against one
 // generation while a writer publishes the next; no traversed page is mutable.
@@ -593,24 +612,192 @@ func lookupStorePageKey(pages *storeio.PageFile, keyRoot, chunkRoot storeio.Page
 				return StorePageValue{}, false, closeErr
 			}
 		}
-		next := view.Header().Next
-		follow := view.Header().MaxHash == key.hash && next != (storeio.PageRef{})
+		follow := view.Header().MaxHash == key.hash
 		if closeErr := lease.Close(); closeErr != nil {
 			return StorePageValue{}, false, closeErr
 		}
 		if !follow {
 			return StorePageValue{}, false, nil
 		}
-		// A copy-on-write leaf keeps its stable logical id but moves to a
-		// later physical extent, so its unchanged forward link may point to
-		// an older, lower offset. Logical ids retain strict forward order and
-		// are therefore the cycle-prevention invariant across generations.
-		if next.LogicalID <= ref.LogicalID {
-			return StorePageValue{}, false, corruptStorePage("key-leaf continuation order", storeio.ErrKeyDirectoryCorrupt)
-		}
-		ref = next
+		return lookupStorePageKeyCollisionSuccessors(pages, keyRoot, chunkRoot, key, prepared)
 	}
 	return StorePageValue{}, false, nil
+}
+
+// lookupStorePageKeyCollisionSuccessors reconstructs a parent cursor only
+// after the common first leaf exhausted an equal-hash run. Ordinary lookups
+// therefore pay neither the cursor stores nor its stack frame, while the
+// adversarial path remains generation-correct under copy-on-write.
+func lookupStorePageKeyCollisionSuccessors(pages *storeio.PageFile, keyRoot, chunkRoot storeio.PageRef,
+	key StorePageKey, prepared *StorePageKey) (StorePageValue, bool, error) {
+	var path [storePageKeyMaxDepth - 1]storePageKeyPathEntry
+	depth := 0
+	ref := keyRoot
+	for {
+		lease, err := pages.Cache().Pin(ref)
+		if err != nil {
+			return StorePageValue{}, false, storePageReadError(err)
+		}
+		view := storeio.AdmittedPageKeyDirectory(lease.Bytes())
+		if view.Header().Level == 0 {
+			if closeErr := lease.Close(); closeErr != nil {
+				return StorePageValue{}, false, closeErr
+			}
+			break
+		}
+		child, rank, ok := view.ChildIndex(key.hash)
+		if !ok || depth == len(path) {
+			_ = lease.Close()
+			return StorePageValue{}, false, corruptStorePage("key-collision cursor", storeio.ErrKeyDirectoryCorrupt)
+		}
+		path[depth] = storePageKeyPathEntry{ref: ref, rank: uint16(rank), level: view.Header().Level}
+		depth++
+		if closeErr := lease.Close(); closeErr != nil {
+			return StorePageValue{}, false, closeErr
+		}
+		if child.Offset >= ref.Offset {
+			return StorePageValue{}, false, corruptStorePage("key-collision child order", storeio.ErrKeyDirectoryCorrupt)
+		}
+		ref = child
+	}
+
+	for {
+		ref, ok, err := nextStorePageKeyLeaf(pages, &path, &depth)
+		if err != nil || !ok {
+			return StorePageValue{}, false, err
+		}
+		lease, err := pages.Cache().Pin(ref)
+		if err != nil {
+			return StorePageValue{}, false, storePageReadError(err)
+		}
+		view := storeio.AdmittedPageKeyDirectory(lease.Bytes())
+		if view.Header().Level != 0 {
+			_ = lease.Close()
+			return StorePageValue{}, false, corruptStorePage("key-collision leaf level", storeio.ErrKeyDirectoryCorrupt)
+		}
+		first, end, candidates := view.CandidateRange(key.hash)
+		for i := first; candidates && i < end; i++ {
+			location, _ := view.LocationAt(i)
+			docRef, exists, resolveErr := resolveStoreDocumentPage(pages, chunkRoot, location.Chunk)
+			if resolveErr != nil {
+				_ = lease.Close()
+				return StorePageValue{}, false, resolveErr
+			}
+			if !exists {
+				continue
+			}
+			docLease, pinErr := pages.Cache().Pin(docRef)
+			if pinErr != nil {
+				_ = lease.Close()
+				return StorePageValue{}, false, storePageReadError(pinErr)
+			}
+			doc := storeio.AdmittedDocumentPage(docLease.Bytes())
+			if doc.Header().ChunkID != location.Chunk {
+				_ = docLease.Close()
+				_ = lease.Close()
+				return StorePageValue{}, false, corruptStorePage("collision document identity", storeio.ErrDocumentPageCorrupt)
+			}
+			if raw, exact := doc.LookupString(location.Slot, key.key); exact {
+				if prepared != nil {
+					prepared.document = docRef
+					prepared.chunk = location.Chunk
+					prepared.slot = location.Slot
+					prepared.resolved = true
+				}
+				if closeErr := lease.Close(); closeErr != nil {
+					_ = docLease.Close()
+					return StorePageValue{}, false, closeErr
+				}
+				return StorePageValue{lease: docLease, raw: raw}, true, nil
+			}
+			if closeErr := docLease.Close(); closeErr != nil {
+				_ = lease.Close()
+				return StorePageValue{}, false, closeErr
+			}
+		}
+		follow := view.Header().MaxHash == key.hash
+		if closeErr := lease.Close(); closeErr != nil {
+			return StorePageValue{}, false, closeErr
+		}
+		if !follow {
+			return StorePageValue{}, false, nil
+		}
+	}
+}
+
+// nextStorePageKeyLeaf advances one B+tree cursor without following the
+// leaf's physical Next hint. Parent pages belong to the selected immutable
+// root, so their child references always name the correct COW generation.
+// The uncommon collision path may reread branch pages but allocates nothing.
+func nextStorePageKeyLeaf(pages *storeio.PageFile,
+	path *[storePageKeyMaxDepth - 1]storePageKeyPathEntry, depth *int) (storeio.PageRef, bool, error) {
+	for level := *depth - 1; level >= 0; level-- {
+		cursor := &path[level]
+		lease, err := pages.Cache().Pin(cursor.ref)
+		if err != nil {
+			return storeio.PageRef{}, false, storePageReadError(err)
+		}
+		view := storeio.AdmittedPageKeyDirectory(lease.Bytes())
+		if view.Header().Level != cursor.level || view.Header().Level == 0 {
+			_ = lease.Close()
+			return storeio.PageRef{}, false, corruptStorePage("key-successor branch level", storeio.ErrKeyDirectoryCorrupt)
+		}
+		rank := int(cursor.rank) + 1
+		if rank >= view.Len() {
+			if closeErr := lease.Close(); closeErr != nil {
+				return storeio.PageRef{}, false, closeErr
+			}
+			continue
+		}
+		branch, ok := view.BranchAt(rank)
+		if !ok {
+			_ = lease.Close()
+			return storeio.PageRef{}, false, corruptStorePage("key-successor branch rank", storeio.ErrKeyDirectoryCorrupt)
+		}
+		cursor.rank = uint16(rank)
+		parent := cursor.ref
+		if closeErr := lease.Close(); closeErr != nil {
+			return storeio.PageRef{}, false, closeErr
+		}
+		if branch.Child.Offset >= parent.Offset {
+			return storeio.PageRef{}, false, corruptStorePage("key-successor child order", storeio.ErrKeyDirectoryCorrupt)
+		}
+		*depth = level + 1
+		ref := branch.Child
+		expected := cursor.level - 1
+		for expected != 0 {
+			if *depth == len(path) {
+				return storeio.PageRef{}, false, corruptStorePage("key-successor depth", storeio.ErrKeyDirectoryCorrupt)
+			}
+			lease, err := pages.Cache().Pin(ref)
+			if err != nil {
+				return storeio.PageRef{}, false, storePageReadError(err)
+			}
+			view := storeio.AdmittedPageKeyDirectory(lease.Bytes())
+			if view.Header().Level != expected {
+				_ = lease.Close()
+				return storeio.PageRef{}, false, corruptStorePage("key-successor descent level", storeio.ErrKeyDirectoryCorrupt)
+			}
+			branch, ok := view.BranchAt(0)
+			if !ok {
+				_ = lease.Close()
+				return storeio.PageRef{}, false, corruptStorePage("key-successor first child", storeio.ErrKeyDirectoryCorrupt)
+			}
+			path[*depth] = storePageKeyPathEntry{ref: ref, level: expected}
+			*depth = *depth + 1
+			parent = ref
+			if closeErr := lease.Close(); closeErr != nil {
+				return storeio.PageRef{}, false, closeErr
+			}
+			if branch.Child.Offset >= parent.Offset {
+				return storeio.PageRef{}, false, corruptStorePage("key-successor descent order", storeio.ErrKeyDirectoryCorrupt)
+			}
+			ref = branch.Child
+			expected--
+		}
+		return ref, true, nil
+	}
+	return storeio.PageRef{}, false, nil
 }
 
 func (r *StorePageReader) resolveDocumentPage(pages *storeio.PageFile, chunkID uint32) (storeio.PageRef, bool, error) {

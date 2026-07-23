@@ -214,9 +214,11 @@ that image.
 For an immutable checkpoint that must be read through an explicit fixed-size
 page cache, `Store.WritePageFile` and `OpenStorePageReader` provide a narrower
 page-file surface. `StorePageDB` can durably replace or delete existing keys in
-that format. It is kept as a focused page-I/O and crash-consistency baseline;
-it does not support insertion, TTL, secondary indexes, overflow values, or
-extent reuse. Use `FileStore` for the general durable collection below.
+that format and can insert a missing key by reusing the first free stable slot
+or splitting its copy-on-write key and chunk paths. It is kept as a focused
+page-I/O and crash-consistency baseline; it does not support TTL, secondary
+indexes, overflow values, or extent reuse. Use `FileStore` for the general
+durable collection below.
 
 For incremental durability and a bounded resident set, attach a `FileStore` to
 a caller-owned file. Its key, chunk, exact-index, TTL, free-space, document, and

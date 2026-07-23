@@ -8,11 +8,11 @@ scalar semantics, and the compiled query layer; they intentionally have
 different ownership and index-lifecycle surfaces.
 
 `StorePageReader` and `StorePageDB` preserve a smaller page-file contract:
-fixed-cache reads plus durable replacement/deletion of keys already present in
-a `Store.WritePageFile` checkpoint. They are useful as a specialized I/O
-baseline, but their format does not support insertion, TTL, secondary indexes,
-overflow values, or extent reuse. Their hash-routed page-key directory is
-therefore intentionally separate from `FileStore`'s variable-key tree.
+fixed-cache reads plus durable insertion, replacement, and deletion in a
+`Store.WritePageFile` checkpoint. They are useful as a specialized I/O
+baseline, but their format does not support TTL, secondary indexes, overflow
+values, or extent reuse. Their hash-routed page-key directory is therefore
+intentionally separate from `FileStore`'s variable-key tree.
 
 The zero value is ready to use. Options are frozen by the first `Put`,
 `CreateIndex`, or `AddIndex`.
@@ -62,7 +62,7 @@ raw, ok := view.GetRaw("user:42")
 | `AppendStoreBitmapAnd/And3/Or/AndNot` | combine dense caller-owned workspaces | O(shortest or longest input words), zero allocation with capacity |
 | `query.RunSnapshotInto` | late-bound indexed query over a snapshot | candidate masks + selected-column work |
 | `Store.WritePageFile` / `OpenStorePageReader` | write/open the specialized fixed-cache checkpoint | full export / bounded page-cache open |
-| `StorePageDB.Put` / `Delete` | durably replace/delete an existing checkpoint key | copied page paths + synchronous barriers |
+| `StorePageDB.Put` / `Delete` | durably insert, replace, or delete a checkpoint key | copied page paths + synchronous barriers |
 | `CreateFileStore` / `OpenFileStore` | create or lazily recover a durable page graph | bounded root/page scratch; no corpus walk on open |
 | `FileStore.Put` / `Delete` | publish a copy-on-write durable generation | changed document plus copied metadata paths |
 | `FileStore.SetDeadline` / `Persist` / `ExpireDue` | mutate the persistent deadline tree | copied key/TTL paths; due work is caller-bounded by `limit` |

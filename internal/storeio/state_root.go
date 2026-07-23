@@ -17,7 +17,9 @@ const (
 	// reference.
 	PageRefSize = 32
 
-	stateRootVersion        = uint32(2)
+	stateRootVersionV2      = uint32(2)
+	stateRootVersion        = uint32(3)
+	stateRootFreeHintOffset = 60
 	stateRootChunkRefOffset = 64
 	stateRootKeyRefOffset   = stateRootChunkRefOffset + PageRefSize
 	stateRootIndexRefOffset = stateRootKeyRefOffset + PageRefSize
@@ -74,10 +76,15 @@ type StateRoot struct {
 	IndexCount       uint32
 	IndexMaxDepth    uint32
 	IndexCatalogHash uint64
-	ChunkDirectory   PageRef
-	KeyDirectory     PageRef
-	IndexDirectory   PageRef
-	TTLDirectory     PageRef
+	// FreeChunkHint is a conservative lower bound for the first chunk that
+	// may contain a free stable slot. ChunkHighWater means no known hole.
+	// Insertion advances it while delete can lower it in O(1), avoiding a
+	// heap-side free-slot object or pointer for every key.
+	FreeChunkHint  uint32
+	ChunkDirectory PageRef
+	KeyDirectory   PageRef
+	IndexDirectory PageRef
+	TTLDirectory   PageRef
 }
 
 // EncodeStateRootPage writes and seals one complete common-format page into
@@ -110,6 +117,7 @@ func EncodeStateRootPage(dst []byte, root StateRoot, fileEnd uint64) ([]byte, er
 	binary.LittleEndian.PutUint32(payload[44:48], root.IndexCount)
 	binary.LittleEndian.PutUint32(payload[48:52], root.IndexMaxDepth)
 	binary.LittleEndian.PutUint64(payload[52:60], root.IndexCatalogHash)
+	binary.LittleEndian.PutUint32(payload[stateRootFreeHintOffset:stateRootChunkRefOffset], root.FreeChunkHint)
 	encodePageRef(payload[stateRootChunkRefOffset:stateRootKeyRefOffset], root.ChunkDirectory)
 	encodePageRef(payload[stateRootKeyRefOffset:stateRootIndexRefOffset], root.KeyDirectory)
 	encodePageRef(payload[stateRootIndexRefOffset:stateRootTTLRefOffset], root.IndexDirectory)
@@ -129,16 +137,24 @@ func DecodeStateRootPage(src []byte, fileEnd uint64) (StateRoot, error) {
 	if err != nil {
 		return StateRoot{}, fmt.Errorf("%w: %w", ErrStateRootCorrupt, err)
 	}
+	version := binary.LittleEndian.Uint32(payload[0:4])
 	if header.Kind != PageStateRoot || header.LogicalID != StateRootLogicalID ||
 		len(payload) != StateRootPayloadSize ||
-		binary.LittleEndian.Uint32(payload[0:4]) != stateRootVersion ||
-		!allZero(payload[60:stateRootChunkRefOffset]) ||
+		version != stateRootVersionV2 && version != stateRootVersion ||
 		!pageRefReservedZero(payload[stateRootChunkRefOffset:stateRootKeyRefOffset]) ||
 		!pageRefReservedZero(payload[stateRootKeyRefOffset:stateRootIndexRefOffset]) ||
 		!pageRefReservedZero(payload[stateRootIndexRefOffset:stateRootTTLRefOffset]) ||
 		!pageRefReservedZero(payload[stateRootTTLRefOffset:stateRootRefsEnd]) ||
 		!allZero(payload[stateRootRefsEnd:]) {
 		return StateRoot{}, fmt.Errorf("%w: header, version, or reserved bytes", ErrStateRootCorrupt)
+	}
+	freeChunkHint := uint32(0)
+	if version == stateRootVersionV2 {
+		if !allZero(payload[stateRootFreeHintOffset:stateRootChunkRefOffset]) {
+			return StateRoot{}, fmt.Errorf("%w: version-two reserved bytes", ErrStateRootCorrupt)
+		}
+	} else {
+		freeChunkHint = binary.LittleEndian.Uint32(payload[stateRootFreeHintOffset:stateRootChunkRefOffset])
 	}
 	root := StateRoot{
 		StoreID:          header.StoreID,
@@ -154,6 +170,7 @@ func DecodeStateRootPage(src []byte, fileEnd uint64) (StateRoot, error) {
 		IndexCount:       binary.LittleEndian.Uint32(payload[44:48]),
 		IndexMaxDepth:    binary.LittleEndian.Uint32(payload[48:52]),
 		IndexCatalogHash: binary.LittleEndian.Uint64(payload[52:60]),
+		FreeChunkHint:    freeChunkHint,
 		ChunkDirectory:   decodePageRef(payload[stateRootChunkRefOffset:stateRootKeyRefOffset]),
 		KeyDirectory:     decodePageRef(payload[stateRootKeyRefOffset:stateRootIndexRefOffset]),
 		IndexDirectory:   decodePageRef(payload[stateRootIndexRefOffset:stateRootTTLRefOffset]),
@@ -200,7 +217,7 @@ func validateStateRoot(root StateRoot, fileEnd uint64) error {
 	}
 	if root.ChunkDocuments == 0 || root.ChunkDocuments > 64 ||
 		root.LiveChunks > root.ChunkHighWater || root.TTLCount > root.DocumentCount ||
-		root.NextLogicalID <= StateRootLogicalID ||
+		root.FreeChunkHint > root.ChunkHighWater || root.NextLogicalID <= StateRootLogicalID ||
 		(root.IndexCount == 0) != (root.IndexCatalogHash == 0) {
 		return fmt.Errorf("%w: state counts", ErrInvalidWrite)
 	}

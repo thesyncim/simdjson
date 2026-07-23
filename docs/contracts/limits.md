@@ -206,13 +206,13 @@ metadata separately; `OpenStore` images do not provide an eviction budget or a
 fixed frame budget, and their 4,096-row smoke keeps a 1,155,072-byte file
 correct over an 8,192-byte cache (141.0x). That ratio covers the page cache,
 not process baseline, kernel cache, or equal latency. `StorePageDB` currently
-supports durable existing-key replacement and deletion only; inserts, TTL and
-secondary-index roots, overflow values, and free-extent reuse remain rejected
-or unavailable rather than silently exceeding the contract. In this
-specialized checkpoint format, replacement versions increase file bytes even
-though resident memory stays bounded. The separate `FileStore` format below
-implements insertion, TTL, frozen exact indexes, overflow extents, and
-snapshot-safe persistent extent reuse.
+supports durable insertion, replacement, deletion, stable-slot reuse, key-tree
+splits, and chunk-radix growth. TTL and secondary-index roots, overflow values,
+and free-extent reuse remain rejected or unavailable rather than silently
+exceeding the contract. In this specialized checkpoint format, replacement
+versions increase file bytes even though resident memory stays bounded. The
+separate `FileStore` format below implements TTL, frozen exact indexes,
+overflow extents, and snapshot-safe persistent extent reuse.
 
 Dense Store bitmap workspaces use one `uint64` per logical chunk high-water id,
 including empty historical ids. Prefer sparse `StoreMask` streams for selective

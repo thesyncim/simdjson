@@ -15,20 +15,18 @@ import (
 
 const (
 	storePageDBMaxDirectoryDepth = 6
-	storePageDBMaxKeyDepth       = 16
 	storePageDBKeyLeafCapacity   = (int(storePageQuantum) - storeio.PageHeaderSize - storeio.PageTrailerSize -
 		storeio.PageKeyDirectoryPayloadHeaderSize) / storeio.PageKeyLeafEntrySize
 	storePageDBKeyBranchCapacity = (int(storePageQuantum) - storeio.PageHeaderSize - storeio.PageTrailerSize -
 		storeio.PageKeyDirectoryPayloadHeaderSize) / storeio.PageKeyBranchEntrySize
-	storePageDBMaxCommitPages = storePageDBMaxDirectoryDepth + storePageDBMaxKeyDepth + 2 // document, paths, state
+	// A worst-case insert can split every key-tree level: two physical
+	// versions per level plus a new root, alongside one document, six radix
+	// nodes, and the state page. Buffers remain fixed for the database life.
+	storePageDBMaxCommitPages = storePageDBMaxDirectoryDepth + 2*storePageKeyMaxDepth + 3
 	storePageDBDefaultBuffers = storePageDBMaxCommitPages + 2
 )
 
 var (
-	// ErrStorePageInsertUnsupported reports a missing key passed to Put. The
-	// first mutable format slice replaces and deletes existing stable slots;
-	// insertion remains gated until the key-directory split path is durable.
-	ErrStorePageInsertUnsupported = errors.New("simdjson: Store page insertion is not supported")
 	// ErrStorePageInvalidJSON reports a Put value that is not one complete JSON
 	// document. Validation happens before any page or generation is published.
 	ErrStorePageInvalidJSON = errors.New("simdjson: invalid Store page JSON")
@@ -87,9 +85,9 @@ func storePageCommitBackend(backend storeio.Backend) StorePageCommitBackend {
 }
 
 // StorePageDBOptions fixes both bounded read residency and bounded writer
-// staging. WriterBuffers zero selects 26 buffers: enough for one document,
-// six packed-radix nodes, sixteen key-directory nodes, the state page, the
-// alternate root, and one spare.
+// staging. WriterBuffers zero selects 43 buffers: enough for one document,
+// six packed-radix nodes, a split at every level of the sixteen-level key
+// tree, a new key root, the state page, and two spares.
 // Every writer buffer is max(MaxDocumentPageBytes, host page size), remains
 // reusable for the life of the database, lives outside the Go heap on
 // supported Unix systems, and is registered when the native backend is used.
@@ -131,35 +129,34 @@ type storePageDBDirectoryNode struct {
 	rank      int
 	newBitmap uint64
 	newRef    storeio.PageRef
+	hadChild  bool
 }
 
 type storePageDBKeyLeaf struct {
-	header   storeio.PageKeyDirectoryHeader
-	entries  [storePageDBKeyLeafCapacity]storeio.PageKeyLocation
-	count    int
-	rank     int
-	newCount int
-	newRef   storeio.PageRef
+	header     storeio.PageKeyDirectoryHeader
+	entries    [storePageDBKeyLeafCapacity + 1]storeio.PageKeyLocation
+	count      int
+	rank       int
+	newCount   int
+	newRef     storeio.PageRef
+	rightRef   storeio.PageRef
+	rightCount int
 }
 
 type storePageDBKeyBranchNode struct {
-	header   storeio.PageKeyDirectoryHeader
-	entries  [storePageDBKeyBranchCapacity]storeio.PageKeyBranch
-	count    int
-	rank     int
-	newCount int
-	newRef   storeio.PageRef
+	header     storeio.PageKeyDirectoryHeader
+	entries    [storePageDBKeyBranchCapacity + 1]storeio.PageKeyBranch
+	count      int
+	rank       int
+	newCount   int
+	newRef     storeio.PageRef
+	rightRef   storeio.PageRef
+	rightCount int
 }
 
 type storePageDBPublishedView struct {
-	documents      uint64
-	generation     uint64
-	fileEnd        uint64
-	nextLogicalID  uint64
-	chunkHighWater uint32
-	chunkDocuments uint32
-	chunkRoot      storeio.PageRef
-	keyRoot        storeio.PageRef
+	root    storeio.StateRoot
+	fileEnd uint64
 }
 
 type storePageDBPublishedSlot struct {
@@ -182,10 +179,7 @@ func (p *storePageDBPublished) store(root storeio.StateRoot, fileEnd uint64) {
 		runtime.Gosched()
 	}
 	p.slots[next].view = storePageDBPublishedView{
-		documents: root.DocumentCount, generation: root.Generation,
-		fileEnd: fileEnd, nextLogicalID: root.NextLogicalID,
-		chunkHighWater: root.ChunkHighWater, chunkDocuments: root.ChunkDocuments,
-		chunkRoot: root.ChunkDirectory, keyRoot: root.KeyDirectory,
+		root: root, fileEnd: fileEnd,
 	}
 	p.current.Store(next)
 }
@@ -200,16 +194,17 @@ func (p *storePageDBPublished) load() storePageDBPublishedView {
 func (p *storePageDBPublished) loadLookup() (uint64, storeio.PageRef, storeio.PageRef) {
 	p.readers.Add(1)
 	view := &p.slots[p.current.Load()].view
-	documents, keyRoot, chunkRoot := view.documents, view.keyRoot, view.chunkRoot
+	documents := view.root.DocumentCount
+	keyRoot, chunkRoot := view.root.KeyDirectory, view.root.ChunkDirectory
 	p.readers.Add(^uint64(0))
 	return documents, keyRoot, chunkRoot
 }
 
 // StorePageDB is a bounded-residency, crash-consistent mutable view of a page
-// file created by Store.WritePageFile. Put replaces an existing stable slot;
-// Delete removes one. Both append immutable pages, pass a data barrier, and
-// publish the alternate superblock before returning. Applications never call
-// a separate persistence method after a successful mutation.
+// file created by Store.WritePageFile. Put inserts or replaces a stable slot;
+// Delete removes one. Every mutation appends immutable pages, passes a data
+// barrier, and publishes the alternate superblock before returning.
+// Applications never call a separate persistence method after success.
 //
 // One writer is serialized. Readers take a pointer-free atomic root snapshot,
 // then traverse immutable pages without locking. A reader that copied the old
@@ -230,7 +225,7 @@ type StorePageDB struct {
 	rows    [64]storeio.DocumentRecord
 	path    [storePageDBMaxDirectoryDepth]storePageDBDirectoryNode
 	keyLeaf storePageDBKeyLeaf
-	keyPath [storePageDBMaxKeyDepth - 1]storePageDBKeyBranchNode
+	keyPath [storePageKeyMaxDepth - 1]storePageDBKeyBranchNode
 }
 
 // OpenStorePageDB recovers the newest valid generation, truncates any
@@ -298,12 +293,7 @@ func (db *StorePageDB) snapshot() (storeio.StateRoot, uint64) {
 		return storeio.StateRoot{}, 0
 	}
 	view := db.published.load()
-	return storeio.StateRoot{
-		StoreID: db.storeID, Generation: view.generation, PageSize: storePageQuantum,
-		DocumentCount: view.documents, NextLogicalID: view.nextLogicalID,
-		ChunkHighWater: view.chunkHighWater, ChunkDocuments: view.chunkDocuments,
-		ChunkDirectory: view.chunkRoot, KeyDirectory: view.keyRoot,
-	}, view.fileEnd
+	return view.root, view.fileEnd
 }
 
 func (db *StorePageDB) publish(root storeio.StateRoot, fileEnd uint64) {
@@ -365,21 +355,21 @@ func (db *StorePageDB) AppendRawKey(dst []byte, key StorePageDBKey) ([]byte, boo
 	return dst, true, nil
 }
 
-// Put validates src and durably replaces an existing key. It returns created
-// as false because insertion is not part of this first COW slice. A missing
-// key returns ErrStorePageInsertUnsupported without changing the file.
+// Put validates src and durably inserts or replaces key. New keys reuse the
+// first stable-slot hole at or above the persistent free-chunk hint before
+// extending ChunkHighWater.
 func (db *StorePageDB) Put(key string, src []byte) (created bool, err error) {
 	if !Valid(src) {
 		return false, ErrStorePageInvalidJSON
 	}
-	return false, db.mutate(key, src, false)
+	return db.mutate(key, src, false)
 }
 
 // Delete durably removes key and reports whether it existed. The rewritten
 // document page contains only live rows, and empty radix nodes disappear from
 // the new generation; no document tombstone or scan-time compaction remains.
 func (db *StorePageDB) Delete(key string) (deleted bool, err error) {
-	err = db.mutate(key, nil, true)
+	_, err = db.mutate(key, nil, true)
 	if errors.Is(err, errStorePageKeyMissing) {
 		return false, nil
 	}
@@ -388,36 +378,37 @@ func (db *StorePageDB) Delete(key string) (deleted bool, err error) {
 
 var errStorePageKeyMissing = errors.New("simdjson: Store page key is missing")
 
-func (db *StorePageDB) mutate(key string, src []byte, deleting bool) error {
+func (db *StorePageDB) mutate(key string, src []byte, deleting bool) (bool, error) {
 	if db == nil {
-		return ErrStorePageClosed
+		return false, ErrStorePageClosed
 	}
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
 	pages := db.pages.Load()
 	if pages == nil {
-		return ErrStorePageClosed
+		return false, ErrStorePageClosed
 	}
 	root, fileEnd := db.root, db.fileEnd
 	compiled := StorePageKey{key: key, storeID: root.StoreID, hash: storeio.KeyHash(root.StoreID, key)}
 	value, found, err := lookupStorePageKey(pages, root.KeyDirectory, root.ChunkDirectory, compiled, &compiled)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !found {
 		if deleting {
-			return errStorePageKeyMissing
+			return false, errStorePageKeyMissing
 		}
-		return ErrStorePageInsertUnsupported
+		err := db.insertLocked(pages, root, fileEnd, key, src, compiled.hash)
+		return err == nil, err
 	}
 	if !deleting && bytes.Equal(value.Bytes(), src) {
-		return value.Close()
+		return false, value.Close()
 	}
 
 	doc := storeio.AdmittedDocumentPage(value.lease.Bytes())
 	if doc.Header().ChunkID != compiled.chunk {
 		_ = value.Close()
-		return corruptStorePage("mutable document identity", storeio.ErrDocumentPageCorrupt)
+		return false, corruptStorePage("mutable document identity", storeio.ErrDocumentPageCorrupt)
 	}
 	keyDepth, rewriteKey := 0, false
 	if deleting {
@@ -426,18 +417,18 @@ func (db *StorePageDB) mutate(key string, src []byte, deleting bool) error {
 		})
 		if err != nil {
 			_ = value.Close()
-			return err
+			return false, err
 		}
 	}
 	depth, err := db.loadDirectoryPath(pages, root, compiled.chunk, compiled.document)
 	if err != nil {
 		_ = value.Close()
-		return err
+		return false, err
 	}
 	rowCount, live, required, err := db.buildDocumentRows(doc, compiled.slot, src, deleting)
 	if err != nil {
 		_ = value.Close()
-		return err
+		return false, err
 	}
 	docSize := uint32(0)
 	if rowCount != 0 {
@@ -446,7 +437,7 @@ func (db *StorePageDB) mutate(key string, src []byte, deleting bool) error {
 		if !ok {
 			_ = value.Close()
 			clear(db.rows[:])
-			return fmt.Errorf("%w: chunk=%d bytes=%d max=%d", ErrStoreDocumentPageTooLarge,
+			return false, fmt.Errorf("%w: chunk=%d bytes=%d max=%d", ErrStoreDocumentPageTooLarge,
 				compiled.chunk, required, db.options.Open.MaxDocumentPageBytes)
 		}
 	}
@@ -457,7 +448,7 @@ func (db *StorePageDB) mutate(key string, src []byte, deleting bool) error {
 	if value.raw != nil {
 		closeErr = value.Close()
 	}
-	return errors.Join(err, closeErr)
+	return false, errors.Join(err, closeErr)
 }
 
 func (db *StorePageDB) buildDocumentRows(doc storeio.DocumentPageView, slot uint8, src []byte,
@@ -522,6 +513,7 @@ func (db *StorePageDB) loadDirectoryPath(pages *storeio.PageFile, root storeio.S
 		node.rank = bits.OnesCount64(header.Bitmap & (bit - 1))
 		node.newBitmap = header.Bitmap
 		node.newRef = storeio.PageRef{}
+		node.hadChild = true
 		for rank := 0; rank < node.count; rank++ {
 			child, ok := view.RefAt(rank)
 			if !ok {
@@ -553,11 +545,10 @@ func (db *StorePageDB) loadDirectoryPath(pages *storeio.PageFile, root storeio.S
 	return 0, corruptStorePage("mutable chunk-directory depth", storeio.ErrChunkDirectoryCorrupt)
 }
 
-// loadKeyDeletePath copies one B+tree search path into fixed writer scratch.
-// The common leaf is rewritten without the removed location. An adversarial
-// equal-hash run that reaches the key only through a leaf continuation remains
-// a safe exact-recheck entry for now; rewriting that forward chain is a
-// separate bounded-batch case and rewrite is returned false.
+// loadKeyDeletePath copies the exact B+tree leaf path into fixed writer
+// scratch. Equal-hash runs advance through parent-derived successors instead
+// of physical leaf links, so COW always rewrites the generation-visible leaf
+// and leaves no stale candidate behind.
 func (db *StorePageDB) loadKeyDeletePath(pages *storeio.PageFile, root storeio.StateRoot,
 	hash uint64, location storeio.PageKeyLocation) (depth int, rewrite bool, err error) {
 	ref := root.KeyDirectory
@@ -599,10 +590,20 @@ func (db *StorePageDB) loadKeyDeletePath(pages *storeio.PageFile, root storeio.S
 				leaf.newCount--
 				return depth, true, nil
 			}
-			if header.MaxHash == hash && header.Next != (storeio.PageRef{}) {
-				return depth, false, nil
+			if header.MaxHash != hash {
+				return 0, false, corruptStorePage("mutable key location", storeio.ErrKeyDirectoryCorrupt)
 			}
-			return 0, false, corruptStorePage("mutable key location", storeio.ErrKeyDirectoryCorrupt)
+			next, ok, nextErr := db.nextKeyDeleteLeaf(pages, &depth)
+			if nextErr != nil {
+				return 0, false, nextErr
+			}
+			if !ok {
+				return 0, false, corruptStorePage("mutable key collision continuation", storeio.ErrKeyDirectoryCorrupt)
+			}
+			ref = next
+			expectedLevel = 0
+			haveExpectedLevel = true
+			continue
 		}
 		if depth == len(db.keyPath) {
 			_ = lease.Close()
@@ -642,6 +643,64 @@ func (db *StorePageDB) loadKeyDeletePath(pages *storeio.PageFile, root storeio.S
 		depth++
 	}
 	return 0, false, corruptStorePage("mutable missing key root", storeio.ErrKeyDirectoryCorrupt)
+}
+
+// nextKeyDeleteLeaf advances the writer's copied branch path to the next
+// physical leaf in the selected immutable root. Nodes below the first branch
+// with a successor are replaced in scratch by their leftmost descent, leaving
+// commitMutation with the exact path it must copy.
+func (db *StorePageDB) nextKeyDeleteLeaf(pages *storeio.PageFile, depth *int) (storeio.PageRef, bool, error) {
+	for level := *depth - 1; level >= 0; level-- {
+		node := &db.keyPath[level]
+		if node.rank+1 >= node.count {
+			continue
+		}
+		node.rank++
+		ref := node.entries[node.rank].Child
+		*depth = level + 1
+		expected := node.header.Level - 1
+		for expected != 0 {
+			if *depth == len(db.keyPath) {
+				return storeio.PageRef{}, false, corruptStorePage("mutable key-successor depth", storeio.ErrKeyDirectoryCorrupt)
+			}
+			lease, err := pages.Cache().Pin(ref)
+			if err != nil {
+				return storeio.PageRef{}, false, storePageReadError(err)
+			}
+			view := storeio.AdmittedPageKeyDirectory(lease.Bytes())
+			header := view.Header()
+			if header.Level != expected {
+				_ = lease.Close()
+				return storeio.PageRef{}, false, corruptStorePage("mutable key-successor level", storeio.ErrKeyDirectoryCorrupt)
+			}
+			childNode := &db.keyPath[*depth]
+			childNode.header = header
+			childNode.count = view.Len()
+			childNode.rank = 0
+			childNode.newCount = childNode.count
+			childNode.newRef = storeio.PageRef{}
+			for rank := 0; rank < childNode.count; rank++ {
+				entry, ok := view.BranchAt(rank)
+				if !ok {
+					_ = lease.Close()
+					return storeio.PageRef{}, false, corruptStorePage("mutable key-successor branch", storeio.ErrKeyDirectoryCorrupt)
+				}
+				childNode.entries[rank] = entry
+			}
+			child := childNode.entries[0].Child
+			if closeErr := lease.Close(); closeErr != nil {
+				return storeio.PageRef{}, false, closeErr
+			}
+			if child.Offset >= ref.Offset {
+				return storeio.PageRef{}, false, corruptStorePage("mutable key-successor child order", storeio.ErrKeyDirectoryCorrupt)
+			}
+			ref = child
+			*depth = *depth + 1
+			expected--
+		}
+		return ref, true, nil
+	}
+	return storeio.PageRef{}, false, nil
 }
 
 func (db *StorePageDB) commitMutation(root storeio.StateRoot, oldFileEnd uint64, chunkID uint32,
@@ -864,6 +923,7 @@ func (db *StorePageDB) commitMutation(root storeio.StateRoot, oldFileEnd uint64,
 	next.KeyDirectory = keyRoot
 	if deleting {
 		next.DocumentCount--
+		next.FreeChunkHint = min(next.FreeChunkHint, chunkID)
 		if rowCount == 0 {
 			next.LiveChunks--
 		}
@@ -923,7 +983,7 @@ func (db *StorePageDB) Len() uint64 {
 	if db == nil {
 		return 0
 	}
-	return db.published.load().documents
+	return db.published.load().root.DocumentCount
 }
 
 // Generation returns the generation visible to new readers.
@@ -931,7 +991,7 @@ func (db *StorePageDB) Generation() uint64 {
 	if db == nil {
 		return 0
 	}
-	return db.published.load().generation
+	return db.published.load().root.Generation
 }
 
 // DurableGeneration returns the latest generation that passed both barriers.
@@ -941,11 +1001,11 @@ func (db *StorePageDB) DurableGeneration() uint64 {
 	}
 	view := db.published.load()
 	if db.committer == nil {
-		return view.generation
+		return view.root.Generation
 	}
 	durable := db.committer.DurableGeneration()
 	if durable == 0 {
-		return view.generation
+		return view.root.Generation
 	}
 	return durable
 }
@@ -956,6 +1016,9 @@ type StorePageDBStats struct {
 	Generation         uint64
 	DurableGeneration  uint64
 	FileBytes          uint64
+	ChunkHighWater     uint32
+	LiveChunks         uint32
+	FreeChunkHint      uint32
 	DirectIO           bool
 	CommitBackend      StorePageCommitBackend
 	QueuedGenerations  uint64
@@ -972,8 +1035,10 @@ func (db *StorePageDB) Stats() StorePageDBStats {
 		return StorePageDBStats{}
 	}
 	view := db.published.load()
-	stats := StorePageDBStats{Documents: view.documents, Generation: view.generation,
-		DurableGeneration: db.DurableGeneration(), FileBytes: view.fileEnd}
+	stats := StorePageDBStats{Documents: view.root.DocumentCount, Generation: view.root.Generation,
+		DurableGeneration: db.DurableGeneration(), FileBytes: view.fileEnd,
+		ChunkHighWater: view.root.ChunkHighWater, LiveChunks: view.root.LiveChunks,
+		FreeChunkHint: view.root.FreeChunkHint}
 	if committer := db.committer; committer != nil {
 		commit := committer.Stats()
 		stats.CommitBackend = storePageCommitBackend(commit.Backend)
