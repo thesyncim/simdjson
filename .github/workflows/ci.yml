@@ -214,15 +214,10 @@ jobs:
           GOARCH=386 $RUNNER_TEMP/gotip/bin/go build ./...
           GOARCH=s390x $RUNNER_TEMP/gotip/bin/go build ./...
 
-      - name: Comparison module builds
+      - name: Native benchmark module builds
         if: ${{ matrix.primary }}
-        run: $RUNNER_TEMP/gotip/bin/go test -run 'TestValidatorsAcceptFixtures|TestStage2MachineCorpora' .
+        run: $RUNNER_TEMP/gotip/bin/go test ./...
         working-directory: benchmarks
-
-      - name: Stable comparison module builds
-        if: ${{ matrix.primary }}
-        run: go test ./...
-        working-directory: benchmarks/legacy
 
   race:
     name: race (${{ matrix.configuration.name }})

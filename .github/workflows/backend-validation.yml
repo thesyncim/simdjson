@@ -1,4 +1,4 @@
-name: backend comparison
+name: backend validation
 
 on:
   pull_request:
@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: backend-comparison-${{ github.event.pull_request.number || github.ref }}
+  group: backend-validation-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -148,10 +148,10 @@ jobs:
             -run '^$' -bench '^(BenchmarkPortableBackend|BenchmarkBuildIndex|BenchmarkDecodeSmall$|BenchmarkDecodeUint64Array16$|BenchmarkDecodeLargeReused$|BenchmarkEncodeLarge$|BenchmarkStoreDenseBitmapPlan)' \
             -benchmem -benchtime="$BENCHTIME" -count="$BENCHCOUNT" -cpu=1 \
             2>&1 | tee "$RUNNER_TEMP/simd-end-to-end-${RUNNER_ARCH}.txt"
-      - name: Upload comparison
+      - name: Upload backend results
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: backend-comparison-${{ matrix.runner }}-${{ runner.arch }}
+          name: backend-validation-${{ matrix.runner }}-${{ runner.arch }}
           path: ${{ runner.temp }}/*.txt
           if-no-files-found: error

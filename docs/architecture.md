@@ -59,9 +59,9 @@ backend reporting. CPU capability checks and selection policy remain internal.
 CPU and compiler selection belongs at build or package initialization
 boundaries, never in per-byte loops.
 
-`internal/cmd` contains repository tooling, not runtime code. Comparison and
-stdlib-corpus dependencies stay in nested modules, keeping the root module free
-of third-party dependencies.
+`internal/cmd` contains repository tooling, not runtime code. Corpus
+dependencies stay in nested modules, keeping the root module free of
+third-party dependencies.
 
 Create packages only for cohesive responsibilities with stable typed boundaries
 and no reverse dependency on the root package. Do not extract hot paths when

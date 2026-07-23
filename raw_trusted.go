@@ -7,9 +7,8 @@ import (
 )
 
 // ScanFirstRawTrusted returns the JSON Pointer target as a raw source slice
-// without validating src. It is the explicit spelling of the contract that
-// gjson- and sonic-style path extractors provide implicitly: navigation
-// trusts the document.
+// without validating src. It is the explicit spelling of a trusted navigation
+// contract: navigation trusts the document.
 //
 // For src that is valid JSON the three results are identical to
 // [ScanFirstRaw], including its rule that each pointer token resolves to the

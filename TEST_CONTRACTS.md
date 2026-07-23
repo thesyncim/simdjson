@@ -22,8 +22,8 @@ because it records the implementation incident that created it.
 | `RES` | Allocation ceilings, cache growth, scratch clearing, and retained-byte budgets | Documented byte/allocation budgets | Huge-then-small and poison matrices | Resource operation sequences | Forced GC, race exclusions for allocation assertions | Weekly scheduled and release |
 | `ROUTE` | Generic/specialized and portable/SIMD route equivalence | Generic portable implementation | Forced-route corpus and malformed cases | SIMD/scalar/route parity | Portable/SIMD, checkptr | PR and weekly scheduled |
 | `API` | Exported construction, zero values, errors, and examples | Package documentation and Go API conventions | External-package examples and contract tests | Covered through domain campaigns | Normal PR matrix | PR |
-| `PERF` | Latency, throughput, allocations, compile cost, binary size, and retained memory | Fixed baseline and interleaved `benchstat` | Named benchmark families | Not fuzzed | Hosted ARM64/amd64 comparisons; dedicated ARM64 hard gate | PR signal; manual hard gate |
-| `TOOL` | Generators, publishers, corpus provenance, and CI helpers | Reproducible checked-in output | Tool unit tests and clean-tree checks | Not fuzzed | Pinned toolchain | PR |
+| `PERF` | Latency, throughput, allocations, compile cost, binary size, and retained memory | Fixed baseline and interleaved `benchstat` | Named benchmark families | Not fuzzed | Hosted ARM64/amd64 measurements; dedicated ARM64 hard gate | PR signal; manual hard gate |
+| `TOOL` | Generators, corpus provenance, and CI helpers | Reproducible checked-in output | Tool unit tests and clean-tree checks | Not fuzzed | Pinned toolchain | PR |
 
 ## Invariant naming rule
 
@@ -134,10 +134,14 @@ internal/storeio/committer_test.go
 internal/storeio/chunk_directory_test.go
 internal/storeio/chunk_tree_test.go
 internal/storeio/device_test.go
+internal/storeio/document_group_test.go
 internal/storeio/document_page_test.go
+internal/storeio/float64_group_test.go
+internal/storeio/float64_scan_test.go
 internal/storeio/free_directory_test.go
 internal/storeio/free_tree_test.go
 internal/storeio/generation_leases_test.go
+internal/storeio/index_group_catalog_test.go
 internal/storeio/index_directory_test.go
 internal/storeio/index_pool_test.go
 internal/storeio/key_directory_test.go
@@ -175,13 +179,17 @@ shape_column_typed_test.go
 shape_test.go
 store_test.go
 store_builder_test.go
+store_file_bulk_test.go
+store_file_group_test.go
 store_file_linux_test.go
 store_file_reliability_test.go
 store_file_test.go
+store_float64_reduce_test.go
 store_bitmap_test.go
 store_index_exact_test.go
 store_index_packed_test.go
 store_persist_test.go
+store_schema_test.go
 store_page_db_test.go
 store_page_file_test.go
 internal/storeio/ring_linux_test.go
@@ -320,29 +328,19 @@ typed_bench_test.go
 typed_hook_bench_test.go
 benchmarks/bench_test.go
 benchmarks/benchmark_corpus_test.go
-benchmarks/legacy/bench_test.go
-benchmarks/legacy/stdlib_corpus_bench_test.go
-benchmarks/legacy/stdlib_models_test.go
-benchmarks/lookup_competitors_bench_test.go
 benchmarks/native_corpus_bench_test.go
 benchmarks/stage2_machine_bench_test.go
 benchmarks/stdlib_corpus_bench_test.go
-benchmarks/stdlib_corpus_jsonv2_bench_test.go
 benchmarks/typed_bench_test.go
-benchmarks/typed_jsonv2_bench_test.go
 internal/scanner/scan_backend_bench_test.go
-benchmarks/duckdbbench/duckdbbench_test.go
 tests/stdlib/corpus_bench_test.go
 ```
 
 ### `TOOL`
 
 ```text
-internal/cmd/benchpublish/charts_test.go
-internal/cmd/benchpublish/main_test.go
 internal/cmd/testcontracts/main_test.go
 internal/cmd/unsafeinventory/main_test.go
-benchmarks/crosslang/go_contract/main_test.go
 simd/release_window_test.go
 test_budget_test.go
 ```
