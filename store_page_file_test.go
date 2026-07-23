@@ -415,35 +415,51 @@ func TestStorePageReaderConcurrentClose(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("PrepareKey = (%v,%v)", ok, err)
 	}
-	ready := make(chan struct{})
-	done := make(chan error, 1)
+	leaseHeld := make(chan struct{})
+	releaseLease := make(chan struct{})
+	readDone := make(chan error, 1)
 	go func() {
-		announced := false
-		for {
-			value, ok, err := reader.ViewRawKey(key)
-			if errors.Is(err, ErrStorePageClosed) {
-				done <- nil
-				return
-			}
-			if err != nil || !ok {
-				done <- fmt.Errorf("concurrent ViewRawKey = (%v,%w)", ok, err)
-				return
-			}
-			if err := value.Close(); err != nil {
-				done <- err
-				return
-			}
-			if !announced {
-				close(ready)
-				announced = true
-			}
+		value, ok, viewErr := reader.ViewRawKey(key)
+		if viewErr != nil || !ok {
+			readDone <- fmt.Errorf("concurrent ViewRawKey = (%v,%w)", ok, viewErr)
+			return
 		}
+		close(leaseHeld)
+		<-releaseLease
+		if closeErr := value.Close(); closeErr != nil {
+			readDone <- closeErr
+			return
+		}
+		if _, _, viewErr = reader.ViewRawKey(key); !errors.Is(viewErr, ErrStorePageClosed) {
+			readDone <- fmt.Errorf("ViewRawKey after concurrent Close = %v, want %v", viewErr, ErrStorePageClosed)
+			return
+		}
+		readDone <- nil
 	}()
-	<-ready
-	if err := reader.Close(); err != nil {
-		t.Fatal(err)
+	<-leaseHeld
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- reader.Close() }()
+	for reader.pages.Load() != nil {
+		runtime.Gosched()
 	}
-	if err := <-done; err != nil {
+	var earlyClose error
+	closedEarly := false
+	select {
+	case earlyClose = <-closeDone:
+		closedEarly = true
+	default:
+	}
+	close(releaseLease)
+	if !closedEarly {
+		earlyClose = <-closeDone
+	}
+	if earlyClose != nil {
+		t.Fatal(earlyClose)
+	}
+	if closedEarly {
+		t.Fatal("Close returned while a zero-copy value still pinned its cache extent")
+	}
+	if err := <-readDone; err != nil {
 		t.Fatal(err)
 	}
 }

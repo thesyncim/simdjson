@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
+	"time"
 )
 
 // ErrDirectIOUnsupported reports a platform or filesystem that cannot honor
@@ -94,8 +96,27 @@ func (f *PageFile) Close() error {
 	f.closeOnce.Do(func() {
 		// Keep both pointers immutable. A reader that acquired PageFile just
 		// before Close can safely observe the cache's closing state; the cache
-		// drains all in-flight reads and leases before the descriptor closes.
-		f.closeErr = errors.Join(f.cache.Close(), f.file.Close())
+		// rejects new admission and drains in-flight loads on the first call.
+		// PageCache.Close deliberately reports a live caller-owned lease
+		// instead of blocking; PageFile owns both resources, so it must wait
+		// until those leases drain before releasing the arena or descriptor.
+		//
+		// The retry is entirely on the cold close path. Yield first so a
+		// racing short-lived view can release immediately, then back off to
+		// avoid burning a core when an application intentionally holds a view
+		// for longer. Read, pin, and release paths pay no extra synchronization.
+		for retry := 0; ; retry++ {
+			cacheErr := f.cache.Close()
+			if !errors.Is(cacheErr, ErrPageCachePinned) {
+				f.closeErr = errors.Join(cacheErr, f.file.Close())
+				break
+			}
+			if retry < 16 {
+				runtime.Gosched()
+				continue
+			}
+			time.Sleep(time.Millisecond)
+		}
 	})
 	return f.closeErr
 }
